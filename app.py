@@ -101,23 +101,7 @@ CORS(
     max_age=86400,
 )
 
-from flask import make_response
 
-@app.before_request
-def _handle_options_preflight():
-    """Ensure preflight requests always get the CORS + credentials headers."""
-    if request.method != "OPTIONS":
-        return None
-
-    origin = request.headers.get("Origin", "")
-    resp = make_response("", 204)
-    if origin in FRONTEND_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        resp.headers["Vary"] = "Origin"
-    return resp
 
 @app.route("/", methods=["GET"])
 def root():
