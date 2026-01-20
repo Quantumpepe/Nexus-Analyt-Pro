@@ -1,0 +1,6 @@
+flask
+flask-cors
+gunicorn
+requests
+itsdangerous
+python-dotenv
