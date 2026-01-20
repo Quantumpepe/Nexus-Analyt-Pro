@@ -1,6 +1,0 @@
-flask
-flask-cors
-gunicorn
-requests
-web3
-python-dotenv
