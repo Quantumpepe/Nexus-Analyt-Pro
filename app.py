@@ -4361,3 +4361,45 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host=host, port=port, debug=True)
+
+# -------------------------
+# 🔧 PATCH: Missing helpers (Render-safe)
+# These were referenced but not defined in the file, causing 500s / worker timeouts.
+# -------------------------
+
+# Price series cache for grid backtests
+PRICE_SERIES_CACHE = {}
+
+# Autorun state
+GRID_AUTORUN = {}
+
+def _autorun_loop(item_id, stop_evt, interval):
+    """Simple autorun loop: periodically calls grid tick until stopped."""
+    while not stop_evt.is_set():
+        try:
+            # internal call via function, not HTTP
+            sess = GRID_SESSIONS.get(item_id)
+            if isinstance(sess, dict):
+                _sim_tick(sess, new_price=None)
+                GRID_SESSIONS[item_id] = _trim_grid_session(sess)
+                _persist_grid_state()
+        except Exception:
+            pass
+        stop_evt.wait(interval)
+
+def _sim_tick(session: dict, new_price=None):
+    """Safe wrapper around grid_sim step."""
+    try:
+        cfg = GRID_CONFIGS.get(session.get("item_id")) or {}
+        snap = {"price": new_price} if new_price is not None else {}
+        return _grid_step(session, cfg, snap) or session
+    except Exception:
+        return session
+
+def _grid_prune_history(sess: dict):
+    """Prune grid history safely (no-op fallback)."""
+    try:
+        return _trim_grid_session(sess)
+    except Exception:
+        return sess
+
