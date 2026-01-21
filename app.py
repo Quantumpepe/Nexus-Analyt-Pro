@@ -2608,6 +2608,98 @@ def api_watchlist_snapshot():
 
 
 
+
+# ---------------------------
+# CoinGecko proxy (server-side)
+# ---------------------------
+# IMPORTANT:
+# Browsers will often be blocked by CORS when calling api.coingecko.com directly.
+# Also CoinGecko rate-limits aggressively (429). We proxy + cache here.
+_CG_PROXY_CACHE = {}  # key -> (ts, payload)
+
+def _cg_proxy_get(url: str, params: dict | None = None, ttl_s: int = 30):
+    """GET CoinGecko URL with small TTL cache. Returns (payload_dict, http_status)."""
+    try:
+        key = url + "?" + "&".join([f"{k}={params[k]}" for k in sorted(params or {})])
+    except Exception:
+        key = url
+
+    now = time.time()
+    hit = _CG_PROXY_CACHE.get(key)
+    if hit:
+        ts, payload = hit
+        if now - ts < ttl_s:
+            return payload, 200
+
+    headers = {
+        "Accept": "application/json",
+        # Some CDNs behave better with an explicit UA
+        "User-Agent": "Nexus-Analyt/1.0 (+render)",
+    }
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        # If rate-limited, serve stale cache if available
+        if r.status_code == 429 and hit:
+            return hit[1], 200
+        payload = r.json() if r.content else {}
+        if r.status_code == 200:
+            _CG_PROXY_CACHE[key] = (now, payload)
+        return payload, r.status_code
+    except Exception as e:
+        # Serve stale cache on network errors
+        if hit:
+            return hit[1], 200
+        return {"error": "coingecko_proxy_error", "detail": str(e)}, 502
+
+
+@app.route("/api/cg/simple_price", methods=["GET"])
+def api_cg_simple_price():
+    # Example: /api/cg/simple_price?ids=bitcoin,ethereum&vs_currencies=usd
+    ids = request.args.get("ids", "").strip()
+    vs = request.args.get("vs_currencies", "usd").strip()
+    if not ids:
+        return jsonify({"error": "missing_ids"}), 400
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    payload, status = _cg_proxy_get(url, params={"ids": ids, "vs_currencies": vs}, ttl_s=20)
+    return jsonify(payload), status
+
+
+@app.route("/api/cg/coins_markets", methods=["GET"])
+def api_cg_coins_markets():
+    # Minimal wrapper for coins/markets used by UI "live prices"
+    # Example: /api/cg/coins_markets?vs_currency=usd&ids=bitcoin,ethereum&per_page=50&page=1
+    vs = request.args.get("vs_currency", "usd").strip()
+    ids = request.args.get("ids", "").strip()
+    per_page = request.args.get("per_page", "50").strip()
+    page = request.args.get("page", "1").strip()
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": vs,
+        "ids": ids,
+        "order": "market_cap_desc",
+        "per_page": per_page,
+        "page": page,
+        "sparkline": "false",
+        "price_change_percentage": "24h",
+    }
+    payload, status = _cg_proxy_get(url, params=params, ttl_s=30)
+    return jsonify(payload), status
+
+
+@app.route("/api/cg/market_chart", methods=["GET"])
+def api_cg_market_chart():
+    # Example: /api/cg/market_chart?id=bitcoin&vs_currency=usd&days=30
+    coin_id = request.args.get("id", "").strip()
+    vs = request.args.get("vs_currency", "usd").strip()
+    days = request.args.get("days", "30").strip()
+    if not coin_id:
+        return jsonify({"error": "missing_id"}), 400
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    payload, status = _cg_proxy_get(url, params={"vs_currency": vs, "days": days}, ttl_s=60)
+    return jsonify(payload), status
+
+
+
 @app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
     """Compare price series for up to 10 symbols.
