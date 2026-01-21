@@ -225,6 +225,18 @@ def _cg_market_chart_usd(coin_id: str, days: int = 30):
 
 
 
+
+# -------------------------
+# Error handling (ensure JSON + avoid missing CORS headers on exceptions)
+# -------------------------
+@app.errorhandler(Exception)
+def _handle_unexpected_error(e):
+    try:
+        app.logger.exception("Unhandled error: %s", e)
+    except Exception:
+        pass
+    return jsonify({"error": "internal_error", "detail": str(e)}), 500
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
