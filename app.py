@@ -84,14 +84,11 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
-# Allow multiple origins via ENV (comma-separated). Example:
-# FRONTEND_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,https://nexus-analyt-ui.onrender.com"
-_env_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
-FRONTEND_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()] or [
+FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://nexus-analyt-ui.onrender.com",
 ]
+
 CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
@@ -2410,6 +2407,90 @@ def api_market_resolve():
         if cached is not None:
             return jsonify(cached)
         return err(str(e), 500)
+
+# -------------------------
+# CoinGecko proxy endpoints (server-side) to avoid browser CORS/429 issues
+# -------------------------
+@app.route("/api/cg/simple_price", methods=["GET"])
+def api_cg_simple_price():
+    """
+    Proxy for CoinGecko /simple/price.
+
+    Query params:
+      - ids: comma-separated CoinGecko ids (e.g. "ethereum,bitcoin")
+      - vs_currencies: comma-separated (default "usd")
+      - include_24hr_change: "true"/"false" (default "true")
+      - include_24hr_vol: "true"/"false" (default "true")
+      - include_market_cap: "true"/"false" (default "true")
+    """
+    ids = (request.args.get("ids") or "").strip()
+    vs = (request.args.get("vs_currencies") or "usd").strip()
+    if not ids:
+        return jsonify({"status": "error", "error": "missing ids"}), 400
+
+    params = {
+        "ids": ids,
+        "vs_currencies": vs,
+        "include_24hr_change": request.args.get("include_24hr_change", "true"),
+        "include_24hr_vol": request.args.get("include_24hr_vol", "true"),
+        "include_market_cap": request.args.get("include_market_cap", "true"),
+    }
+
+    cache_key = f"cg-simple-price|{ids}|{vs}|{params['include_24hr_change']}|{params['include_24hr_vol']}|{params['include_market_cap']}"
+    try:
+        cached = _cg_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+        data = _cg_request_json("https://api.coingecko.com/api/v3/simple/price", params=params, timeout=15)
+        _cg_cache_set(cache_key, data, ttl=60)
+        return jsonify(data)
+    except Exception as e:
+        cached_any = _cg_cache_get_any(cache_key)
+        if cached_any is not None:
+            return jsonify(cached_any)
+        return jsonify({"status": "error", "error": str(e)}), 502
+
+
+@app.route("/api/cg/token_price/<platform>", methods=["GET"])
+def api_cg_token_price(platform: str):
+    """
+    Proxy for CoinGecko /simple/token_price/{platform}
+
+    Query params:
+      - contract_addresses: comma-separated
+      - vs_currencies: comma-separated (default "usd")
+    """
+    platform = (platform or "").strip().lower()
+    contracts = (request.args.get("contract_addresses") or "").strip()
+    vs = (request.args.get("vs_currencies") or "usd").strip()
+    if not platform or not contracts:
+        return jsonify({"status": "error", "error": "missing platform or contract_addresses"}), 400
+
+    params = {
+        "contract_addresses": contracts,
+        "vs_currencies": vs,
+        "include_24hr_change": request.args.get("include_24hr_change", "true"),
+        "include_24hr_vol": request.args.get("include_24hr_vol", "true"),
+        "include_market_cap": request.args.get("include_market_cap", "true"),
+    }
+
+    cache_key = f"cg-token-price|{platform}|{contracts}|{vs}"
+    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+    try:
+        cached = _cg_cache_get(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+
+        data = _cg_request_json(url, params=params, timeout=15)
+        _cg_cache_set(cache_key, data, ttl=60)
+        return jsonify(data)
+    except Exception as e:
+        cached_any = _cg_cache_get_any(cache_key)
+        if cached_any is not None:
+            return jsonify(cached_any)
+        return jsonify({"status": "error", "error": str(e)}), 502
+
 @app.route("/api/watchlist/snapshot", methods=["GET", "POST"])
 def api_watchlist_snapshot():
     """
@@ -2499,7 +2580,11 @@ def api_watchlist_snapshot():
                 ids_by_symbol[sym] = cid
                 coin_ids.append(cid)
 
-        snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+        try:
+            snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+        except Exception:
+            # Do not fail the whole snapshot if CoinGecko is rate-limited/unavailable.
+            snaps_by_id = {}
 
         # ---- Build results (normalized keys expected by frontend) ----
         results = []
@@ -2575,10 +2660,10 @@ def api_watchlist_snapshot():
                     "source": "error",
                 })
 
-        _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, {"status": "ok", "results": results, "items": results, "ts": int(time.time())})
+        _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, {"status": "ok", "results": results, "ts": int(time.time())})
         return jsonify({"status": "ok", "results": results, "items": results, "ts": int(time.time())})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "results": [], "items": [], "ts": int(time.time())}), 500
+        return jsonify({"status": "error", "error": str(e), "results": [], "items": [], "ts": int(time.time())})
 
 
 
