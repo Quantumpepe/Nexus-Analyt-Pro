@@ -84,13 +84,9 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
-# In production (Render), set env:
-#   FRONTEND_ORIGINS="https://nexus-analyt-ui.onrender.com,http://localhost:5173"
-_env_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
-FRONTEND_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()] or [
+FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://nexus-analyt-ui.onrender.com",
 ]
 
 CORS(
@@ -102,6 +98,7 @@ CORS(
     expose_headers=["Content-Type"],
     max_age=86400,
 )
+
 from flask import make_response
 
 @app.before_request
@@ -119,48 +116,6 @@ def _handle_options_preflight():
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         resp.headers["Vary"] = "Origin"
     return resp
-
-# -------------------------
-# CoinGecko proxy (avoid CORS; small cache to reduce 429)
-# -------------------------
-_CG_CACHE = {}  # key -> (expires_ts, data)
-
-def _cg_cached_get(url: str, params: dict, ttl: int = 60):
-    key = url + "?" + "&".join([f"{k}={params.get(k)}" for k in sorted(params.keys())])
-    now = time.time()
-    hit = _CG_CACHE.get(key)
-    if hit and hit[0] > now:
-        return hit[1]
-    r = requests.get(url, params=params, timeout=15)
-    try:
-        data = r.json()
-    except Exception:
-        data = {"error": "bad_response", "status_code": r.status_code, "text": (r.text or "")[:500]}
-    _CG_CACHE[key] = (now + ttl, data)
-    return data
-
-@app.route("/api/cg/simple_price", methods=["GET"])
-def cg_simple_price():
-    """Proxy for CoinGecko /simple/price"""
-    ids = (request.args.get("ids") or "").strip()
-    vs = (request.args.get("vs_currencies") or request.args.get("vs") or "usd").strip()
-    if not ids:
-        return jsonify({"error": "missing_ids"}), 400
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    data = _cg_cached_get(url, {"ids": ids, "vs_currencies": vs}, ttl=30)
-    return jsonify(data)
-
-@app.route("/api/cg/token_price/<platform>", methods=["GET"])
-def cg_token_price(platform: str):
-    """Proxy for CoinGecko /simple/token_price/{platform}"""
-    platform = (platform or "").strip().lower()
-    contract_addresses = (request.args.get("contract_addresses") or "").strip()
-    vs = (request.args.get("vs_currencies") or request.args.get("vs") or "usd").strip()
-    if not platform or not contract_addresses:
-        return jsonify({"error": "missing_platform_or_contract_addresses"}), 400
-    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
-    data = _cg_cached_get(url, {"contract_addresses": contract_addresses, "vs_currencies": vs}, ttl=30)
-    return jsonify(data)
 
 @app.route("/", methods=["GET"])
 def root():
