@@ -2664,6 +2664,28 @@ def api_cg_simple_price():
     return jsonify(payload), status
 
 
+@app.route("/api/cg/token_price/<platform>", methods=["GET"])
+def api_cg_token_price(platform):
+    """
+    Proxy for CoinGecko simple/token_price to avoid browser CORS + reduce rate limits.
+
+    Example:
+      /api/cg/token_price/ethereum?contract_addresses=0x...,&vs_currencies=usd
+      /api/cg/token_price/binance-smart-chain?contract_addresses=0x...,&vs_currencies=usd
+    """
+    platform = (platform or "").strip()
+    addrs = request.args.get("contract_addresses", "").strip()
+    vs = request.args.get("vs_currencies", "usd").strip()
+    if not platform:
+        return jsonify({"error": "missing_platform"}), 400
+    if not addrs:
+        return jsonify({"error": "missing_contract_addresses"}), 400
+
+    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+    payload, status = _cg_proxy_get(url, params={"contract_addresses": addrs, "vs_currencies": vs}, ttl_s=30)
+    return jsonify(payload), status
+
+
 @app.route("/api/cg/coins_markets", methods=["GET"])
 def api_cg_coins_markets():
     # Minimal wrapper for coins/markets used by UI "live prices"
