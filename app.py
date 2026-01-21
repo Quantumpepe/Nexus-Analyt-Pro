@@ -102,6 +102,128 @@ CORS(
 )
 
 
+from flask import make_response
+
+@app.after_request
+def _add_cors_headers(resp):
+    # Ensure CORS headers are present even on JSON errors.
+    origin = request.headers.get("Origin", "")
+    if origin and origin in FRONTEND_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        req_hdrs = request.headers.get("Access-Control-Request-Headers")
+        resp.headers["Access-Control-Allow-Headers"] = req_hdrs or "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    return resp
+
+# -----------------------------------------------------------------------------
+# Coingecko helpers (production-safe: low timeouts + caching)
+# -----------------------------------------------------------------------------
+_CG_BASE = "https://api.coingecko.com/api/v3"
+_CG_CACHE: dict[str, tuple[float, object]] = {}
+
+def _cg_cache_get(key: str):
+    now = time.time()
+    hit = _CG_CACHE.get(key)
+    if not hit:
+        return None
+    exp, val = hit
+    if exp < now:
+        _CG_CACHE.pop(key, None)
+        return None
+    return val
+
+def _cg_cache_set(key: str, val, ttl_s: int = 120):
+    _CG_CACHE[key] = (time.time() + ttl_s, val)
+    return val
+
+def _cg_request_json(path: str, params: dict | None = None, timeout: float = 8.0):
+    url = _CG_BASE + path
+    try:
+        r = requests.get(
+            url,
+            params=params or {},
+            timeout=timeout,
+            headers={"User-Agent": "Nexus-Analyt/1.0 (+render)"},
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        app.logger.warning("Coingecko request failed: %s %s (%s)", path, params, e)
+        return None
+
+def _cg_resolve_symbol(sym: str) -> str | None:
+    s = (sym or "").strip().lower()
+    if not s:
+        return None
+    mapping = {
+        "btc": "bitcoin",
+        "eth": "ethereum",
+        "pol": "matic-network",
+        "matic": "matic-network",
+        "bnb": "binancecoin",
+        "sol": "solana",
+        "xrp": "ripple",
+        "ada": "cardano",
+    }
+    return mapping.get(s)
+
+def _cg_market_snapshots(ids: list[str], vs: str = "usd"):
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    key = f"mkts:{vs}:{','.join(sorted(ids))}"
+    cached = _cg_cache_get(key)
+    if cached is not None:
+        return cached
+
+    js = _cg_request_json(
+        "/coins/markets",
+        params={
+            "vs_currency": vs,
+            "ids": ",".join(ids),
+            "order": "market_cap_desc",
+            "per_page": 250,
+            "page": 1,
+            "sparkline": "false",
+            "price_change_percentage": "24h",
+        },
+        timeout=8.0,
+    )
+    out = {}
+    if isinstance(js, list):
+        for row in js:
+            cid = row.get("id")
+            if cid:
+                out[cid] = row
+    return _cg_cache_set(key, out, ttl_s=60)
+
+def _cg_market_chart_usd(coin_id: str, days: int = 30):
+    days = int(days or 30)
+    days = max(1, min(days, 365))
+    key = f"chart:{coin_id}:{days}"
+    cached = _cg_cache_get(key)
+    if cached is not None:
+        return cached
+
+    js = _cg_request_json(
+        f"/coins/{coin_id}/market_chart",
+        params={"vs_currency": "usd", "days": days, "interval": "daily"},
+        timeout=8.0,
+    )
+    prices = (js or {}).get("prices") or []
+    cleaned = []
+    for p in prices:
+        try:
+            cleaned.append([int(p[0]), float(p[1])])
+        except Exception:
+            pass
+    return _cg_cache_set(key, cleaned, ttl_s=120)
+
+
+
+
 
 @app.route("/", methods=["GET"])
 def root():
@@ -2393,191 +2515,74 @@ def api_market_resolve():
         if cached is not None:
             return jsonify(cached)
         return err(str(e), 500)
-@app.route("/api/watchlist/snapshot", methods=["GET", "POST"])
+@app.route("/api/watchlist/snapshot", methods=["GET", "POST", "OPTIONS"])
 def api_watchlist_snapshot():
     """
-    Watchlist snapshot.
-
-    - GET: Uses server-side configured watchlist (get_watchlist()) for backwards compatibility.
-    - POST: Expects JSON: { "items": [{symbol, mode: "market"|"dex", id?, chain?, contract?}, ...] }
-            Returns normalized rows for the frontend:
-            { symbol, mode, id, price, change24h, volume24h, liquidity, source }
+    Returns the configured watchlist + best-effort snapshot data.
+    - Uses DEX pair data when available (get_pair_data)
+    - Falls back to Coingecko for basic prices
     """
-    try:
-        items = None
+    if request.method == "OPTIONS":
+        return make_response("", 204)
 
-        if request.method == "POST":
-            body = request.get_json(silent=True) or {}
-            items = body.get("items")
+    items = get_watchlist() or []
 
-        if not isinstance(items, list) or not items:
-            # Fallback to server-side watchlist for GET (or empty POST)
-            wl = get_watchlist()
-            items = wl.get("items", []) if isinstance(wl, dict) else []
+    out_items = []
+    fallback_syms = []
+    for it in items:
+        label = (it.get("label") or "").strip()
+        base = label.split("/")[0].strip().upper() if "/" in label else ""
+        if base:
+            fallback_syms.append(base)
 
-        # ---- Normalize input items ----
-        norm_items = []
-        for it in items:
-            if isinstance(it, str):
-                sym = it.strip().upper()
-                if sym:
-                    norm_items.append({"symbol": sym, "mode": "market"})
-                continue
+    fallback_ids = []
+    sym_to_id = {}
+    for s in list(dict.fromkeys(fallback_syms))[:20]:
+        cid = _cg_resolve_symbol(s)
+        if cid:
+            fallback_ids.append(cid)
+            sym_to_id[s] = cid
+    markets = _cg_market_snapshots(fallback_ids, vs="usd") if fallback_ids else {}
 
-            if not isinstance(it, dict):
-                continue
+    for it in items:
+        row = dict(it)
+        snap = {}
 
-            sym = (it.get("symbol") or it.get("sym") or "").strip().upper()
-            mode = (it.get("mode") or "market").strip().lower()
-            if not sym:
-                continue
+        # 1) DEX pair data (best effort)
+        try:
+            net = it.get("network")
+            pool = it.get("pool")
+            if net and pool and pool != "0x0000000000000000000000000000000000000000":
+                dex = get_pair_data(net, pool)
+                if isinstance(dex, dict):
+                    snap["dex"] = dex
+                    if "price_usd" in dex:
+                        snap["usd"] = dex.get("price_usd")
+                    if "liquidity_usd" in dex:
+                        snap["liquidity_usd"] = dex.get("liquidity_usd")
+                    if "volume_h24_usd" in dex:
+                        snap["volume_h24_usd"] = dex.get("volume_h24_usd")
+        except Exception as e:
+            app.logger.warning("DEX snapshot failed for %s: %s", it.get("id"), e)
 
-            row = {"symbol": sym, "mode": ("dex" if mode == "dex" else "market")}
+        # 2) Coingecko fallback for price
+        if snap.get("usd") is None:
+            label = (it.get("label") or "").strip()
+            base = label.split("/")[0].strip().upper() if "/" in label else ""
+            cid = sym_to_id.get(base)
+            m = markets.get(cid) if cid else None
+            if m:
+                snap["usd"] = m.get("current_price")
+                snap["change_24h"] = m.get("price_change_percentage_24h_in_currency") or m.get("price_change_percentage_24h")
+                snap["market_cap"] = m.get("market_cap")
 
-            # market extras
-            if row["mode"] == "market":
-                if it.get("id"):
-                    row["id"] = str(it.get("id")).strip()
+        row["snapshot"] = snap
+        out_items.append(row)
 
-            # dex extras
-            if row["mode"] == "dex":
-                if it.get("chain"):
-                    row["chain"] = str(it.get("chain")).strip()
-                if it.get("contract"):
-                    row["contract"] = str(it.get("contract")).strip()
-
-            norm_items.append(row)
-
-        # de-dupe keep order
-        seen = set()
-        ordered = []
-        for it in norm_items:
-            key = (it.get("symbol"), it.get("mode"), it.get("contract") or it.get("id") or "")
-            if key in seen:
-                continue
-            seen.add(key)
-            ordered.append(it)
-
-        if not ordered:
-            return jsonify({"status": "ok", "results": [], "ts": int(time.time())})
-
-
-        # Fast-path cache (avoid repeated upstream calls while user clicks quickly)
-        wl_cache_key = _key_from_items(ordered)
-        fresh_cached = _cache_get_fresh(_WATCH_SNAP_CACHE, wl_cache_key, _WATCH_SNAP_TTL_SEC)
-        if fresh_cached is not None:
-            return jsonify(fresh_cached)
-
-        # ---- Market batch (CoinGecko) ----
-        market_items = [it for it in ordered if it.get("mode") == "market"]
-        ids_by_symbol = {}
-        coin_ids = []
-
-        for it in market_items:
-            sym = it["symbol"]
-            cid = it.get("id")
-            if not cid:
-                cid = _cg_resolve_symbol(sym)
-            if cid:
-                ids_by_symbol[sym] = cid
-                coin_ids.append(cid)
-
-        snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
-
-        # ---- Build results (normalized keys expected by frontend) ----
-        results = []
-
-        for it in ordered:
-            sym = it.get("symbol")
-            mode = it.get("mode") or "market"
-
-            if mode == "dex":
-                contract = (it.get("contract") or "").strip()
-                if not contract:
-                    results.append({
-                        "symbol": sym,
-                        "mode": "dex",
-                        "id": None,
-                        "price": None,
-                        "change24h": None,
-                        "volume24h": None,
-                        "liquidity": None,
-                        "source": "error",
-                        "error": "missing_contract",
-                    })
-                    continue
-                try:
-                    snap = _dexscreener_snapshot(contract)
-                    results.append({
-                        "symbol": sym,
-                        "mode": "dex",
-                        "id": contract,
-                        "price": snap.get("price"),
-                        "change24h": snap.get("change24h"),
-                        "volume24h": snap.get("volume24h"),
-                        "liquidity": snap.get("liquidity"),
-                        "source": snap.get("source") or "dexscreener",
-                    })
-                except Exception as e:
-                    results.append({
-                        "symbol": sym,
-                        "mode": "dex",
-                        "id": contract,
-                        "price": None,
-                        "change24h": None,
-                        "volume24h": None,
-                        "liquidity": None,
-                        "source": "error",
-                        "error": str(e),
-                    })
-                continue
-
-            # market
-            cid = ids_by_symbol.get(sym) or it.get("id")
-            snap = snaps_by_id.get(cid) if cid else None
-            if snap:
-                results.append({
-                    "symbol": sym,
-                    "mode": "market",
-                    "id": cid,
-                    "price": snap.get("price"),
-                    "change24h": snap.get("change24") if "change24" in snap else snap.get("change24h"),
-                    "volume24h": snap.get("volume24") if "volume24" in snap else snap.get("volume24h"),
-                    "liquidity": None,
-                    "source": snap.get("source") or "coingecko",
-                })
-            else:
-                results.append({
-                    "symbol": sym,
-                    "mode": "market",
-                    "id": cid,
-                    "price": None,
-                    "change24h": None,
-                    "volume24h": None,
-                    "liquidity": None,
-                    "source": "error",
-                })
-
-        _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, {"status": "ok", "results": results, "ts": int(time.time())})
-        return jsonify({"status": "ok", "results": results, "ts": int(time.time())})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "results": [], "ts": int(time.time())}), 500
-
-
-
-# -------------------------
-# Compare (normalized series) + Health (aggregate)
-# -------------------------
-_RANGE_TO_DAYS = {
-    "15M": 1,
-    "1H": 1,
-    "1D": 1,
-    "7D": 7,
-    "30D": 30,
-    "90D": 90,
-    "1Y": 365,
-    "3Y": 1095,
-}
+    return jsonify({
+        "items": out_items,
+        "ts": int(time.time()),
+    })
 
 def _downsample_points(prices, max_points: int = 240):
     """Downsample CoinGecko [ms, price] points to keep payload small."""
@@ -2594,167 +2599,58 @@ def _downsample_points(prices, max_points: int = 240):
         out.append(prices[-1])
     return out
 
-@app.route("/api/compare", methods=["GET"])
+@app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
     """
-    GET /api/compare?symbols=BTC,ETH&range=30D
-
-    Returns:
-    {
-      "status":"ok",
-      "range":"30D",
-      "days":30,
-      "symbols":["BTC","ETH"],
-      "series": {"BTC":[{"t":..., "v":...}, ...], ...},
-      "health": {"BTC":{"score":78,"label":"Strong","status":"healthy"}, ...},
-      "updated_at": 1700000000
-    }
+    Compare chart + live snapshot for up to 10 symbols.
+    Keeps requests fast in production to avoid Gunicorn timeouts.
     """
-    try:
-        symbols_raw = (request.args.get("symbols") or "").strip()
-        if not symbols_raw:
-            return err("missing symbols", 400)
+    if request.method == "OPTIONS":
+        return make_response("", 204)
 
-        range_key = (request.args.get("range") or "30D").strip().upper()
-        days = _RANGE_TO_DAYS.get(range_key, 30)
+    symbols_q = (request.args.get("symbols") or "").strip()
+    days = int(request.args.get("range", "30") or 30)
+    days = max(1, min(days, 365))
 
-        include_health = str(request.args.get("include_health", "1")).strip().lower() not in ("0","false","no","off")
+    symbols = [s.strip().upper() for s in symbols_q.split(",") if s.strip()]
+    symbols = symbols[:10]
 
-        symbols = []
-        for s in symbols_raw.split(","):
-            s = (s or "").strip().upper()
-            if s and s not in symbols:
-                symbols.append(s)
-        if not symbols:
-            return err("missing symbols", 400)
+    # resolve to coingecko ids (only for known symbols)
+    ids = []
+    sym_to_id = {}
+    for s in symbols:
+        cid = _cg_resolve_symbol(s)
+        if cid:
+            ids.append(cid)
+            sym_to_id[s] = cid
 
-        symbols = symbols[:8]  # hard limit to protect API + payload
-
-        cache_key = "compare|" + range_key + "|" + ",".join(symbols)
-        cached = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
-        if cached is not None:
-            return jsonify(cached)
-
-        # single-flight: if multiple requests for same key arrive, compute once
-        lock = _lock_for(cache_key)
-        with lock:
-            cached2 = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
-            if cached2 is not None:
-                return jsonify(cached2)
-
-
-        series_out = {}
-        health_out = {} if include_health else None
-
-        for sym in symbols:
-            coin_id = _resolve_cg_id(sym)
-            if not coin_id:
-                # Skip unknown symbols but keep response stable
-                continue
-
-            # Series for selected range
-            chart = _cg_market_chart_usd(coin_id, days) or {}
-            prices = _downsample_points(chart.get("prices") or [], max_points=240)
-
-            # Return RAW prices (indexing is done in the frontend).
-            series = []
-            now_ms = int(time.time() * 1000)
-
-            # Intraday ranges: use last 15 minutes / 1 hour from the 1D market chart.
-            min_ms = None
-            if range_key == "15M":
-                min_ms = now_ms - 15 * 60 * 1000
-            elif range_key == "1H":
-                min_ms = now_ms - 60 * 60 * 1000
-
-            for p in prices:
-                try:
-                    t_ms = int(p[0])
-                    px = float(p[1])
-                    if px <= 0:
-                        continue
-                    if min_ms is not None and t_ms < min_ms:
-                        continue
-                    series.append({"t": t_ms, "v": px})
-                except Exception:
-                    continue
-            if series:
-                series_out[sym] = series
-
-            if include_health:
-                # Health (reuse existing market health logic; cached)
-                snap = _cg_market_snapshot(coin_id) or {}
-                row = {
-                    "price": snap.get("price"),
-                    "change24h": snap.get("change24h"),
-                    "volume24h": snap.get("volume24h"),
-                }
-
-                # Use the same hist inputs as /api/health/market (cached)
-                hist = None
-                try:
-                    d30 = _cg_market_chart_usd(coin_id, 30)
-                    d180 = _cg_market_chart_usd(coin_id, 180)
-                    m30 = _compute_history_metrics((d30 or {}).get("prices"))
-                    m180 = _compute_history_metrics((d180 or {}).get("prices"))
-                    hist = {
-                        "trend30d": (m30 or {}).get("retPct"),
-                        "vol30d": (m30 or {}).get("vol"),
-                        "trend180d": (m180 or {}).get("retPct"),
-                        "dd180d": (m180 or {}).get("maxDrawdownPct"),
-                    }
-                except Exception:
-                    hist = None
-
-                h = compute_market_health(row, sym, hist) or {}
-                score = h.get("score")
-                # Map to frontend labels
-                if isinstance(score, (int, float)):
-                    if score >= 71:
-                        label = "Strong"
-                    elif score >= 51:
-                        label = "Medium"
-                    else:
-                        label = "Weak"
-                else:
-                    label = None
-
-                health_out[sym] = {
-                    "score": score,
-                    "label": label,
-                    "status": h.get("status"),
-                }
-
-
-
-        out = {
-            "status": "ok",
-            "range": range_key,
-            "days": days,
-            "symbols": symbols,
-            "series": series_out,
-            "updated_at": now_ts(),
+    markets = _cg_market_snapshots(ids, vs="usd") if ids else {}
+    live = {}
+    for sym, cid in sym_to_id.items():
+        row = markets.get(cid) or {}
+        live[sym] = {
+            "usd": row.get("current_price"),
+            "change_24h": row.get("price_change_percentage_24h_in_currency") or row.get("price_change_percentage_24h"),
+            "market_cap": row.get("market_cap"),
         }
-        if include_health:
-            out["health"] = health_out
 
-        _cache_set(_COMPARE_CACHE, cache_key, out)
-        return jsonify(out)
+    # charts: limit to 3 series max to stay within time budget on Render
+    chart = {}
+    for sym in symbols[:3]:
+        cid = sym_to_id.get(sym)
+        if not cid:
+            continue
+        series = _cg_market_chart_usd(cid, days=days)
+        if series:
+            chart[sym] = series
 
-    except Exception as e:
-        # Best-effort: return last cached compare result to avoid UI blanks
-        try:
-            stale = _cache_get_any(_COMPARE_CACHE, cache_key) if 'cache_key' in locals() else None
-            if stale is not None:
-                return jsonify(stale)
-        except Exception:
-            pass
-        return err(str(e), 500)
+    return jsonify({
+        "symbols": symbols,
+        "range": days,
+        "live": live,
+        "chart": chart,
+    })
 
-
-# -------------------------
-# Trading Suitability (informational)
-# -------------------------
 def _suitability_for_snapshot(sym: str, snap: dict, profile: str) -> dict:
     """
     Convert market snapshot -> suitability score (0..100) and label.
@@ -4361,45 +4257,3 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host=host, port=port, debug=True)
-
-# -------------------------
-# 🔧 PATCH: Missing helpers (Render-safe)
-# These were referenced but not defined in the file, causing 500s / worker timeouts.
-# -------------------------
-
-# Price series cache for grid backtests
-PRICE_SERIES_CACHE = {}
-
-# Autorun state
-GRID_AUTORUN = {}
-
-def _autorun_loop(item_id, stop_evt, interval):
-    """Simple autorun loop: periodically calls grid tick until stopped."""
-    while not stop_evt.is_set():
-        try:
-            # internal call via function, not HTTP
-            sess = GRID_SESSIONS.get(item_id)
-            if isinstance(sess, dict):
-                _sim_tick(sess, new_price=None)
-                GRID_SESSIONS[item_id] = _trim_grid_session(sess)
-                _persist_grid_state()
-        except Exception:
-            pass
-        stop_evt.wait(interval)
-
-def _sim_tick(session: dict, new_price=None):
-    """Safe wrapper around grid_sim step."""
-    try:
-        cfg = GRID_CONFIGS.get(session.get("item_id")) or {}
-        snap = {"price": new_price} if new_price is not None else {}
-        return _grid_step(session, cfg, snap) or session
-    except Exception:
-        return session
-
-def _grid_prune_history(sess: dict):
-    """Prune grid history safely (no-op fallback)."""
-    try:
-        return _trim_grid_session(sess)
-    except Exception:
-        return sess
-
