@@ -1779,20 +1779,6 @@ COINGECKO_KNOWN = {
     "POL": "polygon-ecosystem-token",
 }
 
-# Cache TTL in seconds (default 180s). You can set CG_TTL_SEC in env.
-_CG_CACHE = {"by_key": {}, "ts": {}}
-_CG_TTL_SEC = int(os.getenv("CG_TTL_SEC", "180"))
-
-def _cg_cache_get(key: str):
-    now = time.time()
-    ts = _CG_CACHE["ts"].get(key, 0)
-    if key in _CG_CACHE["by_key"] and (now - ts) < _CG_TTL_SEC:
-        return _CG_CACHE["by_key"][key]
-    return None
-
-def _cg_cache_set(key: str, value):
-    _CG_CACHE["by_key"][key] = value
-    _CG_CACHE["ts"][key] = time.time()
 
 def _cg_cache_get_any(key: str):
     # Return cached value even if TTL expired (fallback on 429/outage)
