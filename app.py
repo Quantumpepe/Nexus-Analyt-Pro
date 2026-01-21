@@ -101,6 +101,22 @@ CORS(
     max_age=86400,
 )
 
+# --- Ensure CORS headers are present even on 4xx/5xx responses ---
+@app.after_request
+def _add_cors_headers(resp):
+    try:
+        origin = request.headers.get("Origin", "")
+        if origin in FRONTEND_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers.setdefault("Vary", "Origin")
+            resp.headers.setdefault("Access-Control-Expose-Headers", "Content-Type")
+    except Exception:
+        # Never break responses because of CORS header setting
+        pass
+    return resp
+
+
 
 from flask import make_response
 
@@ -1948,7 +1964,7 @@ def _cg_market_snapshot(coin_id: str):
                 "per_page": 1,
                 "page": 1,
             },
-            timeout=20,
+            timeout=10,
         ) or []
         if not arr:
             raise RuntimeError(f"CoinGecko id not found: {coin_id}")
@@ -2527,241 +2543,148 @@ def api_market_resolve():
         if cached is not None:
             return jsonify(cached)
         return err(str(e), 500)
+
 @app.route("/api/watchlist/snapshot", methods=["GET", "POST", "OPTIONS"])
 def api_watchlist_snapshot():
-    """
-    Returns the configured watchlist + best-effort snapshot data.
-    - Uses DEX pair data when available (get_pair_data)
-    - Falls back to Coingecko for basic prices
+    """Return watchlist items + best-effort snapshot.
+
+    IMPORTANT for production:
+    - Never throw (otherwise browser shows CORS errors and UI breaks)
+    - Prefer returning cached/empty snapshot rather than timing out
     """
     if request.method == "OPTIONS":
-        return make_response("", 204)
+        # Flask-CORS will handle headers; returning quickly avoids timeouts.
+        return ("", 204)
 
-    items = get_watchlist() or []
+    # Small cache so we don't hammer upstreams on Render
+    now = time.time()
+    cache_key = "watchlist_snapshot_v1"
+    cached = _cg_cache_get(cache_key, max_age_s=60)
+    if cached is not None:
+        return jsonify(cached)
+
+    payload = request.get_json(silent=True) or {}
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        try:
+            items = get_watchlist() or []
+        except Exception:
+            items = []
 
     out_items = []
-    fallback_syms = []
-    for it in items:
-        label = (it.get("label") or "").strip()
-        base = label.split("/")[0].strip().upper() if "/" in label else ""
-        if base:
-            fallback_syms.append(base)
-
-    fallback_ids = []
-    sym_to_id = {}
-    for s in list(dict.fromkeys(fallback_syms))[:20]:
-        cid = _cg_resolve_symbol(s)
-        if cid:
-            fallback_ids.append(cid)
-            sym_to_id[s] = cid
-    markets = _cg_market_snapshots(fallback_ids, vs="usd") if fallback_ids else {}
+    errors = []
 
     for it in items:
-        row = dict(it)
-        snap = {}
+        if not isinstance(it, dict):
+            continue
+        row = {
+            "id": it.get("id"),
+            "label": it.get("label"),
+            "network": it.get("network"),
+            "pool": it.get("pool"),
+            "min_lp_usd": it.get("min_lp_usd"),
+            "min_vol_h24_usd": it.get("min_vol_h24_usd"),
+            # Best-effort snapshot fields (UI can handle null/0)
+            "price_usd": None,
+            "lp_usd": None,
+            "vol_h24_usd": None,
+            "source": "fallback",
+        }
 
-        # 1) DEX pair data (best effort)
+        # If market_data.get_pair_data is available and fast enough, enrich.
         try:
-            net = it.get("network")
-            pool = it.get("pool")
-            if net and pool and pool != "0x0000000000000000000000000000000000000000":
-                dex = get_pair_data(net, pool)
-                if isinstance(dex, dict):
-                    snap["dex"] = dex
-                    if "price_usd" in dex:
-                        snap["usd"] = dex.get("price_usd")
-                    if "liquidity_usd" in dex:
-                        snap["liquidity_usd"] = dex.get("liquidity_usd")
-                    if "volume_h24_usd" in dex:
-                        snap["volume_h24_usd"] = dex.get("volume_h24_usd")
+            # Support both signatures:
+            # - get_pair_data(item_dict)
+            # - get_pair_data(network, pool)
+            snap = None
+            try:
+                snap = get_pair_data(it)  # type: ignore
+            except TypeError:
+                snap = get_pair_data(it.get("network"), it.get("pool"))  # type: ignore
+
+            if isinstance(snap, dict):
+                row["source"] = snap.get("source", "pair")
+                row["price_usd"] = snap.get("price_usd", snap.get("price"))
+                row["lp_usd"] = snap.get("lp_usd", snap.get("liquidity_usd"))
+                row["vol_h24_usd"] = snap.get("vol_h24_usd", snap.get("volume_24h_usd"))
         except Exception as e:
-            app.logger.warning("DEX snapshot failed for %s: %s", it.get("id"), e)
+            errors.append({"id": row.get("id"), "error": str(e)[:200]})
 
-        # 2) Coingecko fallback for price
-        if snap.get("usd") is None:
-            label = (it.get("label") or "").strip()
-            base = label.split("/")[0].strip().upper() if "/" in label else ""
-            cid = sym_to_id.get(base)
-            m = markets.get(cid) if cid else None
-            if m:
-                snap["usd"] = m.get("current_price")
-                snap["change_24h"] = m.get("price_change_percentage_24h_in_currency") or m.get("price_change_percentage_24h")
-                snap["market_cap"] = m.get("market_cap")
-
-        row["snapshot"] = snap
         out_items.append(row)
 
-    return jsonify({
-        "items": out_items,
-        "ts": int(time.time()),
-    })
+    resp = {"ts": int(now), "items": out_items, "errors": errors}
+    _cg_cache_set(cache_key, resp)
+    return jsonify(resp)
 
-def _downsample_points(prices, max_points: int = 240):
-    """Downsample CoinGecko [ms, price] points to keep payload small."""
-    if not isinstance(prices, list):
-        return []
-    n = len(prices)
-    if n <= max_points:
-        return prices
-    import math
-    step = int(math.ceil(n / max_points))
-    out = prices[::step]
-    # ensure last point is included
-    if out and prices and out[-1] != prices[-1]:
-        out.append(prices[-1])
-    return out
+
+
 
 @app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
-    """
-    Compare chart + live snapshot for up to 10 symbols.
-    Keeps requests fast in production to avoid Gunicorn timeouts.
+    """Compare price series for up to 10 symbols.
+
+    Production rules:
+    - Never raise (return empty series on errors)
+    - Cache results briefly to avoid Render/Gunicorn timeouts
     """
     if request.method == "OPTIONS":
-        return make_response("", 204)
+        return ("", 204)
 
-    symbols_q = (request.args.get("symbols") or "").strip()
-    days = int(request.args.get("range", "30") or 30)
-    days = max(1, min(days, 365))
+    raw_symbols = (request.args.get("symbols") or "").strip()
+    if not raw_symbols:
+        return jsonify({"symbols": [], "days": 0, "series": {}, "error": "missing symbols"})
 
-    symbols = [s.strip().upper() for s in symbols_q.split(",") if s.strip()]
+    symbols = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
     symbols = symbols[:10]
 
-    # resolve to coingecko ids (only for known symbols)
-    ids = []
-    sym_to_id = {}
-    for s in symbols:
-        cid = _cg_resolve_symbol(s)
-        if cid:
-            ids.append(cid)
-            sym_to_id[s] = cid
+    range_s = (request.args.get("range") or "30D").strip().upper()
+    range_map = {"1D": 1, "7D": 7, "30D": 30, "90D": 90, "1Y": 365, "3Y": 365 * 3}
+    days = range_map.get(range_s, 30)
 
-    markets = _cg_market_snapshots(ids, vs="usd") if ids else {}
-    live = {}
-    for sym, cid in sym_to_id.items():
-        row = markets.get(cid) or {}
-        live[sym] = {
-            "usd": row.get("current_price"),
-            "change_24h": row.get("price_change_percentage_24h_in_currency") or row.get("price_change_percentage_24h"),
-            "market_cap": row.get("market_cap"),
-        }
+    cache_key = f"compare_v2:{','.join(symbols)}:{days}"
+    cached = _cg_cache_get(cache_key, max_age_s=120)
+    if cached is not None:
+        return jsonify(cached)
 
-    # charts: limit to 3 series max to stay within time budget on Render
-    chart = {}
-    for sym in symbols[:3]:
-        cid = sym_to_id.get(sym)
-        if not cid:
-            continue
-        series = _cg_market_chart_usd(cid, days=days)
-        if series:
-            chart[sym] = series
+    series = {}
+    errors = []
+    started = time.time()
 
-    return jsonify({
-        "symbols": symbols,
-        "range": days,
-        "live": live,
-        "chart": chart,
-    })
+    for sym in symbols:
+        # Hard deadline to avoid worker timeout
+        if time.time() - started > 20:
+            errors.append({"symbol": sym, "error": "deadline"})
+            break
 
-def _suitability_for_snapshot(sym: str, snap: dict, profile: str) -> dict:
-    """
-    Convert market snapshot -> suitability score (0..100) and label.
-    Profiles:
-      - conservative: prioritize liquidity/volume, penalize volatility
-      - volatility: prioritize movement (volatility) but still require some volume
-      - balanced: middle ground
-    """
-    sym = (sym or "").strip().upper()
-    profile = (profile or "conservative").strip().lower()
-    if profile not in ("conservative", "balanced", "volatility"):
-        profile = "conservative"
+        try:
+            coin_id = _cg_resolve_symbol(sym)
+            if not coin_id:
+                errors.append({"symbol": sym, "error": "unresolved"})
+                continue
 
-    price = snap.get("price")
-    ch = snap.get("change24h")
-    vol = snap.get("volume24h")
+            chart = _cg_market_chart_usd(coin_id, days) or {}
+            # chart: { 'prices': [[ts, price], ...], ... }
+            prices = chart.get("prices") if isinstance(chart, dict) else None
+            if not isinstance(prices, list):
+                errors.append({"symbol": sym, "error": "no_prices"})
+                continue
 
-    # Volume bucket score (0..60)
-    vscore = 0
-    try:
-        v = float(vol or 0)
-        if v >= 50_000_000: vscore = 60
-        elif v >= 10_000_000: vscore = 52
-        elif v >= 1_000_000: vscore = 44
-        elif v >= 250_000: vscore = 34
-        elif v >= 50_000: vscore = 22
-        elif v > 0: vscore = 12
-        else: vscore = 0
-    except Exception:
-        vscore = 0
+            # Convert to compact arrays for frontend
+            xs = []
+            ys = []
+            for pt in prices[-2000:]:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    xs.append(int(pt[0]))
+                    ys.append(float(pt[1]))
+            series[sym] = {"t": xs, "p": ys}
+        except Exception as e:
+            errors.append({"symbol": sym, "error": str(e)[:200]})
 
-    # Volatility proxy from abs(24h change)
-    try:
-        ach = abs(float(ch)) if ch is not None else None
-    except Exception:
-        ach = None
+    resp = {"symbols": symbols, "days": days, "series": series, "errors": errors}
+    _cg_cache_set(cache_key, resp)
+    return jsonify(resp)
 
-    # Movement score (0..40) depending on profile
-    mscore = 0
-    reasons = []
 
-    if ach is None:
-        reasons.append("24h change not available")
-    else:
-        if profile == "conservative":
-            # Lower volatility preferred
-            if ach <= 2: mscore = 40
-            elif ach <= 5: mscore = 30
-            elif ach <= 10: mscore = 18
-            elif ach <= 20: mscore = 8
-            else: mscore = 0
-            reasons.append(f"volatility: {ach:.2f}% (lower is better)")
-        elif profile == "volatility":
-            # Moderate-high movement preferred, extreme is risky
-            if 5 <= ach <= 20: mscore = 40
-            elif 2 <= ach < 5: mscore = 26
-            elif 20 < ach <= 35: mscore = 22
-            elif ach < 2: mscore = 10
-            else: mscore = 12
-            reasons.append(f"volatility: {ach:.2f}% (movement preferred)")
-        else:  # balanced
-            if ach <= 2: mscore = 28
-            elif ach <= 5: mscore = 34
-            elif ach <= 10: mscore = 30
-            elif ach <= 20: mscore = 20
-            else: mscore = 10
-            reasons.append(f"volatility: {ach:.2f}%")
-
-    # Basic sanity checks
-    try:
-        if float(price or 0) <= 0:
-            reasons.append("price missing")
-    except Exception:
-        reasons.append("price missing")
-
-    score = int(_clamp(vscore + mscore, 0, 100))
-
-    # Labels
-    if score >= 75:
-        label = "Good for Grid"
-        band = "good"
-    elif score >= 55:
-        label = "OK"
-        band = "ok"
-    else:
-        label = "Not suitable"
-        band = "bad"
-
-    # Add volume reason
-    if vscore >= 52:
-        reasons.append("high 24h volume")
-    elif vscore >= 34:
-        reasons.append("decent 24h volume")
-    elif vscore >= 12:
-        reasons.append("low 24h volume")
-    else:
-        reasons.append("very low/no volume data")
-
-    return {"symbol": sym, "score": score, "label": label, "band": band, "profile": profile, "metrics": {"price": price, "change24h": ch, "volume24h": vol}, "reasons": reasons}
 
 @app.route("/api/trading/suitability", methods=["GET"])
 def api_trading_suitability():
