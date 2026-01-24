@@ -1,6 +1,4 @@
-flask
-flask-cors
-gunicorn
-requests
-itsdangerous
-python-dotenv
+Flask>=2.2
+flask-cors>=4.0
+requests>=2.31
+gunicorn>=21.2
