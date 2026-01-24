@@ -84,17 +84,16 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
-FRONTEND_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
+# CORS
+# In production (Render), the frontend is usually on a different origin than the Flask API.
+# We do NOT rely on cookies; the UI authenticates via Bearer token, so we can safely allow
+# all origins without credentials.
 CORS(
     app,
-    resources={r"/api/.*": {"origins": FRONTEND_ORIGINS}},
-    supports_credentials=True,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=False,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers="*",
+    allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
     max_age=86400,
 )
