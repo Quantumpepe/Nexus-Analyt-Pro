@@ -12,6 +12,7 @@ import secrets
 import requests
 import random
 import math
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -84,14 +85,15 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
-# CORS
-# In production (Render), the frontend is usually on a different origin than the Flask API.
-# We do NOT rely on cookies; the UI authenticates via Bearer token, so we can safely allow
-# all origins without credentials.
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
+    supports_credentials=True,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
@@ -112,9 +114,54 @@ def _handle_options_preflight():
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        # Echo requested headers so preflight passes even if the browser asks
+        # for additional headers (e.g. x-*, privy headers, etc.).
+        resp.headers["Access-Control-Allow-Headers"] = request.headers.get(
+            "Access-Control-Request-Headers", "Content-Type, Authorization"
+        )
         resp.headers["Vary"] = "Origin"
     return resp
+
+
+# ----------------------------
+# CoinGecko proxy (browser CORS-safe)
+# ----------------------------
+# Frontend should call:
+#   GET /api/proxy/coingecko?url=<encoded https://api.coingecko.com/...>
+# We keep this tiny + allowlisted to avoid SSRF.
+
+_CG_PROXY_ALLOWED_HOSTS = {"api.coingecko.com", "www.api.coingecko.com"}
+
+
+@app.route("/api/proxy/coingecko", methods=["GET"])
+def proxy_coingecko():
+    raw = (request.args.get("url") or "").strip()
+    if not raw:
+        return jsonify({"error": "missing url"}), 400
+
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return jsonify({"error": "invalid url"}), 400
+
+    if p.scheme != "https" or (p.netloc or "") not in _CG_PROXY_ALLOWED_HOSTS:
+        return jsonify({"error": "blocked"}), 403
+
+    try:
+        r = requests.get(
+            raw,
+            timeout=12,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "Nexus-Analyt/1.0",
+            },
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": "upstream failed", "detail": str(e)}), 502
+
+    # Return raw body + upstream status.
+    content_type = r.headers.get("Content-Type", "application/json")
+    return (r.content, r.status_code, {"Content-Type": content_type})
 
 @app.route("/", methods=["GET"])
 def root():
