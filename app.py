@@ -75,6 +75,18 @@ app = Flask(__name__)
 import os, time
 from flask import jsonify
 
+import traceback
+
+@app.errorhandler(Exception)
+def handle_any_exception(e):
+    app.logger.exception("Unhandled exception")
+    return jsonify({
+        "status": "error",
+        "error": str(e),
+        "trace": traceback.format_exc()[-2000:],
+    }), 500
+
+
 @app.get("/api/ping")
 def ping():
     return jsonify({
