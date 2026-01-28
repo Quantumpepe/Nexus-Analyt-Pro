@@ -72,6 +72,19 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
+import os, time
+from flask import jsonify
+
+@app.get("/api/ping")
+def ping():
+    return jsonify({
+        "ok": True,
+        "ts": int(time.time()),
+        "origins": FRONTEND_ORIGINS,
+        "render_commit": os.getenv("RENDER_GIT_COMMIT", None),
+    })
+
+
 """CORS
 
 Frontend (Vite) calls the backend from http://localhost:5173 and uses
