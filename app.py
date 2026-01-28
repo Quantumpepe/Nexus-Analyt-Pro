@@ -2482,10 +2482,14 @@ def api_market_resolve():
         _gen_cache_set(cache_key, resp)
         return jsonify(resp)
     except Exception as e:
-        cached = _gen_cache_get_any(cache_key)
-        if cached is not None:
-            return jsonify(cached)
-        return err(str(e), 500)
+        app.logger.exception("watchlist_snapshot failed")
+        return jsonify({
+            "status": "error",
+            "results": [],
+            "error": str(e),
+            "ts": int(time.time()),
+        }), 200
+
 @app.route("/api/watchlist/snapshot", methods=["GET", "POST"])
 def api_watchlist_snapshot():
     """
