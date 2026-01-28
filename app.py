@@ -12,7 +12,6 @@ import secrets
 import requests
 import random
 import math
-from urllib.parse import urlparse
 from typing import Optional, Dict, Any
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -114,54 +113,9 @@ def _handle_options_preflight():
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-        # Echo requested headers so preflight passes even if the browser asks
-        # for additional headers (e.g. x-*, privy headers, etc.).
-        resp.headers["Access-Control-Allow-Headers"] = request.headers.get(
-            "Access-Control-Request-Headers", "Content-Type, Authorization"
-        )
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         resp.headers["Vary"] = "Origin"
     return resp
-
-
-# ----------------------------
-# CoinGecko proxy (browser CORS-safe)
-# ----------------------------
-# Frontend should call:
-#   GET /api/proxy/coingecko?url=<encoded https://api.coingecko.com/...>
-# We keep this tiny + allowlisted to avoid SSRF.
-
-_CG_PROXY_ALLOWED_HOSTS = {"api.coingecko.com", "www.api.coingecko.com"}
-
-
-@app.route("/api/proxy/coingecko", methods=["GET"])
-def proxy_coingecko():
-    raw = (request.args.get("url") or "").strip()
-    if not raw:
-        return jsonify({"error": "missing url"}), 400
-
-    try:
-        p = urlparse(raw)
-    except Exception:
-        return jsonify({"error": "invalid url"}), 400
-
-    if p.scheme != "https" or (p.netloc or "") not in _CG_PROXY_ALLOWED_HOSTS:
-        return jsonify({"error": "blocked"}), 403
-
-    try:
-        r = requests.get(
-            raw,
-            timeout=12,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "Nexus-Analyt/1.0",
-            },
-        )
-    except requests.RequestException as e:
-        return jsonify({"error": "upstream failed", "detail": str(e)}), 502
-
-    # Return raw body + upstream status.
-    content_type = r.headers.get("Content-Type", "application/json")
-    return (r.content, r.status_code, {"Content-Type": content_type})
 
 @app.route("/", methods=["GET"])
 def root():
@@ -174,6 +128,50 @@ def root():
 @app.route("/api/healthz", methods=["GET"])
 def healthz():
     return jsonify({"status": "ok"})
+
+
+# -------------------------
+# CoinGecko proxy (avoid browser CORS + basic throttling)
+# -------------------------
+_CG_CACHE: dict[str, tuple[float, dict]] = {}
+_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "20"))
+
+def _cg_get(url: str) -> dict:
+    now = time.time()
+    hit = _CG_CACHE.get(url)
+    if hit and (now - hit[0]) < _CG_TTL_SEC:
+        return hit[1]
+    headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
+    r = requests.get(url, headers=headers, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    _CG_CACHE[url] = (now, data)
+    return data
+
+@app.route("/api/coingecko/simple_price", methods=["GET"])
+def coingecko_simple_price():
+    # Pass-through query params (ids, vs_currencies, include_* etc.)
+    qs = request.query_string.decode("utf-8", errors="ignore")
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    if qs:
+        url = f"{url}?{qs}"
+    try:
+        data = _cg_get(url)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
+
+@app.route("/api/coingecko/token_price/<platform>", methods=["GET"])
+def coingecko_token_price(platform: str):
+    qs = request.query_string.decode("utf-8", errors="ignore")
+    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+    if qs:
+        url = f"{url}?{qs}"
+    try:
+        data = _cg_get(url)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
 
 # Flask secret key for signing tokens (set FLASK_SECRET_KEY in env for production)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
