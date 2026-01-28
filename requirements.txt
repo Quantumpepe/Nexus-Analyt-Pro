@@ -2,3 +2,5 @@ Flask>=2.2
 flask-cors>=4.0
 requests>=2.31
 gunicorn>=21.2
+itsdangerous>=2.1
+eth-account>=0.9
