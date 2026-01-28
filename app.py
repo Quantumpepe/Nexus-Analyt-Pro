@@ -87,8 +87,16 @@ That requires:
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # Render static site (prod)
     "https://nexus-analyt-ui.onrender.com",
 ]
+
+# Optional: extend allowed origins via env (comma-separated)
+_extra_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
+if _extra_origins:
+    for _o in [x.strip() for x in _extra_origins.split(",") if x.strip()]:
+        if _o not in FRONTEND_ORIGINS:
+            FRONTEND_ORIGINS.append(_o)
 
 CORS(
     app,
@@ -116,6 +124,19 @@ def _handle_options_preflight():
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         resp.headers["Vary"] = "Origin"
+    return resp
+
+
+@app.after_request
+def add_cors_headers(resp):
+    """Always attach CORS + credentials headers for allowed frontend origins (also on 4xx/5xx)."""
+    origin = request.headers.get("Origin")
+    if origin in FRONTEND_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
 @app.route("/", methods=["GET"])
