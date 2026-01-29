@@ -1856,29 +1856,33 @@ def _res_hist_cache_set(key: str, value):
     _RES_HIST_CACHE["by_key"][key] = value
     _RES_HIST_CACHE["ts"][key] = time.time()
 
-def _cg_request_json(url: str, params: dict, timeout: int = 20):
-    # CoinGecko GET with small retry/backoff on 429.
+def _cg_request_json(url: str, params: dict, timeout: int = 8):
+    """CoinGecko GET with tight timeouts suitable for Render/Gunicorn.
+
+    - Max 2 attempts
+    - Small backoff on 429
+    - Keeps endpoints responsive to avoid WORKER TIMEOUT
+    """
     last_exc = None
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
+                # respect Retry-After but cap to keep API responsive
                 ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        wait = min(30.0, float(ra))
-                    except Exception:
-                        wait = 2.0
-                else:
-                    wait = min(30.0, 1.5 ** attempt)
-                time.sleep(wait)
+                try:
+                    wait = float(ra) if ra else (1.2 ** attempt)
+                except Exception:
+                    wait = 1.0
+                time.sleep(min(2.0, max(0.5, wait)))
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            time.sleep(min(10.0, 0.5 * (attempt + 1)))
+            time.sleep(min(1.5, 0.4 * (attempt + 1)))
     raise last_exc or RuntimeError("CoinGecko request failed")
+
 
 def _resolve_cg_id(symbol: str) -> Optional[str]:
     sym = (symbol or "").strip().upper()
@@ -2021,7 +2025,7 @@ def _cg_market_chart_usd(coin_id: str, days: int):
 
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     try:
-        j = _cg_request_json(url, params={"vs_currency": "usd", "days": days}, timeout=25) or {}
+        j = _cg_request_json(url, params={"vs_currency": "usd", "days": days}, timeout=8) or {}
         _cg_cache_set(key, j)
         return j
     except Exception as e:
@@ -2851,17 +2855,33 @@ def api_compare():
                     errors[sym] = f"{ex.__class__.__name__}"
                     series_out[sym] = []
 
-            # If everything failed, return stale cache if any; otherwise 502
-            if all(len(series_out.get(s, [])) == 0 for s in symbols):
-                stale = _cache_get_any(_COMPARE_CACHE, cache_key)
-                if stale is not None:
-                    try:
-                        stale = dict(stale)
-                        stale["errors"] = errors
-                    except Exception:
-                        pass
-                    return jsonify(stale)
-                return err({"message": "compare upstream unavailable", "errors": errors}, 502)
+            # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
+# This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
+if all(len(series_out.get(s, [])) == 0 for s in symbols):
+    stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+    if stale is not None:
+        try:
+            stale = dict(stale)
+            stale["errors"] = errors
+            stale["status"] = stale.get("status") or "ok"
+            stale["partial"] = True
+        except Exception:
+            pass
+        return jsonify(stale)
+
+    out = {
+        "status": "partial",
+        "partial": True,
+        "range": range_key,
+        "days": days,
+        "symbols": symbols,
+        "errors": errors,
+        "series": series_out,
+        "updated_at": int(time.time()),
+    }
+    if include_health:
+        out["health"] = health_out
+    return jsonify(out), 200
 
             # ✅ IMPORTANT: this MUST be inside try
             out = {
@@ -4257,7 +4277,7 @@ def _cg_search_best_id_for_symbol(symbol: str):
     if not symbol:
         return None
     url = f"{COINGECKO_BASE}/search"
-    j = _cg_request_json(url, params={"query": symbol}, timeout=12) or {}
+    j = _cg_request_json(url, params={"query": symbol}, timeout=8) or {}
     coins = j.get("coins") if isinstance(j, dict) else None
     if not isinstance(coins, list) or not coins:
         return None
