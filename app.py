@@ -2732,7 +2732,8 @@ def api_compare():
         range_key = (request.args.get("range") or "30D").strip().upper()
         days = _RANGE_TO_DAYS.get(range_key, 30)
 
-        include_health = str(request.args.get("include_health", "1")).strip().lower() not in ("0", "false", "no", "off")
+        include_health = str(request.args.get("include_health", "0")).strip().lower() not in ("0","false","no","off")
+
 
         symbols = []
         for s in symbols_raw.split(","):
