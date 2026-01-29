@@ -80,6 +80,15 @@ def _all_errors(e):
     tb = traceback.format_exc()
     return jsonify({"status": "error", "error": str(e), "trace": tb}), 500
 
+@app.get("/api/ping")
+def ping():
+    return "ok", 200
+
+@app.get("/api/version")
+def version():
+    import os
+    return {"version": os.getenv("RENDER_GIT_COMMIT", "unknown")}, 200
+
 
 """CORS
 
