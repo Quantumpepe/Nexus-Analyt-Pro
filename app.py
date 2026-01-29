@@ -1856,33 +1856,29 @@ def _res_hist_cache_set(key: str, value):
     _RES_HIST_CACHE["by_key"][key] = value
     _RES_HIST_CACHE["ts"][key] = time.time()
 
-def _cg_request_json(url: str, params: dict, timeout: int = 8):
-    """CoinGecko GET with tight timeouts suitable for Render/Gunicorn.
-
-    - Max 2 attempts
-    - Small backoff on 429
-    - Keeps endpoints responsive to avoid WORKER TIMEOUT
-    """
+def _cg_request_json(url: str, params: dict, timeout: int = 20):
+    # CoinGecko GET with small retry/backoff on 429.
     last_exc = None
-    for attempt in range(2):
+    for attempt in range(4):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
-                # respect Retry-After but cap to keep API responsive
                 ra = r.headers.get("Retry-After")
-                try:
-                    wait = float(ra) if ra else (1.2 ** attempt)
-                except Exception:
-                    wait = 1.0
-                time.sleep(min(2.0, max(0.5, wait)))
+                if ra:
+                    try:
+                        wait = min(30.0, float(ra))
+                    except Exception:
+                        wait = 2.0
+                else:
+                    wait = min(30.0, 1.5 ** attempt)
+                time.sleep(wait)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            time.sleep(min(1.5, 0.4 * (attempt + 1)))
+            time.sleep(min(10.0, 0.5 * (attempt + 1)))
     raise last_exc or RuntimeError("CoinGecko request failed")
-
 
 def _resolve_cg_id(symbol: str) -> Optional[str]:
     sym = (symbol or "").strip().upper()
@@ -2025,7 +2021,7 @@ def _cg_market_chart_usd(coin_id: str, days: int):
 
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
     try:
-        j = _cg_request_json(url, params={"vs_currency": "usd", "days": days}, timeout=8) or {}
+        j = _cg_request_json(url, params={"vs_currency": "usd", "days": days}, timeout=25) or {}
         _cg_cache_set(key, j)
         return j
     except Exception as e:
@@ -2711,23 +2707,31 @@ def _downsample_points(prices, max_points: int = 240):
         out.append(prices[-1])
     return out
 
-@app.route("/api/compare", methods=["GET"])
+@app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
     """
-    GET /api/compare?symbols=BTC,ETH&range=30D
+    Compare major symbols via CoinGecko market charts.
+
+    Example:
+      GET /api/compare?symbols=BTC,ETH&range=30D
 
     Returns:
-    {
-      "status":"ok",
-      "range":"30D",
-      "days":30,
-      "symbols":["BTC","ETH"],
-      "errors": {"ETH":"..."} ,
-      "series": {"BTC":[{"t":...,"v":...}, ...], "ETH":[...]},
-      "health": {...},
-      "updated_at": 1700000000
-    }
+      {
+        "status":"ok"|"partial",
+        "partial": true|false,
+        "range":"30D",
+        "days":30,
+        "symbols":["BTC","ETH"],
+        "errors":{"ETH":"coingecko id not found"},
+        "series":{"BTC":[{"t":...,"v":...}, ...], "ETH":[...]},
+        "health":{"BTC":{...}, "ETH":{...}},
+        "updated_at": 1700000000
+      }
     """
+    # CORS preflight safety (some proxies hit OPTIONS explicitly)
+    if request.method == "OPTIONS":
+        return ("", 204)
+
     try:
         symbols_raw = (request.args.get("symbols") or "").strip()
         if not symbols_raw:
@@ -2736,26 +2740,30 @@ def api_compare():
         range_key = (request.args.get("range") or "30D").strip().upper()
         days = _RANGE_TO_DAYS.get(range_key, 30)
 
-        include_health = str(request.args.get("include_health", "0")).strip().lower() not in ("0","false","no","off")
+        # Default ON to match UI expectations
+        include_health = str(request.args.get("include_health", "1")).strip().lower() not in ("0", "false", "no", "off")
 
-
+        # Parse + de-dup
         symbols = []
         for s in symbols_raw.split(","):
             s = (s or "").strip().upper()
             if s and s not in symbols:
                 symbols.append(s)
+
         if not symbols:
             return err("missing symbols", 400)
 
-        symbols = symbols[:8]  # hard limit
+        # Hard limit (protect API + payload)
+        symbols = symbols[:10]
 
-        cache_key = f"{range_key}|{','.join(symbols)}|h={1 if include_health else 0}"
+        cache_key = f"{range_key}|{days}|{include_health}|{','.join(symbols)}"
 
         cached = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
         if cached is not None:
             return jsonify(cached)
 
-        lock = _lock_for(cache_key)
+        # single-flight: if multiple requests for same key arrive, compute once
+        lock = lock_for(cache_key)
         with lock:
             cached2 = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
             if cached2 is not None:
@@ -2765,10 +2773,11 @@ def api_compare():
             health_out = {} if include_health else None
             errors = {}
 
-            # init keys
+            # Initialize keys so frontend legend stays stable
             for sym in symbols:
                 series_out[sym] = []
 
+            # Build each symbol independently; never fail the whole endpoint
             for sym in symbols:
                 try:
                     coin_id = _resolve_cg_id(sym)
@@ -2780,9 +2789,10 @@ def api_compare():
                     prices = _downsample_points(chart.get("prices") or [], max_points=240)
 
                     series = []
+                    min_ms = None
                     now_ms = int(time.time() * 1000)
 
-                    min_ms = None
+                    # Intraday ranges: use last X minutes from 1D market chart
                     if range_key == "15M":
                         min_ms = now_ms - 15 * 60 * 1000
                     elif range_key == "1H":
@@ -2826,7 +2836,7 @@ def api_compare():
                             except Exception:
                                 hist = None
 
-                            h = compute_market_health(row, sym, hist) or {}
+                            h = _compact_market_health(0, sym, row, hist) or {}
                             score = h.get("score")
 
                             if isinstance(score, (int, float)):
@@ -2855,165 +2865,56 @@ def api_compare():
                     errors[sym] = f"{ex.__class__.__name__}"
                     series_out[sym] = []
 
-    # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
-    # This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
-try:
-    # 1️⃣ FALL: ALLES FEHLERHAFT → stale cache
-    if all(len(series_out.get(s, [])) == 0 for s in symbols):
-        stale = _cache_get_any(_COMPARE_CACHE, cache_key)
-        if stale is not None:
-            stale = dict(stale)
-            stale["errors"] = errors
-            stale["status"] = "partial"
-            stale["partial"] = True
-            return jsonify(stale), 200
+            # If everything failed, prefer stale cache; else return partial with 200
+            if all(len(series_out.get(s, [])) == 0 for s in symbols):
+                stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+                if stale is not None:
+                    try:
+                        stale = dict(stale)
+                        stale["errors"] = errors
+                        stale["status"] = stale.get("status") or "partial"
+                        stale["partial"] = True
+                    except Exception:
+                        pass
+                    return jsonify(stale), 200
 
-        return err("no data", 502)
+                return jsonify({
+                    "status": "partial",
+                    "partial": True,
+                    "range": range_key,
+                    "days": days,
+                    "symbols": symbols,
+                    "errors": errors,
+                    "series": series_out,
+                    "health": health_out if include_health else None,
+                    "updated_at": int(time.time())
+                }), 200
 
-    # 2️⃣ FALL: PARTIAL
-    if errors:
-        out = {
-            "status": "partial",
-            "partial": True,
-            "range": range_key,
-            "days": days,
-            "symbols": symbols,
-            "errors": errors,
-            "series": series_out,
-            "updated_at": int(time.time()),
-        }
-        if include_health:
-            out["health"] = health_out
-        return jsonify(out), 200
+            out = {
+                "status": "partial" if errors else "ok",
+                "partial": bool(errors),
+                "range": range_key,
+                "days": days,
+                "symbols": symbols,
+                "errors": errors,
+                "series": series_out,
+                "updated_at": int(time.time()),
+            }
+            if include_health:
+                out["health"] = health_out
 
-    # 3️⃣ FALL: OK
-    out = {
-        "status": "ok",
-        "range": range_key,
-        "days": days,
-        "symbols": symbols,
-        "errors": {},
-        "series": series_out,
-        "updated_at": int(time.time()),
-    }
-    if include_health:
-        out["health"] = health_out
+            _cache_set(_COMPARE_CACHE, cache_key, out)
+            return jsonify(out), 200
 
-    _cache_set(_COMPARE_CACHE, cache_key, out)
-    return jsonify(out), 200
-
-except Exception as e:
-    stale = _cache_get_any(_COMPARE_CACHE, cache_key)
-    if stale:
-        return jsonify(stale), 200
-    return err(str(e), 500)
-
-
-
-
-
-# -------------------------
-# Trading Suitability (informational)
-# -------------------------
-def _suitability_for_snapshot(sym: str, snap: dict, profile: str) -> dict:
-    """
-    Convert market snapshot -> suitability score (0..100) and label.
-    Profiles:
-      - conservative: prioritize liquidity/volume, penalize volatility
-      - volatility: prioritize movement (volatility) but still require some volume
-      - balanced: middle ground
-    """
-    sym = (sym or "").strip().upper()
-    profile = (profile or "conservative").strip().lower()
-    if profile not in ("conservative", "balanced", "volatility"):
-        profile = "conservative"
-
-    price = snap.get("price")
-    ch = snap.get("change24h")
-    vol = snap.get("volume24h")
-
-    # Volume bucket score (0..60)
-    vscore = 0
-    try:
-        v = float(vol or 0)
-        if v >= 50_000_000: vscore = 60
-        elif v >= 10_000_000: vscore = 52
-        elif v >= 1_000_000: vscore = 44
-        elif v >= 250_000: vscore = 34
-        elif v >= 50_000: vscore = 22
-        elif v > 0: vscore = 12
-        else: vscore = 0
-    except Exception:
-        vscore = 0
-
-    # Volatility proxy from abs(24h change)
-    try:
-        ach = abs(float(ch)) if ch is not None else None
-    except Exception:
-        ach = None
-
-    # Movement score (0..40) depending on profile
-    mscore = 0
-    reasons = []
-
-    if ach is None:
-        reasons.append("24h change not available")
-    else:
-        if profile == "conservative":
-            # Lower volatility preferred
-            if ach <= 2: mscore = 40
-            elif ach <= 5: mscore = 30
-            elif ach <= 10: mscore = 18
-            elif ach <= 20: mscore = 8
-            else: mscore = 0
-            reasons.append(f"volatility: {ach:.2f}% (lower is better)")
-        elif profile == "volatility":
-            # Moderate-high movement preferred, extreme is risky
-            if 5 <= ach <= 20: mscore = 40
-            elif 2 <= ach < 5: mscore = 26
-            elif 20 < ach <= 35: mscore = 22
-            elif ach < 2: mscore = 10
-            else: mscore = 12
-            reasons.append(f"volatility: {ach:.2f}% (movement preferred)")
-        else:  # balanced
-            if ach <= 2: mscore = 28
-            elif ach <= 5: mscore = 34
-            elif ach <= 10: mscore = 30
-            elif ach <= 20: mscore = 20
-            else: mscore = 10
-            reasons.append(f"volatility: {ach:.2f}%")
-
-    # Basic sanity checks
-    try:
-        if float(price or 0) <= 0:
-            reasons.append("price missing")
-    except Exception:
-        reasons.append("price missing")
-
-    score = int(_clamp(vscore + mscore, 0, 100))
-
-    # Labels
-    if score >= 75:
-        label = "Good for Grid"
-        band = "good"
-    elif score >= 55:
-        label = "OK"
-        band = "ok"
-    else:
-        label = "Not suitable"
-        band = "bad"
-
-    # Add volume reason
-    if vscore >= 52:
-        reasons.append("high 24h volume")
-    elif vscore >= 34:
-        reasons.append("decent 24h volume")
-    elif vscore >= 12:
-        reasons.append("low 24h volume")
-    else:
-        reasons.append("very low/no volume data")
-
-    return {"symbol": sym, "score": score, "label": label, "band": band, "profile": profile, "metrics": {"price": price, "change24h": ch, "volume24h": vol}, "reasons": reasons}
+    except Exception as e:
+        # Best-effort: return last cached compare result to avoid UI blanks
+        try:
+            stale = _cache_get_any(_COMPARE_CACHE, cache_key) if "cache_key" in locals() else None
+            if stale is not None:
+                return jsonify(stale), 200
+        except Exception:
+            pass
+        return err(str(e), 500)
 
 @app.route("/api/trading/suitability", methods=["GET"])
 def api_trading_suitability():
@@ -4278,7 +4179,7 @@ def _cg_search_best_id_for_symbol(symbol: str):
     if not symbol:
         return None
     url = f"{COINGECKO_BASE}/search"
-    j = _cg_request_json(url, params={"query": symbol}, timeout=8) or {}
+    j = _cg_request_json(url, params={"query": symbol}, timeout=12) or {}
     coins = j.get("coins") if isinstance(j, dict) else None
     if not isinstance(coins, list) or not coins:
         return None
