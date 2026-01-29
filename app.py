@@ -2747,6 +2747,49 @@ def _downsample_points(prices, max_points: int = 240):
     return out
 
 @app.route("/api/compare", methods=["GET", "OPTIONS"])
+
+def _get_series_for_symbol(sym: str, days: int):
+    """
+    Returns list[[ts_ms, price_usd], ...] for the last N days.
+    Uses existing CoinGecko helpers in this file.
+    """
+    # 1) resolve "BTC" -> coingecko id (e.g. "bitcoin")
+    cg_id = _cg_resolve_symbol(sym)
+    if not cg_id:
+        return []
+
+    # 2) fetch market chart (your helper should return something like {"prices":[[ts,price],...]}
+    data = _cg_market_chart_usd(cg_id, days=days)
+    if not data:
+        return []
+
+    prices = data.get("prices") or []
+    # ensure shape [[ts,price],...]
+    out = []
+    for row in prices:
+        try:
+            ts = int(row[0])
+            px = float(row[1])
+            out.append([ts, px])
+        except Exception:
+            continue
+    return out
+
+
+def _health_for_symbol(sym: str, series):
+    """
+    Minimal health: last price + pct change vs first point.
+    UI can ignore it if not needed.
+    """
+    if not series or len(series) < 2:
+        return None
+    p0 = float(series[0][1])
+    p1 = float(series[-1][1])
+    if p0 <= 0:
+        return None
+    pct = (p1 - p0) / p0 * 100.0
+    return {"symbol": sym, "last": p1, "pct": pct}
+
 def api_compare():
     try:
         symbols = request.args.get("symbols", "")
