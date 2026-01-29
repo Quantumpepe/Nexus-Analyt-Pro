@@ -2886,12 +2886,28 @@ try:
             out["health"] = health_out
         return jsonify(out), 200
 
-    
+    # 3️⃣ FALL: OK
+    out = {
+        "status": "ok",
+        "range": range_key,
+        "days": days,
+        "symbols": symbols,
+        "errors": {},
+        "series": series_out,
+        "updated_at": int(time.time()),
+    }
+    if include_health:
+        out["health"] = health_out
+
+    _cache_set(_COMPARE_CACHE, cache_key, out)
+    return jsonify(out), 200
+
 except Exception as e:
     stale = _cache_get_any(_COMPARE_CACHE, cache_key)
     if stale:
         return jsonify(stale), 200
     return err(str(e), 500)
+
 
 
 
