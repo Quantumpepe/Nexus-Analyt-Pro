@@ -2718,8 +2718,9 @@ def api_compare():
       "range":"30D",
       "days":30,
       "symbols":["BTC","ETH"],
-      "series": {"BTC":[{"t":..., "v":...}, ...], ...},
-      "health": {"BTC":{"score":78,"label":"Strong","status":"healthy"}, ...},
+      "errors": {"ETH":"..."} ,
+      "series": {"BTC":[{"t":...,"v":...}, ...], "ETH":[...]},
+      "health": {...},
       "updated_at": 1700000000
     }
     """
@@ -2731,7 +2732,7 @@ def api_compare():
         range_key = (request.args.get("range") or "30D").strip().upper()
         days = _RANGE_TO_DAYS.get(range_key, 30)
 
-        include_health = str(request.args.get("include_health", "1")).strip().lower() not in ("0","false","no","off")
+        include_health = str(request.args.get("include_health", "1")).strip().lower() not in ("0", "false", "no", "off")
 
         symbols = []
         for s in symbols_raw.split(","):
@@ -2741,159 +2742,152 @@ def api_compare():
         if not symbols:
             return err("missing symbols", 400)
 
-        symbols = symbols[:8]  # hard limit to protect API + payload
+        symbols = symbols[:8]  # hard limit
 
-        cache_key = "compare|" + range_key + "|" + ",".join(symbols)
+        cache_key = f"{range_key}|{','.join(symbols)}|h={1 if include_health else 0}"
+
         cached = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
         if cached is not None:
             return jsonify(cached)
 
-        # single-flight: if multiple requests for same key arrive, compute once
         lock = _lock_for(cache_key)
         with lock:
             cached2 = _cache_get_fresh(_COMPARE_CACHE, cache_key, _COMPARE_TTL_SEC)
             if cached2 is not None:
                 return jsonify(cached2)
 
+            series_out = {}
+            health_out = {} if include_health else None
+            errors = {}
 
-        series_out = {}
-        health_out = {} if include_health else None
-
-
-        errors = {}
-
-        # Always initialize series keys so frontend can render legend consistently
-        for sym in symbols:
-            series_out[sym] = []
-
-        for sym in symbols:
-            try:
-                coin_id = _resolve_cg_id(sym)
-                if not coin_id:
-                    errors[sym] = "coingecko id not found"
-                    continue
-
-                # Series for selected range
-                chart = _cg_market_chart_usd(coin_id, days) or {}
-                prices = _downsample_points(chart.get("prices") or [], max_points=240)
-
-                series = []
-                now_ms = int(time.time() * 1000)
-
-                # Intraday ranges: use last 15 minutes / 1 hour from the 1D market chart.
-                min_ms = None
-                if range_key == "15M":
-                    min_ms = now_ms - 15 * 60 * 1000
-                elif range_key == "1H":
-                    min_ms = now_ms - 60 * 60 * 1000
-
-                for p in prices:
-                    try:
-                        t_ms = int(p[0])
-                        px = float(p[1])
-                        if px <= 0:
-                            continue
-                        if min_ms is not None and t_ms < min_ms:
-                            continue
-                        series.append({"t": t_ms, "v": px})
-                    except Exception:
-                        continue
-
-                series_out[sym] = series
-
-                if include_health:
-                    try:
-                        snap = _cg_market_snapshot(coin_id) or {}
-                        row = {
-                            "price": snap.get("price"),
-                            "change24h": snap.get("change24h"),
-                            "volume24h": snap.get("volume24h"),
-                        }
-
-                        hist = None
-                        try:
-                            d30 = _cg_market_chart_usd(coin_id, 30)
-                            d180 = _cg_market_chart_usd(coin_id, 180)
-                            m30 = _compute_history_metrics((d30 or {}).get("prices"))
-                            m180 = _compute_history_metrics((d180 or {}).get("prices"))
-                            hist = {
-                                "trend30d": (m30 or {}).get("retPct"),
-                                "vol30d": (m30 or {}).get("vol"),
-                                "trend180d": (m180 or {}).get("retPct"),
-                                "dd180d": (m180 or {}).get("maxDrawdownPct"),
-                            }
-                        except Exception:
-                            hist = None
-
-                        h = compute_market_health(row, sym, hist) or {}
-                        score = h.get("score")
-                        if isinstance(score, (int, float)):
-                            if score >= 71:
-                                label = "Strong"
-                            elif score >= 51:
-                                label = "Balanced"
-                            elif score >= 31:
-                                label = "Weak"
-                            else:
-                                label = "Risk"
-                        else:
-                            label = "Unknown"
-
-                        health_out = health_out or {}
-                        health_out[sym] = {
-                            "score": score if isinstance(score, (int, float)) else None,
-                            "label": label,
-                            "status": h.get("status") or None,
-                            "notes": h.get("notes") or [],
-                        }
-                    except Exception as he:
-                        errors[sym] = errors.get(sym) or f"health error: {he.__class__.__name__}"
-            except Exception as ex:
-                # Never fail whole compare due to one coin (rate-limit, 404, etc.)
-                errors[sym] = f"{ex.__class__.__name__}"
+            # init keys
+            for sym in symbols:
                 series_out[sym] = []
 
-        # If everything failed, return stale cache if any; otherwise return 502 with details (not 500)
-        if all(len(series_out.get(s, [])) == 0 for s in symbols):
-            stale = _cache_get_any(_COMPARE_CACHE, cache_key)
-            if stale is not None:
-                # attach last errors for transparency
+            for sym in symbols:
                 try:
-                    stale = dict(stale)
-                    stale["errors"] = errors
-                except Exception:
-                    pass
-                return jsonify(stale)
-            return err({"message": "compare upstream unavailable", "errors": errors}, 502)
+                    coin_id = _resolve_cg_id(sym)
+                    if not coin_id:
+                        errors[sym] = "coingecko id not found"
+                        continue
 
+                    chart = _cg_market_chart_usd(coin_id, days) or {}
+                    prices = _downsample_points(chart.get("prices") or [], max_points=240)
 
+                    series = []
+                    now_ms = int(time.time() * 1000)
 
+                    min_ms = None
+                    if range_key == "15M":
+                        min_ms = now_ms - 15 * 60 * 1000
+                    elif range_key == "1H":
+                        min_ms = now_ms - 60 * 60 * 1000
 
+                    for p in prices:
+                        try:
+                            t_ms = int(p[0])
+                            px = float(p[1])
+                            if px <= 0:
+                                continue
+                            if min_ms is not None and t_ms < min_ms:
+                                continue
+                            series.append({"t": t_ms, "v": px})
+                        except Exception:
+                            continue
 
-        out = {
-            "status": "ok",
-            "range": range_key,
-            "days": days,
-            "symbols": symbols,
-                  "errors": errors,
-"series": series_out,
-            "updated_at": now_ts(),
-        }
-        if include_health:
-            out["health"] = health_out
+                    series_out[sym] = series
 
-        _cache_set(_COMPARE_CACHE, cache_key, out)
-        return jsonify(out)
+                    if include_health:
+                        try:
+                            snap = _cg_market_snapshot(coin_id) or {}
+                            row = {
+                                "price": snap.get("price"),
+                                "change24h": snap.get("change24h"),
+                                "volume24h": snap.get("volume24h"),
+                            }
+
+                            hist = None
+                            try:
+                                d30 = _cg_market_chart_usd(coin_id, 30)
+                                d180 = _cg_market_chart_usd(coin_id, 180)
+                                m30 = _compute_history_metrics((d30 or {}).get("prices"))
+                                m180 = _compute_history_metrics((d180 or {}).get("prices"))
+                                hist = {
+                                    "trend30d": (m30 or {}).get("retPct"),
+                                    "vol30d": (m30 or {}).get("vol"),
+                                    "trend180d": (m180 or {}).get("retPct"),
+                                    "dd180d": (m180 or {}).get("maxDrawdownPct"),
+                                }
+                            except Exception:
+                                hist = None
+
+                            h = compute_market_health(row, sym, hist) or {}
+                            score = h.get("score")
+
+                            if isinstance(score, (int, float)):
+                                if score >= 71:
+                                    label = "Strong"
+                                elif score >= 51:
+                                    label = "Balanced"
+                                elif score >= 31:
+                                    label = "Weak"
+                                else:
+                                    label = "Risk"
+                            else:
+                                label = "Unknown"
+
+                            health_out = health_out or {}
+                            health_out[sym] = {
+                                "score": score if isinstance(score, (int, float)) else None,
+                                "label": label,
+                                "status": h.get("status") or None,
+                                "notes": h.get("notes") or [],
+                            }
+                        except Exception as he:
+                            errors[sym] = errors.get(sym) or f"health error: {he.__class__.__name__}"
+
+                except Exception as ex:
+                    errors[sym] = f"{ex.__class__.__name__}"
+                    series_out[sym] = []
+
+            # If everything failed, return stale cache if any; otherwise 502
+            if all(len(series_out.get(s, [])) == 0 for s in symbols):
+                stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+                if stale is not None:
+                    try:
+                        stale = dict(stale)
+                        stale["errors"] = errors
+                    except Exception:
+                        pass
+                    return jsonify(stale)
+                return err({"message": "compare upstream unavailable", "errors": errors}, 502)
+
+            # ✅ IMPORTANT: this MUST be inside try
+            out = {
+                "status": "ok",
+                "range": range_key,
+                "days": days,
+                "symbols": symbols,
+                "errors": errors,
+                "series": series_out,
+                "updated_at": int(time.time()),
+            }
+            if include_health:
+                out["health"] = health_out
+
+            _cache_set(_COMPARE_CACHE, cache_key, out)
+            return jsonify(out)
 
     except Exception as e:
         # Best-effort: return last cached compare result to avoid UI blanks
         try:
-            stale = _cache_get_any(_COMPARE_CACHE, cache_key) if 'cache_key' in locals() else None
+            stale = _cache_get_any(_COMPARE_CACHE, cache_key) if "cache_key" in locals() else None
             if stale is not None:
                 return jsonify(stale)
         except Exception:
             pass
         return err(str(e), 500)
+)
 
 
 # -------------------------
