@@ -1,4 +1,7 @@
+# backend/app.py
 from __future__ import annotations
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 import os
 import time
@@ -11,8 +14,6 @@ import random
 import math
 from typing import Optional, Dict, Any
 
-from flask import Flask, jsonify, request, make_response
-from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from market_data import get_pair_data
@@ -20,25 +21,75 @@ from watchlist import get_watchlist
 from safety import evaluate_safety
 import grid_sim
 
+# --- Grid simulator adapter (supports grid_sim exposing functions OR class methods) ---
+import inspect as _inspect
+
+def _grid_build(cfg):
+    # Try function-style first
+    if hasattr(grid_sim, "build_grid") and callable(getattr(grid_sim, "build_grid")):
+        try:
+            return grid_sim.build_grid(cfg)
+        except TypeError as e:
+            # If build_grid is an unbound method (expects self,cfg), fall through to class scan
+            msg = str(e)
+            if "positional argument" not in msg or "cfg" not in msg:
+                raise
+    # Class-scan fallback
+    for _name, _cls in _inspect.getmembers(grid_sim, _inspect.isclass):
+        if hasattr(_cls, "build_grid") and callable(getattr(_cls, "build_grid")):
+            try:
+                _inst = _cls()
+                return _inst._grid_build(cfg)
+            except TypeError:
+                continue
+    raise RuntimeError("grid_sim: could not find callable _grid_build(cfg)")
+
+def _grid_step(state, cfg, snapshot):
+    if hasattr(grid_sim, "step_sim") and callable(getattr(grid_sim, "step_sim")):
+        try:
+            return grid_sim._grid_step(state, cfg, snapshot)
+        except TypeError as e:
+            msg = str(e)
+            if "positional argument" not in msg:
+                raise
+    for _name, _cls in _inspect.getmembers(grid_sim, _inspect.isclass):
+        if hasattr(_cls, "step_sim") and callable(getattr(_cls, "step_sim")):
+            try:
+                _inst = _cls()
+                return _inst._grid_step(state, cfg, snapshot)
+            except TypeError:
+                continue
+    raise RuntimeError("grid_sim: could not find callable _grid_step(state,cfg,snapshot)")
+
+# Expose GridConfig regardless of how grid_sim defines it
+GridConfig = getattr(grid_sim, "GridConfig", None)
+if GridConfig is None:
+    raise ImportError("grid_sim does not export GridConfig")
+
+
 # -------------------------
-# App init (MUSS vor @app.* kommen!)
+# App init
 # -------------------------
 app = Flask(__name__)
 
-# -------------------------
-# CORS (MUSS vor Routes, die FRONTEND_ORIGINS nutzen)
-# -------------------------
+"""CORS
+
+Frontend (Vite) calls the backend from http://localhost:5173 and uses
+fetch(..., { credentials: 'include' }).
+
+That requires:
+  - Access-Control-Allow-Origin must NOT be '*'
+  - Access-Control-Allow-Credentials must be 'true'
+  - Preflight (OPTIONS) must include the same headers
+"""
+
+# IMPORTANT: when supports_credentials=True, origins cannot be '*'
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://nexus-analyt-ui.onrender.com",
+    "https://www.nexus-analyt-ui.onrender.com",
 ]
-
-_extra_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
-if _extra_origins:
-    for _o in [x.strip() for x in _extra_origins.split(",") if x.strip()]:
-        if _o not in FRONTEND_ORIGINS:
-            FRONTEND_ORIGINS.append(_o)
 
 CORS(
     app,
@@ -50,8 +101,33 @@ CORS(
     max_age=86400,
 )
 
+
+from flask import make_response
+
+@app.after_request
+def _add_cors_headers(resp):
+    """Make CORS robust even when an endpoint raises and returns 4xx/5xx.
+
+    flask-cors usually handles this, but in some Render/gunicorn error paths
+    the header can be missing. We mirror the allow-list here defensively.
+    """
+    try:
+        origin = request.headers.get("Origin", "")
+        if origin in FRONTEND_ORIGINS:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+            # Allow headers/methods for browsers that do non-simple requests
+            resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    except Exception:
+        pass
+    return resp
+
+
 @app.before_request
 def _handle_options_preflight():
+    """Ensure preflight requests always get the CORS + credentials headers."""
     if request.method != "OPTIONS":
         return None
 
@@ -65,33 +141,17 @@ def _handle_options_preflight():
         resp.headers["Vary"] = "Origin"
     return resp
 
-@app.after_request
-def add_cors_headers(resp):
-    origin = request.headers.get("Origin")
-    if origin in FRONTEND_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    return resp
-
-# -------------------------
-# Debug ping (jetzt ist app + FRONTEND_ORIGINS definiert)
-# -------------------------
-@app.get("/api/ping")
-def ping():
+@app.route("/", methods=["GET"])
+def root():
     return jsonify({
-        "ok": True,
-        "ts": int(time.time()),
-        "origins": FRONTEND_ORIGINS,
-        "render_commit": os.getenv("RENDER_GIT_COMMIT", None),
+        "status": "ok",
+        "service": "Nexus-Analyt backend",
+        "hint": "Try /api/health or /api/watchlist"
     })
 
-# Flask secret key for signing tokens (set FLASK_SECRET_KEY in env for production)
-app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
-_serializer = URLSafeTimedSerializer(app.secret_key)
-
+@app.route("/api/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"status": "ok"})
 
 
 # -------------------------
@@ -2411,14 +2471,10 @@ def api_market_resolve():
         _gen_cache_set(cache_key, resp)
         return jsonify(resp)
     except Exception as e:
-        app.logger.exception("watchlist_snapshot failed")
-        return jsonify({
-            "status": "error",
-            "results": [],
-            "error": str(e),
-            "ts": int(time.time()),
-        }), 200
-
+        cached = _gen_cache_get_any(cache_key)
+        if cached is not None:
+            return jsonify(cached)
+        return err(str(e), 500)
 @app.route("/api/watchlist/snapshot", methods=["GET", "POST"])
 def api_watchlist_snapshot():
     """
