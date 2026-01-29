@@ -1701,6 +1701,18 @@ def api_health():
 # Market Health (CoinGecko) — server-side + cache
 # -------------------------
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+# --- Major symbol → CoinGecko ID (fast-path, avoids search ambiguity) ---
+_STATIC_CG_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    # Polygon token on CoinGecko is commonly 'matic-network' (POL rebrand)
+    "POL": "matic-network",
+    "MATIC": "matic-network",
+}
 COINGECKO_KNOWN = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
