@@ -2857,57 +2857,57 @@ def api_compare():
 
             # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
 # This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
-if all(len(series_out.get(s, [])) == 0 for s in symbols):
-    stale = _cache_get_any(_COMPARE_CACHE, cache_key)
-    if stale is not None:
-        try:
+try:
+    # 1️⃣ FALL: ALLES FEHLERHAFT → stale cache
+    if all(len(series_out.get(s, [])) == 0 for s in symbols):
+        stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+        if stale is not None:
             stale = dict(stale)
             stale["errors"] = errors
-            stale["status"] = stale.get("status") or "ok"
+            stale["status"] = "partial"
             stale["partial"] = True
-        except Exception:
-            pass
-        return jsonify(stale)
+            return jsonify(stale), 200
 
+        return err("no data", 502)
+
+    # 2️⃣ FALL: PARTIAL
+    if errors:
+        out = {
+            "status": "partial",
+            "partial": True,
+            "range": range_key,
+            "days": days,
+            "symbols": symbols,
+            "errors": errors,
+            "series": series_out,
+            "updated_at": int(time.time()),
+        }
+        if include_health:
+            out["health"] = health_out
+        return jsonify(out), 200
+
+    # 3️⃣ FALL: OK
     out = {
-        "status": "partial",
-        "partial": True,
+        "status": "ok",
         "range": range_key,
         "days": days,
         "symbols": symbols,
-        "errors": errors,
+        "errors": {},
         "series": series_out,
         "updated_at": int(time.time()),
     }
     if include_health:
         out["health"] = health_out
+
+    _cache_set(_COMPARE_CACHE, cache_key, out)
     return jsonify(out), 200
 
-            # ✅ IMPORTANT: this MUST be inside try
-            out = {
-                "status": "ok",
-                "range": range_key,
-                "days": days,
-                "symbols": symbols,
-                "errors": errors,
-                "series": series_out,
-                "updated_at": int(time.time()),
-            }
-            if include_health:
-                out["health"] = health_out
+except Exception as e:
+    stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+    if stale:
+        return jsonify(stale), 200
+    return err(str(e), 500)
 
-            _cache_set(_COMPARE_CACHE, cache_key, out)
-            return jsonify(out)
-
-    except Exception as e:
-        # Best-effort: return last cached compare result to avoid UI blanks
-        try:
-            stale = _cache_get_any(_COMPARE_CACHE, cache_key) if "cache_key" in locals() else None
-            if stale is not None:
-                return jsonify(stale)
-        except Exception:
-            pass
-        return err(str(e), 500)
 
 
 
