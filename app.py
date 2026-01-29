@@ -2887,7 +2887,7 @@ def api_compare():
         except Exception:
             pass
         return err(str(e), 500)
-)
+
 
 
 # -------------------------
