@@ -2827,7 +2827,16 @@ def api_compare():
                 stale["errors"] = errors
                 return jsonify(stale), 200
 
-            return err("no data", 502)
+            return jsonify({
+                "status": "empty",
+                "range": range_key,
+                "days": days,
+                "symbols": symbols,
+                "errors": errors,
+                "series": series_out,
+                "updated_at": int(time.time()),
+            }), 200
+
 
         # ✅ PARTIAL OK
         if errors:
