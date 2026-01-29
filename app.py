@@ -2857,7 +2857,7 @@ def api_compare():
 
     # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
     # This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
-    try:
+try:
     # 1️⃣ FALL: ALLES FEHLERHAFT → stale cache
     if all(len(series_out.get(s, [])) == 0 for s in symbols):
         stale = _cache_get_any(_COMPARE_CACHE, cache_key)
@@ -2886,22 +2886,7 @@ def api_compare():
             out["health"] = health_out
         return jsonify(out), 200
 
-    # 3️⃣ FALL: OK
-    out = {
-        "status": "ok",
-        "range": range_key,
-        "days": days,
-        "symbols": symbols,
-        "errors": {},
-        "series": series_out,
-        "updated_at": int(time.time()),
-    }
-    if include_health:
-        out["health"] = health_out
-
-    _cache_set(_COMPARE_CACHE, cache_key, out)
-    return jsonify(out), 200
-
+    
 except Exception as e:
     stale = _cache_get_any(_COMPARE_CACHE, cache_key)
     if stale:
