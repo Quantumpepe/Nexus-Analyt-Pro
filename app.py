@@ -73,6 +73,21 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
+from flask_cors import CORS
+
+ALLOWED_ORIGINS = [
+    "https://nexus-analyt-ui.onrender.com",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+)
+
+
 import traceback
 from flask import jsonify
 
