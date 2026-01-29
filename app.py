@@ -8,6 +8,7 @@ import os
 import time
 import threading
 import json
+import re
 import sqlite3
 import secrets
 import requests
@@ -48,7 +49,7 @@ def _grid_build(cfg):
 def _grid_step(state, cfg, snapshot):
     if hasattr(grid_sim, "step_sim") and callable(getattr(grid_sim, "step_sim")):
         try:
-            return grid_sim.step_sim(state, cfg, snapshot)
+            return grid_sim._grid_step(state, cfg, snapshot)
         except TypeError as e:
             msg = str(e)
             if "positional argument" not in msg:
@@ -57,7 +58,7 @@ def _grid_step(state, cfg, snapshot):
         if hasattr(_cls, "step_sim") and callable(getattr(_cls, "step_sim")):
             try:
                 _inst = _cls()
-                return _inst.step_sim(state, cfg, snapshot)
+                return _inst._grid_step(state, cfg, snapshot)
             except TypeError:
                 continue
     raise RuntimeError("grid_sim: could not find callable _grid_step(state,cfg,snapshot)")
@@ -72,6 +73,21 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
+
+from flask_cors import CORS
+
+ALLOWED_ORIGINS = [
+    "https://nexus-analyt-ui.onrender.com",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
+    supports_credentials=True,
+)
+
 
 import traceback
 from flask import jsonify
@@ -2693,6 +2709,28 @@ _RANGE_TO_DAYS = {
     "3Y": 1095,
 }
 
+
+
+def _range_to_days(range_key: str) -> int:
+    """Normalize UI range keys like '30D', '30d', '7D', '1Y' into integer days."""
+    rk = (range_key or "").strip()
+    if not rk:
+        return 30
+    rk_u = rk.upper()
+    # direct map
+    if rk_u in _RANGE_TO_DAYS:
+        return int(_RANGE_TO_DAYS[rk_u])
+    # allow '30d' etc.
+    m = re.match(r"^(\d{1,4})\s*D$", rk_u)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^(\d{1,4})\s*DAY(S)?$", rk_u)
+    if m:
+        return int(m.group(1))
+    # small hour/min buckets -> treat as 1 day
+    if rk_u.endswith("H") or rk_u.endswith("M"):
+        return 1
+    return 30
 def _downsample_points(prices, max_points: int = 240):
     """Downsample CoinGecko [ms, price] points to keep payload small."""
     if not isinstance(prices, list):
@@ -2707,62 +2745,6 @@ def _downsample_points(prices, max_points: int = 240):
     if out and prices and out[-1] != prices[-1]:
         out.append(prices[-1])
     return out
-
-
-
-def _range_to_days(r: str) -> int:
-    """Convert UI range keys like '1D','7D','30D','90D','1Y','3Y' or '30d' into days."""
-    r = (r or "").strip().lower()
-    mapping = {
-        "1d": 1, "7d": 7, "30d": 30, "90d": 90,
-        "1y": 365, "3y": 365 * 3,
-    }
-    if r in mapping:
-        return mapping[r]
-    # suffix parsing: Nd/Nw/Nm/Ny
-    try:
-        if r.endswith("d") and r[:-1].isdigit():
-            return int(r[:-1])
-        if r.endswith("w") and r[:-1].isdigit():
-            return int(r[:-1]) * 7
-        if r.endswith("m") and r[:-1].isdigit():
-            return int(r[:-1]) * 30
-        if r.endswith("y") and r[:-1].isdigit():
-            return int(r[:-1]) * 365
-        if r.isdigit():
-            return int(r)
-    except Exception:
-        pass
-    return 30
-
-
-def _get_series_for_symbol(sym: str, days: int):
-    """Resolve symbol to CoinGecko id and return downsampled [ms, price] list."""
-    sym = (sym or "").strip().upper()
-    if not sym:
-        return []
-    # resolve to CoinGecko coin id
-    cg_id = _cg_resolve_symbol(sym)
-    if not cg_id:
-        raise ValueError(f"unknown symbol: {sym}")
-    j = _cg_market_chart_usd(cg_id, int(days))
-    prices = (j or {}).get("prices") or []
-    # Keep payload reasonable
-    return _downsample_cg_prices(prices, max_points=400)
-
-
-def _health_for_symbol(sym: str, series):
-    """Very small health payload (optional)."""
-    try:
-        if not series or len(series) < 2:
-            return None
-        # series is [ms, price]
-        p0 = float(series[0][1])
-        p1 = float(series[-1][1])
-        chg = (p1 / p0 - 1.0) * 100.0 if p0 else 0.0
-        return {"symbol": sym, "change_pct": chg}
-    except Exception:
-        return None
 
 @app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
@@ -2789,7 +2771,7 @@ def api_compare():
                     health_out[sym] = h
 
             except Exception as ex:
-                errors[sym] = f"{ex.__class__.__name__}"
+                errors[sym] = f"{ex.__class__.__name__}: {ex}"
                 series_out[sym] = []
 
         # 🔁 FALLBACK: alles leer → Cache
@@ -2802,7 +2784,7 @@ def api_compare():
                 stale["errors"] = errors
                 return jsonify(stale), 200
 
-            return jsonify({"status":"empty","range":range_key,"days":days,"symbols":symbols,"series":series_out,"errors":errors,"updated_at":int(time.time())}), 200
+            return err("no data", 502)
 
         # ✅ PARTIAL OK
         if errors:
