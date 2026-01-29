@@ -74,30 +74,6 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
-from flask_cors import CORS
-
-ALLOWED_ORIGINS = [
-    "https://nexus-analyt-ui.onrender.com",
-    "http://localhost:5173",
-    "http://localhost:3000",
-]
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
-    supports_credentials=True,
-)
-@app.after_request
-def _force_cors_headers(resp):
-    # Ensure CORS headers are present even on error responses / exceptions.
-    origin = request.headers.get("Origin")
-    if origin and origin in ALLOWED_ORIGINS:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
-    resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-    return resp
 
 
 
@@ -2882,7 +2858,12 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        stale = _cache_get_any(_COMPARE_CACHE, request.args.get("symbols", ""))
+        # Try serve last cached payload for the same symbols+range
+        symbols_raw = request.args.get("symbols", "")
+        range_key = request.args.get("range", "30d")
+        symbols_list = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        cache_key = f"{','.join(symbols_list)}:{range_key}" if symbols_list else symbols_raw
+        stale = _cache_get_any(_COMPARE_CACHE, cache_key)
         if stale:
             return jsonify(stale), 200
         return err(str(e), 500)
