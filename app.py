@@ -2740,84 +2740,114 @@ def api_compare():
         series_out = {}
         health_out = {} if include_health else None
 
+
+        errors = {}
+
+        # Always initialize series keys so frontend can render legend consistently
         for sym in symbols:
-            coin_id = _resolve_cg_id(sym)
-            if not coin_id:
-                # Skip unknown symbols but keep response stable
-                continue
+            series_out[sym] = []
 
-            # Series for selected range
-            chart = _cg_market_chart_usd(coin_id, days) or {}
-            prices = _downsample_points(chart.get("prices") or [], max_points=240)
-
-            # Return RAW prices (indexing is done in the frontend).
-            series = []
-            now_ms = int(time.time() * 1000)
-
-            # Intraday ranges: use last 15 minutes / 1 hour from the 1D market chart.
-            min_ms = None
-            if range_key == "15M":
-                min_ms = now_ms - 15 * 60 * 1000
-            elif range_key == "1H":
-                min_ms = now_ms - 60 * 60 * 1000
-
-            for p in prices:
-                try:
-                    t_ms = int(p[0])
-                    px = float(p[1])
-                    if px <= 0:
-                        continue
-                    if min_ms is not None and t_ms < min_ms:
-                        continue
-                    series.append({"t": t_ms, "v": px})
-                except Exception:
+        for sym in symbols:
+            try:
+                coin_id = _resolve_cg_id(sym)
+                if not coin_id:
+                    errors[sym] = "coingecko id not found"
                     continue
-            if series:
+
+                # Series for selected range
+                chart = _cg_market_chart_usd(coin_id, days) or {}
+                prices = _downsample_points(chart.get("prices") or [], max_points=240)
+
+                series = []
+                now_ms = int(time.time() * 1000)
+
+                # Intraday ranges: use last 15 minutes / 1 hour from the 1D market chart.
+                min_ms = None
+                if range_key == "15M":
+                    min_ms = now_ms - 15 * 60 * 1000
+                elif range_key == "1H":
+                    min_ms = now_ms - 60 * 60 * 1000
+
+                for p in prices:
+                    try:
+                        t_ms = int(p[0])
+                        px = float(p[1])
+                        if px <= 0:
+                            continue
+                        if min_ms is not None and t_ms < min_ms:
+                            continue
+                        series.append({"t": t_ms, "v": px})
+                    except Exception:
+                        continue
+
                 series_out[sym] = series
 
-            if include_health:
-                # Health (reuse existing market health logic; cached)
-                snap = _cg_market_snapshot(coin_id) or {}
-                row = {
-                    "price": snap.get("price"),
-                    "change24h": snap.get("change24h"),
-                    "volume24h": snap.get("volume24h"),
-                }
+                if include_health:
+                    try:
+                        snap = _cg_market_snapshot(coin_id) or {}
+                        row = {
+                            "price": snap.get("price"),
+                            "change24h": snap.get("change24h"),
+                            "volume24h": snap.get("volume24h"),
+                        }
 
-                # Use the same hist inputs as /api/health/market (cached)
-                hist = None
+                        hist = None
+                        try:
+                            d30 = _cg_market_chart_usd(coin_id, 30)
+                            d180 = _cg_market_chart_usd(coin_id, 180)
+                            m30 = _compute_history_metrics((d30 or {}).get("prices"))
+                            m180 = _compute_history_metrics((d180 or {}).get("prices"))
+                            hist = {
+                                "trend30d": (m30 or {}).get("retPct"),
+                                "vol30d": (m30 or {}).get("vol"),
+                                "trend180d": (m180 or {}).get("retPct"),
+                                "dd180d": (m180 or {}).get("maxDrawdownPct"),
+                            }
+                        except Exception:
+                            hist = None
+
+                        h = compute_market_health(row, sym, hist) or {}
+                        score = h.get("score")
+                        if isinstance(score, (int, float)):
+                            if score >= 71:
+                                label = "Strong"
+                            elif score >= 51:
+                                label = "Balanced"
+                            elif score >= 31:
+                                label = "Weak"
+                            else:
+                                label = "Risk"
+                        else:
+                            label = "Unknown"
+
+                        health_out = health_out or {}
+                        health_out[sym] = {
+                            "score": score if isinstance(score, (int, float)) else None,
+                            "label": label,
+                            "status": h.get("status") or None,
+                            "notes": h.get("notes") or [],
+                        }
+                    except Exception as he:
+                        errors[sym] = errors.get(sym) or f"health error: {he.__class__.__name__}"
+            except Exception as ex:
+                # Never fail whole compare due to one coin (rate-limit, 404, etc.)
+                errors[sym] = f"{ex.__class__.__name__}"
+                series_out[sym] = []
+
+        # If everything failed, return stale cache if any; otherwise return 502 with details (not 500)
+        if all(len(series_out.get(s, [])) == 0 for s in symbols):
+            stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+            if stale is not None:
+                # attach last errors for transparency
                 try:
-                    d30 = _cg_market_chart_usd(coin_id, 30)
-                    d180 = _cg_market_chart_usd(coin_id, 180)
-                    m30 = _compute_history_metrics((d30 or {}).get("prices"))
-                    m180 = _compute_history_metrics((d180 or {}).get("prices"))
-                    hist = {
-                        "trend30d": (m30 or {}).get("retPct"),
-                        "vol30d": (m30 or {}).get("vol"),
-                        "trend180d": (m180 or {}).get("retPct"),
-                        "dd180d": (m180 or {}).get("maxDrawdownPct"),
-                    }
+                    stale = dict(stale)
+                    stale["errors"] = errors
                 except Exception:
-                    hist = None
+                    pass
+                return jsonify(stale)
+            return err({"message": "compare upstream unavailable", "errors": errors}, 502)
 
-                h = compute_market_health(row, sym, hist) or {}
-                score = h.get("score")
-                # Map to frontend labels
-                if isinstance(score, (int, float)):
-                    if score >= 71:
-                        label = "Strong"
-                    elif score >= 51:
-                        label = "Medium"
-                    else:
-                        label = "Weak"
-                else:
-                    label = None
 
-                health_out[sym] = {
-                    "score": score,
-                    "label": label,
-                    "status": h.get("status"),
-                }
 
 
 
@@ -2826,7 +2856,8 @@ def api_compare():
             "range": range_key,
             "days": days,
             "symbols": symbols,
-            "series": series_out,
+                  "errors": errors,
+"series": series_out,
             "updated_at": now_ts(),
         }
         if include_health:
