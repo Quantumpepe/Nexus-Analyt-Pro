@@ -73,6 +73,7 @@ if GridConfig is None:
 app = Flask(__name__)
 
 import traceback
+from flask import jsonify
 
 @app.errorhandler(Exception)
 def _all_errors(e):
