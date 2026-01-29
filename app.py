@@ -2855,9 +2855,9 @@ def api_compare():
                     errors[sym] = f"{ex.__class__.__name__}"
                     series_out[sym] = []
 
-            # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
-# This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
-try:
+    # If everything failed, prefer stale cache; otherwise return a **200** with partial status.
+    # This avoids browser-side CORS confusion caused by Gunicorn/edge error pages on non-200s.
+    try:
     # 1️⃣ FALL: ALLES FEHLERHAFT → stale cache
     if all(len(series_out.get(s, [])) == 0 for s in symbols):
         stale = _cache_get_any(_COMPARE_CACHE, cache_key)
