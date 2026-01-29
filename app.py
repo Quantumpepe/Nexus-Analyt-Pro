@@ -2746,8 +2746,6 @@ def _downsample_points(prices, max_points: int = 240):
         out.append(prices[-1])
     return out
 
-@app.route("/api/compare", methods=["GET", "OPTIONS"])
-
 def _get_series_for_symbol(sym: str, days: int):
     """
     Returns list[[ts_ms, price_usd], ...] for the last N days.
@@ -2790,6 +2788,7 @@ def _health_for_symbol(sym: str, series):
     pct = (p1 - p0) / p0 * 100.0
     return {"symbol": sym, "last": p1, "pct": pct}
 
+@app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
     try:
         symbols = request.args.get("symbols", "")
