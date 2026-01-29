@@ -87,6 +87,19 @@ CORS(
     resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
     supports_credentials=True,
 )
+@app.after_request
+def _force_cors_headers(resp):
+    # Ensure CORS headers are present even on error responses / exceptions.
+    origin = request.headers.get("Origin")
+    if origin and origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type,Authorization")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+    return resp
+
+
 
 
 import traceback
