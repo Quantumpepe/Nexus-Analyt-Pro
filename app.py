@@ -74,10 +74,6 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
-
-
-
-
 import traceback
 from flask import jsonify
 
@@ -2735,6 +2731,21 @@ def _downsample_points(prices, max_points: int = 240):
         out.append(prices[-1])
     return out
 
+def _daily_close(points):
+    """Convert intraday [[ts_ms, price], ...] into daily close points (UTC)."""
+    if not isinstance(points, list) or not points:
+        return []
+    from datetime import datetime, timezone
+    by_day = {}
+    for row in points:
+        try:
+            ts = int(row[0]); px = float(row[1])
+        except Exception:
+            continue
+        day = datetime.fromtimestamp(ts/1000, tz=timezone.utc).date().isoformat()
+        by_day[day] = [ts, px]  # overwrite => last point of day (close)
+    return [by_day[k] for k in sorted(by_day.keys())]
+
 def _get_series_for_symbol(sym: str, days: int):
     """
     Returns list[[ts_ms, price_usd], ...] for the last N days.
@@ -2777,7 +2788,8 @@ def _health_for_symbol(sym: str, series):
     pct = (p1 - p0) / p0 * 100.0
     return {"symbol": sym, "last": p1, "pct": pct}
 
-@app.route("/api/compare", methods=["GET", "OPTIONS"])
+
+@app.route("/api/compare", methods=["GET","OPTIONS"])
 def api_compare():
     try:
         symbols = request.args.get("symbols", "")
@@ -2789,6 +2801,7 @@ def api_compare():
             return err("no symbols", 400)
 
         series_out = {}
+        daily_out = {}
         errors = {}
         health_out = {}
 
@@ -2796,6 +2809,7 @@ def api_compare():
             try:
                 series = _get_series_for_symbol(sym, days)
                 series_out[sym] = series or []
+                daily_out[sym] = _daily_close(series_out[sym])[-(days+2):] if days else _daily_close(series_out[sym])
 
                 h = _health_for_symbol(sym, series)
                 if h:
@@ -2804,6 +2818,7 @@ def api_compare():
             except Exception as ex:
                 errors[sym] = f"{ex.__class__.__name__}: {ex}"
                 series_out[sym] = []
+                daily_out[sym] = []
 
         # 🔁 FALLBACK: alles leer → Cache
         if all(len(series_out.get(s, [])) == 0 for s in symbols):
@@ -2822,6 +2837,7 @@ def api_compare():
                 "symbols": symbols,
                 "errors": errors,
                 "series": series_out,
+                "daily": daily_out,
                 "updated_at": int(time.time()),
             }), 200
 
@@ -2836,6 +2852,7 @@ def api_compare():
                 "symbols": symbols,
                 "errors": errors,
                 "series": series_out,
+                "daily": daily_out,
                 "updated_at": int(time.time()),
             }
             if health_out:
@@ -2849,6 +2866,7 @@ def api_compare():
             "days": days,
             "symbols": symbols,
             "series": series_out,
+            "daily": daily_out,
             "updated_at": int(time.time()),
         }
         if health_out:
@@ -2858,12 +2876,7 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Try serve last cached payload for the same symbols+range
-        symbols_raw = request.args.get("symbols", "")
-        range_key = request.args.get("range", "30d")
-        symbols_list = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
-        cache_key = f"{','.join(symbols_list)}:{range_key}" if symbols_list else symbols_raw
-        stale = _cache_get_any(_COMPARE_CACHE, cache_key)
+        stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
         if stale:
             return jsonify(stale), 200
         return err(str(e), 500)
