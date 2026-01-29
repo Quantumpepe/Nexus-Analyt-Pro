@@ -2807,16 +2807,27 @@ def api_compare():
 
         for sym in symbols:
             try:
-                series = _get_series_for_symbol(sym, days)
-                series_out[sym] = series or []
-                daily_out[sym] = _daily_close(series_out[sym])[-(days+2):] if days else _daily_close(series_out[sym])
+                series = _get_series_for_symbol(sym, days) or []
+                series_out[sym] = series
 
-                h = _health_for_symbol(sym, series)
-                if h:
-                    health_out[sym] = h
+                # daily close (defensiv)
+                try:
+                    dc = _daily_close(series)
+                    daily_out[sym] = dc[-(days+2):] if days and len(dc) > (days+2) else dc
+                except Exception:
+                    daily_out[sym] = []
 
-            except Exception as ex:
-                errors[sym] = f"{ex.__class__.__name__}: {ex}"
+                # health (defensiv)
+                try:
+                    h = _health_for_symbol(sym, series)
+                    if h:
+                        health_out[sym] = h
+                except Exception:
+                    pass
+
+            except Exception as e:
+                # NEVER crash compare because of one symbol
+                errors[sym] = str(e)
                 series_out[sym] = []
                 daily_out[sym] = []
 
@@ -2831,15 +2842,16 @@ def api_compare():
                 return jsonify(stale), 200
 
             return jsonify({
-                "status": "empty",
-                "range": range_key,
+                "status": "ok",
                 "days": days,
+                "range": range_key,
                 "symbols": symbols,
-                "errors": errors,
                 "series": series_out,
                 "daily": daily_out,
-                "updated_at": int(time.time()),
+                "health": health_out,
+                "errors": errors
             }), 200
+
 
 
         # ✅ PARTIAL OK
