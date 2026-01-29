@@ -1,7 +1,4 @@
-# backend/app.py
 from __future__ import annotations
-from flask import Flask, jsonify, request
-from flask_cors import CORS
 
 import os
 import time
@@ -14,6 +11,8 @@ import random
 import math
 from typing import Optional, Dict, Any
 
+from flask import Flask, jsonify, request, make_response
+from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 from market_data import get_pair_data
@@ -21,97 +20,20 @@ from watchlist import get_watchlist
 from safety import evaluate_safety
 import grid_sim
 
-# --- Grid simulator adapter (supports grid_sim exposing functions OR class methods) ---
-import inspect as _inspect
-# =========================
-# A) GLOBAL WATCHLIST CACHE
-# =========================
-WATCHLIST_CACHE = {
-    "rows": None,   # gecachte Watchlist-Daten
-    "ts": 0         # Timestamp der letzten Aktualisierung
-}
+# -------------------------
+# App init (MUSS vor @app.* kommen!)
+# -------------------------
+app = Flask(__name__)
 
-WATCHLIST_LOCK = threading.Lock()
-
-# Cache-Gültigkeit in Sekunden
-WATCHLIST_TTL = 120  # 2 Minuten
-
-
-def _grid_build(cfg):
-    # Try function-style first
-    if hasattr(grid_sim, "build_grid") and callable(getattr(grid_sim, "build_grid")):
-        try:
-            return grid_sim.build_grid(cfg)
-        except TypeError as e:
-            # If build_grid is an unbound method (expects self,cfg), fall through to class scan
-            msg = str(e)
-            if "positional argument" not in msg or "cfg" not in msg:
-                raise
-    # Class-scan fallback
-    for _name, _cls in _inspect.getmembers(grid_sim, _inspect.isclass):
-        if hasattr(_cls, "build_grid") and callable(getattr(_cls, "build_grid")):
-            try:
-                _inst = _cls()
-                return _inst._grid_build(cfg)
-            except TypeError:
-                continue
-    raise RuntimeError("grid_sim: could not find callable _grid_build(cfg)")
-
-def _grid_step(state, cfg, snapshot):
-    if hasattr(grid_sim, "step_sim") and callable(getattr(grid_sim, "step_sim")):
-        try:
-            return grid_sim._grid_step(state, cfg, snapshot)
-        except TypeError as e:
-            msg = str(e)
-            if "positional argument" not in msg:
-                raise
-    for _name, _cls in _inspect.getmembers(grid_sim, _inspect.isclass):
-        if hasattr(_cls, "step_sim") and callable(getattr(_cls, "step_sim")):
-            try:
-                _inst = _cls()
-                return _inst._grid_step(state, cfg, snapshot)
-            except TypeError:
-                continue
-    raise RuntimeError("grid_sim: could not find callable _grid_step(state,cfg,snapshot)")
-
-# Expose GridConfig regardless of how grid_sim defines it
-GridConfig = getattr(grid_sim, "GridConfig", None)
-if GridConfig is None:
-    raise ImportError("grid_sim does not export GridConfig")
-
-
-
-
-@app.get("/api/ping")
-def ping():
-    return jsonify({
-        "ok": True,
-        "ts": int(time.time()),
-        "origins": FRONTEND_ORIGINS,
-        "render_commit": os.getenv("RENDER_GIT_COMMIT", None),
-    })
-
-
-"""CORS
-
-Frontend (Vite) calls the backend from http://localhost:5173 and uses
-fetch(..., { credentials: 'include' }).
-
-That requires:
-  - Access-Control-Allow-Origin must NOT be '*'
-  - Access-Control-Allow-Credentials must be 'true'
-  - Preflight (OPTIONS) must include the same headers
-"""
-
-# IMPORTANT: when supports_credentials=True, origins cannot be '*'
+# -------------------------
+# CORS (MUSS vor Routes, die FRONTEND_ORIGINS nutzen)
+# -------------------------
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # Render static site (prod)
     "https://nexus-analyt-ui.onrender.com",
 ]
 
-# Optional: extend allowed origins via env (comma-separated)
 _extra_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
 if _extra_origins:
     for _o in [x.strip() for x in _extra_origins.split(",") if x.strip()]:
@@ -128,11 +50,8 @@ CORS(
     max_age=86400,
 )
 
-from flask import make_response
-
 @app.before_request
 def _handle_options_preflight():
-    """Ensure preflight requests always get the CORS + credentials headers."""
     if request.method != "OPTIONS":
         return None
 
@@ -146,10 +65,8 @@ def _handle_options_preflight():
         resp.headers["Vary"] = "Origin"
     return resp
 
-
 @app.after_request
 def add_cors_headers(resp):
-    """Always attach CORS + credentials headers for allowed frontend origins (also on 4xx/5xx)."""
     origin = request.headers.get("Origin")
     if origin in FRONTEND_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
@@ -159,17 +76,22 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-@app.route("/", methods=["GET"])
-def root():
+# -------------------------
+# Debug ping (jetzt ist app + FRONTEND_ORIGINS definiert)
+# -------------------------
+@app.get("/api/ping")
+def ping():
     return jsonify({
-        "status": "ok",
-        "service": "Nexus-Analyt backend",
-        "hint": "Try /api/health or /api/watchlist"
+        "ok": True,
+        "ts": int(time.time()),
+        "origins": FRONTEND_ORIGINS,
+        "render_commit": os.getenv("RENDER_GIT_COMMIT", None),
     })
 
-@app.route("/api/healthz", methods=["GET"])
-def healthz():
-    return jsonify({"status": "ok"})
+# Flask secret key for signing tokens (set FLASK_SECRET_KEY in env for production)
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
+_serializer = URLSafeTimedSerializer(app.secret_key)
+)
 
 
 # -------------------------
