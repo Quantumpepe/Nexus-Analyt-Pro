@@ -72,6 +72,15 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
+import traceback
+
+@app.errorhandler(Exception)
+def _all_errors(e):
+    # TEMP: debug output (remove later)
+    tb = traceback.format_exc()
+    return jsonify({"status": "error", "error": str(e), "trace": tb}), 500
+
+
 """CORS
 
 Frontend (Vite) calls the backend from http://localhost:5173 and uses
