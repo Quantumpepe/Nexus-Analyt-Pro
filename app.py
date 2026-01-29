@@ -46,30 +46,21 @@ def _grid_build(cfg):
     raise RuntimeError("grid_sim: could not find callable _grid_build(cfg)")
 
 def _grid_step(state, cfg, snapshot):
-    # Prefer function-style exports
     if hasattr(grid_sim, "step_sim") and callable(getattr(grid_sim, "step_sim")):
-        return grid_sim.step_sim(state, cfg, snapshot)
-    if hasattr(grid_sim, "_grid_step") and callable(getattr(grid_sim, "_grid_step")):
-        return grid_sim._grid_step(state, cfg, snapshot)
-
-    # Class-scan fallback
+        try:
+            return grid_sim._grid_step(state, cfg, snapshot)
+        except TypeError as e:
+            msg = str(e)
+            if "positional argument" not in msg:
+                raise
     for _name, _cls in _inspect.getmembers(grid_sim, _inspect.isclass):
-        # Prefer step_sim, then _grid_step
         if hasattr(_cls, "step_sim") and callable(getattr(_cls, "step_sim")):
-            try:
-                _inst = _cls()
-                return _inst.step_sim(state, cfg, snapshot)
-            except TypeError:
-                continue
-        if hasattr(_cls, "_grid_step") and callable(getattr(_cls, "_grid_step")):
             try:
                 _inst = _cls()
                 return _inst._grid_step(state, cfg, snapshot)
             except TypeError:
                 continue
-
-    raise RuntimeError("grid_sim: could not find callable step function (step_sim/_grid_step)(state,cfg,snapshot)")
-
+    raise RuntimeError("grid_sim: could not find callable _grid_step(state,cfg,snapshot)")
 
 # Expose GridConfig regardless of how grid_sim defines it
 GridConfig = getattr(grid_sim, "GridConfig", None)
@@ -2717,31 +2708,6 @@ _RANGE_TO_DAYS = {
     "3Y": 1095,
 }
 
-
-def _range_to_days(range_key: str) -> int:
-    """Map UI range strings (e.g. '30d', '7D', '1Y') to CoinGecko 'days'."""
-    if not range_key:
-        return 30
-    rk = str(range_key).strip().upper()
-    # Normalize common variants (e.g. '30d' -> '30D')
-    rk = rk.replace(" ", "")
-    if rk.endswith("MIN"):
-        # e.g. '15MIN' -> '15M'
-        rk = rk.replace("MIN", "M")
-    if rk.endswith("M") and rk[:-1].isdigit() and rk not in _RANGE_TO_DAYS:
-        # minutes -> treat as 1 day series
-        return 1
-    if rk.endswith("H") and rk[:-1].isdigit() and rk not in _RANGE_TO_DAYS:
-        return 1
-    # 1D/7D/30D etc.
-    if rk in _RANGE_TO_DAYS:
-        return int(_RANGE_TO_DAYS[rk])
-    # Try to coerce '30' -> 30 days
-    if rk.isdigit():
-        return int(rk)
-    # Safe default
-    return 30
-
 def _downsample_points(prices, max_points: int = 240):
     """Downsample CoinGecko [ms, price] points to keep payload small."""
     if not isinstance(prices, list):
@@ -2795,7 +2761,8 @@ def api_compare():
                 stale["errors"] = errors
                 return jsonify(stale), 200
 
-            return err("no data", 502)
+            # Return 200 with empty payload (avoid surfacing as network error in browser)
+            return jsonify({"status":"empty","range": range_key, "days": days, "symbols": symbols, "series": series_out, "errors": errors, "updated_at": int(time.time())}), 200
 
         # ✅ PARTIAL OK
         if errors:
