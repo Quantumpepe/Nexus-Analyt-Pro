@@ -23,6 +23,19 @@ import grid_sim
 
 # --- Grid simulator adapter (supports grid_sim exposing functions OR class methods) ---
 import inspect as _inspect
+# =========================
+# A) GLOBAL WATCHLIST CACHE
+# =========================
+WATCHLIST_CACHE = {
+    "rows": None,   # gecachte Watchlist-Daten
+    "ts": 0         # Timestamp der letzten Aktualisierung
+}
+
+WATCHLIST_LOCK = threading.Lock()
+
+# Cache-Gültigkeit in Sekunden
+WATCHLIST_TTL = 120  # 2 Minuten
+
 
 def _grid_build(cfg):
     # Try function-style first
