@@ -91,7 +91,7 @@ def ping():
 # Flask secret key for signing tokens (set FLASK_SECRET_KEY in env for production)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
 _serializer = URLSafeTimedSerializer(app.secret_key)
-)
+
 
 
 # -------------------------
