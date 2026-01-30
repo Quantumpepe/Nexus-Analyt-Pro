@@ -2598,6 +2598,7 @@ def api_watchlist_snapshot():
             { symbol, mode, id, price, change24h, volume24h, liquidity, source }
     """
     try:
+        wl_cache_key = None  # ensure defined for exception path
         items = None
 
         if request.method == "POST":
@@ -2756,7 +2757,7 @@ def api_watchlist_snapshot():
         return jsonify({"status": "ok", "results": results, "ts": int(time.time())})
     except Exception as e:
         # Never hard-fail the UI; return stale cache or an empty-but-OK payload.
-        stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key)
+        stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key) if wl_cache_key else None
         if stale is not None:
             stale = dict(stale)
             stale["status"] = "partial"
@@ -2977,8 +2978,17 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Last resort: return JSON error (frontend can show message)
-        return err(str(e), 500)
+        # Last resort: never hard-fail the UI (avoid 500/CORS masking).
+        return jsonify({
+            "status": "partial",
+            "partial": True,
+            "range": request.args.get("range", "30d"),
+            "symbols": [],
+            "series": {},
+            "daily": {},
+            "errors": {"_": str(e)},
+            "updated_at": int(time.time()),
+        }), 200
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
@@ -4477,25 +4487,6 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
         except Exception:
             pass
         stop_evt.wait(interval)
-
-from flask import request
-
-UI_ORIGIN = "https://nexus-analyt-ui.onrender.com"
-
-@app.before_request
-def cors_preflight():
-    if request.method == "OPTIONS" and request.path.startswith("/api/"):
-        return ("", 204)
-
-@app.after_request
-def cors_after(resp):
-    if request.path.startswith("/api/"):
-        resp.headers["Access-Control-Allow-Origin"] = UI_ORIGIN
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-    return resp
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
