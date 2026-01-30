@@ -1,3 +1,5 @@
+
+
 # backend/app.py
 from __future__ import annotations
 from flask import Flask, jsonify, request
@@ -111,6 +113,18 @@ FRONTEND_ORIGINS = [
     "https://www.nexus-analyt-ui.onrender.com",
 ]
 
+# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
+# We therefore also mirror headers manually for known frontend origins.
+_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
+
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in FRONTEND_ORIGINS:
+        return True
+    # Accept Render subdomains for this project (ui/pro)
+    return bool(_FRONTEND_ORIGIN_RE.match(origin))
+
 CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
@@ -133,7 +147,7 @@ def _add_cors_headers(resp):
     """
     try:
         origin = request.headers.get("Origin", "")
-        if origin in FRONTEND_ORIGINS:
+        if _is_allowed_origin(origin):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
@@ -153,7 +167,7 @@ def _handle_options_preflight():
 
     origin = request.headers.get("Origin", "")
     resp = make_response("", 204)
-    if origin in FRONTEND_ORIGINS:
+    if _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
