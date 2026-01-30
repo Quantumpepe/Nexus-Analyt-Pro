@@ -106,7 +106,6 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
-
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -114,32 +113,18 @@ FRONTEND_ORIGINS = [
     "https://www.nexus-analyt-ui.onrender.com",
 ]
 
-# Permissive CORS for demo deployments (Render UI <-> Render API).
-# We reflect the Origin back when present; this avoids the common "works in browser URL bar
-# but blocked in fetch()" issue (preflight / error responses / proxy paths).
-_FRONTEND_ORIGIN_RE = re.compile(
-    r"^(https?://)?(localhost:5173|127\.0\.0\.1:5173|([a-z0-9-]+\.)?onrender\.com)$",
-    re.IGNORECASE,
-)
+# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
+# We therefore also mirror headers manually for known frontend origins.
+_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
 
 def _is_allowed_origin(origin: str) -> bool:
     if not origin:
         return False
-    # exact allow-list first
     if origin in FRONTEND_ORIGINS:
         return True
-    # allow any onrender.com origin (demo-safe)
-    try:
-        return origin.endswith(".onrender.com")
-    except Exception:
-        return False
+    # Accept Render subdomains for this project (ui/pro)
+    return bool(_FRONTEND_ORIGIN_RE.match(origin))
 
-# CORS: allow the UI origin(s). If the frontend uses `credentials: 'include'`
-# (cookies), the browser requires `Access-Control-Allow-Credentials: true` and
-# `Access-Control-Allow-Origin` must be the *exact* Origin (not '*').
-#
-# Even if the UI later switches to `credentials: 'omit'`, keeping
-# supports_credentials=True is harmless and makes the API resilient.
 CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
@@ -150,41 +135,44 @@ CORS(
     max_age=86400,
 )
 
+
 from flask import make_response
 
 @app.after_request
 def _add_cors_headers(resp):
-    """Ensure CORS headers exist even on 4xx/5xx and proxy-ish error paths."""
+    """Make CORS robust even when an endpoint raises and returns 4xx/5xx.
+
+    flask-cors usually handles this, but in some Render/gunicorn error paths
+    the header can be missing. We mirror the allow-list here defensively.
+    """
     try:
         origin = request.headers.get("Origin", "")
-        if origin and _is_allowed_origin(origin):
-            # Exact origin required when credentials are used.
+        if _is_allowed_origin(origin):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
+            # Allow headers/methods for browsers that do non-simple requests
             resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
             resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        elif not origin:
-            # Non-browser clients (curl/server-to-server)
-            resp.headers.setdefault("Access-Control-Allow-Origin", "*")
     except Exception:
         pass
     return resp
 
+
 @app.before_request
 def _handle_options_preflight():
+    """Ensure preflight requests always get the CORS + credentials headers."""
     if request.method != "OPTIONS":
         return None
-    resp = make_response("", 204)
+
     origin = request.headers.get("Origin", "")
-    if origin and _is_allowed_origin(origin):
+    resp = make_response("", 204)
+    if _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    elif not origin:
-        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Vary"] = "Origin"
     return resp
 
 @app.route("/", methods=["GET"])
@@ -1883,28 +1871,28 @@ def _res_hist_cache_set(key: str, value):
     _RES_HIST_CACHE["by_key"][key] = value
     _RES_HIST_CACHE["ts"][key] = time.time()
 
-def _cg_request_json(url: str, params: dict, timeout: int = 12):
+def _cg_request_json(url: str, params: dict, timeout: int = 20):
     # CoinGecko GET with small retry/backoff on 429.
     last_exc = None
-    for attempt in range(2):
+    for attempt in range(4):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 if ra:
                     try:
-                        wait = min(6.0, float(ra))
+                        wait = min(30.0, float(ra))
                     except Exception:
                         wait = 2.0
                 else:
-                    wait = min(6.0, 1.5 ** attempt)
+                    wait = min(30.0, 1.5 ** attempt)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            time.sleep(min(2.0, 0.5 * (attempt + 1)))
+            time.sleep(min(10.0, 0.5 * (attempt + 1)))
     raise last_exc or RuntimeError("CoinGecko request failed")
 
 def _resolve_cg_id(symbol: str) -> Optional[str]:
@@ -2571,6 +2559,31 @@ def api_market_search():
             return jsonify(cached)
         return err(str(e), 500)
 
+
+
+# -------------------------
+# Coin search (CoinGecko) - used by UI dropdown/autocomplete (old app behavior)
+# -------------------------
+@app.get("/api/coins/search")
+def api_coins_search():
+    """
+    Proxy CoinGecko /search results for the frontend.
+
+    Query params:
+      - q: search string (symbol or name)
+
+    Returns: list[{id,name,symbol,market_cap_rank}]
+    """
+    q = (request.args.get("q") or request.args.get("query") or "").strip()
+    try:
+        results = _cg_search(q, limit=25)
+        # Return plain list to match old UI behavior
+        return jsonify(results)
+    except Exception as e:
+        # Never 500 here; UI will just show empty results.
+        print("coins/search error:", e)
+        return jsonify([])
+
 @app.route("/api/market/resolve", methods=["GET"])
 def api_market_resolve():
     symbol = request.args.get("symbol") or ""
@@ -2598,7 +2611,6 @@ def api_watchlist_snapshot():
             { symbol, mode, id, price, change24h, volume24h, liquidity, source }
     """
     try:
-        wl_cache_key = None  # ensure defined for exception path
         items = None
 
         if request.method == "POST":
@@ -2664,9 +2676,6 @@ def api_watchlist_snapshot():
             return jsonify(fresh_cached)
 
         # ---- Market batch (CoinGecko) ----
-        # Hard deadline to avoid platform timeouts on cold-cache.
-        ws_t0 = time.time()
-        ws_deadline_sec = float(os.getenv('WATCH_SNAP_DEADLINE_SEC', '12'))
         market_items = [it for it in ordered if it.get("mode") == "market"]
         ids_by_symbol = {}
         coin_ids = []
@@ -2680,10 +2689,7 @@ def api_watchlist_snapshot():
                 ids_by_symbol[sym] = cid
                 coin_ids.append(cid)
 
-        if (time.time() - ws_t0) > ws_deadline_sec:
-            snaps_by_id = {}
-        else:
-            snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+        snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
 
         # ---- Build results (normalized keys expected by frontend) ----
         results = []
@@ -2763,7 +2769,7 @@ def api_watchlist_snapshot():
         return jsonify({"status": "ok", "results": results, "ts": int(time.time())})
     except Exception as e:
         # Never hard-fail the UI; return stale cache or an empty-but-OK payload.
-        stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key) if wl_cache_key else None
+        stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key)
         if stale is not None:
             stale = dict(stale)
             stale["status"] = "partial"
@@ -2928,15 +2934,7 @@ def api_compare():
         errors = {}
         health_out = {}
 
-        # Hard deadline so Render/Gunicorn won't kill the worker on cold-cache or 429 retries.
-        t0 = time.time()
-        deadline_sec = float(os.getenv('COMPARE_DEADLINE_SEC', '18'))
-
         for sym in symbols:
-            # stop early on deadline (return partial)
-            if (time.time() - t0) > deadline_sec:
-                errors['_deadline'] = f"compare deadline {deadline_sec}s exceeded"
-                break
             try:
                 series = _get_series_for_symbol(sym, days) or []
                 series_out[sym] = series
@@ -2992,17 +2990,8 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Last resort: never hard-fail the UI (avoid 500/CORS masking).
-        return jsonify({
-            "status": "partial",
-            "partial": True,
-            "range": request.args.get("range", "30d"),
-            "symbols": [],
-            "series": {},
-            "daily": {},
-            "errors": {"_": str(e)},
-            "updated_at": int(time.time()),
-        }), 200
+        # Last resort: return JSON error (frontend can show message)
+        return err(str(e), 500)
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
