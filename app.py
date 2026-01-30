@@ -1883,28 +1883,28 @@ def _res_hist_cache_set(key: str, value):
     _RES_HIST_CACHE["by_key"][key] = value
     _RES_HIST_CACHE["ts"][key] = time.time()
 
-def _cg_request_json(url: str, params: dict, timeout: int = 20):
+def _cg_request_json(url: str, params: dict, timeout: int = 12):
     # CoinGecko GET with small retry/backoff on 429.
     last_exc = None
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 if ra:
                     try:
-                        wait = min(30.0, float(ra))
+                        wait = min(6.0, float(ra))
                     except Exception:
                         wait = 2.0
                 else:
-                    wait = min(30.0, 1.5 ** attempt)
+                    wait = min(6.0, 1.5 ** attempt)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception as e:
             last_exc = e
-            time.sleep(min(10.0, 0.5 * (attempt + 1)))
+            time.sleep(min(2.0, 0.5 * (attempt + 1)))
     raise last_exc or RuntimeError("CoinGecko request failed")
 
 def _resolve_cg_id(symbol: str) -> Optional[str]:
@@ -2664,6 +2664,9 @@ def api_watchlist_snapshot():
             return jsonify(fresh_cached)
 
         # ---- Market batch (CoinGecko) ----
+        # Hard deadline to avoid platform timeouts on cold-cache.
+        ws_t0 = time.time()
+        ws_deadline_sec = float(os.getenv('WATCH_SNAP_DEADLINE_SEC', '12'))
         market_items = [it for it in ordered if it.get("mode") == "market"]
         ids_by_symbol = {}
         coin_ids = []
@@ -2677,7 +2680,10 @@ def api_watchlist_snapshot():
                 ids_by_symbol[sym] = cid
                 coin_ids.append(cid)
 
-        snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+        if (time.time() - ws_t0) > ws_deadline_sec:
+            snaps_by_id = {}
+        else:
+            snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
 
         # ---- Build results (normalized keys expected by frontend) ----
         results = []
@@ -2922,7 +2928,15 @@ def api_compare():
         errors = {}
         health_out = {}
 
+        # Hard deadline so Render/Gunicorn won't kill the worker on cold-cache or 429 retries.
+        t0 = time.time()
+        deadline_sec = float(os.getenv('COMPARE_DEADLINE_SEC', '18'))
+
         for sym in symbols:
+            # stop early on deadline (return partial)
+            if (time.time() - t0) > deadline_sec:
+                errors['_deadline'] = f"compare deadline {deadline_sec}s exceeded"
+                break
             try:
                 series = _get_series_for_symbol(sym, days) or []
                 series_out[sym] = series
