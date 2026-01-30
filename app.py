@@ -2864,16 +2864,45 @@ def _health_for_symbol(sym: str, series):
     return {"symbol": sym, "last": p1, "pct": pct}
 
 
-@app.route("/api/compare", methods=["GET","OPTIONS"])
+@app.route("/api/compare", methods=["GET", "OPTIONS"])
 def api_compare():
-    try:
-        symbols = request.args.get("symbols", "")
-        range_key = request.args.get("range", "30d")
-        days = _range_to_days(range_key)
+    # Preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
 
-        symbols = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-        if not symbols:
-            return err("no symbols", 400)
+    try:
+        symbols_raw = (request.args.get("symbols", "") or "").strip()
+        range_key = (request.args.get("range", "30d") or "30d").strip().lower()
+
+        # Normalize common variants
+        range_alias = {
+            "1d": "1d", "7d": "7d", "30d": "30d", "90d": "90d",
+            "1y": "1y", "3y": "3y",
+            "30": "30d", "90": "90d", "365": "1y",
+        }
+        range_key = range_alias.get(range_key, range_key)
+
+        # Parse days safely (never 500 because of range)
+        try:
+            days = _range_to_days(range_key)
+        except Exception:
+            range_key = "30d"
+            days = _range_to_days(range_key)
+
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+
+        # Instead of 400 -> return empty ok (frontend stays stable)
+        if len(symbols) < 2:
+            return jsonify({
+                "status": "ok",
+                "range": range_key,
+                "days": days,
+                "symbols": symbols,
+                "series": {},
+                "daily": {},
+                "health": {},
+                "errors": {"_": "select at least 2 symbols"}
+            }), 200
 
         series_out = {}
         daily_out = {}
@@ -2885,14 +2914,14 @@ def api_compare():
                 series = _get_series_for_symbol(sym, days) or []
                 series_out[sym] = series
 
-                # daily close (defensiv)
+                # daily close (defensive)
                 try:
                     dc = _daily_close(series)
-                    daily_out[sym] = dc[-(days+2):] if days and len(dc) > (days+2) else dc
+                    daily_out[sym] = dc[-(days + 2):] if days and len(dc) > (days + 2) else dc
                 except Exception:
                     daily_out[sym] = []
 
-                # health (defensiv)
+                # health (defensive)
                 try:
                     h = _health_for_symbol(sym, series)
                     if h:
@@ -2901,12 +2930,11 @@ def api_compare():
                     pass
 
             except Exception as e:
-                # NEVER crash compare because of one symbol
                 errors[sym] = str(e)
                 series_out[sym] = []
                 daily_out[sym] = []
 
-        # 🔁 FALLBACK: alles leer → Cache
+        # If everything empty, try cache fallback
         if all(len(series_out.get(s, [])) == 0 for s in symbols):
             stale = _cache_get_any(_COMPARE_CACHE, f"{','.join(symbols)}:{range_key}")
             if stale:
@@ -2916,56 +2944,28 @@ def api_compare():
                 stale["errors"] = errors
                 return jsonify(stale), 200
 
-            return jsonify({
-                "status": "ok",
-                "days": days,
-                "range": range_key,
-                "symbols": symbols,
-                "series": series_out,
-                "daily": daily_out,
-                "health": health_out,
-                "errors": errors
-            }), 200
-
-
-
-        # ✅ PARTIAL OK
-        if errors:
-            out = {
-                "status": "partial",
-                "partial": True,
-                "range": range_key,
-                "days": days,
-                "symbols": symbols,
-                "errors": errors,
-                "series": series_out,
-                "daily": daily_out,
-                "updated_at": int(time.time()),
-            }
-            if health_out:
-                out["health"] = health_out
-            return jsonify(out), 200
-
-        # ✅ FULL OK
+        # Build response (PARTIAL vs FULL)
         out = {
-            "status": "ok",
+            "status": "partial" if errors else "ok",
+            "partial": True if errors else False,
             "range": range_key,
             "days": days,
             "symbols": symbols,
             "series": series_out,
             "daily": daily_out,
+            "errors": errors,
             "updated_at": int(time.time()),
         }
         if health_out:
             out["health"] = health_out
 
+        # Cache good/partial response (key must match fallback key!)
         _cache_set(_COMPARE_CACHE, f"{','.join(symbols)}:{range_key}", out)
+
         return jsonify(out), 200
 
     except Exception as e:
-        stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
-        if stale:
-            return jsonify(stale), 200
+        # Last resort: return JSON error (frontend can show message)
         return err(str(e), 500)
 
 
