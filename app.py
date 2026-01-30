@@ -1,3 +1,5 @@
+
+
 # backend/app.py
 from __future__ import annotations
 from flask import Flask, jsonify, request
@@ -1791,7 +1793,7 @@ def _gen_cache_get_fresh(key: str):
 # Watchlist + Compare caches (frontend stability)
 # -------------------------
 _WATCH_SNAP_CACHE = {"by_key": {}, "ts": {}}
-_WATCH_SNAP_TTL_SEC = int(os.getenv("WATCH_SNAP_TTL_SEC", "60"))  # 1 min default
+_WATCH_SNAP_TTL_SEC = int(os.getenv("WATCH_SNAP_TTL_SEC", "120"))  # 1 min default
 
 _COMPARE_CACHE = {"by_key": {}, "ts": {}}
 _COMPARE_TTL_SEC = int(os.getenv("COMPARE_TTL_SEC", "900"))  # 15 min default
@@ -2029,7 +2031,7 @@ def _cg_market_chart_usd(coin_id: str, days: int):
         stale = _cg_cache_get_any(key)
         if stale is not None:
             return stale
-        return {}
+        raise e
 
 def _compute_history_metrics(points):
     if not isinstance(points, list) or len(points) < 10:
@@ -2098,24 +2100,78 @@ def _cg_change24h_from_chart(coin_id: str):
     return None
 
 def _cg_search(query: str, limit: int = 25):
-    """Search CoinGecko coins by query. Returns list of {id,name,symbol,market_cap_rank}."""
+    """Search CoinGecko coins by query. Returns list of {id,name,symbol,market_cap_rank}.
+
+    This endpoint is rate-limited. To keep the UI stable we:
+      - apply a short global cooldown when we hit 429
+      - cache results for a short time (per query) via the existing _cg_cache helpers
+      - return [] on throttling instead of throwing (so callers can fallback to stale caches)
+    """
     q = (query or "").strip()
     if not q:
         return []
+
+    # small cache (120s) for search results (prevents hammering /search)
+    cache_key = f"search|{q.lower()}"
+    try:
+        cached = _cg_cache_get(cache_key)
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+
+    # global cooldown after we see 429
+    global _CG_SEARCH_COOLDOWN_UNTIL
+    try:
+        if int(time.time()) < int(_CG_SEARCH_COOLDOWN_UNTIL or 0):
+            stale = _cg_cache_get_any(cache_key)
+            return stale if stale is not None else []
+    except Exception:
+        pass
+
     url = f"{COINGECKO_BASE}/search"
-    r = requests.get(url, params={"query": q}, timeout=15)
-    r.raise_for_status()
-    data = r.json() or {}
-    coins = data.get("coins") or []
-    out = []
-    for c in coins[: max(1, min(int(limit), 50))]:
-        out.append({
-            "id": c.get("id"),
-            "name": c.get("name"),
-            "symbol": (c.get("symbol") or "").upper(),
-            "market_cap_rank": c.get("market_cap_rank"),
-        })
-    return out
+    try:
+        r = requests.get(url, params={"query": q}, timeout=15)
+
+        # throttle handling
+        if r.status_code == 429:
+            _CG_SEARCH_COOLDOWN_UNTIL = int(time.time()) + 120
+            stale = _cg_cache_get_any(cache_key)
+            return stale if stale is not None else []
+
+        r.raise_for_status()
+        data = r.json() or {}
+        coins = data.get("coins") or []
+        out = []
+        for c in coins[: max(1, min(int(limit), 50))]:
+            out.append({
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "symbol": (c.get("symbol") or "").upper(),
+                "market_cap_rank": c.get("market_cap_rank"),
+            })
+
+        # cache (short)
+        try:
+            _cg_cache_set(cache_key, out)
+        except Exception:
+            pass
+        return out
+
+    except Exception:
+        # best-effort: stale
+        try:
+            stale = _cg_cache_get_any(cache_key)
+            if stale is not None:
+                return stale
+        except Exception:
+            pass
+        return []
+
+
+# search cooldown (seconds since epoch); set when 429 happens
+_CG_SEARCH_COOLDOWN_UNTIL = 0
+
 
 
 # --- CoinGecko symbol->id fast path / cache (prevents slow /search on every refresh) ---
@@ -2136,7 +2192,6 @@ _CG_COMMON_IDS = {
     "POL": "polygon-ecosystem-token",
     "USDT": "tether",
     "USDC": "usd-coin",
-    "PEPE": "pepe",
 }
 _CG_SYMBOL_CACHE_TTL_SEC = 24 * 3600
 
@@ -2676,7 +2731,15 @@ def api_watchlist_snapshot():
         _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, {"status": "ok", "results": results, "ts": int(time.time())})
         return jsonify({"status": "ok", "results": results, "ts": int(time.time())})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "results": [], "ts": int(time.time())}), 500
+        # Never hard-fail the UI; return stale cache or an empty-but-OK payload.
+        stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key)
+        if stale is not None:
+            stale = dict(stale)
+            stale["status"] = "partial"
+            stale["partial"] = True
+            stale["error"] = str(e)
+            return jsonify(stale), 200
+        return jsonify({"status": "partial", "partial": True, "error": str(e), "results": [], "ts": int(time.time())}), 200
 
 
 
@@ -2888,26 +2951,10 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Never let /api/compare crash the UI (Render/Cloudflare would return HTML 500 without CORS).
-        # Instead, return a stable JSON payload.
-        try:
-            stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
-            if stale:
-                return jsonify(stale), 200
-        except Exception:
-            pass
-        return jsonify({
-            "status": "partial",
-            "partial": True,
-            "range": request.args.get('range', '30d'),
-            "days": _range_to_days(request.args.get('range', '30d')),
-            "symbols": [s.strip().upper() for s in (request.args.get('symbols','') or '').split(',') if s.strip()],
-            "series": {},
-            "daily": {},
-            "health": {},
-            "errors": {"__fatal__": str(e)},
-            "updated_at": int(time.time())
-        }), 200
+        stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
+        if stale:
+            return jsonify(stale), 200
+        return err(str(e), 500)
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
@@ -3773,30 +3820,14 @@ def _ai_call_openai(sys_prompt: str, user_payload: dict, wallet_address: str | N
     }
 
     try:
-        last_err = None
-        for _attempt in range(2):
-            try:
-                r = requests.post(
-                    "https://api.openai.com/v1/responses",
-                    headers=headers,
-                    json=payload,
-                    timeout=30,
-                )
-                # retry once on transient upstream errors / rate limits
-                if r.status_code in (429, 500, 502, 503, 504):
-                    last_err = f"upstream {r.status_code}: {(r.text or '')[:200]}"
-                    time.sleep(0.8)
-                    continue
-                r.raise_for_status()
-                data = r.json() or {}
-                break
-            except Exception as _e:
-                last_err = str(_e)
-                time.sleep(0.8)
-                continue
-        else:
-            return None, (last_err or "openai error", 502)
-
+        r = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+        r.raise_for_status()
+        data = r.json() or {}
 
         # Extract output text from Responses API
         ans = ""
