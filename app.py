@@ -1,4 +1,3 @@
-
 # backend/app.py
 from __future__ import annotations
 from flask import Flask, jsonify, request
@@ -2030,7 +2029,7 @@ def _cg_market_chart_usd(coin_id: str, days: int):
         stale = _cg_cache_get_any(key)
         if stale is not None:
             return stale
-        raise e
+        return {}
 
 def _compute_history_metrics(points):
     if not isinstance(points, list) or len(points) < 10:
@@ -2137,6 +2136,7 @@ _CG_COMMON_IDS = {
     "POL": "polygon-ecosystem-token",
     "USDT": "tether",
     "USDC": "usd-coin",
+    "PEPE": "pepe",
 }
 _CG_SYMBOL_CACHE_TTL_SEC = 24 * 3600
 
@@ -2888,10 +2888,26 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
-        if stale:
-            return jsonify(stale), 200
-        return err(str(e), 500)
+        # Never let /api/compare crash the UI (Render/Cloudflare would return HTML 500 without CORS).
+        # Instead, return a stable JSON payload.
+        try:
+            stale = _cache_get_any(_COMPARE_CACHE, f"{request.args.get('symbols', '')}:{request.args.get('range', '30d')}")
+            if stale:
+                return jsonify(stale), 200
+        except Exception:
+            pass
+        return jsonify({
+            "status": "partial",
+            "partial": True,
+            "range": request.args.get('range', '30d'),
+            "days": _range_to_days(request.args.get('range', '30d')),
+            "symbols": [s.strip().upper() for s in (request.args.get('symbols','') or '').split(',') if s.strip()],
+            "series": {},
+            "daily": {},
+            "health": {},
+            "errors": {"__fatal__": str(e)},
+            "updated_at": int(time.time())
+        }), 200
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
@@ -3757,14 +3773,30 @@ def _ai_call_openai(sys_prompt: str, user_payload: dict, wallet_address: str | N
     }
 
     try:
-        r = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers=headers,
-            json=payload,
-            timeout=45,
-        )
-        r.raise_for_status()
-        data = r.json() or {}
+        last_err = None
+        for _attempt in range(2):
+            try:
+                r = requests.post(
+                    "https://api.openai.com/v1/responses",
+                    headers=headers,
+                    json=payload,
+                    timeout=30,
+                )
+                # retry once on transient upstream errors / rate limits
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last_err = f"upstream {r.status_code}: {(r.text or '')[:200]}"
+                    time.sleep(0.8)
+                    continue
+                r.raise_for_status()
+                data = r.json() or {}
+                break
+            except Exception as _e:
+                last_err = str(_e)
+                time.sleep(0.8)
+                continue
+        else:
+            return None, (last_err or "openai error", 502)
+
 
         # Extract output text from Responses API
         ans = ""
