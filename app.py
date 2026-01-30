@@ -4478,6 +4478,25 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
             pass
         stop_evt.wait(interval)
 
+from flask import request
+
+UI_ORIGIN = "https://nexus-analyt-ui.onrender.com"
+
+@app.before_request
+def cors_preflight():
+    if request.method == "OPTIONS" and request.path.startswith("/api/"):
+        return ("", 204)
+
+@app.after_request
+def cors_after(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Access-Control-Allow-Origin"] = UI_ORIGIN
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS,PUT,DELETE"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
+
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
 
