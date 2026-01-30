@@ -134,10 +134,16 @@ def _is_allowed_origin(origin: str) -> bool:
     except Exception:
         return False
 
+# CORS: allow the UI origin(s). If the frontend uses `credentials: 'include'`
+# (cookies), the browser requires `Access-Control-Allow-Credentials: true` and
+# `Access-Control-Allow-Origin` must be the *exact* Origin (not '*').
+#
+# Even if the UI later switches to `credentials: 'omit'`, keeping
+# supports_credentials=True is harmless and makes the API resilient.
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
+    supports_credentials=True,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
@@ -151,14 +157,16 @@ def _add_cors_headers(resp):
     """Ensure CORS headers exist even on 4xx/5xx and proxy-ish error paths."""
     try:
         origin = request.headers.get("Origin", "")
-        if origin:
-            # reflect origin for browsers
-            resp.headers["Access-Control-Allow-Origin"] = origin if _is_allowed_origin(origin) else origin
+        if origin and _is_allowed_origin(origin):
+            # Exact origin required when credentials are used.
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Vary"] = "Origin"
-        else:
+            resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        elif not origin:
+            # Non-browser clients (curl/server-to-server)
             resp.headers.setdefault("Access-Control-Allow-Origin", "*")
-        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     except Exception:
         pass
     return resp
@@ -169,13 +177,14 @@ def _handle_options_preflight():
         return None
     resp = make_response("", 204)
     origin = request.headers.get("Origin", "")
-    if origin:
-        resp.headers["Access-Control-Allow-Origin"] = origin if _is_allowed_origin(origin) else origin
+    if origin and _is_allowed_origin(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Vary"] = "Origin"
-    else:
+        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    elif not origin:
         resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
 @app.route("/", methods=["GET"])
