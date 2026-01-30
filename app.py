@@ -106,6 +106,7 @@ That requires:
 """
 
 # IMPORTANT: when supports_credentials=True, origins cannot be '*'
+
 FRONTEND_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -113,66 +114,68 @@ FRONTEND_ORIGINS = [
     "https://www.nexus-analyt-ui.onrender.com",
 ]
 
-# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
-# We therefore also mirror headers manually for known frontend origins.
-_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
+# Permissive CORS for demo deployments (Render UI <-> Render API).
+# We reflect the Origin back when present; this avoids the common "works in browser URL bar
+# but blocked in fetch()" issue (preflight / error responses / proxy paths).
+_FRONTEND_ORIGIN_RE = re.compile(
+    r"^(https?://)?(localhost:5173|127\.0\.0\.1:5173|([a-z0-9-]+\.)?onrender\.com)$",
+    re.IGNORECASE,
+)
 
 def _is_allowed_origin(origin: str) -> bool:
     if not origin:
         return False
+    # exact allow-list first
     if origin in FRONTEND_ORIGINS:
         return True
-    # Accept Render subdomains for this project (ui/pro)
-    return bool(_FRONTEND_ORIGIN_RE.match(origin))
+    # allow any onrender.com origin (demo-safe)
+    try:
+        return origin.endswith(".onrender.com")
+    except Exception:
+        return False
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
-    supports_credentials=True,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=False,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
     max_age=86400,
 )
 
-
 from flask import make_response
 
 @app.after_request
 def _add_cors_headers(resp):
-    """Make CORS robust even when an endpoint raises and returns 4xx/5xx.
-
-    flask-cors usually handles this, but in some Render/gunicorn error paths
-    the header can be missing. We mirror the allow-list here defensively.
-    """
+    """Ensure CORS headers exist even on 4xx/5xx and proxy-ish error paths."""
     try:
         origin = request.headers.get("Origin", "")
-        if _is_allowed_origin(origin):
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
+        if origin:
+            # reflect origin for browsers
+            resp.headers["Access-Control-Allow-Origin"] = origin if _is_allowed_origin(origin) else origin
             resp.headers["Vary"] = "Origin"
-            # Allow headers/methods for browsers that do non-simple requests
-            resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        else:
+            resp.headers.setdefault("Access-Control-Allow-Origin", "*")
+        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     except Exception:
         pass
     return resp
 
-
 @app.before_request
 def _handle_options_preflight():
-    """Ensure preflight requests always get the CORS + credentials headers."""
     if request.method != "OPTIONS":
         return None
-
-    origin = request.headers.get("Origin", "")
     resp = make_response("", 204)
-    if _is_allowed_origin(origin):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    origin = request.headers.get("Origin", "")
+    if origin:
+        resp.headers["Access-Control-Allow-Origin"] = origin if _is_allowed_origin(origin) else origin
         resp.headers["Vary"] = "Origin"
+    else:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
 @app.route("/", methods=["GET"])
