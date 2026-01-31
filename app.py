@@ -2120,6 +2120,16 @@ def _cg_search(query: str, limit: int = 25):
       - return [] on throttling instead of throwing (so callers can fallback to stale caches)
     """
     q = (query or "").strip()
+    # fast-path: exact ticker matches (instant, avoids network on common coins)
+    q_upper = q.upper()
+    try:
+        if q_upper in _CG_COMMON_IDS:
+            quick = [{"id": _CG_COMMON_IDS[q_upper], "name": q_upper, "symbol": q_upper, "market_cap_rank": None}]
+            try: _cg_cache_set(f"search|{q.lower()}", quick)
+            except Exception: pass
+            return quick
+    except Exception:
+        pass
     if not q:
         return []
 
@@ -2143,7 +2153,7 @@ def _cg_search(query: str, limit: int = 25):
 
     url = f"{COINGECKO_BASE}/search"
     try:
-        r = requests.get(url, params={"query": q}, timeout=15)
+        r = requests.get(url, params={"query": q}, timeout=6)
 
         # throttle handling
         if r.status_code == 429:
@@ -2983,18 +2993,8 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Last resort: never hard-fail compare (so frontend doesn't require refresh)
-        return jsonify({
-            "status": "error",
-            "partial": True,
-            "range": range_key if "range_key" in locals() else "30d",
-            "days": days if "days" in locals() else 30,
-            "symbols": symbols if "symbols" in locals() else [],
-            "series": series_out if "series_out" in locals() else {},
-            "daily": daily_out if "daily_out" in locals() else {},
-            "errors": {"_": str(e)},
-            "updated_at": int(time.time()),
-        }), 200
+        # Last resort: return JSON error (frontend can show message)
+        return err(str(e), 500)
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
