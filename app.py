@@ -2983,8 +2983,18 @@ def api_compare():
         return jsonify(out), 200
 
     except Exception as e:
-        # Last resort: return JSON error (frontend can show message)
-        return err(str(e), 500)
+        # Last resort: never hard-fail compare (so frontend doesn't require refresh)
+        return jsonify({
+            "status": "error",
+            "partial": True,
+            "range": range_key if "range_key" in locals() else "30d",
+            "days": days if "days" in locals() else 30,
+            "symbols": symbols if "symbols" in locals() else [],
+            "series": series_out if "series_out" in locals() else {},
+            "daily": daily_out if "daily_out" in locals() else {},
+            "errors": {"_": str(e)},
+            "updated_at": int(time.time()),
+        }), 200
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
