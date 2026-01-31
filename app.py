@@ -2557,32 +2557,25 @@ def api_market_search():
         cached = _gen_cache_get_any(cache_key)
         if cached is not None:
             return jsonify(cached)
-        return err(str(e), 500)
+        return jsonify({"query": q, "results": [], "error": str(e)}), 200
 
 
-
-# -------------------------
-# Coin search (CoinGecko) - used by UI dropdown/autocomplete (old app behavior)
-# -------------------------
-@app.get("/api/coins/search")
+@app.route("/api/coins/search", methods=["GET"])
 def api_coins_search():
-    """
-    Proxy CoinGecko /search results for the frontend.
+    """Coin search for the UI (like the old app).
 
-    Query params:
-      - q: search string (symbol or name)
-
-    Returns: list[{id,name,symbol,market_cap_rank}]
+    GET /api/coins/search?q=TON
+    Returns: [{id,name,symbol,market_cap_rank}, ...]
+    Never returns 500; on error returns [].
     """
     q = (request.args.get("q") or request.args.get("query") or "").strip()
+    if not q:
+        return jsonify([]), 200
     try:
-        results = _cg_search(q, limit=25)
-        # Return plain list to match old UI behavior
-        return jsonify(results)
+        return jsonify(_cg_search(q, limit=25)), 200
     except Exception as e:
-        # Never 500 here; UI will just show empty results.
         print("coins/search error:", e)
-        return jsonify([])
+        return jsonify([]), 200
 
 @app.route("/api/market/resolve", methods=["GET"])
 def api_market_resolve():
@@ -2599,7 +2592,7 @@ def api_market_resolve():
         cached = _gen_cache_get_any(cache_key)
         if cached is not None:
             return jsonify(cached)
-        return err(str(e), 500)
+        return jsonify({"symbol": symbol.upper(), "resolved": None, "error": str(e)}), 200
 @app.route("/api/watchlist/snapshot", methods=["GET", "POST"])
 def api_watchlist_snapshot():
     """
