@@ -127,8 +127,8 @@ def _is_allowed_origin(origin: str) -> bool:
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
-    supports_credentials=True,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=False,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
@@ -138,34 +138,38 @@ CORS(
 
 from flask import make_response
 
+
 @app.after_request
 def _add_cors_headers(resp):
-    """Make CORS robust even when an endpoint raises and returns 4xx/5xx.
+    """Ensure every /api response has permissive CORS headers.
 
-    flask-cors usually handles this, but in some Render/gunicorn error paths
-    the header can be missing. We mirror the allow-list here defensively.
+    The frontend uses fetch(..., credentials: 'omit'), so we can safely allow '*'.
+    This avoids Render/gunicorn edge-cases where flask-cors headers go missing.
     """
     try:
-        origin = request.headers.get("Origin", "")
-        if _is_allowed_origin(origin):
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
-            # Allow headers/methods for browsers that do non-simple requests
-            resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-            resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        origin = request.headers.get("Origin")
+        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+        resp.headers["Vary"] = "Origin"
+        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     except Exception:
         pass
     return resp
 
-
 @app.before_request
 def _handle_options_preflight():
-    """Ensure preflight requests always get the CORS + credentials headers."""
+    """Ensure preflight requests always get CORS headers."""
     if request.method != "OPTIONS":
         return None
+    origin = request.headers.get("Origin")
+    resp = make_response("", 204)
+    resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+    resp.headers["Vary"] = "Origin"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
 
-    origin = request.headers.get("Origin", "")
+origin = request.headers.get("Origin", "")
     resp = make_response("", 204)
     if _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
