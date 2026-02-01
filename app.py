@@ -42,15 +42,15 @@ def _grid_build(cfg):
         if hasattr(_cls, "build_grid") and callable(getattr(_cls, "build_grid")):
             try:
                 _inst = _cls()
-                return _inst._grid_build(cfg)
+                return _inst.build_grid(cfg)
             except TypeError:
                 continue
-    raise RuntimeError("grid_sim: could not find callable _grid_build(cfg)")
+    raise RuntimeError("grid_sim: could not find callable build_grid(cfg)")
 
 def _grid_step(state, cfg, snapshot):
     if hasattr(grid_sim, "step_sim") and callable(getattr(grid_sim, "step_sim")):
         try:
-            return grid_sim._grid_step(state, cfg, snapshot)
+            return grid_sim.step_sim(state, cfg, snapshot)
         except TypeError as e:
             msg = str(e)
             if "positional argument" not in msg:
@@ -59,10 +59,10 @@ def _grid_step(state, cfg, snapshot):
         if hasattr(_cls, "step_sim") and callable(getattr(_cls, "step_sim")):
             try:
                 _inst = _cls()
-                return _inst._grid_step(state, cfg, snapshot)
+                return _inst.step_sim(state, cfg, snapshot)
             except TypeError:
                 continue
-    raise RuntimeError("grid_sim: could not find callable _grid_step(state,cfg,snapshot)")
+    raise RuntimeError("grid_sim: could not find callable step_sim(state,cfg,snapshot)")
 
 # Expose GridConfig regardless of how grid_sim defines it
 GridConfig = getattr(grid_sim, "GridConfig", None)
@@ -2554,12 +2554,37 @@ def api_watchlist_safety():
             return jsonify(cached)
         return err(str(e), 500)
 
+
+@app.route("/api/prices", methods=["GET"])
+def api_prices():
+    """GET /api/prices?symbols=BTC,ETH
+    Returns: { status, prices: {SYM:{price,source,...}}, errors: {SYM:msg} }.
+    Never returns 500; partial failures are reported in `errors`.
+    """
+    syms_raw = (request.args.get("symbols") or "").strip()
+    symbols = [s.strip().upper() for s in syms_raw.split(",") if s.strip()]
+    symbols = list(dict.fromkeys(symbols))[:25]
+
+    prices = {}
+    errors = {}
+    for sym in symbols:
+        try:
+            p = _price_multi(sym)
+            if p:
+                prices[sym] = p
+            else:
+                errors[sym] = "price_unavailable"
+        except Exception as e:
+            errors[sym] = str(e)
+
+    return jsonify({"status": "ok" if not errors else "partial", "prices": prices, "errors": errors}), 200
+
 @app.route("/api/market/search", methods=["GET"])
 def api_market_search():
     q = request.args.get("query") or ""
     cache_key = f"market-search|{q.strip().lower()}"
     try:
-        results = _cg_search(q, limit=25)
+        results = _search_assets_multi(q, limit=25)
         resp = {"query": q, "results": results}
         _gen_cache_set(cache_key, resp)
         return jsonify(resp)
@@ -2582,7 +2607,7 @@ def api_coins_search():
     if not q:
         return jsonify([]), 200
     try:
-        return jsonify(_cg_search(q, limit=25)), 200
+        return jsonify(_search_assets_multi(q, limit=25)), 200
     except Exception as e:
         print("coins/search error:", e)
         return jsonify([]), 200
@@ -2852,30 +2877,47 @@ def _daily_close(points):
 def _get_series_for_symbol(sym: str, days: int):
     """
     Returns list[[ts_ms, price_usd], ...] for the last N days.
-    Uses existing CoinGecko helpers in this file.
+
+    Router:
+      1) CryptoCompare histoday (USD) when available
+      2) CoinGecko market_chart fallback
     """
-    # 1) resolve "BTC" -> coingecko id (e.g. "bitcoin")
-    cg_id = _cg_resolve_symbol(sym)
-    if not cg_id:
+    sym_u = (sym or "").strip().upper()
+    try:
+        days_i = int(days or 0)
+    except Exception:
+        days_i = 0
+    if not sym_u or days_i <= 0:
         return []
 
-    # 2) fetch market chart (your helper should return something like {"prices":[[ts,price],...]}
-    data = _cg_market_chart_usd(cg_id, days=days)
-    if not data:
+    # 1) CryptoCompare daily closes
+    try:
+        hist = _cryptocompare_histoday(sym_u, days_i)
+        if hist:
+            return [[int(p["ts"]) * 1000, float(p["price"])] for p in hist if isinstance(p, dict) and p.get("ts") and p.get("price") is not None]
+    except Exception:
+        pass
+
+    # 2) CoinGecko fallback (cached)
+    try:
+        cg_id = _cg_resolve_symbol(sym_u)
+        if not cg_id:
+            return []
+        data = _cg_market_chart_usd(cg_id, days=days_i)
+        if not data:
+            return []
+        prices = data.get("prices") or []
+        out = []
+        for row in prices:
+            try:
+                ts = int(row[0])
+                px = float(row[1])
+                out.append([ts, px])
+            except Exception:
+                continue
+        return out
+    except Exception:
         return []
-
-    prices = data.get("prices") or []
-    # ensure shape [[ts,price],...]
-    out = []
-    for row in prices:
-        try:
-            ts = int(row[0])
-            px = float(row[1])
-            out.append([ts, px])
-        except Exception:
-            continue
-    return out
-
 
 def _health_for_symbol(sym: str, series):
     """
@@ -4248,6 +4290,173 @@ Rules:
     except Exception as e:
         return err(f"openai_error: {str(e)}", 502)
 
+
+# -------------------------
+# Multi-API market data router (Search=CoinCap, Prices=Binance, History=CryptoCompare optional, Meta/Fallback=CoinGecko)
+# -------------------------
+COINCAP_BASE = os.getenv("COINCAP_BASE", "https://api.coincap.io/v2")
+BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
+CRYPTOCOMPARE_BASE = os.getenv("CRYPTOCOMPARE_BASE", "https://min-api.cryptocompare.com")
+CRYPTOCOMPARE_KEY = (os.getenv("CRYPTOCOMPARE_API_KEY") or "").strip()
+
+def _coincap_request_json(path: str, params: dict | None = None, timeout: int = 6):
+    url = COINCAP_BASE.rstrip("/") + "/" + path.lstrip("/")
+    try:
+        r = requests.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def _coincap_search_assets(query: str, limit: int = 25) -> list:
+    """Primary search: CoinCap assets. Normalized to [{id,name,symbol,market_cap_rank}, ...]."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    cache_key = f"cc:search|{q.lower()}|{int(limit or 25)}"
+    try:
+        cached = _gen_cache_get(cache_key)
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+
+    data = _coincap_request_json("/assets", params={"search": q, "limit": max(1, min(int(limit), 50))}, timeout=6) or {}
+    items = data.get("data") if isinstance(data, dict) else None
+    out = []
+    if isinstance(items, list):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sym = (it.get("symbol") or "").upper().strip()
+            if not sym:
+                continue
+            out.append({
+                "id": it.get("id"),
+                "name": it.get("name") or sym,
+                "symbol": sym,
+                "market_cap_rank": int(it.get("rank")) if str(it.get("rank") or "").isdigit() else None,
+            })
+    try:
+        _gen_cache_set(cache_key, out, ttl=120)
+    except Exception:
+        pass
+    return out
+
+def _binance_symbol_candidates(symbol: str) -> list[str]:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return []
+    return [f"{s}USDT", f"{s}BUSD", f"{s}USD"]
+
+def _binance_price_for_symbol(symbol: str) -> dict | None:
+    """Primary CEX price: Binance ticker price. Returns {symbol,pair,price,source}."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+    cache_key = f"bz:price|{s}"
+    try:
+        cached = _gen_cache_get(cache_key)
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+
+    for pair in _binance_symbol_candidates(s):
+        try:
+            url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
+            r = requests.get(url, params={"symbol": pair}, timeout=3)
+            if r.status_code == 400:
+                continue
+            r.raise_for_status()
+            j = r.json() or {}
+            price = float(j.get("price"))
+            if price > 0:
+                out = {"symbol": s, "pair": pair, "price": price, "source": "binance"}
+                try:
+                    _gen_cache_set(cache_key, out, ttl=2)
+                except Exception:
+                    pass
+                return out
+        except Exception:
+            continue
+    return None
+
+def _cryptocompare_histoday(symbol: str, days: int) -> list:
+    """Optional history: CryptoCompare histoday (USD). Returns [{ts,price}] (ts seconds)."""
+    sym = (symbol or "").strip().upper()
+    try:
+        days_i = int(days or 0)
+    except Exception:
+        days_i = 0
+    if not sym or days_i <= 0:
+        return []
+    cache_key = f"ccmp:histoday|{sym}|{days_i}"
+    cached = _cache_get(_COMPARE_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    headers = {}
+    if CRYPTOCOMPARE_KEY:
+        headers["authorization"] = f"Apikey {CRYPTOCOMPARE_KEY}"
+    try:
+        url = CRYPTOCOMPARE_BASE.rstrip("/") + "/data/v2/histoday"
+        r = requests.get(url, params={"fsym": sym, "tsym": "USD", "limit": max(1, min(days_i, 2000))}, headers=headers, timeout=8)
+        if r.status_code in (401, 403):
+            return []
+        r.raise_for_status()
+        j = r.json() or {}
+        data = (((j.get("Data") or {}).get("Data")) if isinstance(j, dict) else None) or []
+        out = []
+        if isinstance(data, list):
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                ts = int(row.get("time") or 0)
+                close = row.get("close")
+                try:
+                    close_f = float(close)
+                except Exception:
+                    continue
+                if ts and close_f > 0:
+                    out.append({"ts": ts, "price": close_f})
+        _cache_set(_COMPARE_CACHE, cache_key, out)
+        return out
+    except Exception:
+        return []
+
+def _search_assets_multi(query: str, limit: int = 25) -> list:
+    """Search router: CoinCap first, CoinGecko fallback."""
+    try:
+        out = _coincap_search_assets(query, limit=limit)
+        if out:
+            return out
+    except Exception:
+        pass
+    try:
+        return _cg_search(query, limit=limit)
+    except Exception:
+        return []
+
+def _price_multi(symbol: str) -> dict | None:
+    """Price router: Binance first, CoinGecko fallback."""
+    try:
+        p = _binance_price_for_symbol(symbol)
+        if p:
+            return p
+    except Exception:
+        pass
+    try:
+        coin_id = _cg_search_best_id_for_symbol(symbol)
+        if coin_id:
+            px = _cg_simple_price_usd(coin_id)
+            if px is not None:
+                px = float(px)
+                if px > 0:
+                    return {"symbol": (symbol or "").upper(), "price": px, "source": "coingecko", "id": coin_id}
+    except Exception:
+        pass
+    return None
 
 def _cg_set_symbol_id_cache(symbol: str, coin_id: str):
     if not symbol or not coin_id:
