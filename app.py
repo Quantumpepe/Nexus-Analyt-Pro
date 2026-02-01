@@ -1,6 +1,3 @@
-
-
-
 # backend/app.py
 from __future__ import annotations
 from flask import Flask, jsonify, request
@@ -2615,39 +2612,6 @@ def api_coins_search():
     except Exception as e:
         print("coins/search error:", e)
         return jsonify([]), 200
-
-
-# --- Compatibility aliases for older UI builds ---------------------------------
-# Some frontend builds call /search or /api/search (or variants) for CoinGecko-like
-# token search. The canonical endpoint is /api/coins/search.
-# These aliases MUST NOT raise 500; on any error they return [] to keep UI stable.
-
-@app.route("/api/search", methods=["GET"])
-def api_search_alias():
-    q = (request.args.get("q") or request.args.get("query") or "").strip()
-    if not q:
-        return jsonify([]), 200
-    try:
-        return jsonify(_search_assets_multi(q, limit=25)), 200
-    except Exception as e:
-        print("api/search alias error:", e)
-        return jsonify([]), 200
-
-
-@app.route("/search", methods=["GET"])
-def search_alias_root():
-    # Static UI sometimes hits same-origin /search; keep compatible.
-    return api_search_alias()
-
-
-@app.route("/api/coingecko_search", methods=["GET"])
-def api_coingecko_search_alias():
-    return api_search_alias()
-
-
-@app.route("/api/coingecko/search", methods=["GET"])
-def api_coingecko_search_slash_alias():
-    return api_search_alias()
 
 @app.route("/api/market/resolve", methods=["GET"])
 def api_market_resolve():
