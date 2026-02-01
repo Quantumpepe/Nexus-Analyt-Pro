@@ -2601,31 +2601,16 @@ def api_market_search():
 
 @app.route("/api/coins/search", methods=["GET"])
 def api_coins_search():
-    """Coin search for the UI (like the old app).
-
-@app.route("/api/search", methods=["GET"])
-def api_search():
-    """
-    Unified search endpoint for UI.
-    Short queries (e.g. TON) will return all matching coins
-    via CoinGecko-first logic in _search_assets_multi().
-    """
+    # Coin search for the UI (legacy endpoint)
     q = (request.args.get("q") or request.args.get("query") or "").strip()
     if not q:
-        return jsonify({"query": q, "results": []}), 200
-
+        return jsonify([]), 200
     try:
-        results = _search_assets_multi(q, limit=50)
-        return jsonify({"query": q, "results": results}), 200
+        return jsonify(_search_assets_multi(q, limit=25)), 200
     except Exception as e:
-        print("search error:", e)
-        return jsonify({"query": q, "results": []}), 200
-    
+        print("coins/search error:", e)
+        return jsonify([]), 200
 
-    GET /api/coins/search?q=TON
-    Returns: [{id,name,symbol,market_cap_rank}, ...]
-    Never returns 500; on error returns [].
-    """
     q = (request.args.get("q") or request.args.get("query") or "").strip()
     if not q:
         return jsonify([]), 200
