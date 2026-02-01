@@ -1,8 +1,9 @@
 
 
+
 # backend/app.py
 from __future__ import annotations
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
 import os
@@ -4429,15 +4430,25 @@ def _cryptocompare_histoday(symbol: str, days: int) -> list:
         return []
 
 def _search_assets_multi(query: str, limit: int = 25) -> list:
-    """Search router: CoinCap first, CoinGecko fallback."""
+    """Search router:
+    - short ticker-like queries (TON, ETH, SOL) -> CoinGecko first (bigger list so user can choose)
+    - longer queries -> CoinCap first (fast), fallback CoinGecko
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
     try:
-        out = _coincap_search_assets(query, limit=limit)
+        if len(q) <= 3:
+            out = _cg_search(q, limit=limit)
+            if out:
+                return out
+            return _coincap_search_assets(q, limit=limit)
+
+        out = _coincap_search_assets(q, limit=limit)
         if out:
             return out
-    except Exception:
-        pass
-    try:
-        return _cg_search(query, limit=limit)
+        return _cg_search(q, limit=limit)
     except Exception:
         return []
 
