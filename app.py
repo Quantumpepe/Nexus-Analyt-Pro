@@ -75,6 +75,14 @@ if GridConfig is None:
 # -------------------------
 app = Flask(__name__)
 
+# Enable CORS for all API routes (UI is on a different domain)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=False,
+)
+
+
 import traceback
 from flask import jsonify
 
