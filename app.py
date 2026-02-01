@@ -3,7 +3,7 @@
 
 # backend/app.py
 from __future__ import annotations
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 import os
@@ -2601,7 +2601,12 @@ def api_market_search():
 
 @app.route("/api/coins/search", methods=["GET"])
 def api_coins_search():
-    # Coin search for the UI (legacy endpoint)
+    """Coin search for the UI (like the old app).
+
+    GET /api/coins/search?q=TON
+    Returns: [{id,name,symbol,market_cap_rank}, ...]
+    Never returns 500; on error returns [].
+    """
     q = (request.args.get("q") or request.args.get("query") or "").strip()
     if not q:
         return jsonify([]), 200
@@ -2611,14 +2616,38 @@ def api_coins_search():
         print("coins/search error:", e)
         return jsonify([]), 200
 
+
+# --- Compatibility aliases for older UI builds ---------------------------------
+# Some frontend builds call /search or /api/search (or variants) for CoinGecko-like
+# token search. The canonical endpoint is /api/coins/search.
+# These aliases MUST NOT raise 500; on any error they return [] to keep UI stable.
+
+@app.route("/api/search", methods=["GET"])
+def api_search_alias():
     q = (request.args.get("q") or request.args.get("query") or "").strip()
     if not q:
         return jsonify([]), 200
     try:
         return jsonify(_search_assets_multi(q, limit=25)), 200
     except Exception as e:
-        print("coins/search error:", e)
+        print("api/search alias error:", e)
         return jsonify([]), 200
+
+
+@app.route("/search", methods=["GET"])
+def search_alias_root():
+    # Static UI sometimes hits same-origin /search; keep compatible.
+    return api_search_alias()
+
+
+@app.route("/api/coingecko_search", methods=["GET"])
+def api_coingecko_search_alias():
+    return api_search_alias()
+
+
+@app.route("/api/coingecko/search", methods=["GET"])
+def api_coingecko_search_slash_alias():
+    return api_search_alias()
 
 @app.route("/api/market/resolve", methods=["GET"])
 def api_market_resolve():
@@ -4434,25 +4463,15 @@ def _cryptocompare_histoday(symbol: str, days: int) -> list:
         return []
 
 def _search_assets_multi(query: str, limit: int = 25) -> list:
-    """Search router:
-    - short ticker-like queries (TON, ETH, SOL) -> CoinGecko first (bigger list so user can choose)
-    - longer queries -> CoinCap first (fast), fallback CoinGecko
-    """
-    q = (query or "").strip()
-    if not q:
-        return []
-
+    """Search router: CoinCap first, CoinGecko fallback."""
     try:
-        if len(q) <= 3:
-            out = _cg_search(q, limit=limit)
-            if out:
-                return out
-            return _coincap_search_assets(q, limit=limit)
-
-        out = _coincap_search_assets(q, limit=limit)
+        out = _coincap_search_assets(query, limit=limit)
         if out:
             return out
-        return _cg_search(q, limit=limit)
+    except Exception:
+        pass
+    try:
+        return _cg_search(query, limit=limit)
     except Exception:
         return []
 
