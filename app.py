@@ -169,15 +169,6 @@ def _handle_options_preflight():
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
-origin = request.headers.get("Origin", "")
-    resp = make_response("", 204)
-    if _is_allowed_origin(origin):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        resp.headers["Vary"] = "Origin"
-    return resp
 
 @app.route("/", methods=["GET"])
 def root():
