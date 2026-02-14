@@ -1895,7 +1895,7 @@ def _cg_request_json(url: str, params: dict, timeout: int = 20):
     last_exc = None
     for attempt in range(4):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, params=params, headers=_cg_headers(), timeout=timeout)
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 if ra:
