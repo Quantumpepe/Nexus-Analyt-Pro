@@ -2613,6 +2613,15 @@ def api_coins_search():
         print("coins/search error:", e)
         return jsonify([]), 200
 
+# --- Search alias (compat with architecture doc & newer UI) ---
+# Frontend expects: GET /api/search?q=...
+# Canonical implementation currently lives at /api/coins/search.
+@app.route("/api/search", methods=["GET"])
+def api_search_alias():
+    return api_coins_search()
+
+
+
 @app.route("/api/market/resolve", methods=["GET"])
 def api_market_resolve():
     symbol = request.args.get("symbol") or ""
