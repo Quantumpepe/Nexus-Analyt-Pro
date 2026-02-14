@@ -190,6 +190,16 @@ def healthz():
 
 
 # -------------------------
+# CoinGecko Pro (server-side only)
+# -------------------------
+# Use CoinGecko Pro if COINGECKO_API_KEY is set (recommended).
+# Otherwise fall back to public API (may rate-limit).
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY") or os.getenv("CG_PRO_API_KEY") or ""
+COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL") or (
+    "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY else "https://api.coingecko.com/api/v3"
+)
+
+# -------------------------
 # CoinGecko proxy (avoid browser CORS + basic throttling)
 # -------------------------
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
@@ -201,6 +211,8 @@ def _cg_get(url: str) -> dict:
     if hit and (now - hit[0]) < _CG_TTL_SEC:
         return hit[1]
     headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
+    if COINGECKO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
     r = requests.get(url, headers=headers, timeout=12)
     r.raise_for_status()
     data = r.json()
@@ -211,7 +223,7 @@ def _cg_get(url: str) -> dict:
 def coingecko_simple_price():
     # Pass-through query params (ids, vs_currencies, include_* etc.)
     qs = request.query_string.decode("utf-8", errors="ignore")
-    url = "https://api.coingecko.com/api/v3/simple/price"
+    url = f"{COINGECKO_BASE}/simple/price"
     if qs:
         url = f"{url}?{qs}"
     try:
@@ -223,7 +235,7 @@ def coingecko_simple_price():
 @app.route("/api/coingecko/token_price/<platform>", methods=["GET"])
 def coingecko_token_price(platform: str):
     qs = request.query_string.decode("utf-8", errors="ignore")
-    url = f"https://api.coingecko.com/api/v3/simple/token_price/{platform}"
+    url = f"{COINGECKO_BASE}/simple/token_price/{platform}"
     if qs:
         url = f"{url}?{qs}"
     try:
@@ -1735,7 +1747,6 @@ def api_health():
 # -------------------------
 # Market Health (CoinGecko) — server-side + cache
 # -------------------------
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 # --- Major symbol → CoinGecko ID (fast-path, avoids search ambiguity) ---
 _STATIC_CG_IDS = {
@@ -1776,6 +1787,13 @@ def _cg_cache_set(key: str, value):
 def _cg_cache_get_any(key: str):
     # Return cached value even if TTL expired (fallback on 429/outage)
     return _CG_CACHE["by_key"].get(key)
+
+
+def _cg_headers() -> dict:
+    h = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
+    if COINGECKO_API_KEY:
+        h["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    return h
 
 # -------------------------
 # Generic stale cache (non-health endpoints)
@@ -2154,7 +2172,7 @@ def _cg_search(query: str, limit: int = 25):
 
     url = f"{COINGECKO_BASE}/search"
     try:
-        r = requests.get(url, params={"query": q}, timeout=6)
+        r = requests.get(url, params={"query": q}, headers=_cg_headers(), timeout=6)
 
         # throttle handling
         if r.status_code == 429:
@@ -2283,7 +2301,7 @@ def _cg_price_series(cg_id: str, days: int = 14):
     Uses /coins/{id}/market_chart.
     """
     url = f"{COINGECKO_BASE}/coins/{cg_id}/market_chart"
-    r = requests.get(url, params={"vs_currency": "usd", "days": str(days)}, timeout=15)
+    r = requests.get(url, params={"vs_currency": "usd", "days": str(days)}, headers=_cg_headers(), timeout=15)
     r.raise_for_status()
     data = r.json() or {}
     prices = data.get("prices") or []
@@ -4375,7 +4393,7 @@ def _binance_price_for_symbol(symbol: str) -> dict | None:
     for pair in _binance_symbol_candidates(s):
         try:
             url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
-            r = requests.get(url, params={"symbol": pair}, timeout=3)
+            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3)
             if r.status_code == 400:
                 continue
             r.raise_for_status()
