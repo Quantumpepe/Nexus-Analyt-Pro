@@ -2847,6 +2847,7 @@ _RANGE_TO_DAYS = {
     "30D": 30,
     "90D": 90,
     "1Y": 365,
+    "2Y": 730,
     "3Y": 1095,
 }
 
@@ -2975,8 +2976,8 @@ def api_compare():
         # Normalize common variants
         range_alias = {
             "1d": "1d", "7d": "7d", "30d": "30d", "90d": "90d",
-            "1y": "1y", "3y": "3y",
-            "30": "30d", "90": "90d", "365": "1y",
+            "1y": "1y", "2y": "2y", "3y": "3y",
+            "30": "30d", "90": "90d", "365": "1y", "730": "2y",
         }
         range_key = range_alias.get(range_key, range_key)
 
