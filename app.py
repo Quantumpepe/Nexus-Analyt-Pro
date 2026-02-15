@@ -649,8 +649,11 @@ def set_policy(wallet_address: str, policy: dict):
 # Chains (features) unlocked by access
 _CHAINS_SILVER = ["ETH", "BNB", "POL"]
 _CHAINS_GOLD = [
+    # Silver chains
     "ETH", "BNB", "POL",
+    # Gold adds more networks
     "BASE", "ARBITRUM", "OPTIMISM", "AVALANCHE",
+    "SOL", "BTC",
 ]
 
 # For now we model AI limit as an integer per day (free=1). Unlimited = -1.
