@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import secrets
+import uuid
 import requests
 import random
 import math
@@ -447,7 +448,46 @@ def init_db():
     """)
 
 
-    conn.commit()
+    
+    # Profit / Fee ledger (lifetime)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profit_state (
+            wallet_address TEXT PRIMARY KEY,
+            lifetime_profit_usd REAL,
+            lifetime_fee_paid_usd REAL,
+            updated_ts INTEGER
+        )
+    """)
+
+    # PnL events (idempotent, per fill/session)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pnl_events (
+            event_id TEXT PRIMARY KEY,
+            wallet_address TEXT,
+            item_id TEXT,
+            side TEXT,
+            pnl_delta_usd REAL,
+            fill_id TEXT,
+            filled_ts INTEGER,
+            created_ts INTEGER
+        )
+    """)
+
+    # Withdraw quotes (contract-ready; can be used later for EIP-712)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS withdraw_quotes (
+            quote_id TEXT PRIMARY KEY,
+            wallet_address TEXT,
+            amount_usd REAL,
+            fee_usd REAL,
+            taxable_profit_usd REAL,
+            nonce TEXT,
+            deadline_ts INTEGER,
+            status TEXT,
+            created_ts INTEGER
+        )
+    """)
+conn.commit()
     conn.close()
 
 
@@ -1085,6 +1125,108 @@ def api_access_status():
     return jsonify({"status": "ok", **st})
 
 
+
+@app.route("/api/fees/state", methods=["GET"])
+def api_fees_state():
+    """Return lifetime profit + fee state for the authenticated wallet."""
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _profit_state_get(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet_address": _norm_addr(wa),
+        "fee_rate": FEE_RATE,
+        "fee_free_threshold_usd": FEE_FREE_THRESHOLD_USD,
+        **st
+    })
+
+
+@app.route("/api/fees/preview", methods=["GET"])
+def api_fees_preview():
+    """Preview the fee for a hypothetical profit delta (no state change)."""
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    try:
+        profit_delta = float(request.args.get("profit_delta") or 0.0)
+    except Exception:
+        profit_delta = 0.0
+    st = _profit_state_get(wa)
+    fee, taxable = _fee_for_profit_delta(float(st.get("lifetime_profit_usd") or 0.0), profit_delta)
+    return jsonify({
+        "status": "ok",
+        "profit_delta_usd": profit_delta,
+        "taxable_profit_usd": taxable,
+        "fee_usd": fee,
+        "lifetime_profit_usd_before": float(st.get("lifetime_profit_usd") or 0.0),
+        "lifetime_profit_usd_after": float(st.get("lifetime_profit_usd") or 0.0) + max(0.0, profit_delta),
+    })
+
+
+@app.route("/api/withdraw/quote", methods=["POST"])
+def api_withdraw_quote():
+    """Create a withdraw quote (contract-ready).
+
+    This does NOT move funds. Later, the vault contract will enforce this quote.
+    For now it returns:
+      - fee_due_usd (based on lifetime profit threshold)
+      - a nonce + deadline for signing / EIP-712 later
+    """
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+
+    try:
+        amount_usd = float(body.get("amount_usd") or body.get("amount") or 0.0)
+    except Exception:
+        amount_usd = 0.0
+
+    # For MVP we treat 'amount_usd' as the realized profit the user is trying to withdraw.
+    # Later: connect this to the vault balance + withdrawable profit accounting.
+    if amount_usd <= 0:
+        return err("missing/invalid amount_usd", 400)
+
+    st = _profit_state_get(wa)
+    prev_profit = float(st.get("lifetime_profit_usd") or 0.0)
+
+    fee_usd, taxable_profit_usd = _fee_for_profit_delta(prev_profit, amount_usd)
+
+    quote_id = str(uuid.uuid4())
+    nonce = str(uuid.uuid4()).replace("-", "")
+    deadline_ts = now_ts() + int(os.getenv("NEXUS_WITHDRAW_QUOTE_TTL_SEC", "900"))  # 15 min
+
+    # Persist quote (so later the vault can use it; also helps idempotency)
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO withdraw_quotes(quote_id, wallet_address, amount_usd, fee_usd, taxable_profit_usd, nonce, deadline_ts, status, created_ts)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (quote_id, _norm_addr(wa), float(amount_usd), float(fee_usd), float(taxable_profit_usd), nonce, int(deadline_ts), "CREATED", now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "quote_id": quote_id,
+        "wallet_address": _norm_addr(wa),
+        "amount_usd": float(amount_usd),
+        "fee_usd": float(fee_usd),
+        "taxable_profit_usd": float(taxable_profit_usd),
+        "fee_rate": FEE_RATE,
+        "fee_free_threshold_usd": FEE_FREE_THRESHOLD_USD,
+        "nonce": nonce,
+        "deadline_ts": int(deadline_ts),
+
+        # Later (contracts):
+        # "treasury": os.getenv("TREASURY_WALLET"),
+        # "vault_contract": os.getenv("VAULT_CONTRACT"),
+        # "signature": "0x..." (EIP-712)
+    })
 def _seed_unlimited_codes_if_needed(cur):
     """Seed access_codes table if empty.
 
@@ -1258,6 +1400,163 @@ except Exception as _e:
     print("[WARN] init_db failed:", _e)
 
 
+
+# -------------------------
+# Profit / Fee Engine (Lifetime threshold)
+# -------------------------
+FEE_RATE = float(os.getenv("NEXUS_FEE_RATE", "0.03"))
+FEE_FREE_THRESHOLD_USD = float(os.getenv("NEXUS_FEE_FREE_THRESHOLD_USD", "1000"))
+
+def _profit_state_get(wallet_address: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"wallet_address": "", "lifetime_profit_usd": 0.0, "lifetime_fee_paid_usd": 0.0}
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT lifetime_profit_usd, lifetime_fee_paid_usd FROM profit_state WHERE wallet_address = ?", (wa,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"wallet_address": wa, "lifetime_profit_usd": 0.0, "lifetime_fee_paid_usd": 0.0}
+    return {
+        "wallet_address": wa,
+        "lifetime_profit_usd": float(row[0] or 0.0),
+        "lifetime_fee_paid_usd": float(row[1] or 0.0),
+    }
+
+def _profit_state_upsert(wallet_address: str, lifetime_profit_usd: float, lifetime_fee_paid_usd: float):
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO profit_state(wallet_address, lifetime_profit_usd, lifetime_fee_paid_usd, updated_ts)
+        VALUES(?, ?, ?, ?)
+        ON CONFLICT(wallet_address) DO UPDATE SET
+          lifetime_profit_usd=excluded.lifetime_profit_usd,
+          lifetime_fee_paid_usd=excluded.lifetime_fee_paid_usd,
+          updated_ts=excluded.updated_ts
+        """,
+        (wa, float(lifetime_profit_usd or 0.0), float(lifetime_fee_paid_usd or 0.0), now_ts()),
+    )
+    conn.commit()
+    conn.close()
+
+def _fee_for_profit_delta(prev_lifetime_profit: float, profit_delta: float) -> tuple[float, float]:
+    """Returns (fee_usd, taxable_profit_usd) for a new realized profit delta.
+
+    Model:
+      - first FEE_FREE_THRESHOLD_USD lifetime profit is free
+      - after threshold, 3% fee on every additional realized profit
+      - if a profit delta crosses the threshold, only the part above threshold is taxable
+    """
+    try:
+        prev = float(prev_lifetime_profit or 0.0)
+        delta = float(profit_delta or 0.0)
+    except Exception:
+        return (0.0, 0.0)
+
+    if delta <= 0:
+        return (0.0, 0.0)
+
+    thr = float(FEE_FREE_THRESHOLD_USD or 1000.0)
+    new_total = prev + delta
+
+    taxable = max(0.0, new_total - thr) - max(0.0, prev - thr)
+    fee = taxable * float(FEE_RATE or 0.03)
+    # keep it stable
+    fee = round(fee, 6)
+    taxable = round(taxable, 6)
+    return (fee, taxable)
+
+def _ledger_record_pnl_event(
+    wallet_address: str,
+    item_id: str,
+    fill: dict,
+    pnl_delta_usd: float,
+) -> dict:
+    """Idempotently record a realized pnl event (for SELL fills).
+
+    Returns:
+      {
+        ok: bool,
+        event_id: str,
+        already_recorded: bool,
+        pnl_delta_usd: float,
+        fee_usd: float,
+        taxable_profit_usd: float,
+        lifetime_profit_usd: float
+      }
+    """
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"ok": False, "error": "missing wallet"}
+
+    # Only profit deltas affect the lifetime-profit threshold.
+    try:
+        delta = float(pnl_delta_usd or 0.0)
+    except Exception:
+        delta = 0.0
+
+    side = str((fill or {}).get("side") or "").upper()
+    fill_id = str((fill or {}).get("id") or (fill or {}).get("fill_id") or "")
+    filled_ts = int((fill or {}).get("filled_ts") or now_ts())
+
+    # Build a stable idempotency key.
+    # If fill_id exists, use it; otherwise derive from (item + ts + side + delta).
+    if fill_id:
+        event_id = f"{wa}:{item_id}:{fill_id}"
+    else:
+        event_id = f"{wa}:{item_id}:{side}:{filled_ts}:{round(delta, 8)}"
+
+    conn = _db()
+    cur = conn.cursor()
+
+    # Idempotent insert
+    try:
+        cur.execute(
+            """
+            INSERT INTO pnl_events(event_id, wallet_address, item_id, side, pnl_delta_usd, fill_id, filled_ts, created_ts)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, wa, str(item_id or ""), side, float(delta), fill_id, int(filled_ts), now_ts()),
+        )
+        inserted = True
+    except Exception:
+        inserted = False
+
+    # Update profit_state only if newly inserted and delta > 0
+    state = _profit_state_get(wa)
+    prev_profit = float(state.get("lifetime_profit_usd") or 0.0)
+    prev_fee_paid = float(state.get("lifetime_fee_paid_usd") or 0.0)
+
+    fee_usd = 0.0
+    taxable_profit_usd = 0.0
+    if inserted and delta > 0:
+        fee_usd, taxable_profit_usd = _fee_for_profit_delta(prev_profit, delta)
+        _profit_state_upsert(
+            wa,
+            lifetime_profit_usd=prev_profit + delta,
+            lifetime_fee_paid_usd=prev_fee_paid + fee_usd,
+        )
+        state = _profit_state_get(wa)
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "event_id": event_id,
+        "already_recorded": (not inserted),
+        "side": side,
+        "pnl_delta_usd": float(delta),
+        "fee_usd": float(fee_usd),
+        "taxable_profit_usd": float(taxable_profit_usd),
+        "lifetime_profit_usd": float(state.get("lifetime_profit_usd") or 0.0),
+        "lifetime_fee_paid_usd": float(state.get("lifetime_fee_paid_usd") or 0.0),
+    }
 # -------------------------
 # In-memory state
 # -------------------------
@@ -3414,7 +3713,17 @@ def api_grid_tick():
                         _f["pnl_delta"] = _delta
                         _f["_pnl_applied"] = True
 
-                        # release locked wallet budget on BUY fills (simple model)
+                        
+                        # Ledger: record realized profit events (SELL only, idempotent)
+                        try:
+                            if str(_f.get("side") or "").upper() == "SELL" and float(_delta or 0.0) != 0.0:
+                                # session owner wallet is attached on start; fallback to current request wallet
+                                owner = session.get("wallet_address") or wa
+                                _f["_ledger"] = _ledger_record_pnl_event(owner, item_id, _f, float(_delta or 0.0))
+                        except Exception:
+                            pass
+
+# release locked wallet budget on BUY fills (simple model)
                         try:
                             if str(_f.get("side") or "").upper() == "BUY":
                                 oid = _f.get("id")
