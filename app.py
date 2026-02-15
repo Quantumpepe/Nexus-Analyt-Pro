@@ -487,7 +487,7 @@ def init_db():
             created_ts INTEGER
         )
     """)
-conn.commit()
+    conn.commit()
     conn.close()
 
 
