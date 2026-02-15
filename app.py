@@ -649,9 +649,21 @@ def set_policy(wallet_address: str, policy: dict):
 # Chains (features) unlocked by access
 _CHAINS_SILVER = ["ETH", "BNB", "POL"]
 _CHAINS_GOLD = [
+    # Silver chains
     "ETH", "BNB", "POL",
+    # Gold adds more networks
     "BASE", "ARBITRUM", "OPTIMISM", "AVALANCHE",
+    "SOL", "BTC",
 ]
+
+
+# Networks that the backend treats as EVM-style chains (wallet / tx verification, etc.)
+# Important: BTC and SOL are assets, not EVM chains here.
+_KNOWN_NETWORKS = ["ETH", "BNB", "POL", "BASE", "ARBITRUM", "OPTIMISM", "AVALANCHE"]
+
+# Assets/features unlocked by tiers (independent of chain/network selection)
+_ASSETS_SILVER = []
+_ASSETS_GOLD_EXTRA = ["BTC", "SOL"]
 
 # For now we model AI limit as an integer per day (free=1). Unlimited = -1.
 _AI_LIMIT_FREE = 1
@@ -1095,15 +1107,19 @@ def _compute_access_status(wallet_address: str | None) -> dict:
 
     can_open = bool(st.get("can_open_new_trades"))
 
+    
     return {
-        "plan": plan,
-        "source": source,
-        "expires_at": int(exp) if exp is not None else None,
-        "chains_allowed": chains,
-        "ai_limit": ai_limit,
-        "can_open_new_trades": can_open,
-        "can_close_trades": True,
-    }
+            "plan": plan,
+            "source": source,
+            "expires_at": int(exp) if exp is not None else None,
+            # Only expose real networks as "chains" to the UI to avoid treating assets like BTC/SOL as chains.
+            "chains_allowed": [c for c in chains if c in _KNOWN_NETWORKS],
+            # Extra assets/features unlocked by tier (safe to ignore by older frontends).
+            "assets_allowed": (_ASSETS_GOLD_EXTRA if plan in ("gold", "unlimited") else _ASSETS_SILVER),
+            "ai_limit": ai_limit,
+            "can_open_new_trades": can_open,
+            "can_close_trades": True,
+        }
 
 
 def _require_access_open() -> tuple[str | None, dict | None, tuple | None]:
