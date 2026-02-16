@@ -1172,6 +1172,7 @@ def _access_defaults() -> dict:
         "ai_limit": _AI_LIMIT_FREE,
         "can_open_new_trades": False,
         "can_close_trades": True,
+            "active": (plan != "free"),
     }
 
 
@@ -1241,6 +1242,7 @@ def _compute_access_status(wallet_address: str | None) -> dict:
             "ai_limit": ai_limit,
             "can_open_new_trades": can_open,
             "can_close_trades": True,
+            "active": (plan != "free"),
         }
 
 
@@ -1474,13 +1476,14 @@ def api_access_redeem():
 
         return jsonify({
             "status": "ok",
-            "plan": "unlimited",
+            "plan": "pro",
             "source": "code",
             "expires_at": None,
             "chains_allowed": list(_CHAINS_PRO_EFFECTIVE),
             "ai_limit": _AI_LIMIT_UNLIMITED,
             "can_open_new_trades": True,
             "can_close_trades": True,
+            "active": (plan != "free"),
         })
     finally:
         try:
