@@ -220,6 +220,30 @@ def _cg_get(url: str) -> dict:
     _CG_CACHE[url] = (now, data)
     return data
 
+
+@app.route("/api/contracts", methods=["GET"])
+def api_contracts():
+    # Expose the active chain contract addresses (Vault/Executor/Router).
+    # This helps the frontend/bot stay in sync with Render ENV after deploys.
+    out = {
+        "enabledEvmChains": list(_ENABLED_EVM_CHAINS),
+        "chains": {}
+    }
+    for key in _ENABLED_EVM_CHAINS:
+        cid = int(_CHAIN_ID_BY_KEY.get(key, 0) or 0)
+        if cid <= 0:
+            continue
+        out["chains"][key] = {
+            "chainId": cid,
+            "rpc": (_RPC_URL_BY_CHAIN.get(cid) or ""),
+            "usdc": (_USDC_BY_CHAIN.get(cid) or ""),
+            "usdt": (_USDT_BY_CHAIN.get(cid) or ""),
+            "vault": (_VAULT_BY_CHAIN.get(cid) or ""),
+            "executor": (_EXECUTOR_BY_CHAIN.get(cid) or ""),
+            "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
+        }
+    return jsonify(out)
+
 @app.route("/api/coingecko/simple_price", methods=["GET"])
 def coingecko_simple_price():
     # Pass-through query params (ids, vs_currencies, include_* etc.)
@@ -781,6 +805,30 @@ _USDT_BY_CHAIN = {
     56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56"),
     137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137"),
 }
+
+# -------------------------
+# Nexus Vault / Executor (Trading Contracts)
+# -------------------------
+# Phase 1: Polygon only (137). Later add other chains by ENV.
+_VAULT_BY_CHAIN = {
+    1: (os.getenv("VAULT_ADDRESS_ETH") or os.getenv("VAULT_ADDRESS_1") or "").strip(),
+    56: (os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
+    137: (os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
+}
+
+_EXECUTOR_BY_CHAIN = {
+    1: (os.getenv("EXECUTOR_ADDRESS_ETH") or os.getenv("EXECUTOR_ADDRESS_1") or "").strip(),
+    56: (os.getenv("EXECUTOR_ADDRESS_BNB") or os.getenv("EXECUTOR_ADDRESS_56") or "").strip(),
+    137: (os.getenv("EXECUTOR_ADDRESS_POL") or os.getenv("EXECUTOR_ADDRESS_POLYGON") or os.getenv("EXECUTOR_ADDRESS_137") or "").strip(),
+}
+
+# DEX Router (QuickSwap V2 for Polygon by default)
+_ROUTER_BY_CHAIN = {
+    1: (os.getenv("ROUTER_ADDRESS_ETH") or os.getenv("ROUTER_ADDRESS_1") or "").strip(),
+    56: (os.getenv("ROUTER_ADDRESS_BNB") or os.getenv("ROUTER_ADDRESS_56") or "").strip(),
+    137: (os.getenv("ROUTER_ADDRESS_POL") or os.getenv("ROUTER_ADDRESS_POLYGON") or os.getenv("ROUTER_ADDRESS_137") or "").strip(),
+}
+
 
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
 _USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", "6"))
