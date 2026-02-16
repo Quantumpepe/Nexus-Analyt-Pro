@@ -1373,16 +1373,26 @@ def _seed_unlimited_codes_if_needed(cur):
 
 @app.route("/api/access/redeem", methods=["POST"])
 def api_access_redeem():
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
+    """
+    Redeem a permanent code.
 
+    IMPORTANT:
+    - This endpoint intentionally supports BOTH:
+        A) Bearer auth (preferred once user already has a token)
+        B) direct wallet address in body: {"addr": "...", "code": "..."}
+      because first-time users do NOT have a token yet.
+    """
     body = request.get_json(silent=True) or {}
+    wa = _require_auth() or _norm_addr(body.get("addr") or body.get("wallet") or "")
+    if not wa:
+        return err("missing wallet", 400)
+
     code = str(body.get("code") or "").strip()
     if not code:
         return err("missing code", 400)
 
     conn = _db()
+conn = _db()
     cur = conn.cursor()
 
     # best-effort seed (if env provides codes)
