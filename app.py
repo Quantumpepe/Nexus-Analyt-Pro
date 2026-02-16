@@ -355,10 +355,21 @@ def _persist_grid_state() -> None:
 DB_PATH = os.getenv("NEXUS_DB_PATH", os.path.join(os.path.dirname(__file__), "nexus.db"))
 TOKEN_TTL_SEC = int(os.getenv("NEXUS_TOKEN_TTL_SEC", "604800"))  # 7 days
 
+import sqlite3
+
 def _db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,                # oder "nexus.db"
+        timeout=30,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+
     return conn
+
 
 def init_db():
     conn = _db()
