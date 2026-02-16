@@ -1172,7 +1172,7 @@ def _access_defaults() -> dict:
         "ai_limit": _AI_LIMIT_FREE,
         "can_open_new_trades": False,
         "can_close_trades": True,
-            "active": (plan != "free"),
+            "active": True,
     }
 
 
@@ -1242,7 +1242,7 @@ def _compute_access_status(wallet_address: str | None) -> dict:
             "ai_limit": ai_limit,
             "can_open_new_trades": can_open,
             "can_close_trades": True,
-            "active": (plan != "free"),
+            "active": True,
         }
 
 
@@ -1483,7 +1483,7 @@ def api_access_redeem():
             "ai_limit": _AI_LIMIT_UNLIMITED,
             "can_open_new_trades": True,
             "can_close_trades": True,
-            "active": (plan != "free"),
+            "active": True,
         })
     finally:
         try:
