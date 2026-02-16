@@ -669,6 +669,32 @@ if not _CHAINS_PRO:
 # Networks that the backend treats as EVM-style chains (wallet / tx verification, etc.)
 # Important: BTC and SOL are assets, not EVM chains here.
 _KNOWN_NETWORKS = ["ETH", "BNB", "POL", "BASE", "ARBITRUM", "OPTIMISM", "AVALANCHE"]
+# --- Chain enablement (Phase 1: only POL enabled; later enable more via env) ---
+# Controls which EVM networks are ACTIVE in this deployment (affects UI exposure + tx verification).
+# Example: NEXUS_ENABLED_EVM_CHAINS="POL" (Phase 1), later: "POL,BNB,BASE,ARBITRUM,ETH"
+_CHAIN_ID_BY_KEY = {
+    "ETH": 1,
+    "BNB": 56,
+    "POL": 137,
+    "BASE": 8453,
+    "ARBITRUM": 42161,
+    "OPTIMISM": 10,
+    "AVALANCHE": 43114,
+}
+_ENABLED_EVM_CHAINS = _parse_csv_list(os.getenv("NEXUS_ENABLED_EVM_CHAINS", "POL"))
+# Always keep POL enabled by default to match Phase 1 expectations
+if not _ENABLED_EVM_CHAINS:
+    _ENABLED_EVM_CHAINS = ["POL"]
+_ENABLED_EVM_CHAINS = [c for c in _ENABLED_EVM_CHAINS if c in _KNOWN_NETWORKS]
+if "POL" not in _ENABLED_EVM_CHAINS:
+    _ENABLED_EVM_CHAINS.insert(0, "POL")
+_ENABLED_CHAIN_IDS = {int(_CHAIN_ID_BY_KEY[c]) for c in _ENABLED_EVM_CHAINS if c in _CHAIN_ID_BY_KEY}
+
+# Effective PRO chains exposed/used in this deployment (intersection of plan chains and enabled chains)
+_CHAINS_PRO_EFFECTIVE = [c for c in _CHAINS_PRO if c in _ENABLED_EVM_CHAINS]
+if not _CHAINS_PRO_EFFECTIVE:
+    _CHAINS_PRO_EFFECTIVE = list(_ENABLED_EVM_CHAINS)
+
 
 # Assets/features unlocked by tiers (independent of chain/network selection)
 _ASSETS_SILVER = []
@@ -898,7 +924,10 @@ def _nft_activation_put(wallet_address: str, tier: str, contract: str, chain_id:
     conn.close()
 
 def _rpc_call(chain_id: int, method: str, params: list):
-    url = _RPC_URL_BY_CHAIN.get(int(chain_id) or 0)
+    cid = int(chain_id) or 0
+    if _ENABLED_CHAIN_IDS and cid not in _ENABLED_CHAIN_IDS:
+        raise RuntimeError(f"chain_id not enabled: {cid}")
+    url = _RPC_URL_BY_CHAIN.get(cid)
     if not url:
         raise RuntimeError(f"rpc url not configured for chain_id={chain_id}")
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -1127,7 +1156,7 @@ def _compute_access_status(wallet_address: str | None) -> dict:
             "source": source,
             "expires_at": int(exp) if exp is not None else None,
             # Only expose real networks as "chains" to the UI to avoid treating assets like BTC/SOL as chains.
-            "chains_allowed": [c for c in chains if c in _KNOWN_NETWORKS],
+            "chains_allowed": [c for c in chains if (c in _KNOWN_NETWORKS and (not _ENABLED_EVM_CHAINS or c in _ENABLED_EVM_CHAINS))],
             # Extra assets/features unlocked by tier (safe to ignore by older frontends).
             "assets_allowed": (_ASSETS_GOLD_EXTRA if plan in ("gold", "unlimited") else _ASSETS_SILVER),
             "ai_limit": ai_limit,
@@ -1338,7 +1367,7 @@ def api_access_redeem():
         plan="pro",
         source="code",
         expires_ts=None,
-        chains_allowed=list(_CHAINS_PRO),
+        chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
         ai_limit=_AI_LIMIT_UNLIMITED,
         can_open_new_trades=True,
     )
@@ -1784,7 +1813,7 @@ def api_access_subscribe_verify():
     sub_seconds = int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
     expires_ts = now_ts() + sub_seconds
     plan = "pro"
-    chains_allowed = list(_CHAINS_PRO)
+    chains_allowed = list(_CHAINS_PRO_EFFECTIVE)
     ai_limit = _AI_LIMIT_UNLIMITED
 
     _access_state_put(
@@ -1905,7 +1934,7 @@ def api_intent_create():
         return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
-    chain_id = body.get("chain_id") or 1
+    chain_id = body.get("chain_id") or 137
     pair = (body.get("pair") or "").strip()
     side = (body.get("side") or "").strip().lower()
     amount = body.get("amount")  # keep as string for precision
@@ -1922,6 +1951,10 @@ def api_intent_create():
 
     if max_slippage_bps is None:
         max_slippage_bps = policy.get("max_slippage_bps", 75)
+
+    # Enforce enabled chains in this deployment (Phase 1: POL only)
+    if _ENABLED_CHAIN_IDS and int(chain_id) not in _ENABLED_CHAIN_IDS:
+        return err("chain not enabled", 400)
 
     intent_id = create_intent(
         wallet_address=wa,
