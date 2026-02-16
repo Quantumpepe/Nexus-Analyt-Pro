@@ -9,6 +9,8 @@ import threading
 import json
 import re
 import sqlite3
+import threading
+DB_WRITE_LOCK = threading.Lock()
 import secrets
 import uuid
 import requests
@@ -358,18 +360,18 @@ TOKEN_TTL_SEC = int(os.getenv("NEXUS_TOKEN_TTL_SEC", "604800"))  # 7 days
 import sqlite3
 
 def _db():
+    # NOTE: sqlite on Render can be hit concurrently by multiple requests.
+    # We use WAL + busy_timeout and a process-level lock for writes.
     conn = sqlite3.connect(
-        DB_PATH,                # oder "nexus.db"
+        DB_PATH,
         timeout=30,
-        check_same_thread=False
+        check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-
+    conn.execute("PRAGMA busy_timeout=5000;")
     return conn
-
 
 def init_db():
     conn = _db()
@@ -1118,30 +1120,47 @@ def _access_state_get(wallet_address: str) -> dict | None:
     return d
 
 
-def _access_state_put(wallet_address: str, plan: str, source: str, expires_ts: int | None, chains_allowed: list, ai_limit: int, can_open_new_trades: bool):
+def _access_state_put(wallet_address: str, plan: str, source: str, expires_ts: int | None, chains_allowed: list,
+                      ai_limit: int, can_open_new_trades: bool, conn=None, cur=None):
+    """Upsert access_state.
+
+    If conn/cur are provided, we reuse them (important to avoid nested sqlite writes that can lock).
+    """
     wa = _norm_addr(wallet_address or "")
     if not wa:
         return
-    conn = _db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO access_state(wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, updated_ts) "
-        "VALUES (?,?,?,?,?,?,?,?) "
-        "ON CONFLICT(wallet_address) DO UPDATE SET plan=excluded.plan, source=excluded.source, expires_ts=excluded.expires_ts, chains_allowed_json=excluded.chains_allowed_json, ai_limit=excluded.ai_limit, can_open_new_trades=excluded.can_open_new_trades, updated_ts=excluded.updated_ts",
-        (
-            wa,
-            str(plan or "free"),
-            str(source or "default"),
-            int(expires_ts) if expires_ts is not None else None,
-            json.dumps(chains_allowed or [], ensure_ascii=False),
-            int(ai_limit),
-            1 if bool(can_open_new_trades) else 0,
-            now_ts(),
-        ),
-    )
-    conn.commit()
-    conn.close()
 
+    own_conn = False
+    if conn is None:
+        conn = _db()
+        own_conn = True
+    if cur is None:
+        cur = conn.cursor()
+
+    with DB_WRITE_LOCK:
+        cur.execute(
+            "INSERT INTO access_state(wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(wallet_address) DO UPDATE SET "
+            "plan=excluded.plan, source=excluded.source, expires_ts=excluded.expires_ts, "
+            "chains_allowed_json=excluded.chains_allowed_json, ai_limit=excluded.ai_limit, "
+            "can_open_new_trades=excluded.can_open_new_trades, updated_ts=excluded.updated_ts",
+            (
+                wa,
+                str(plan or "free"),
+                str(source or "default"),
+                int(expires_ts) if expires_ts is not None else None,
+                json.dumps(chains_allowed or [], ensure_ascii=False),
+                int(ai_limit),
+                1 if bool(can_open_new_trades) else 0,
+                now_ts(),
+            ),
+        )
+        if own_conn:
+            conn.commit()
+
+    if own_conn:
+        conn.close()
 
 def _access_defaults() -> dict:
     return {
@@ -1384,14 +1403,13 @@ def _seed_unlimited_codes_if_needed(cur):
 
 @app.route("/api/access/redeem", methods=["POST"])
 def api_access_redeem():
-    """
-    Redeem a permanent code.
+    """Redeem a permanent code.
 
-    IMPORTANT:
-    - This endpoint intentionally supports BOTH:
-        A) Bearer auth (preferred once user already has a token)
-        B) direct wallet address in body: {"addr": "...", "code": "..."}
-      because first-time users do NOT have a token yet.
+    Supports:
+      A) Bearer auth (if user already has a token)
+      B) direct wallet in body (first-time users)
+
+    IMPORTANT: avoid nested sqlite writes (causes "database is locked").
     """
     body = request.get_json(silent=True) or {}
     wa = _require_auth() or _norm_addr(body.get("addr") or body.get("wallet") or "")
@@ -1403,52 +1421,57 @@ def api_access_redeem():
         return err("missing code", 400)
 
     conn = _db()
-
     cur = conn.cursor()
-
-    # best-effort seed (if env provides codes)
     try:
-        _seed_unlimited_codes_if_needed(cur)
-    except Exception:
-        pass
+        # best-effort seed (if env provides codes)
+        try:
+            _seed_unlimited_codes_if_needed(cur)
+        except Exception:
+            pass
 
-    # validate code exists and not redeemed
-    cur.execute("SELECT code, redeemed_by, redeemed_ts FROM access_codes WHERE code=?", (code,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return err("invalid code", 404)
+        with DB_WRITE_LOCK:
+            cur.execute("SELECT code, redeemed_by, redeemed_ts FROM access_codes WHERE code=?", (code,))
+            row = cur.fetchone()
+            if not row:
+                return err("invalid code", 404)
+            redeemed_by = (row[1] or "")
+            if redeemed_by:
+                return err("code already redeemed", 409)
 
-    redeemed_by = (row[1] or "")
-    if redeemed_by:
-        conn.close()
-        return err("code already redeemed", 409)
+            cur.execute(
+                "UPDATE access_codes SET redeemed_by=?, redeemed_ts=? WHERE code=?",
+                (wa, now_ts(), code),
+            )
 
-    # redeem
-    cur.execute(
-        "UPDATE access_codes SET redeemed_by=?, redeemed_ts=? WHERE code=?",
-        (wa, now_ts(), code),
-    )
+            _access_state_put(
+                wallet_address=wa,
+                plan="pro",
+                source="code",
+                expires_ts=None,
+                chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
+                ai_limit=_AI_LIMIT_UNLIMITED,
+                can_open_new_trades=True,
+                conn=conn,
+                cur=cur,
+            )
+            conn.commit()
 
-    # redeem code grants PRO access (lifetime)
-    _access_state_put(
-        wallet_address=wa,
-        plan="pro",
-        source="code",
-        expires_ts=None,
-        chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
-        ai_limit=_AI_LIMIT_UNLIMITED,
-        can_open_new_trades=True,
-    )
+        return jsonify({
+            "status": "ok",
+            "plan": "unlimited",
+            "source": "code",
+            "expires_at": None,
+            "chains_allowed": list(_CHAINS_PRO_EFFECTIVE),
+            "ai_limit": _AI_LIMIT_UNLIMITED,
+            "can_open_new_trades": True,
+            "can_close_trades": True,
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    conn.commit()
-    conn.close()
-
-    return jsonify({"status": "ok", "plan": "unlimited", "source": "code", "expires_at": None, "chains_allowed": _CHAINS_GOLD, "ai_limit": _AI_LIMIT_UNLIMITED, "can_open_new_trades": True, "can_close_trades": True})
-
-
-# Trading permission helpers
-# -------------------------
 def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[tuple]]:
     """
     Returns (wallet_address, policy, error_response_tuple_or_None).
