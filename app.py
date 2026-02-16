@@ -10,7 +10,8 @@ import json
 import re
 import sqlite3
 import threading
-DB_WRITE_LOCK = threading.Lock()
+DB_WRITE_LOCK = threading.RLock()
+
 import secrets
 import uuid
 import requests
