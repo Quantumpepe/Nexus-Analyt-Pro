@@ -657,6 +657,15 @@ _CHAINS_GOLD = [
 ]
 
 
+# Single subscription plan chains (configurable via env)
+# Example: NEXUS_CHAINS_PRO="ETH,BNB,POL"
+def _parse_csv_list(s: str) -> list[str]:
+    return [x.strip().upper() for x in (s or "").split(",") if x.strip()]
+
+_CHAINS_PRO = _parse_csv_list(os.getenv("NEXUS_CHAINS_PRO", "ETH,BNB,POL"))
+if not _CHAINS_PRO:
+    _CHAINS_PRO = ["ETH", "BNB", "POL"]
+
 # Networks that the backend treats as EVM-style chains (wallet / tx verification, etc.)
 # Important: BTC and SOL are assets, not EVM chains here.
 _KNOWN_NETWORKS = ["ETH", "BNB", "POL", "BASE", "ARBITRUM", "OPTIMISM", "AVALANCHE"]
@@ -750,9 +759,7 @@ _USDT_BY_CHAIN = {
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
 _USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", "6"))
 
-PRICE_SILVER_USD = float(os.getenv("PRICE_SILVER_USD", "10"))
-PRICE_GOLD_USD = float(os.getenv("PRICE_GOLD_USD", "25"))
-
+PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "15")))
 # keccak256("Transfer(address,address,uint256)")
 ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
@@ -918,14 +925,21 @@ def _hex_to_int(h: str) -> int:
         return 0
 
 def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
+    """
+    Verify an onchain USDC/USDT payment to TREASURY_ADDRESS.
+
+    We now use a single subscription plan ("pro") priced by PRICE_PRO_USD.
+    For backwards compatibility, we accept plan values like "silver"/"gold" but
+    always enforce PRICE_PRO_USD.
+    """
     if not TREASURY_ADDRESS:
         raise RuntimeError("missing NEXUS_TREASURY_ADDRESS")
 
     plan_l = (plan or "").strip().lower()
-    if plan_l not in ("silver", "gold"):
-        raise RuntimeError("plan must be 'silver' or 'gold'")
+    if plan_l not in ("pro", "silver", "gold", "basic", "premium"):
+        raise RuntimeError("plan must be 'pro'")
 
-    price = PRICE_SILVER_USD if plan_l == "silver" else PRICE_GOLD_USD
+    price = float(PRICE_PRO_USD)
 
     txh = (tx_hash or "").strip().lower()
     if not txh.startswith("0x") or len(txh) < 20:
@@ -1318,13 +1332,13 @@ def api_access_redeem():
         (wa, now_ts(), code),
     )
 
-    # set plan = unlimited (lifetime)
+    # redeem code grants PRO access (lifetime)
     _access_state_put(
         wallet_address=wa,
-        plan="unlimited",
+        plan="pro",
         source="code",
         expires_ts=None,
-        chains_allowed=_CHAINS_GOLD,  # all currently offered chains
+        chains_allowed=list(_CHAINS_PRO),
         ai_limit=_AI_LIMIT_UNLIMITED,
         can_open_new_trades=True,
     )
@@ -1706,77 +1720,15 @@ def api_auth_nonce():
 
 @app.route("/api/nft/activate", methods=["POST"])
 def api_nft_activate():
-    """Activate Silver/Gold NFT access for ~2 months (backend lock).
-
-    Body: { tier: "silver"|"gold" }
-
-    Rules:
-      - NFT is NOT burned.
-      - Activation locks re-activation for the tier until expires_ts.
-      - Access gating is still handled via /api/access/status.
-    """
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-
-    body = request.get_json(silent=True) or {}
-    tier = str(body.get("tier") or "").strip().lower()
-    if tier not in ("silver", "gold"):
-        return err("tier must be 'silver' or 'gold'", 400)
-
-    # Unlimited has highest priority; do not downgrade.
-    st = _compute_access_status(wa)
-    if str(st.get("plan") or "").lower() == "unlimited":
-        return jsonify({"status": "ok", "note": "already unlimited", "access": st})
-
-    # ownership check
-    if not _owns_nft(wa, tier):
-        return err("nft not owned", 403)
-
-    now = now_ts()
-    act = _nft_activation_get(wa, tier)
-    if act and not _is_expired(act.get("expires_ts")):
-        # already active and still locked
-        st2 = _compute_access_status(wa)
-        return jsonify({"status": "ok", "already_active": True, "access": st2, "expires_at": int(act.get("expires_ts") or 0)})
-
-    expires = now + int(NFT_LOCK_SECONDS)
-
-    if tier == "silver":
-        contract = NFT_SILVER_CONTRACT
-        chain_id = NFT_SILVER_CHAIN_ID
-        plan = "silver"
-        chains_allowed = _CHAINS_SILVER
-        source = "nft_silver"
-    else:
-        contract = NFT_GOLD_CONTRACT
-        chain_id = NFT_GOLD_CHAIN_ID
-        plan = "gold"
-        chains_allowed = _CHAINS_GOLD
-        source = "nft_gold"
-
-    _nft_activation_put(wa, tier, contract, chain_id, now, expires)
-
-    # write to access_state (so /api/access/status stays stable)
-    _access_state_put(
-        wa,
-        plan=plan,
-        source=source,
-        expires_ts=int(expires),
-        chains_allowed=chains_allowed,
-        ai_limit=_AI_LIMIT_UNLIMITED,
-        can_open_new_trades=True,
-    )
-
-    st3 = _compute_access_status(wa)
-    return jsonify({"status": "ok", "access": st3})
-
+    # NFTs are disabled for the initial release (UI removed). Keeping the endpoint
+    # for future re-enable without breaking old deployments.
+    return err("nft access is disabled", 403)
 
 @app.route("/api/access/subscribe/verify", methods=["POST"])
 def api_access_subscribe_verify():
-    """Verify an onchain USDC/USDT payment to Treasury and activate Silver/Gold access.
+    """Verify an onchain USDC/USDT payment to Treasury and activate PRO subscription access.
 
-    Body: { chain_id, tx_hash, plan: "silver"|"gold" }
+    Body: { chain_id, tx_hash, plan?: "pro" }
 
     Notes:
       - expects an ERC20 Transfer from the caller wallet -> TREASURY_ADDRESS
@@ -1789,15 +1741,13 @@ def api_access_subscribe_verify():
     body = request.get_json(silent=True) or {}
     chain_id = body.get("chain_id")
     tx_hash = str(body.get("tx_hash") or "").strip()
-    plan = str(body.get("plan") or "").strip().lower()
+    plan = "pro"  # single plan (15$/mo); client may still send plan but we ignore it
 
     try:
         chain_id = int(chain_id)
     except Exception:
         return err("invalid chain_id", 400)
 
-    if plan not in ("silver", "gold"):
-        return err("plan must be 'silver' or 'gold'", 400)
 
     if not tx_hash:
         return err("missing tx_hash", 400)
@@ -1830,15 +1780,12 @@ def api_access_subscribe_verify():
         conn.close()
         return err(str(e), 500)
 
-    # activate access (2 months)
-    expires_ts = now_ts() + int(60 * 60 * 24 * 60)  # ~60 days
-    if plan == "silver":
-        chains_allowed = ["ETH", "BNB", "POL"]
-        ai_limit = _AI_LIMIT_UNLIMITED
-    else:
-        # gold: all chains (backend doesn't enforce list beyond UI, but we provide it)
-        chains_allowed = ["ALL"]
-        ai_limit = _AI_LIMIT_UNLIMITED
+    # activate PRO subscription (default 30 days; configurable)
+    sub_seconds = int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
+    expires_ts = now_ts() + sub_seconds
+    plan = "pro"
+    chains_allowed = list(_CHAINS_PRO)
+    ai_limit = _AI_LIMIT_UNLIMITED
 
     _access_state_put(
         wallet_address=wa,
@@ -4412,6 +4359,13 @@ def api_ai_run():
 
     Returns: {status, answer, model, context_used}
     """
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
     symbols = body.get("symbols") or []
@@ -4478,6 +4432,13 @@ Task:
 
 @app.route("/api/ai/memory", methods=["GET"])
 def api_ai_memory_get():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
     wa = str(request.args.get("wallet_address") or "").strip()
     mem = _ai_mem_get(wa) if wa else []
     return jsonify({"status": "ok", "wallet_address": _norm_addr(wa), "memory": mem})
@@ -4485,6 +4446,13 @@ def api_ai_memory_get():
 
 @app.route("/api/ai/memory/clear", methods=["POST"])
 def api_ai_memory_clear():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
     body = request.get_json(silent=True) or {}
     wa = str(body.get("wallet_address") or "").strip()
     wa = _norm_addr(wa)
@@ -4503,6 +4471,13 @@ def api_ai():
 
     The model is instructed to ONLY use provided context JSON and to NEVER mention unrelated tokens.
     """
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
     body = request.get_json(silent=True) or {}
 
     mode = str(body.get("mode") or "analysis").strip().lower()
