@@ -1392,7 +1392,7 @@ def api_access_redeem():
         return err("missing code", 400)
 
     conn = _db()
-conn = _db()
+
     cur = conn.cursor()
 
     # best-effort seed (if env provides codes)
