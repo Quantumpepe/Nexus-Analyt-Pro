@@ -1259,8 +1259,23 @@ def _require_access_open() -> tuple[str | None, dict | None, tuple | None]:
 @app.route("/api/access/status", methods=["GET"])
 def api_access_status():
     wa = _require_auth()
+
+    # Fallback: allow wallet via query param if no token
+    if not wa:
+        wa = _norm_addr(
+            request.args.get("wallet")
+            or request.args.get("addr")
+            or ""
+        )
+
     st = _compute_access_status(wa)
-    return jsonify({"status": "ok", **st})
+
+    return jsonify({
+        "status": "ok",
+        "wallet_address": _norm_addr(wa) if wa else None,
+        **st
+    })
+
 
 
 
