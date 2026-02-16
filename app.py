@@ -189,6 +189,23 @@ def root():
 def healthz():
     return jsonify({"status": "ok"})
 
+@app.route("/api/contracts", methods=["GET"])
+def contracts():
+    """Return configured on-chain contract addresses per chain.
+    This is informational only; trading is executed by the client/bot.
+    """
+    return jsonify({
+        "chains": {
+            "POL": {
+                "chain_id": 137,
+                "vault": _VAULT_BY_CHAIN.get(137),
+                "executor": _EXECUTOR_BY_CHAIN.get(137),
+                "router": _ROUTER_BY_CHAIN.get(137),
+            }
+        }
+    })
+
+
 
 # -------------------------
 # CoinGecko Pro (server-side only)
@@ -781,6 +798,22 @@ _USDT_BY_CHAIN = {
     56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56"),
     137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137"),
 }
+
+# -------------------------
+# Trading contracts (POL phase 1)
+# NOTE: These are used by frontend/bot to call the on-chain Vault/Executor.
+# -------------------------
+_VAULT_BY_CHAIN = {
+    137: (_norm_addr(os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "") or "").lower(),
+}
+_EXECUTOR_BY_CHAIN = {
+    137: (_norm_addr(os.getenv("EXECUTOR_ADDRESS_POL") or os.getenv("EXECUTOR_ADDRESS_POLYGON") or os.getenv("EXECUTOR_ADDRESS_137") or "") or "").lower(),
+}
+# Router used for swaps (QuickSwap V2 / UniswapV2 style on Polygon)
+_ROUTER_BY_CHAIN = {
+    137: (_norm_addr(os.getenv("ROUTER_ADDRESS_POL") or os.getenv("ROUTER_QUICKSWAP_POL") or os.getenv("ROUTER_ADDRESS_137") or "") or "").lower(),
+}
+
 
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
 _USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", "6"))
