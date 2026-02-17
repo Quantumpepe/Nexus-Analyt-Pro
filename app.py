@@ -1434,22 +1434,12 @@ def api_withdraw_quote():
         # "signature": "0x..." (EIP-712)
     })
 def _seed_unlimited_codes_if_needed(cur):
-    """Seed access_codes table if empty.
+    """Ensure access_codes table contains all configured one-time codes.
 
-    Priority:
-      1) hardcoded REDEEM_CODES (50 one-time codes)
-      2) env NEXUS_UNLIMITED_CODES (CSV) as optional override/extension
+    We *append* missing codes on every call (idempotent), so you can add more
+    codes later without wiping the DB. Redeemed codes remain redeemed because
+    they live in the DB.
     """
-    try:
-        cur.execute("SELECT COUNT(1) as n FROM access_codes")
-        row = cur.fetchone()
-        n = int(row[0] if row else 0)
-    except Exception:
-        n = 0
-
-    if n > 0:
-        return
-
     codes = list(REDEEM_CODES or [])
 
     raw = str(os.getenv("NEXUS_UNLIMITED_CODES", "")).strip()
@@ -1462,9 +1452,13 @@ def _seed_unlimited_codes_if_needed(cur):
     if not codes:
         return
 
-    for c in codes[:500]:
+    # Insert any missing codes (do NOT clear existing rows)
+    for c in codes[:5000]:
         try:
-            cur.execute("INSERT OR IGNORE INTO access_codes(code, redeemed_by, redeemed_ts) VALUES (?,?,?)", (c, None, None))
+            cur.execute(
+                "INSERT OR IGNORE INTO access_codes(code, redeemed_by, redeemed_ts) VALUES (?,?,?)",
+                (c, None, None),
+            )
         except Exception:
             pass
 
