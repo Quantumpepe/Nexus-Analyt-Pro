@@ -355,7 +355,7 @@ def _persist_grid_state() -> None:
 # -------------------------
 # Persistence (SQLite) + Token utilities
 # -------------------------
-DB_PATH = os.getenv("NEXUS_DB_PATH", os.path.join(os.path.dirname(__file__), "nexus.db"))
+DB_PATH = os.getenv("NEXUS_DB_PATH", "/data/nexus.db")
 TOKEN_TTL_SEC = int(os.getenv("NEXUS_TOKEN_TTL_SEC", "604800"))  # 7 days
 
 import sqlite3
