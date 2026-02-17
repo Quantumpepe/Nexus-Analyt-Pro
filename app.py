@@ -1267,6 +1267,7 @@ def api_access_status():
         wa = _norm_addr(
             request.args.get("wallet")
             or request.args.get("addr")
+            or request.args.get("address")
             or ""
         )
 
@@ -1430,7 +1431,7 @@ def api_access_redeem():
     IMPORTANT: avoid nested sqlite writes (causes "database is locked").
     """
     body = request.get_json(silent=True) or {}
-    wa = _require_auth() or _norm_addr(body.get("addr") or body.get("wallet") or "")
+    wa = _require_auth() or _norm_addr(body.get("addr") or body.get("wallet") or body.get("address") or "")
     if not wa:
         return err("missing wallet", 400)
 
