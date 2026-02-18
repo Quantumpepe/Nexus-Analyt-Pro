@@ -250,12 +250,61 @@ def api_contracts():
 @app.route("/api/coingecko/simple_price", methods=["GET"])
 def coingecko_simple_price():
     # Pass-through query params (ids, vs_currencies, include_* etc.)
+    # + add small compatibility aliases for assets whose CoinGecko IDs changed over time.
     qs = request.query_string.decode("utf-8", errors="ignore")
     url = f"{COINGECKO_BASE}/simple/price"
     if qs:
         url = f"{url}?{qs}"
     try:
         data = _cg_get(url)
+
+        # --- Compatibility aliasing (prevents "0 USD" when CoinGecko ID differs) ---
+        # Frontend may request POL as "polygon-pos". If CoinGecko doesn't return it,
+        # fall back to other known IDs and map the USD price back onto "polygon-pos".
+        try:
+            ids_raw = (request.args.get("ids") or "").strip()
+            if ids_raw:
+                ids = [s.strip() for s in ids_raw.split(",") if s.strip()]
+            else:
+                ids = []
+
+            def _ensure_alias(missing_id: str, fallbacks: list[str]):
+                nonlocal data
+                if missing_id not in ids:
+                    return
+                if isinstance(data, dict) and missing_id in data and isinstance(data.get(missing_id), dict):
+                    # already present
+                    return
+                fb_ids = [x for x in fallbacks if x]
+                if not fb_ids:
+                    return
+                fb_qs = request.args.to_dict(flat=True)
+                fb_qs["ids"] = ",".join(fb_ids)
+                fb_url = f"{COINGECKO_BASE}/simple/price"
+                if fb_qs:
+                    fb_url = f"{fb_url}?" + "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in fb_qs.items()])
+                fb = _cg_get(fb_url) or {}
+                # pick first valid USD price
+                px = None
+                for fid in fb_ids:
+                    try:
+                        v = fb.get(fid, {}).get("usd")
+                        if v is not None:
+                            px = float(v)
+                            if px > 0:
+                                break
+                    except Exception:
+                        continue
+                if px is not None:
+                    if not isinstance(data, dict):
+                        data = {}
+                    data[missing_id] = {"usd": px}
+
+            # POL (Polygon) native coin ID variations
+            _ensure_alias("polygon-pos", ["polygon-ecosystem-token", "matic-network"])
+        except Exception:
+            pass
+
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
