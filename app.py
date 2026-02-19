@@ -249,7 +249,7 @@ def api_contracts():
             "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
             "routerV3": (_ROUTER_V3_BY_CHAIN.get(cid) or ""),
             "wnative": (_WNATIVE_BY_CHAIN.get(cid) or ""),
-            "native": (_WNATIVE_BY_CHAIN.get(cid) or ""),
+            "native": native_symbol_by_chain_id.get(cid, key),
             "nativeSymbol": native_symbol_by_chain_id.get(cid, key),
         }
     return jsonify(out)
