@@ -232,6 +232,9 @@ def api_contracts():
         "enabledEvmChains": list(_ENABLED_EVM_CHAINS),
         "chains": {}
     }
+
+    # For UI/UX: explicit native symbols, and a backward-compatible "native" field.
+    native_symbol_by_chain_id = {1: "ETH", 56: "BNB", 137: "POL"}
     for key in _ENABLED_EVM_CHAINS:
         cid = int(_CHAIN_ID_BY_KEY.get(key, 0) or 0)
         if cid <= 0:
@@ -246,6 +249,8 @@ def api_contracts():
             "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
             "routerV3": (_ROUTER_V3_BY_CHAIN.get(cid) or ""),
             "wnative": (_WNATIVE_BY_CHAIN.get(cid) or ""),
+            "native": (_WNATIVE_BY_CHAIN.get(cid) or ""),
+            "nativeSymbol": native_symbol_by_chain_id.get(cid, key),
         }
     return jsonify(out)
 
