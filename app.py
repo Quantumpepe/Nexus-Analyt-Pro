@@ -412,6 +412,13 @@ def _persist_grid_state() -> None:
 # Persistence (SQLite) + Token utilities
 # -------------------------
 DB_PATH = os.getenv("NEXUS_DB_PATH", "/data/nexus.db")
+# Ensure DB directory exists (Render disk typically mounts at /data)
+try:
+    _db_dir = os.path.dirname(DB_PATH)
+    if _db_dir:
+        os.makedirs(_db_dir, exist_ok=True)
+except Exception:
+    pass
 TOKEN_TTL_SEC = int(os.getenv("NEXUS_TOKEN_TTL_SEC", "604800"))  # 7 days
 
 import sqlite3
@@ -1219,88 +1226,6 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
 
     raise RuntimeError("no matching USDC/USDT transfer found")
 
-def _verify_native_payment(chain_id: int, tx_hash: str, payer: str):
-    """Verify an onchain NATIVE payment (ETH/BNB/POL) to TREASURY_ADDRESS.
-
-    Accepts a plain value transfer from payer -> TREASURY_ADDRESS.
-
-    Required amount is computed as PRICE_PRO_USD worth of the native asset at verification time
-    using CoinGecko spot price (simple/price). This is pragmatic for subscriptions; for stricter
-    accounting you can instead pin a fixed native amount per chain via env and compare to that.
-    """
-    if not TREASURY_ADDRESS:
-        raise RuntimeError("missing NEXUS_TREASURY_ADDRESS")
-
-    txh = (tx_hash or "").strip().lower()
-    if not txh.startswith("0x") or len(txh) < 20:
-        raise RuntimeError("invalid tx_hash")
-
-    payer = _norm_addr(payer)
-
-    rcpt = _rpc_call(int(chain_id), "eth_getTransactionReceipt", [txh])
-    if not rcpt:
-        raise RuntimeError("tx not found")
-
-    status_hex = rcpt.get("status")
-    if status_hex is not None and _hex_to_int(status_hex) != 1:
-        raise RuntimeError("tx failed")
-
-    tx = _rpc_call(int(chain_id), "eth_getTransactionByHash", [txh])
-    if not tx:
-        raise RuntimeError("tx not found")
-
-    frm = _norm_addr(tx.get("from") or "")
-    to = _norm_addr(tx.get("to") or "")
-    if frm != payer:
-        raise RuntimeError("payer mismatch")
-    if to != TREASURY_ADDRESS:
-        raise RuntimeError("receiver mismatch")
-
-    value_wei = _hex_to_int(tx.get("value") or "0x0")
-    if value_wei <= 0:
-        raise RuntimeError("no native value")
-
-    # Determine CoinGecko id for the chain native
-    native_id = None
-    if int(chain_id) == 1:
-        native_id = "ethereum"
-        native_sym = "ETH"
-    elif int(chain_id) == 56:
-        native_id = "binancecoin"
-        native_sym = "BNB"
-    elif int(chain_id) == 137:
-        # CoinGecko has changed naming over time; backend also supports aliasing for "polygon-pos".
-        native_id = "polygon-ecosystem-token"
-        native_sym = "POL"
-    else:
-        raise RuntimeError("unsupported chain for native subscription")
-
-    # spot price in USD
-    try:
-        url = f"{COINGECKO_BASE}/simple/price?ids={native_id}&vs_currencies=usd"
-        data = _cg_get(url) or {}
-        usd = float(((data.get(native_id) or {}).get("usd") or 0))
-    except Exception:
-        usd = 0.0
-
-    if usd <= 0:
-        raise RuntimeError("could not fetch native USD price")
-
-    # Required wei for PRICE_PRO_USD at current spot
-    price_usd = float(PRICE_PRO_USD)
-    required_wei = int(math.ceil((price_usd / usd) * (10 ** 18)))
-
-    if value_wei < required_wei:
-        raise RuntimeError("insufficient native amount")
-
-    return {
-        "token": native_sym,
-        "token_address": None,
-        "amount_units": int(value_wei),
-        "required_units": int(required_wei),
-        "native_usd": usd,
-    }
-
 def _access_state_get(wallet_address: str) -> dict | None:
     wa = _norm_addr(wallet_address or "")
     if not wa:
@@ -2078,8 +2003,6 @@ def api_access_subscribe_verify():
     body = request.get_json(silent=True) or {}
     chain_id = body.get("chain_id")
     tx_hash = str(body.get("tx_hash") or "").strip()
-    token_type = str(body.get("token_type") or body.get("pay_type") or "").strip().lower()
-    token_hint = str(body.get("token") or body.get("asset") or "").strip().upper()
     plan = "pro"  # single plan (15$/mo); client may still send plan but we ignore it
 
     try:
@@ -2104,13 +2027,7 @@ def api_access_subscribe_verify():
         return jsonify({"status": "ok", "already_verified": True, "access": st})
 
     try:
-        # Decide whether this tx is an ERC20 (USDC/USDT) payment or a native (ETH/BNB/POL) payment.
-        # Backward compatible default is ERC20.
-        is_native = (token_type == "native") or (token_hint in ("ETH","BNB","POL"))
-        if is_native:
-            proof = _verify_native_payment(chain_id=int(chain_id), tx_hash=tx_hash, payer=wa)
-        else:
-            proof = _verify_erc20_payment(chain_id=chain_id, tx_hash=tx_hash, payer=wa, plan=plan)
+        proof = _verify_erc20_payment(chain_id=chain_id, tx_hash=tx_hash, payer=wa, plan=plan)
     except Exception as e:
         conn.close()
         return err(str(e), 400)
@@ -2127,16 +2044,7 @@ def api_access_subscribe_verify():
 
     # activate PRO subscription (default 30 days; configurable)
     sub_seconds = int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
-    current = _access_state_get(wa) or {}
-    cur_exp = current.get("expires_ts")
-    base_ts = now_ts()
-    try:
-        cur_exp_i = int(cur_exp) if cur_exp is not None else None
-    except Exception:
-        cur_exp_i = None
-    if cur_exp_i is not None and cur_exp_i > base_ts:
-        base_ts = cur_exp_i
-    expires_ts = base_ts + sub_seconds
+    expires_ts = now_ts() + sub_seconds
     plan = "pro"
     chains_allowed = list(_CHAINS_PRO_EFFECTIVE)
     ai_limit = _AI_LIMIT_UNLIMITED
@@ -2149,6 +2057,8 @@ def api_access_subscribe_verify():
         chains_allowed=chains_allowed,
         ai_limit=ai_limit,
         can_open_new_trades=True,
+        conn=conn,
+        cur=cur,
     )
 
     conn.commit()
