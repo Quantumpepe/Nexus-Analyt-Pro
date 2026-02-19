@@ -244,6 +244,8 @@ def api_contracts():
             "vault": (_VAULT_BY_CHAIN.get(cid) or ""),
             "executor": (_EXECUTOR_BY_CHAIN.get(cid) or ""),
             "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
+            "routerV3": (_ROUTER_V3_BY_CHAIN.get(cid) or ""),
+            "wnative": (_WNATIVE_BY_CHAIN.get(cid) or ""),
         }
     return jsonify(out)
 
@@ -940,6 +942,20 @@ _ROUTER_BY_CHAIN = {
     1: (os.getenv("ROUTER_ADDRESS_ETH") or os.getenv("ROUTER_ADDRESS_1") or "").strip(),
     56: (os.getenv("ROUTER_ADDRESS_BNB") or os.getenv("ROUTER_ADDRESS_56") or "").strip(),
     137: (os.getenv("ROUTER_ADDRESS_POL") or os.getenv("ROUTER_ADDRESS_POLYGON") or os.getenv("ROUTER_ADDRESS_137") or "").strip(),
+}
+
+# Optional: Uniswap V3 Router (used on ETH mainly; can be empty on chains without V3 usage)
+_ROUTER_V3_BY_CHAIN = {
+    1: (os.getenv("ROUTER_V3_ADDRESS_ETH") or os.getenv("ROUTER_V3_ADDRESS_1") or "").strip(),
+    56: (os.getenv("ROUTER_V3_ADDRESS_BNB") or os.getenv("ROUTER_V3_ADDRESS_56") or "").strip(),
+    137: (os.getenv("ROUTER_V3_ADDRESS_POL") or os.getenv("ROUTER_V3_ADDRESS_POLYGON") or os.getenv("ROUTER_V3_ADDRESS_137") or "").strip(),
+}
+
+# Wrapped native token per chain (useful for auto-path building & validation)
+_WNATIVE_BY_CHAIN = {
+    1: (os.getenv("WNATIVE_ADDRESS_ETH") or os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").strip(),
+    56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "").strip(),  # WBNB expected
+    137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "").strip(),  # WMATIC expected
 }
 
 
