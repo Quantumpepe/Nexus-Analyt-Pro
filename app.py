@@ -4613,10 +4613,11 @@ def api_grid_manual_add():
     if expected and api_key and api_key != expected:
         return jsonify({"error": "forbidden"}), 403
 
-    body = request.get_json(silent=True) or {}
-    wa = (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or "").strip()
-    if not wa:
-    return jsonify({"error": "wallet required"}), 401
+ body = request.get_json(silent=True) or {}
+
+ wa = (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or "").strip()
+ if not wa:
+     return jsonify({"error": "wallet required"}), 401
     
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
