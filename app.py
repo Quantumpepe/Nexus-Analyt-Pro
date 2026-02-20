@@ -771,9 +771,9 @@ def _require_auth() -> Optional[str]:
         return None
 
 def issue_token(wallet_address: str) -> str:
-(wallet_address: str) -> str:
-    return _serializer.dumps({"wallet_address": _norm_addr(wallet_address)})
-
+    return _serializer.dumps({
+        "wallet_address": _norm_addr(wallet_address)
+    })
 def upsert_user(wallet_address: str):
     wa = _norm_addr(wallet_address)
     conn = _db()
