@@ -676,11 +676,94 @@ def _ai_mem_append(wallet_address: str, user_text: str, assistant_text: str, max
 def _norm_addr(addr: str) -> str:
     return (addr or "").strip().lower()
 
+def _looks_like_evm_addr(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", s))
+
+def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
+    """Best-effort decode of a JWT *without* verification to extract an EVM wallet address.
+    This is an interim compatibility layer for Privy access tokens.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        import base64
+        def b64url_decode(seg: str) -> bytes:
+            seg = seg.strip().replace("-", "+").replace("_", "/")
+            seg += "=" * (-len(seg) % 4)
+            return base64.b64decode(seg)
+
+        payload_raw = b64url_decode(parts[1]).decode("utf-8", errors="ignore")
+        payload = json.loads(payload_raw) if payload_raw else {}
+
+        # Common direct fields
+        for k in ("wallet_address", "walletAddress", "address"):
+            v = payload.get(k)
+            if isinstance(v, str) and _looks_like_evm_addr(v):
+                return _norm_addr(v)
+
+        # Some providers nest wallets in arrays/objects
+        candidates = []
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                for kk, vv in obj.items():
+                    if kk in ("wallet_address", "walletAddress", "address") and isinstance(vv, str):
+                        candidates.append(vv)
+                    walk(vv)
+            elif isinstance(obj, list):
+                for it in obj:
+                    walk(it)
+
+        walk(payload)
+
+        for v in candidates:
+            if _looks_like_evm_addr(v):
+                return _norm_addr(v)
+
+        return None
+    except Exception:
+        return None
+
 def _require_auth() -> Optional[str]:
+    """Return normalized wallet address if caller is authorized, else None.
+
+    Accepted Bearer tokens:
+      1) Internal server API key (env: NEXUS_API_KEY) + wallet supplied via header/query/body
+      2) Privy-style JWT (best-effort decode to extract wallet)
+      3) Legacy signed token issued by this backend (itsdangerous serializer)
+    """
     auth = request.headers.get("Authorization", "").strip()
     if not auth.lower().startswith("bearer "):
         return None
+
     token = auth.split(" ", 1)[1].strip()
+
+    # (1) Internal server API key
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    if server_key and secrets.compare_digest(token, server_key):
+        # Allow passing wallet through header/query/body for internal calls
+        wa = (
+            request.headers.get("X-Wallet-Address")
+            or request.args.get("wallet")
+            or request.args.get("wallet_address")
+        )
+        if not wa:
+            body = request.get_json(silent=True) or {}
+            wa = body.get("wallet") or body.get("wallet_address") or body.get("walletAddress")
+        if isinstance(wa, str) and _looks_like_evm_addr(wa):
+            return _norm_addr(wa)
+        # If no wallet provided, treat as unauthorized for wallet-bound endpoints
+        return None
+
+    # (2) JWT (Privy or similar) – extract wallet best-effort
+    if "." in token:
+        wa = _try_extract_wallet_from_jwt(token)
+        if wa:
+            return wa
+
+    # (3) Legacy backend-issued token
     try:
         data = _serializer.loads(token, max_age=TOKEN_TTL_SEC)
         return _norm_addr(data.get("wallet_address", ""))
@@ -688,6 +771,7 @@ def _require_auth() -> Optional[str]:
         return None
 
 def issue_token(wallet_address: str) -> str:
+(wallet_address: str) -> str:
     return _serializer.dumps({"wallet_address": _norm_addr(wallet_address)})
 
 def upsert_user(wallet_address: str):
