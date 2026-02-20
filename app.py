@@ -76,6 +76,7 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
+print("BOOT: nexus-analyt-pro app.py loaded ✅")
 
 # Enable CORS for all API routes (UI is on a different domain)
 # ---- CORS ----
