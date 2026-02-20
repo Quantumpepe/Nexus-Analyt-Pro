@@ -78,13 +78,19 @@ if GridConfig is None:
 app = Flask(__name__)
 
 # Enable CORS for all API routes (UI is on a different domain)
+# ---- CORS ----
+# Frontend and backend are on different domains. The frontend uses fetch(..., credentials: 'include'),
+# so we MUST:
+#  - echo a concrete Origin (not '*')
+#  - set Access-Control-Allow-Credentials: true
+FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("FRONTEND_ORIGINS") or "https://nexus-analyt-ui.onrender.com,http://localhost:5173,http://localhost:3000").split(",") if o.strip()]
+FRONTEND_ORIGINS_SET = set(FRONTEND_ORIGINS)
+
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
+    supports_credentials=True,
 )
-
-
 import traceback
 from flask import jsonify
 
@@ -151,15 +157,25 @@ from flask import make_response
 
 @app.after_request
 def _add_cors_headers(resp):
-    """Ensure every /api response has permissive CORS headers.
+    """Ensure every /api response has correct CORS headers.
 
-    The frontend uses fetch(..., credentials: 'omit'), so we can safely allow '*'.
-    This avoids Render/gunicorn edge-cases where flask-cors headers go missing.
+    The frontend uses fetch(..., credentials: 'include'), therefore:
+      - Access-Control-Allow-Origin must be the requesting origin (not '*')
+      - Access-Control-Allow-Credentials must be 'true'
     """
     try:
         origin = request.headers.get("Origin")
-        resp.headers["Access-Control-Allow-Origin"] = origin or "*"
-        resp.headers["Vary"] = "Origin"
+
+        if origin and origin in FRONTEND_ORIGINS_SET:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+        else:
+            # Non-browser clients (no Origin) are fine. For unknown origins, don't enable credentials.
+            if origin:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Vary"] = "Origin"
+
         resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
         resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     except Exception:
@@ -168,13 +184,22 @@ def _add_cors_headers(resp):
 
 @app.before_request
 def _handle_options_preflight():
-    """Ensure preflight requests always get CORS headers."""
+    """Ensure preflight requests always get correct CORS headers."""
     if request.method != "OPTIONS":
         return None
+
     origin = request.headers.get("Origin")
     resp = make_response("", 204)
-    resp.headers["Access-Control-Allow-Origin"] = origin or "*"
-    resp.headers["Vary"] = "Origin"
+
+    if origin and origin in FRONTEND_ORIGINS_SET:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
+    else:
+        if origin:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
