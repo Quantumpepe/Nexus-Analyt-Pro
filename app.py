@@ -4614,9 +4614,10 @@ def api_grid_manual_add():
         return jsonify({"error": "forbidden"}), 403
 
     body = request.get_json(silent=True) or {}
-    wa, policy, e = _require_trading_enabled()
-    if e:
-        return e
+    wa = (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or "").strip()
+if not wa:
+    return jsonify({"error": "wallet required"}), 401
+    
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
     price = body.get("price")
