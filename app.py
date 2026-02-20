@@ -103,7 +103,7 @@ def _na_add_cors(resp):
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type, Authorization, X-Wallet-Address, x-wallet-address"
+           "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
         )
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     return resp
