@@ -4244,6 +4244,89 @@ def api_grid_budgets():
     })
 
 
+@app.route("/api/grid/budgets_by_chain", methods=["GET"])
+def api_grid_budgets_by_chain():
+    """Return grid budget locks grouped by chain symbol (ETH/BNB/POL).
+
+    Response:
+      { items:[...], totals:{locked_usd, available_usd}, by_chain:{ETH:{locked_usd,available_usd},...} }
+    """
+    wa = _require_auth()
+    if not wa:
+        return ok({"items": [], "totals": {"locked_usd": 0.0, "available_usd": 0.0}, "by_chain": {}})
+
+    wa_n = _norm_addr(wa)
+    items = []
+    locked_total = 0.0
+    avail_total = 0.0
+    by_chain = {}
+
+    def _item_chain(item_id: str) -> str:
+        s = (item_id or "").strip()
+        if ":" in s:
+            pref = s.split(":", 1)[0].upper()
+            if pref in ("ETH", "BNB", "POL"):
+                return pref
+        up = s.upper()
+        if up in ("ETH", "BNB", "POL"):
+            return up
+        # Default: treat unknown as ETH (keeps UI stable). Change to "UNKNOWN" if you prefer.
+        return "ETH"
+
+    try:
+        for item_id, sess in (GRID_SESSIONS or {}).items():
+            if not isinstance(sess, dict):
+                continue
+            if _norm_addr(sess.get("wallet_address") or "") != wa_n:
+                continue
+
+            locked = float(sess.get("wallet_locked_usd") or 0.0)
+            avail = float(sess.get("wallet_available_usd") or 0.0)
+            initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+
+            locked = max(0.0, locked)
+            avail = max(0.0, avail)
+            locked_total += locked
+            avail_total += avail
+
+            ch = _item_chain(str(item_id))
+            if ch not in by_chain:
+                by_chain[ch] = {"locked_usd": 0.0, "available_usd": 0.0}
+            by_chain[ch]["locked_usd"] += locked
+            by_chain[ch]["available_usd"] += avail
+
+            items.append({
+                "item": item_id,
+                "locked_usd": locked,
+                "available_usd": avail,
+                "initial_capital_usd": max(0.0, initc),
+                "mode": sess.get("mode"),
+                "order_mode": sess.get("order_mode"),
+                "chain": ch,
+            })
+    except Exception:
+        items = []
+        locked_total = 0.0
+        avail_total = 0.0
+        by_chain = {}
+
+    for ch in list(by_chain.keys()):
+        by_chain[ch]["locked_usd"] = round(by_chain[ch]["locked_usd"], 6)
+        by_chain[ch]["available_usd"] = round(by_chain[ch]["available_usd"], 6)
+
+    return ok({
+        "items": items,
+        "totals": {
+            "locked_usd": round(locked_total, 6),
+            "available_usd": round(avail_total, 6),
+        },
+        "by_chain": by_chain
+    })
+
+
+
+
+
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
     """Cancel/stop a single grid order for an item.
