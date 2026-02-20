@@ -90,6 +90,8 @@ CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
     supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 import traceback
 from flask import jsonify
