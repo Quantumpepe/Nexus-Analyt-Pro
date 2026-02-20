@@ -4617,12 +4617,6 @@ def api_grid_manual_add():
     wa, policy, e = _require_trading_enabled()
     if e:
         return e
-
-    # Access gate: manual add opens a new trade/order
-    st = _compute_access_status(wa)
-    if not bool(st.get("can_open_new_trades")):
-        return err("access required (no new trades allowed)", 403)
-
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
     price = body.get("price")
