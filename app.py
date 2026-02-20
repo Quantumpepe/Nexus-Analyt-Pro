@@ -93,6 +93,25 @@ CORS(
     allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
+from flask import request
+
+@app.after_request
+def _na_add_cors(resp):
+    origin = request.headers.get("Origin")
+    if origin and origin in FRONTEND_ORIGINS_SET:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Wallet-Address, x-wallet-address"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return resp
+
+@app.route("/api/<path:_path>", methods=["OPTIONS"])
+def _na_cors_preflight(_path):
+    return ("", 204)
+    
 import traceback
 from flask import jsonify
 
