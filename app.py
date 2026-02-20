@@ -4602,25 +4602,27 @@ def api_grid_autorun():
 
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
-   
-    api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
-    expected = os.getenv("NEXUS_API_KEY")
-
-    if expected and api_key != expected:
-        return jsonify({"error": "forbidden"}), 403
-    
     """
     Add a manual simulated order to the current grid session.
-    Body: { item, side: BUY/SELL, price, qty(optional) }
+    Body: { item, side: BUY/SELL, price, qty(optional) | usd(optional for BUY), ttl_s(optional) }
     """
+
+    # Optional internal API key (do NOT block normal authenticated users)
+    api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
+    expected = os.getenv("NEXUS_API_KEY")
+    if expected and api_key and api_key != expected:
+        return jsonify({"error": "forbidden"}), 403
+
     body = request.get_json(silent=True) or {}
     wa, policy, e = _require_trading_enabled()
     if e:
         return e
+
     # Access gate: manual add opens a new trade/order
     st = _compute_access_status(wa)
-    if not bool(st.get('can_open_new_trades')):
-        return err('access required (no new trades allowed)', 403)
+    if not bool(st.get("can_open_new_trades")):
+        return err("access required (no new trades allowed)", 403)
+
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
     price = body.get("price")
@@ -4640,12 +4642,13 @@ def api_grid_manual_add():
     except Exception:
         return err("invalid 'price'", 400)
 
-    session = GRID_SESSIONS.get(item_id)
-    session = _get_owned_session(item_id, wa)
-    if not session:
-        return err("forbidden", 403)
-    if not session:
+    # Distinguish "not started" vs "not owned"
+    raw_sess = GRID_SESSIONS.get(item_id)
+    if raw_sess is None:
         return err("grid not started (press Start first)", 404)
+    session = _get_owned_session(item_id, wa)
+    if session is None:
+        return err("forbidden", 403)
 
     try:
         # Allow BUY orders specified by USD budget (compute qty from the trigger price).
@@ -4661,15 +4664,16 @@ def api_grid_manual_add():
 
         # Wallet budget gate (simple): prevent BUY orders from exceeding available USD
         try:
-            if side == 'BUY' and usd is not None:
+            if side == "BUY" and usd is not None:
                 usd_f = float(usd)
-                avail = float(session.get('wallet_available_usd') or 0.0)
+                avail = float(session.get("wallet_available_usd") or 0.0)
                 if usd_f > avail + 1e-9:
-                    return err('insufficient available wallet budget', 403)
-                session['wallet_locked_usd'] = float(session.get('wallet_locked_usd') or 0.0) + usd_f
-                session['wallet_available_usd'] = max(0.0, avail - usd_f)
+                    return err("insufficient available wallet budget", 403)
+                session["wallet_locked_usd"] = float(session.get("wallet_locked_usd") or 0.0) + usd_f
+                session["wallet_available_usd"] = max(0.0, avail - usd_f)
         except Exception:
             pass
+
         oid = f"m{int(time.time()*1000)}"
         order = {
             "id": oid,
@@ -4684,28 +4688,24 @@ def api_grid_manual_add():
         if qty is not None:
             order["qty"] = round(float(qty), 8)
         if usd is not None:
-            # informational (front-end can show "buy $X at price Y")
             order["usd"] = round(float(usd), 2)
             if side == "BUY":
                 order["usd_locked"] = round(float(usd), 2)
 
-        session.setdefault("orders", []).append(order)
-        # Keep stable ordering: BUY desc, SELL asc, manual mixed in appropriately
-        try:
-            buys = sorted([o for o in session["orders"] if o.get("side") == "BUY"], key=lambda x: float(x.get("price") or 0), reverse=True)
-            sells = sorted([o for o in session["orders"] if o.get("side") == "SELL"], key=lambda x: float(x.get("price") or 0))
-            session["orders"] = buys + sells
-        except Exception:
-            pass
+        session.setdefault("manual_orders", [])
+        session["manual_orders"].append(order)
 
-        GRID_SESSIONS[item_id] = _trim_grid_session(session)
-        _persist_grid_state()
-        return jsonify({"status": "ok", "item": item_id, "order": order, "orders": session.get("orders", []), "fills": session.get("fills", []), "tick": int(session.get("ticks") or 0), "price": session.get("price")})
+        # Track orders list used by UI
+        session.setdefault("orders", [])
+        session["orders"].append(order)
+
+        _touch_session(item_id)
+        return jsonify({"ok": True, "order": order})
+
     except Exception as e:
         return err(str(e), 500)
 
 
-# --- Manual order aliases (compat for older frontends) ---
 @app.route("/api/grid/add", methods=["POST"])
 def api_grid_add_alias():
     return api_grid_manual_add()
