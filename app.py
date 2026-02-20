@@ -4602,6 +4602,13 @@ def api_grid_autorun():
 
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
+   
+    api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
+    expected = os.getenv("NEXUS_API_KEY")
+
+    if expected and api_key != expected:
+        return jsonify({"error": "forbidden"}), 403
+    
     """
     Add a manual simulated order to the current grid session.
     Body: { item, side: BUY/SELL, price, qty(optional) }
