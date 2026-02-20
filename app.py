@@ -4601,7 +4601,14 @@ def api_grid_autorun():
 
 
 @app.route("/api/grid/manual/add", methods=["POST"])
+@app.route("/api/grid/manual/add/", methods=["POST"])
+@app.route("/api/grid/manual_add", methods=["POST"])
+@app.route("/api/grid/manual", methods=["POST"])
+@app.route("/api/grid/add", methods=["POST"])
+@app.route("/api/add", methods=["POST"])
 def api_grid_manual_add():
+    ...
+    ...
     """
     Add a manual simulated order to the current grid session.
     Body: { item, side: BUY/SELL, price, qty(optional) | usd(optional for BUY), ttl_s(optional) }
