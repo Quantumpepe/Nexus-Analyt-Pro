@@ -4185,6 +4185,65 @@ def api_grid_orders():
     return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
 
 
+
+@app.route("/api/grid/budgets", methods=["GET"])
+def api_grid_budgets():
+    """Return per-item budget state for the authenticated wallet.
+
+    This powers the Wallet UI split:
+      - Total (on-chain) remains the vault/privy balance
+      - In bots (reserved) is derived from active grid sessions (USD-based budget lock)
+      - Available is informational (USD-based) and does NOT affect on-chain balances
+
+    Response:
+      { status:"ok", items:[{item, locked_usd, available_usd, initial_capital_usd, mode, order_mode}],
+        totals:{locked_usd, available_usd} }
+    """
+    wa = _require_auth()
+    if not wa:
+        return ok({"items": [], "totals": {"locked_usd": 0.0, "available_usd": 0.0}})
+
+    wa_n = _norm_addr(wa)
+    items = []
+    locked_total = 0.0
+    avail_total = 0.0
+
+    try:
+        for item_id, sess in (GRID_SESSIONS or {}).items():
+            if not isinstance(sess, dict):
+                continue
+            if _norm_addr(sess.get("wallet_address") or "") != wa_n:
+                continue
+
+            locked = float(sess.get("wallet_locked_usd") or 0.0)
+            avail = float(sess.get("wallet_available_usd") or 0.0)
+            initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+
+            locked_total += max(0.0, locked)
+            avail_total += max(0.0, avail)
+
+            items.append({
+                "item": item_id,
+                "locked_usd": max(0.0, locked),
+                "available_usd": max(0.0, avail),
+                "initial_capital_usd": max(0.0, initc),
+                "mode": sess.get("mode"),
+                "order_mode": sess.get("order_mode"),
+            })
+    except Exception:
+        items = []
+        locked_total = 0.0
+        avail_total = 0.0
+
+    return ok({
+        "items": items,
+        "totals": {
+            "locked_usd": round(locked_total, 6),
+            "available_usd": round(avail_total, 6),
+        }
+    })
+
+
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
     """Cancel/stop a single grid order for an item.
