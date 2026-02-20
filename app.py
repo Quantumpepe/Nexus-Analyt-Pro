@@ -5585,7 +5585,10 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
-
+@app.route("/api/grid/<path:subpath>", methods=["POST"])
+def api_grid_catchall(subpath):
+    print("GRID CATCH:", subpath)
+    return api_grid_manual_add()
 if __name__ == "__main__":
 
     import os
