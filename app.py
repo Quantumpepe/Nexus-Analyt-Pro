@@ -838,8 +838,7 @@ def get_policy(wallet_address: str) -> dict:
         "daily_loss_limit_usd": 50,
         "allowed_pairs": [],
         "allowed_contracts": [],
-        "kill_switch": False,
-        # Manual trading permission gate (must be enabled before grid/actions are allowed)
+# Manual trading permission gate (must be enabled before grid/actions are allowed)
         "trading_enabled": True,  # deprecated: access (redeem/subscription) gates trading; keep True for backward compatibility
         # Preference used by /api/trading/suitability (informational only)
         "trading_profile": "conservative",
@@ -1740,11 +1739,9 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     Nexus Analyt policy:
       - NO "Trading ON/OFF" gate in the product anymore.
       - Trading is allowed if (Redeem OR Subscription) access is ACTIVE.
-      - Optional safety: kill_switch remains a backend-side emergency stop.
 
     Enforces:
       - valid Bearer token
-      - kill_switch == False
       - access.can_open_new_trades == True   (Redeem / Subscription)
     """
     wa = _require_auth()
@@ -1752,8 +1749,6 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
         return None, None, err("unauthorized", 401)
 
     policy = get_policy(wa) or {}
-    if policy.get("kill_switch"):
-        return wa, policy, err("trading disabled (kill_switch)", 403)
 
     st = _compute_access_status(wa)
     if not bool(st.get("can_open_new_trades")):
@@ -2277,7 +2272,6 @@ def api_policy_set():
 
     cur = get_policy(wa)
     cur.update(policy)
-    cur["kill_switch"] = bool(cur.get("kill_switch", False))
     # Normalize extra fields
     # Trading ON/OFF removed: ignore any client-provided trading_enabled
     cur["trading_enabled"] = True
@@ -2315,8 +2309,6 @@ def api_intent_create():
         return err("missing pair or invalid side", 400)
 
     policy = get_policy(wa)
-    if policy.get("kill_switch"):
-        return err("trading disabled (kill_switch)", 403)
 
     if max_slippage_bps is None:
         max_slippage_bps = policy.get("max_slippage_bps", 75)
