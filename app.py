@@ -76,8 +76,65 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
-# Accept both /path and /path/ to avoid 404s due to trailing slashes
 app.url_map.strict_slashes = False
+# =========================================================
+# GRID – Manual Order Endpoints (USED BY FRONTEND)
+# =========================================================
+
+def _json():
+    return request.get_json(silent=True) or {}
+
+@app.post("/api/grid/manual")
+@app.post("/api/grid/manual/add")
+@app.post("/api/grid/order/add")
+@app.post("/api/grid/add")
+def api_grid_manual_add():
+    data = _json()
+
+    side = (data.get("side") or "").upper()
+    price = data.get("price")
+    qty = data.get("qty")
+    usd = data.get("usd")
+
+    if side not in ("BUY", "SELL"):
+        return {"error": "invalid side"}, 400
+    if price is None:
+        return {"error": "missing price"}, 400
+
+    try:
+        price = float(price)
+        if price <= 0:
+            raise ValueError()
+    except:
+        return {"error": "invalid price"}, 400
+
+    if qty is None and usd is None:
+        return {"error": "missing qty/usd"}, 400
+
+    try:
+        if qty is not None:
+            qty = float(qty)
+            if qty <= 0:
+                raise ValueError()
+        if usd is not None:
+            usd = float(usd)
+            if usd <= 0:
+                raise ValueError()
+    except:
+        return {"error": "invalid qty/usd"}, 400
+
+    # 🔁 HIER später deine echte Grid-Logik einhängen
+    order = {
+        "id": int(__import__("time").time() * 1000),
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "usd": usd,
+    }
+
+    return {"ok": True, "order": order}
+# Accept both /path and /path/ to avoid 404s due to trailing slashes
+
 
 # Enable CORS for all API routes (UI is on a different domain)
 # ---- CORS ----
