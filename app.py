@@ -92,7 +92,7 @@ CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
     supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address", "X-API-Key", "x-wallet-address", "x-api-key"],
+    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 from flask import request
@@ -152,6 +152,80 @@ FRONTEND_ORIGINS = [
     "https://www.nexus-analyt-ui.onrender.com",
 ]
 
+# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
+# We therefore also mirror headers manually for known frontend origins.
+_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
+
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in FRONTEND_ORIGINS:
+        return True
+    # Accept Render subdomains for this project (ui/pro)
+    return bool(_FRONTEND_ORIGIN_RE.match(origin))
+
+CORS(
+    app,
+    resources={r"/api/*": {"origins": "*"}},
+    supports_credentials=False,
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
+)
+
+
+from flask import make_response
+
+
+@app.after_request
+def _add_cors_headers(resp):
+    """Ensure every /api response has correct CORS headers.
+
+    The frontend uses fetch(..., credentials: 'include'), therefore:
+      - Access-Control-Allow-Origin must be the requesting origin (not '*')
+      - Access-Control-Allow-Credentials must be 'true'
+    """
+    try:
+        origin = request.headers.get("Origin")
+
+        if origin and origin in FRONTEND_ORIGINS_SET:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Vary"] = "Origin"
+        else:
+            # Non-browser clients (no Origin) are fine. For unknown origins, don't enable credentials.
+            if origin:
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Vary"] = "Origin"
+
+        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    except Exception:
+        pass
+    return resp
+
+@app.before_request
+def _handle_options_preflight():
+    """Ensure preflight requests always get correct CORS headers."""
+    if request.method != "OPTIONS":
+        return None
+
+    origin = request.headers.get("Origin")
+    resp = make_response("", 204)
+
+    if origin and origin in FRONTEND_ORIGINS_SET:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
+    else:
+        if origin:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return resp
 
 
 @app.route("/", methods=["GET"])
@@ -766,7 +840,7 @@ def get_policy(wallet_address: str) -> dict:
         "allowed_contracts": [],
         "kill_switch": False,
         # Manual trading permission gate (must be enabled before grid/actions are allowed)
-        "trading_enabled": False,
+        "trading_enabled": True,  # deprecated: access (redeem/subscription) gates trading; keep True for backward compatibility
         # Preference used by /api/trading/suitability (informational only)
         "trading_profile": "conservative",
     }
@@ -1357,7 +1431,7 @@ def _access_defaults() -> dict:
         "ai_limit": _AI_LIMIT_FREE,
         "can_open_new_trades": False,
         "can_close_trades": True,
-            "active": False,
+        "active": False,
     }
 
 
@@ -1400,18 +1474,6 @@ def _compute_access_status(wallet_address: str | None) -> dict:
         ai_limit = int(ai_limit) if ai_limit is not None else _AI_LIMIT_FREE
     except Exception:
         ai_limit = _AI_LIMIT_FREE
-
-    # If access comes from NFT activation, ensure NFT is still owned (no onchain lock possible).
-    try:
-        if str(st.get("source") or "").lower().startswith("nft_"):
-            tier = "gold" if str(st.get("plan") or "").lower() == "gold" else "silver"
-            if not _owns_nft(wa, tier):
-                base = _access_defaults()
-                base["source"] = "nft_not_owned"
-                base["expires_at"] = int(exp) if exp is not None else None
-                return base
-    except Exception:
-        pass
 
     can_open = bool(st.get("can_open_new_trades"))
 
@@ -1674,19 +1736,31 @@ def api_access_redeem():
 def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[tuple]]:
     """
     Returns (wallet_address, policy, error_response_tuple_or_None).
+
+    Nexus Analyt policy:
+      - NO "Trading ON/OFF" gate in the product anymore.
+      - Trading is allowed if (Redeem OR Subscription) access is ACTIVE.
+      - Optional safety: kill_switch remains a backend-side emergency stop.
+
     Enforces:
       - valid Bearer token
       - kill_switch == False
-      - trading_enabled == True
+      - access.can_open_new_trades == True   (Redeem / Subscription)
     """
     wa = _require_auth()
     if not wa:
         return None, None, err("unauthorized", 401)
-    policy = get_policy(wa)
+
+    policy = get_policy(wa) or {}
     if policy.get("kill_switch"):
         return wa, policy, err("trading disabled (kill_switch)", 403)
-    if not bool(policy.get("trading_enabled", False)):
-        return wa, policy, err("trading not enabled; set policy.trading_enabled=true", 403)
+
+    st = _compute_access_status(wa)
+    if not bool(st.get("can_open_new_trades")):
+        return wa, policy, err("access required (redeem or subscription) to open new trades", 403)
+
+    # Backward-compat for older clients expecting this field
+    policy.setdefault("trading_enabled", True)
     return wa, policy, None
 
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
@@ -2198,13 +2272,15 @@ def api_policy_set():
     if not isinstance(policy, dict):
         return err("policy must be an object", 400)
 
+    # Trading ON/OFF removed: do not accept trading_enabled from clients
+    policy.pop("trading_enabled", None)
+
     cur = get_policy(wa)
     cur.update(policy)
     cur["kill_switch"] = bool(cur.get("kill_switch", False))
-
     # Normalize extra fields
-    if "trading_enabled" in cur:
-        cur["trading_enabled"] = bool(cur.get("trading_enabled", False))
+    # Trading ON/OFF removed: ignore any client-provided trading_enabled
+    cur["trading_enabled"] = True
     prof = str(cur.get("trading_profile") or "conservative").strip().lower()
     if prof not in ("conservative", "balanced", "volatility"):
         prof = "conservative"
@@ -2217,38 +2293,6 @@ def api_policy_set():
 # -------------------------
 # Trade Intents (Strategy -> Execution)
 # -------------------------
-# -------------------------
-# Trading enable/disable
-# -------------------------
-@app.route("/api/trading/enable", methods=["POST"])
-def api_trading_enable():
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-
-    cur = get_policy(wa)
-
-    # If a global/user kill switch is active, do not allow enabling trading.
-    if bool(cur.get("kill_switch", False)):
-        return err("trading disabled (kill_switch)", 403)
-
-    cur["trading_enabled"] = True
-    set_policy(wa, cur)
-    return ok({"trading_enabled": True, "policy": cur})
-
-
-@app.route("/api/trading/disable", methods=["POST"])
-def api_trading_disable():
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-
-    cur = get_policy(wa)
-    cur["trading_enabled"] = False
-    set_policy(wa, cur)
-    return ok({"trading_enabled": False, "policy": cur})
-
-
 @app.route("/api/intents/create", methods=["POST"])
 def api_intent_create():
     wa, access, e_access = _require_access_open()
