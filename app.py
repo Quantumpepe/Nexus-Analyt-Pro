@@ -76,7 +76,8 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
-print("BOOT: nexus-analyt-pro app.py loaded ✅")
+# Accept both /path and /path/ to avoid 404s due to trailing slashes
+app.url_map.strict_slashes = False
 
 # Enable CORS for all API routes (UI is on a different domain)
 # ---- CORS ----
@@ -4602,14 +4603,7 @@ def api_grid_autorun():
 
 
 @app.route("/api/grid/manual/add", methods=["POST"])
-@app.route("/api/grid/manual/add/", methods=["POST"])
-@app.route("/api/grid/manual_add", methods=["POST"])
-@app.route("/api/grid/manual", methods=["POST"])
-@app.route("/api/grid/add", methods=["POST"])
-@app.route("/api/add", methods=["POST"])
 def api_grid_manual_add():
-    ...
-    ...
     """
     Add a manual simulated order to the current grid session.
     Body: { item, side: BUY/SELL, price, qty(optional) | usd(optional for BUY), ttl_s(optional) }
@@ -4622,11 +4616,15 @@ def api_grid_manual_add():
         return jsonify({"error": "forbidden"}), 403
 
     body = request.get_json(silent=True) or {}
+    wa, policy, e = _require_trading_enabled()
+    if e:
+        return e
 
-    wa = (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or "").strip()
-    if not wa:
-        return jsonify({"error": "wallet required"}), 401
-    
+    # Access gate: manual add opens a new trade/order
+    st = _compute_access_status(wa)
+    if not bool(st.get("can_open_new_trades")):
+        return err("access required (no new trades allowed)", 403)
+
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
     price = body.get("price")
@@ -5585,10 +5583,7 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
-@app.route("/api/grid/<path:subpath>", methods=["POST"])
-def api_grid_catchall(subpath):
-    print("GRID CATCH:", subpath)
-    return api_grid_manual_add()
+
 if __name__ == "__main__":
 
     import os
