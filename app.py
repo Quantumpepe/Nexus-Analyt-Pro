@@ -1431,7 +1431,7 @@ def _access_defaults() -> dict:
         "ai_limit": _AI_LIMIT_FREE,
         "can_open_new_trades": False,
         "can_close_trades": True,
-            "active": True,
+            "active": False,
     }
 
 
@@ -4621,9 +4621,13 @@ def api_grid_manual_add():
         return e
 
     # Access gate: manual add opens a new trade/order
-    st = _compute_access_status(wa)
-    if not bool(st.get("can_open_new_trades")):
-        return err("access required (no new trades allowed)", 403)
+    # By default we do NOT block manual grid adds by subscription status.
+    # Set NEXUS_REQUIRE_ACCESS_OPEN=1 in ENV to enforce subscription gating.
+    require_access = str(os.getenv("NEXUS_REQUIRE_ACCESS_OPEN") or "0").strip() in ("1", "true", "yes", "on")
+    if require_access:
+        st = _compute_access_status(wa)
+        if not bool(st.get("can_open_new_trades")):
+            return err("access required (no new trades allowed)", 403)
 
     item_id = str(body.get("item") or "").strip()
     side = str(body.get("side") or "").upper().strip()
