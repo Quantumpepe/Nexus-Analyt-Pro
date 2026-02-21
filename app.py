@@ -76,10 +76,6 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
-# ===== GLOBAL POLICY STATE =====
-policy = {
-    "trading_enabled": True  # default ON
-}
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
 app.url_map.strict_slashes = False
 
@@ -96,7 +92,7 @@ CORS(
     app,
     resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
     supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
+    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address", "X-API-Key", "x-wallet-address", "x-api-key"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
 from flask import request
@@ -156,80 +152,6 @@ FRONTEND_ORIGINS = [
     "https://www.nexus-analyt-ui.onrender.com",
 ]
 
-# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
-# We therefore also mirror headers manually for known frontend origins.
-_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
-
-def _is_allowed_origin(origin: str) -> bool:
-    if not origin:
-        return False
-    if origin in FRONTEND_ORIGINS:
-        return True
-    # Accept Render subdomains for this project (ui/pro)
-    return bool(_FRONTEND_ORIGIN_RE.match(origin))
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    expose_headers=["Content-Type"],
-    max_age=86400,
-)
-
-
-from flask import make_response
-
-
-@app.after_request
-def _add_cors_headers(resp):
-    """Ensure every /api response has correct CORS headers.
-
-    The frontend uses fetch(..., credentials: 'include'), therefore:
-      - Access-Control-Allow-Origin must be the requesting origin (not '*')
-      - Access-Control-Allow-Credentials must be 'true'
-    """
-    try:
-        origin = request.headers.get("Origin")
-
-        if origin and origin in FRONTEND_ORIGINS_SET:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Access-Control-Allow-Credentials"] = "true"
-            resp.headers["Vary"] = "Origin"
-        else:
-            # Non-browser clients (no Origin) are fine. For unknown origins, don't enable credentials.
-            if origin:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Vary"] = "Origin"
-
-        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
-    except Exception:
-        pass
-    return resp
-
-@app.before_request
-def _handle_options_preflight():
-    """Ensure preflight requests always get correct CORS headers."""
-    if request.method != "OPTIONS":
-        return None
-
-    origin = request.headers.get("Origin")
-    resp = make_response("", 204)
-
-    if origin and origin in FRONTEND_ORIGINS_SET:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Vary"] = "Origin"
-    else:
-        if origin:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
-
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    return resp
 
 
 @app.route("/", methods=["GET"])
@@ -1761,7 +1683,6 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     if not wa:
         return None, None, err("unauthorized", 401)
     policy = get_policy(wa)
-    policy.setdefault("trading_enabled", True)
     if policy.get("kill_switch"):
         return wa, policy, err("trading disabled (kill_switch)", 403)
     if not bool(policy.get("trading_enabled", False)):
@@ -2296,6 +2217,38 @@ def api_policy_set():
 # -------------------------
 # Trade Intents (Strategy -> Execution)
 # -------------------------
+# -------------------------
+# Trading enable/disable
+# -------------------------
+@app.route("/api/trading/enable", methods=["POST"])
+def api_trading_enable():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+
+    cur = get_policy(wa)
+
+    # If a global/user kill switch is active, do not allow enabling trading.
+    if bool(cur.get("kill_switch", False)):
+        return err("trading disabled (kill_switch)", 403)
+
+    cur["trading_enabled"] = True
+    set_policy(wa, cur)
+    return ok({"trading_enabled": True, "policy": cur})
+
+
+@app.route("/api/trading/disable", methods=["POST"])
+def api_trading_disable():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+
+    cur = get_policy(wa)
+    cur["trading_enabled"] = False
+    set_policy(wa, cur)
+    return ok({"trading_enabled": False, "policy": cur})
+
+
 @app.route("/api/intents/create", methods=["POST"])
 def api_intent_create():
     wa, access, e_access = _require_access_open()
@@ -4732,35 +4685,6 @@ def api_add_alias():
 @app.route("/api/grid/manual", methods=["POST"])
 def api_grid_manual_alias():
     return api_grid_manual_add()
-
-@app.route("/api/policy", methods=["GET", "POST"])
-def api_policy():
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-
-    policy = get_policy(wa) or {}
-    policy.setdefault("trading_enabled", True)
-
-    if request.method == "GET":
-        return jsonify({"ok": True, "policy": policy})
-
-    body = request.get_json(silent=True) or {}
-    if "trading_enabled" in body:
-        policy["trading_enabled"] = bool(body["trading_enabled"])
-
-    if "kill_switch" in body:
-        policy["kill_switch"] = bool(body["kill_switch"])
-
-    # IMPORTANT: persist it
-    try:
-        set_policy(wa, policy)  # falls vorhanden
-    except NameError:
-        # Wenn du keine set_policy hast: sag mir kurz, wie policy gespeichert wird (sqlite? json file? dict?),
-        # dann passe ich es exakt an.
-        pass
-
-    return jsonify({"ok": True, "policy": policy})
 
 
 # -------------------------
