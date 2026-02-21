@@ -1761,6 +1761,7 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     if not wa:
         return None, None, err("unauthorized", 401)
     policy = get_policy(wa)
+    policy.setdefault("trading_enabled", True)
     if policy.get("kill_switch"):
         return wa, policy, err("trading disabled (kill_switch)", 403)
     if not bool(policy.get("trading_enabled", False)):
@@ -4731,6 +4732,35 @@ def api_add_alias():
 @app.route("/api/grid/manual", methods=["POST"])
 def api_grid_manual_alias():
     return api_grid_manual_add()
+
+@app.route("/api/policy", methods=["GET", "POST"])
+def api_policy():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+
+    policy = get_policy(wa) or {}
+    policy.setdefault("trading_enabled", True)
+
+    if request.method == "GET":
+        return jsonify({"ok": True, "policy": policy})
+
+    body = request.get_json(silent=True) or {}
+    if "trading_enabled" in body:
+        policy["trading_enabled"] = bool(body["trading_enabled"])
+
+    if "kill_switch" in body:
+        policy["kill_switch"] = bool(body["kill_switch"])
+
+    # IMPORTANT: persist it
+    try:
+        set_policy(wa, policy)  # falls vorhanden
+    except NameError:
+        # Wenn du keine set_policy hast: sag mir kurz, wie policy gespeichert wird (sqlite? json file? dict?),
+        # dann passe ich es exakt an.
+        pass
+
+    return jsonify({"ok": True, "policy": policy})
 
 
 # -------------------------
