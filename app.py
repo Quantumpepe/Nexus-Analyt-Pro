@@ -76,6 +76,10 @@ if GridConfig is None:
 # App init
 # -------------------------
 app = Flask(__name__)
+# ===== GLOBAL POLICY STATE =====
+policy = {
+    "trading_enabled": True  # default ON
+}
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
 app.url_map.strict_slashes = False
 
