@@ -2,7 +2,24 @@
 from __future__ import annotations
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+import json
+import os
+from web3 import Web3
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+ABI_MAP = {
+    "POL": os.path.join(BASE_DIR, "abi", "NexusVaultLedgerV1_ABI.json"),
+    "BNB": os.path.join(BASE_DIR, "abi", "NexusVaultLedger_BNB_ABI.json"),
+    "ETH": os.path.join(BASE_DIR, "abi", "NexusVaultLedger_ETH_ABI.json"),
+}
+
+def load_vault_abi(chain: str):
+    path = ABI_MAP.get(chain)
+    if not path or not os.path.exists(path):
+        raise RuntimeError(f"ABI not found for chain {chain}: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 import os
 import time
 import threading
