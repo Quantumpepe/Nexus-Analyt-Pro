@@ -59,35 +59,71 @@ def _get_rpc_for_chain(chain: str) -> str:
         return os.getenv("ETH_RPC_URL", "") or os.getenv("RPC_URL", "")
     return os.getenv("RPC_URL", "")
 
-def _vault_contract_min_abi():
-    # Minimal ABI: only what the operator needs for autonomous execution + lightweight state reads.
-    return [
-        {"type":"function","name":"startCycle","stateMutability":"nonpayable",
-         "inputs":[{"name":"user","type":"address"}],"outputs":[]},
-        {"type":"function","name":"buyToken","stateMutability":"nonpayable",
-         "inputs":[
-            {"name":"user","type":"address"},
-            {"name":"polIn","type":"uint256"},
-            {"name":"amountOutMin","type":"uint256"},
-            {"name":"path","type":"address[]"},
-            {"name":"deadline","type":"uint256"}
-         ],"outputs":[]},
-        {"type":"function","name":"sellTokenToPOL","stateMutability":"nonpayable",
-         "inputs":[
-            {"name":"user","type":"address"},
-            {"name":"tokenInAmount","type":"uint256"},
-            {"name":"amountOutMin","type":"uint256"},
-            {"name":"path","type":"address[]"},
-            {"name":"deadline","type":"uint256"}
-         ],"outputs":[]},
-        {"type":"function","name":"endCycle","stateMutability":"nonpayable",
-         "inputs":[{"name":"user","type":"address"}],"outputs":[]},
-        {"type":"function","name":"WMATIC","stateMutability":"view","inputs":[],"outputs":[{"type":"address"}]},
-        {"type":"function","name":"polBalance","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
-        {"type":"function","name":"inCycle","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"bool"}]},
-        {"type":"function","name":"heldToken","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"address"}]},
-        {"type":"function","name":"heldTokenBal","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
-    ]
+def _vault_contract_abi(chain: str):
+    """
+    Load the Vault ABI from local JSON files (recommended), falling back to a minimal ABI.
+    Note: ABI is chain-specific in your deployments:
+      - POL uses WMATIC()
+      - BNB uses WBNB()
+      - ETH version includes V2/V3 helpers
+    Put the ABI JSON files in ./abi/ next to this app file:
+      abi/NexusVaultLedgerV1_ABI.json      (Polygon)
+      abi/NexusVaultLedger_BNB_ABI.json    (BSC)
+      abi/NexusVaultLedger_ETH_ABI.json    (Ethereum)
+    You can override with VAULT_ABI_PATH env var (absolute path or relative to this file).
+    """
+    # 1) explicit override
+    override = os.getenv("VAULT_ABI_PATH", "").strip()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    if override:
+        abi_path = override if os.path.isabs(override) else os.path.join(base_dir, override)
+        try:
+            with open(abi_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load VAULT_ABI_PATH={abi_path}: {e}")
+
+    # 2) chain default
+    c = (chain or "").upper()
+    if c in ("BNB", "BSC"):
+        rel = os.path.join("abi", "NexusVaultLedger_BNB_ABI.json")
+    elif c in ("ETH", "ETHEREUM"):
+        rel = os.path.join("abi", "NexusVaultLedger_ETH_ABI.json")
+    else:
+        rel = os.path.join("abi", "NexusVaultLedgerV1_ABI.json")
+
+    abi_path = os.path.join(base_dir, rel)
+    try:
+        with open(abi_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # 3) minimal fallback (still enough to execute autonomously)
+        return [
+            {"type":"function","name":"startCycle","stateMutability":"nonpayable",
+             "inputs":[{"name":"user","type":"address"}],"outputs":[]},
+            {"type":"function","name":"buyToken","stateMutability":"nonpayable",
+             "inputs":[
+                {"name":"user","type":"address"},
+                {"name":"polIn","type":"uint256"},
+                {"name":"amountOutMin","type":"uint256"},
+                {"name":"path","type":"address[]"},
+                {"name":"deadline","type":"uint256"}
+             ],"outputs":[]},
+            {"type":"function","name":"sellTokenToPOL","stateMutability":"nonpayable",
+             "inputs":[
+                {"name":"user","type":"address"},
+                {"name":"tokenInAmount","type":"uint256"},
+                {"name":"amountOutMin","type":"uint256"},
+                {"name":"path","type":"address[]"},
+                {"name":"deadline","type":"uint256"}
+             ],"outputs":[]},
+            {"type":"function","name":"endCycle","stateMutability":"nonpayable",
+             "inputs":[{"name":"user","type":"address"}],"outputs":[]},
+            {"type":"function","name":"polBalance","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
+            {"type":"function","name":"inCycle","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"bool"}]},
+            {"type":"function","name":"heldToken","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"address"}]},
+            {"type":"function","name":"heldTokenBal","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
+        ]
 
 def _get_operator_key() -> str:
     return os.getenv("BOT_PRIVATE_KEY", "") or os.getenv("OPERATOR_PRIVATE_KEY", "") or os.getenv("PRIVATE_KEY", "")
@@ -121,7 +157,7 @@ def _web3_and_contract(session: dict):
         raise RuntimeError("Missing vault address. Provide session.vault_address or set VAULT_ADDRESS env.")
     if not w3.is_address(vault_addr):
         raise RuntimeError("Invalid vault address: %s" % vault_addr)
-    contract = w3.eth.contract(address=w3.to_checksum_address(vault_addr), abi=_vault_contract_min_abi())
+    contract = w3.eth.contract(address=w3.to_checksum_address(vault_addr), abi=_vault_contract_abi(chain))
     return w3, acct, contract
 
 def _send_tx(w3, acct, fn):
