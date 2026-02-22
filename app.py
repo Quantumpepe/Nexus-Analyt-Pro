@@ -4457,10 +4457,14 @@ def api_grid_budgets_by_chain():
 
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
+    """Stop (cancel) a single order.
+    Accepts (any):
+      {item, id} OR {item, orderId/order_id} OR {item, side, price, level}
     """
-    Cancel/stop a single grid order for an item.
-    Accepts: {item, id} OR {item, side, price, level}
-    """
+    wa = _require_auth()
+    if not wa:
+        return jsonify({"error": "unauthorized"}), 401
+
     payload = request.get_json(silent=True) or {}
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
@@ -4470,7 +4474,7 @@ def api_grid_order_stop():
     if not isinstance(sess, dict):
         return jsonify({"error": f"no grid session for item '{item_id}'"}), 404
 
-    oid = payload.get("id")
+    oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     side = payload.get("side")
     price = payload.get("price")
     level = payload.get("level")
@@ -4478,36 +4482,44 @@ def api_grid_order_stop():
     orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
     updated = False
 
-    for o in orders:
+    def _match(o: dict) -> bool:
         if not isinstance(o, dict):
-            continue
+            return False
         if o.get("status") != "OPEN":
-            continue
+            return False
 
-        # Prefer id match if present
-        if oid and str(o.get("id")) == str(oid):
+        if oid is not None and str(oid).strip() != "":
+            return str(o.get("id")) == str(oid)
+
+        # fallback match: side+level (+ optional price)
+        if side is None or level is None:
+            return False
+        if str(o.get("side")) != str(side):
+            return False
+        if o.get("level") != level:
+            return False
+        if price is None:
+            return True
+        # tolerate string/float comparisons
+        try:
+            return float(o.get("price")) == float(price)
+        except Exception:
+            return o.get("price") == price
+
+    for o in orders:
+        if _match(o):
             o["status"] = "CANCELLED"
             o["cancelled_ts"] = int(time.time())
             updated = True
             break
 
-        # Fallback match (older orders without id)
-        if (oid is None or oid == "") and side and str(o.get("side")) == str(side) and level is not None and o.get("level") == level:
-            if price is None or o.get("price") == price:
-                o["status"] = "CANCELLED"
-                o["cancelled_ts"] = int(time.time())
-                updated = True
-                break
-
     if not updated:
         return jsonify({"error": "order not found or not open"}), 404
 
-    # Keep history tidy + persist (IMPORTANT: do NOT call _grid_prune_history - it doesn't exist)
     try:
         _trim_grid_session(sess)
         _persist_grid_state()
     except Exception as e:
-        # never crash
         print("[WARN] stop order post-processing failed:", e)
 
     return jsonify({
@@ -4519,30 +4531,54 @@ def api_grid_order_stop():
     })
 
 
-# --- ADD this new endpoint anywhere below (e.g. near /api/grid/order/stop) ---
-
 @app.route("/api/grid/order/delete", methods=["POST"])
 def api_grid_order_delete():
+    """Delete a single order from a grid session.
+    Accepts:
+      {item, id} OR {item, orderId/order_id} OR {item, side, price, level}
     """
-    Permanently delete a single order from a grid session.
-    Accepts: {item, id}
-    """
+    wa = _require_auth()
+    if not wa:
+        return jsonify({"error": "unauthorized"}), 401
+
     payload = request.get_json(silent=True) or {}
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
         return jsonify({"error": "missing item"}), 400
 
-    oid = payload.get("id")
-    if oid is None or str(oid).strip() == "":
-        return jsonify({"error": "missing id"}), 400
-
     sess = GRID_SESSIONS.get(item_id)
     if not isinstance(sess, dict):
         return jsonify({"error": f"no grid session for item '{item_id}'"}), 404
 
+    oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
+    side = payload.get("side")
+    price = payload.get("price")
+    level = payload.get("level")
+
     orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+
+    def _match(o: dict) -> bool:
+        if not isinstance(o, dict):
+            return False
+
+        if oid is not None and str(oid).strip() != "":
+            return str(o.get("id")) == str(oid)
+
+        if side is None or level is None:
+            return False
+        if str(o.get("side")) != str(side):
+            return False
+        if o.get("level") != level:
+            return False
+        if price is None:
+            return True
+        try:
+            return float(o.get("price")) == float(price)
+        except Exception:
+            return o.get("price") == price
+
     before = len(orders)
-    orders = [o for o in orders if not (isinstance(o, dict) and str(o.get("id")) == str(oid))]
+    orders = [o for o in orders if not _match(o)]
     after = len(orders)
 
     if after == before:
@@ -4558,7 +4594,6 @@ def api_grid_order_delete():
 
     return jsonify({
         "status": "ok",
-        "deleted_id": str(oid),
         "orders": sess.get("orders", []),
         "fills": sess.get("fills", []),
         "tick": sess.get("ticks", 0),
@@ -4636,112 +4671,105 @@ def api_grid_autorun():
 
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
+    """Add a manual order (OPEN) into an existing grid session.
+
+    Expected JSON:
+      {
+        "item": "...",
+        "side": "BUY"|"SELL",
+        "price": number,
+        "qty": number,          # token/native quantity (UI uses Qty)
+        "slippage": number,
+        "deadline": number
+      }
+
+    Notes:
+    - This endpoint only stores the order + reserves Qty logically.
+    - Execution happens asynchronously by the grid executor (backend) when cycle is running.
     """
-    Add a manual simulated order to the current grid session.
-    Body: { item, side: BUY/SELL, price, qty(optional) | usd(optional for BUY), ttl_s(optional) }
-    """
+    wa = _require_auth()
+    if not wa:
+        return jsonify({"error": "unauthorized"}), 401
 
-    # Optional internal API key (do NOT block normal authenticated users)
-    api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
-    expected = os.getenv("NEXUS_API_KEY")
-    if expected and api_key and api_key != expected:
-        return jsonify({"error": "forbidden"}), 403
-
-    body = request.get_json(silent=True) or {}
-    wa, policy, e = _require_trading_enabled()
-    if e:
-        return e
-
-    # Access gate: manual add opens a new trade/order
-    # By default we do NOT block manual grid adds by subscription status.
-    # Set NEXUS_REQUIRE_ACCESS_OPEN=1 in ENV to enforce subscription gating.
-    require_access = str(os.getenv("NEXUS_REQUIRE_ACCESS_OPEN") or "0").strip() in ("1", "true", "yes", "on")
-    if require_access:
-        st = _compute_access_status(wa)
-        if not bool(st.get("can_open_new_trades")):
-            return err("access required (no new trades allowed)", 403)
-
-    item_id = str(body.get("item") or "").strip()
-    side = str(body.get("side") or "").upper().strip()
-    price = body.get("price")
-    qty = body.get("qty", body.get("amount", None))
-    usd = body.get("usd")
-    ttl_s = body.get("ttl_s") or body.get("ttl")
-    # ttl_s is currently informational (frontend may send it); simulation keeps manual orders until filled/cancelled.
-
-    if not item_id:
-        return err("missing 'item' in body", 400)
-    if side not in ("BUY", "SELL"):
-        return err("side must be BUY or SELL", 400)
-    try:
-        price = float(price)
-        if not (price > 0):
-            raise ValueError()
-    except Exception:
-        return err("invalid 'price'", 400)
-
-    # Distinguish "not started" vs "not owned"
-    raw_sess = GRID_SESSIONS.get(item_id)
-    if raw_sess is None:
-        return err("grid not started (press Start first)", 404)
-    session = _get_owned_session(item_id, wa)
-    if session is None:
-        return err("forbidden", 403)
+    _require_trading_enabled_or_403()
 
     try:
-        # Allow BUY orders specified by USD budget (compute qty from the trigger price).
-        # SELL orders remain qty-based.
-        if qty is None and usd is not None and side == "BUY":
-            usd = float(usd)
-            if usd <= 0:
-                return err("invalid 'usd' amount", 400)
-            qty = usd / float(price)
+        payload = request.get_json(silent=True) or {}
+        item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+        if not item_id:
+            return jsonify({"error": "missing item"}), 400
 
-        if qty is not None:
-            qty = float(qty)
+        side = str(payload.get("side") or "").upper().strip()
+        if side not in ("BUY", "SELL"):
+            return jsonify({"error": "side must be BUY or SELL"}), 400
 
-        # Wallet budget gate (simple): prevent BUY orders from exceeding available USD
+        price = payload.get("price")
+        if price is None:
+            return jsonify({"error": "missing price"}), 400
         try:
-            if side == "BUY" and usd is not None:
-                usd_f = float(usd)
-                avail = float(session.get("wallet_available_usd") or 0.0)
-                if usd_f > avail + 1e-9:
-                    return err("insufficient available wallet budget", 403)
-                session["wallet_locked_usd"] = float(session.get("wallet_locked_usd") or 0.0) + usd_f
-                session["wallet_available_usd"] = max(0.0, avail - usd_f)
+            price_f = float(price)
         except Exception:
-            pass
+            return jsonify({"error": "invalid price"}), 400
+        if price_f <= 0:
+            return jsonify({"error": "price must be > 0"}), 400
 
-        oid = f"m{int(time.time()*1000)}"
+        qty = payload.get("qty")
+        if qty is None:
+            return jsonify({"error": "missing qty"}), 400
+        try:
+            qty_f = float(qty)
+        except Exception:
+            return jsonify({"error": "invalid qty"}), 400
+        if qty_f <= 0:
+            return jsonify({"error": "qty must be > 0"}), 400
+
+        slippage = payload.get("slippage")
+        deadline = payload.get("deadline")
+        try:
+            slip_f = float(slippage) if slippage is not None else float(DEFAULT_SLIPPAGE_PCT)
+        except Exception:
+            slip_f = float(DEFAULT_SLIPPAGE_PCT)
+        try:
+            deadline_i = int(deadline) if deadline is not None else int(DEFAULT_DEADLINE_MINUTES)
+        except Exception:
+            deadline_i = int(DEFAULT_DEADLINE_MINUTES)
+
+        sess = GRID_SESSIONS.get(item_id)
+        if not isinstance(sess, dict):
+            return jsonify({"error": f"no grid session for item '{item_id}' - press Start first"}), 404
+
+        # Create order
         order = {
-            "id": oid,
-            "item": item_id,
+            "id": str(uuid.uuid4()),
             "side": side,
-            "price": round(price, 8),
+            "price": round(price_f, 12),
+            "qty": round(qty_f, 12),
+            "slippage": slip_f,
+            "deadline": deadline_i,
             "status": "OPEN",
-            "level": "MANUAL",
-            "manual": True,
-            "created_ts": int(time.time()),
+            "source": "MANUAL",
+            "ts": int(time.time()),
+            "level": payload.get("level", None),  # optional
         }
-        if qty is not None:
-            order["qty"] = round(float(qty), 8)
-        if usd is not None:
-            order["usd"] = round(float(usd), 2)
-            if side == "BUY":
-                order["usd_locked"] = round(float(usd), 2)
 
-        session.setdefault("manual_orders", [])
-        session["manual_orders"].append(order)
+        if not isinstance(sess.get("orders"), list):
+            sess["orders"] = []
+        sess["orders"].insert(0, order)
 
-        # Track orders list used by UI
-        session.setdefault("orders", [])
-        session["orders"].append(order)
+        _trim_grid_session(sess)
+        _persist_grid_state()
 
-        _touch_session(item_id)
-        return jsonify({"ok": True, "order": order})
-
+        return jsonify({
+            "status": "ok",
+            "order": order,
+            "orders": sess.get("orders", []),
+            "fills": sess.get("fills", []),
+            "tick": sess.get("ticks", 0),
+            "price": sess.get("price")
+        })
     except Exception as e:
-        return err(str(e), 500)
+        print("[ERROR] manual add failed:", e)
+        return jsonify({"error": "internal_error", "detail": str(e)}), 500
 
 
 @app.route("/api/grid/add", methods=["POST"])
