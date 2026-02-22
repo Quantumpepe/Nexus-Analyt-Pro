@@ -26,6 +26,243 @@ from watchlist import get_watchlist
 from safety import evaluate_safety
 import grid_sim
 
+
+# --- On-chain executor (Vault Operator) ---
+# This backend can optionally execute FILLED orders on-chain through the NexusVaultLedgerV1 contract.
+# Autonomy model (as discussed): user signs only for deposit + setOperator (+ optionally startCycle),
+# then the backend bot (operator) calls buyToken/sellTokenToPOL/endCycle without further user signatures.
+
+_ONCHAIN_LOCK = threading.RLock()
+_ONCHAIN_WORKERS: Dict[str, Dict[str, Any]] = {}  # item_id -> {"lock": Lock, "busy": bool}
+
+def _onchain_enabled() -> bool:
+    return str(os.getenv("NEXUS_ONCHAIN", "0")).lower() in ("1", "true", "yes")
+
+def _require_web3():
+    try:
+        from web3 import Web3  # type: ignore
+        from web3.middleware import geth_poa_middleware  # type: ignore
+        return Web3, geth_poa_middleware
+    except Exception as e:
+        raise RuntimeError(
+            "web3 is not installed in the backend environment. "
+            "Add 'web3' to requirements.txt and redeploy. Original error: %s" % (e,)
+        )
+
+def _get_rpc_for_chain(chain: str) -> str:
+    c = (chain or "").upper()
+    if c in ("POL", "POLYGON", "MATIC", "WMATIC"):
+        return os.getenv("POLYGON_RPC_URL", "") or os.getenv("RPC_URL", "")
+    if c in ("BNB", "BSC"):
+        return os.getenv("BSC_RPC_URL", "") or os.getenv("BNB_RPC_URL", "") or os.getenv("RPC_URL", "")
+    if c in ("ETH", "ETHEREUM"):
+        return os.getenv("ETH_RPC_URL", "") or os.getenv("RPC_URL", "")
+    return os.getenv("RPC_URL", "")
+
+def _vault_contract_min_abi():
+    # Minimal ABI: only what the operator needs for autonomous execution + lightweight state reads.
+    return [
+        {"type":"function","name":"startCycle","stateMutability":"nonpayable",
+         "inputs":[{"name":"user","type":"address"}],"outputs":[]},
+        {"type":"function","name":"buyToken","stateMutability":"nonpayable",
+         "inputs":[
+            {"name":"user","type":"address"},
+            {"name":"polIn","type":"uint256"},
+            {"name":"amountOutMin","type":"uint256"},
+            {"name":"path","type":"address[]"},
+            {"name":"deadline","type":"uint256"}
+         ],"outputs":[]},
+        {"type":"function","name":"sellTokenToPOL","stateMutability":"nonpayable",
+         "inputs":[
+            {"name":"user","type":"address"},
+            {"name":"tokenInAmount","type":"uint256"},
+            {"name":"amountOutMin","type":"uint256"},
+            {"name":"path","type":"address[]"},
+            {"name":"deadline","type":"uint256"}
+         ],"outputs":[]},
+        {"type":"function","name":"endCycle","stateMutability":"nonpayable",
+         "inputs":[{"name":"user","type":"address"}],"outputs":[]},
+        {"type":"function","name":"WMATIC","stateMutability":"view","inputs":[],"outputs":[{"type":"address"}]},
+        {"type":"function","name":"polBalance","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
+        {"type":"function","name":"inCycle","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"bool"}]},
+        {"type":"function","name":"heldToken","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"address"}]},
+        {"type":"function","name":"heldTokenBal","stateMutability":"view","inputs":[{"type":"address"}],"outputs":[{"type":"uint256"}]},
+    ]
+
+def _get_operator_key() -> str:
+    return os.getenv("BOT_PRIVATE_KEY", "") or os.getenv("OPERATOR_PRIVATE_KEY", "") or os.getenv("PRIVATE_KEY", "")
+
+def _get_vault_address(session: dict) -> str:
+    return (session.get("vault_address") or os.getenv("VAULT_ADDRESS", "")).strip()
+
+def _get_token_address(session: dict) -> str:
+    return (session.get("token_address") or "").strip()
+
+def _get_chain(session: dict) -> str:
+    return (session.get("chain") or session.get("chainKey") or "POL").strip()
+
+def _web3_and_contract(session: dict):
+    Web3, geth_poa_middleware = _require_web3()
+    rpc = _get_rpc_for_chain(_get_chain(session))
+    if not rpc:
+        raise RuntimeError("Missing RPC URL for chain. Set POLYGON_RPC_URL/BSC_RPC_URL/ETH_RPC_URL or RPC_URL.")
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    # BSC/Polygon are POA style; applying middleware is safe.
+    try:
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    except Exception:
+        pass
+    pk = _get_operator_key()
+    if not pk:
+        raise RuntimeError("Missing operator private key. Set BOT_PRIVATE_KEY (recommended).")
+    acct = w3.eth.account.from_key(pk)
+    vault_addr = _get_vault_address(session)
+    if not vault_addr:
+        raise RuntimeError("Missing vault address. Provide session.vault_address or set VAULT_ADDRESS env.")
+    if not w3.is_address(vault_addr):
+        raise RuntimeError("Invalid vault address: %s" % vault_addr)
+    contract = w3.eth.contract(address=w3.to_checksum_address(vault_addr), abi=_vault_contract_min_abi())
+    return w3, acct, contract
+
+def _send_tx(w3, acct, fn):
+    # Basic tx sender with nonce lock to avoid collisions under concurrent fills.
+    with _ONCHAIN_LOCK:
+        nonce = w3.eth.get_transaction_count(acct.address)
+        gas_price = None
+        try:
+            gas_price = w3.eth.gas_price
+        except Exception:
+            gas_price = None
+        tx = fn.build_transaction({
+            "from": acct.address,
+            "nonce": nonce,
+            "value": 0,
+        })
+        # Gas estimate
+        try:
+            tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
+        except Exception:
+            tx["gas"] = tx.get("gas", 800_000)
+        if gas_price is not None:
+            tx["gasPrice"] = gas_price
+        # Sign + send
+        signed = acct.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+        return tx_hash.hex()
+
+def _onchain_execute_order(session: dict, order: dict) -> str:
+    """Execute one FILLED order on-chain via the Vault. Returns txHash."""
+    w3, acct, vault = _web3_and_contract(session)
+    user = session.get("wallet_address") or order.get("user")
+    if not user:
+        raise RuntimeError("Missing user wallet_address for session/order")
+    if not w3.is_address(user):
+        raise RuntimeError("Invalid user address: %s" % user)
+    user = w3.to_checksum_address(user)
+
+    side = str(order.get("side") or "").upper().strip()
+    # amountOutMin/deadline may be overridden in order
+    amount_out_min = int(order.get("amountOutMin") or 0)
+    deadline = int(order.get("deadline") or (int(time.time()) + 600))
+
+    # Determine token + path
+    token = (order.get("token") or _get_token_address(session) or "").strip()
+    if not token:
+        raise RuntimeError("Missing token address for on-chain execution (order.token or session.token_address).")
+    if not w3.is_address(token):
+        raise RuntimeError("Invalid token address: %s" % token)
+    token = w3.to_checksum_address(token)
+    wmatic = vault.functions.WMATIC().call()
+    wmatic = w3.to_checksum_address(wmatic)
+
+    if side == "BUY":
+        # qty is interpreted as POL amount in wei unless qty_is_wei is false.
+        qty = order.get("qty")
+        if qty is None:
+            raise RuntimeError("BUY order requires qty (POL amount).")
+        qty = float(qty)
+        if qty <= 0:
+            raise RuntimeError("BUY qty must be > 0")
+        qty_is_wei = bool(order.get("qty_is_wei", False))
+        pol_in = int(qty) if qty_is_wei else int(qty * 1e18)
+        path = [wmatic, token]
+        fn = vault.functions.buyToken(user, pol_in, amount_out_min, path, deadline)
+        return _send_tx(w3, acct, fn)
+
+    if side == "SELL":
+        qty = order.get("qty")
+        if qty is None:
+            raise RuntimeError("SELL order requires qty (token amount).")
+        # qty is token units; if not wei, assume decimals already handled by UI.
+        qty = int(float(qty))
+        if qty <= 0:
+            raise RuntimeError("SELL qty must be > 0")
+        path = [token, wmatic]
+        fn = vault.functions.sellTokenToPOL(user, qty, amount_out_min, path, deadline)
+        return _send_tx(w3, acct, fn)
+
+    raise RuntimeError("Unknown order side: %s" % side)
+
+def _maybe_queue_onchain_fill(item_id: str, order_id: str):
+    """Queue on-chain execution for a specific order in a session."""
+    if not _onchain_enabled():
+        return
+    worker = _ONCHAIN_WORKERS.get(item_id)
+    if worker is None:
+        worker = {"lock": threading.RLock(), "busy": False}
+        _ONCHAIN_WORKERS[item_id] = worker
+
+    def _run():
+        with worker["lock"]:
+            if worker.get("busy"):
+                return
+            worker["busy"] = True
+        try:
+            session = GRID_SESSIONS.get(item_id)
+            if not session:
+                return
+            # find order
+            orders = session.get("orders") if isinstance(session.get("orders"), list) else []
+            target = None
+            for o in orders:
+                if isinstance(o, dict) and str(o.get("id")) == str(order_id):
+                    target = o
+                    break
+            if not target:
+                return
+            if target.get("status") != "FILLED":
+                return
+            if target.get("onchain_tx"):
+                return
+            # execute
+            txh = _onchain_execute_order(session, target)
+            target["onchain_tx"] = txh
+            target["onchain_status"] = "SENT"
+            target["onchain_sent_ts"] = int(time.time())
+            GRID_SESSIONS[item_id] = _trim_grid_session(session)
+            _persist_grid_state()
+        except Exception as e:
+            try:
+                session = GRID_SESSIONS.get(item_id)
+                if session:
+                    orders = session.get("orders") if isinstance(session.get("orders"), list) else []
+                    for o in orders:
+                        if isinstance(o, dict) and str(o.get("id")) == str(order_id):
+                            o["status"] = "ERROR"
+                            o["error"] = str(e)
+                            o["error_ts"] = int(time.time())
+                            break
+                    GRID_SESSIONS[item_id] = _trim_grid_session(session)
+                    _persist_grid_state()
+            except Exception:
+                pass
+        finally:
+            with worker["lock"]:
+                worker["busy"] = False
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # --- Grid simulator adapter (supports grid_sim exposing functions OR class methods) ---
 import inspect as _inspect
 
@@ -3905,10 +4142,19 @@ def api_grid_start():
             "stop_loss_pct": body.get("stop_loss_pct"),
             "levels": body.get("levels"),
             "initial_capital_usd": (body.get("invest_usd") or body.get("initial_capital_usd") or body.get("capital_usd") or body.get("budget_usd")),
+            "chain": (body.get("chain") or body.get("chainKey") or "POL"),
+            "vault_address": (body.get("vault_address") or body.get("vault") or ""),
+            "token_address": (body.get("token_address") or body.get("token") or ""),
         }
 
         session = _sim_build(cfg)
         session["wallet_address"] = _norm_addr(addr) if addr else ""
+        # On-chain execution settings (optional)
+        session["chain"] = str(cfg.get("chain") or "POL").upper()
+        if cfg.get("vault_address"):
+            session["vault_address"] = str(cfg.get("vault_address")).strip()
+        if cfg.get("token_address"):
+            session["token_address"] = str(cfg.get("token_address")).strip()
         # If MANUAL, do not auto-create initial grid orders
         if order_mode == 'MANUAL':
             session.setdefault('orders', [])
@@ -5513,6 +5759,11 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                 o["fill_price"] = round(float(price), 8)
                 fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd")})
                 filled_now += 1
+                # Optional: execute this fill on-chain (autonomous operator)
+                try:
+                    _maybe_queue_onchain_fill(str(session.get("item") or session.get("item_id") or ""), str(o.get("id")))
+                except Exception:
+                    pass
 
         elif side == "SELL":
             crossed = (prev_price < op and price >= op) or (prev_price == 0 and price >= op)
@@ -5522,6 +5773,11 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                 o["fill_price"] = round(float(price), 8)
                 fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd")})
                 filled_now += 1
+                # Optional: execute this fill on-chain (autonomous operator)
+                try:
+                    _maybe_queue_onchain_fill(str(session.get("item") or session.get("item_id") or ""), str(o.get("id")))
+                except Exception:
+                    pass
 
     session["fills"] = fills[-500:]
     session["filled_now"] = filled_now
