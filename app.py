@@ -798,6 +798,11 @@ def _require_auth() -> Optional[str]:
 
     # (1) Internal server API key
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    # Accept server API key either via Authorization Bearer <key> OR X-API-Key header.
+    api_key_hdr = (request.headers.get("X-API-Key") or request.headers.get("x-api-key") or "").strip()
+    if server_key and api_key_hdr and secrets.compare_digest(api_key_hdr, server_key):
+        token = server_key
+
     if server_key and secrets.compare_digest(token, server_key):
         body = request.get_json(silent=True) or {}
         wa = (
@@ -824,7 +829,7 @@ def _require_auth() -> Optional[str]:
         pass
 
     # (3) Privy-style JWT (best-effort: decode without verification)
-    wa = _try_extract_wallet_from_jwt(token)
+    wa = _extract_wallet_from_jwt_best_effort(token)
     if isinstance(wa, str) and _looks_like_evm_addr(wa):
         return _norm_addr(wa)
 
