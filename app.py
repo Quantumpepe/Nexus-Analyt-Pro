@@ -808,21 +808,34 @@ def _extract_wallet_from_jwt_best_effort(token: str):
         return None
 
 def _require_auth() -> Optional[str]:
-    """Return normalized wallet address if caller is authorized, else None.
+    """Return normalized wallet address if caller is authorized, else None."""
 
-    Behavior:
-    - If Authorization: Bearer <token> is present:
-        * token == NEXUS_API_KEY  -> authorized; wallet must be provided via header/query/body
-        * token is a legacy itsdangerous signed token -> authorized; wallet is inside token payload
-        * token looks like a JWT (Privy style) -> best-effort decode (no verify) to extract wallet
-        * DEV/SAFE fallback: if GRID_ALLOW_ANON=1 and path is /api/grid/* or /api/ai/*, accept X-Wallet-Address
-    - If no Bearer token:
-        * allow anonymous access to /api/grid/* AND /api/ai/* only when GRID_ALLOW_ANON=1 and wallet is provided
-    """
-    auth = (request.headers.get("Authorization") or "").strip()
+    # ✅ DEV/SAFE bypass: allow anonymous access to /api/grid/* and /api/ai/*
+    #    when GRID_ALLOW_ANON=1 and a wallet is provided (header/body/query).
     allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
+    if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
+        body = request.get_json(silent=True) or {}
+        wa = (
+            body.get("wallet")
+            or body.get("wallet_address")
+            or body.get("walletAddress")
+            or request.headers.get("X-Wallet-Address")
+            or request.args.get("wallet")
+            or request.args.get("wallet_address")
+        )
+        if isinstance(wa, str) and _looks_like_evm_addr(wa):
+            return _norm_addr(wa)
 
-    def _pick_wallet_from_request() -> Optional[str]:
+    # --- normal auth flow below ---
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return None
+
+    token = auth.split(" ", 1)[1].strip()
+
+    # (1) Internal server API key
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    if server_key and token == server_key:
         body = request.get_json(silent=True) or {}
         wa = (
             body.get("wallet")
@@ -835,6 +848,24 @@ def _require_auth() -> Optional[str]:
         if isinstance(wa, str) and _looks_like_evm_addr(wa):
             return _norm_addr(wa)
         return None
+
+    # (2) Legacy signed token issued by this backend
+    try:
+        if _AUTH_SERIALIZER is not None:
+            payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
+            if isinstance(payload, dict):
+                wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
+                if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                    return _norm_addr(wa)
+    except Exception:
+        pass
+
+    # (3) Privy-style JWT (best-effort decode without verification)
+    wa = _extract_wallet_from_jwt_best_effort(token)
+    if isinstance(wa, str) and _looks_like_evm_addr(wa):
+        return _norm_addr(wa)
+
+    return None
 
     # ✅ Anonymous bypass (dev / SAFE mode) when NO bearer token
     if not auth.lower().startswith("bearer "):
