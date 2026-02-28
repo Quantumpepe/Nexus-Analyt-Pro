@@ -764,60 +764,68 @@ def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None.
 
-    Accepted Bearer tokens:
-      1) Internal server API key (env: NEXUS_API_KEY) + wallet supplied via header/query/body
-      2) Privy-style JWT (best-effort decode to extract wallet)
-      3) Legacy signed token issued by this backend (itsdangerous serializer)
+    Behavior:
+    - If Authorization: Bearer <token> is present:
+        * token == NEXUS_API_KEY  -> authorized; wallet must be provided via header/query/body
+        * token is a legacy itsdangerous signed token -> authorized; wallet is inside token payload
+        * token looks like a JWT (Privy style) -> best-effort decode (no verify) to extract wallet
+    - If no Bearer token:
+        * allow anonymous access to /api/grid/* only when GRID_ALLOW_ANON=1 and wallet is provided
     """
-    # --- auth header ---
-auth = (request.headers.get("Authorization") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
 
-# ✅ If no Bearer: allow anon for /api/grid/* when GRID_ALLOW_ANON=1 and wallet is present
-if not auth.lower().startswith("bearer "):
-    allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
-    if allow_anon and request.path.startswith("/api/grid/"):
-        body = request.get_json(silent=True) or {}
-        wa = (
-            body.get("wallet")
-            or body.get("wallet_address")
-            or body.get("walletAddress")
-            or request.args.get("wallet")
-        )
-        if isinstance(wa, str) and _looks_like_evm_addr(wa):
-            return _norm_addr(wa)
-    return None
+    # ✅ Anonymous bypass for Grid endpoints (dev / SAFE mode)
+    if not auth.lower().startswith("bearer "):
+        allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
+        if allow_anon and request.path.startswith("/api/grid/"):
+            body = request.get_json(silent=True) or {}
+            wa = (
+                body.get("wallet")
+                or body.get("wallet_address")
+                or body.get("walletAddress")
+                or request.headers.get("X-Wallet-Address")
+                or request.args.get("wallet")
+                or request.args.get("wallet_address")
+            )
+            if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                return _norm_addr(wa)
+        return None
 
-# ✅ Bearer present → continue with existing logic below
-token = auth.split(" ", 1)[1].strip()
+    token = auth.split(" ", 1)[1].strip()
+
     # (1) Internal server API key
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     if server_key and secrets.compare_digest(token, server_key):
-        # Allow passing wallet through header/query/body for internal calls
+        body = request.get_json(silent=True) or {}
         wa = (
             request.headers.get("X-Wallet-Address")
             or request.args.get("wallet")
             or request.args.get("wallet_address")
+            or body.get("wallet")
+            or body.get("wallet_address")
+            or body.get("walletAddress")
         )
-        if not wa:
-            body = request.get_json(silent=True) or {}
-            wa = body.get("wallet") or body.get("wallet_address") or body.get("walletAddress")
         if isinstance(wa, str) and _looks_like_evm_addr(wa):
             return _norm_addr(wa)
-        # If no wallet provided, treat as unauthorized for wallet-bound endpoints
         return None
 
-    # (2) JWT (Privy or similar) – extract wallet best-effort
-    if "." in token:
-        wa = _try_extract_wallet_from_jwt(token)
-        if wa:
-            return wa
-
-    # (3) Legacy backend-issued token
+    # (2) Legacy signed token issued by this backend
     try:
-        data = _serializer.loads(token, max_age=TOKEN_TTL_SEC)
-        return _norm_addr(data.get("wallet_address", ""))
-    except (BadSignature, SignatureExpired):
-        return None
+        if _AUTH_SERIALIZER is not None:
+            payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
+            if isinstance(payload, dict):
+                wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
+                if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                    return _norm_addr(wa)
+    except Exception:
+        pass
+
+    # (3) Privy-style JWT (best-effort: decode without verification)
+    wa = _extract_wallet_from_jwt_best_effort(token)
+    if isinstance(wa, str) and _looks_like_evm_addr(wa):
+        return _norm_addr(wa)
+
+    return None
 
 def issue_token(wallet_address: str) -> str:
     return _serializer.dumps({
