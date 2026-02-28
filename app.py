@@ -823,16 +823,22 @@ def _require_auth() -> Optional[str]:
         allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
         if allow_anon and request.path.startswith("/api/grid/"):
             body = request.get_json(silent=True) or {}
-            wa = (
-                body.get("wallet")
-                or body.get("wallet_address")
-                or body.get("walletAddress")
-                or request.headers.get("X-Wallet-Address")
-                or request.args.get("wallet")
-                or request.args.get("wallet_address")
-            )
+
+            wa_candidates = [
+                body.get("wallet"),
+                body.get("wallet_address"),
+                body.get("walletAddress"),
+                request.headers.get("X-Wallet-Address"),
+                request.headers.get("x-wallet-address"),
+                request.args.get("wallet"),
+                request.args.get("wallet_address"),
+                request.args.get("walletAddress"),
+            ]
+            wa = next((x for x in wa_candidates if isinstance(x, str) and x.strip()), None)
+
             if isinstance(wa, str) and _looks_like_evm_addr(wa):
                 return _norm_addr(wa)
+
         return None
 
     token = auth.split(" ", 1)[1].strip()
