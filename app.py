@@ -4759,7 +4759,7 @@ def api_grid_manual_add():
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
 
-    _require_trading_enabled_or_403()
+    _require_trading_enabled()
 
     try:
         payload = request.get_json(silent=True) or {}
