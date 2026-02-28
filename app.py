@@ -97,6 +97,7 @@ CORS(
     allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
+
 @app.get("/api/version")
 def api_version():
     return {
@@ -105,7 +106,7 @@ def api_version():
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
         "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
     }
-    
+
 from flask import request
 
 @app.after_request
@@ -1506,6 +1507,36 @@ def _compute_access_status(wallet_address: str | None) -> dict:
 def _require_access_open() -> tuple[str | None, dict | None, tuple | None]:
     """Enforce access for endpoints that OPEN new trades."""
     wa = _require_auth()
+
+    # -----------------------------
+    # Grid trader anon/dev mode
+    # -----------------------------
+    # The Grid Trader UI (and Postman tests) may call grid endpoints without a Bearer token.
+    # If GRID_ALLOW_ANON=1 and the request is for /api/grid/*, accept an explicit wallet
+    # address from JSON/query/header and skip subscription gating.
+    allow_anon = os.getenv("GRID_ALLOW_ANON", "0").strip() in ("1", "true", "True")
+    if not wa and allow_anon and request.path.startswith("/api/grid/"):
+        body = request.get_json(silent=True) or {}
+        wa = _norm_addr(
+            request.headers.get("X-Wallet-Address")
+            or request.args.get("wallet")
+            or request.args.get("wallet_address")
+            or request.args.get("address")
+            or body.get("wallet")
+            or body.get("wallet_address")
+            or body.get("address")
+            or body.get("addr")
+            or ""
+        )
+        if wa:
+            # Minimal access object that allows opening trades during anon grid testing.
+            st = _access_defaults()
+            st["source"] = "grid_anon"
+            st["active"] = True
+            st["can_open_new_trades"] = True
+            st["can_close_trades"] = True
+            return wa, st, None
+
     if not wa:
         return None, None, err("unauthorized", 401)
 
@@ -1755,36 +1786,11 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
       - valid Bearer token
       - access.can_open_new_trades == True   (Redeem / Subscription)
     """
-    # --- Grid trader dev-mode / anon-mode ---
-    # The Grid Trader UI and Postman tests may call endpoints without a Bearer token.
-    # For grid-related endpoints we allow an "anonymous" wallet context when a wallet
-    # address is provided explicitly (JSON/query/header).
-    #
-    # Set GRID_ALLOW_ANON=0 in production to require Bearer auth everywhere.
-    allow_anon = os.getenv("GRID_ALLOW_ANON", "1").strip() not in ("0", "false", "False")
-
     wa = _require_auth()
-    if not wa and allow_anon:
-        # Try to infer wallet from common locations
-        try:
-            data = request.get_json(silent=True) or {}
-        except Exception:
-            data = {}
-        wa = (
-            (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address"))
-            or (data.get("wallet") or data.get("wallet_address") or data.get("address"))
-            or (request.args.get("wallet") or request.args.get("wallet_address") or request.args.get("address"))
-        )
-
     if not wa:
         return None, None, err("unauthorized", 401)
 
     policy = get_policy(wa) or {}
-
-    # If we're in anon-mode, do not enforce subscription gates for grid testing.
-    if not _require_auth() and allow_anon:
-        policy.setdefault("trading_enabled", True)
-        return wa, policy, None
 
     st = _compute_access_status(wa)
     if not bool(st.get("can_open_new_trades")):
@@ -1793,16 +1799,6 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     # Backward-compat for older clients expecting this field
     policy.setdefault("trading_enabled", True)
     return wa, policy, None
-
-def _require_trading_enabled_or_403():
-    """Legacy helper used by some endpoints.
-    Raises/returns a Flask response tuple if trading is not enabled for this wallet.
-    """
-    wa, _policy, e = _require_trading_enabled()
-    if e:
-        # e is already a (payload, status) tuple from err(...)
-        return e
-    return None
 
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
     """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned."""
@@ -3827,7 +3823,7 @@ def api_resolver_history():
     - best-effort fallback to last cached value if upstream is down/rate-limited
     """
     try:
-        payload = (request.get_json(silent=True) or {}) if request.method != "GET" else (request.args.to_dict() or {})
+        payload = request.get_json(silent=True) or {}
         ids = payload.get("ids") or []
         days = int(payload.get("days") or 30)
 
@@ -3902,28 +3898,6 @@ def api_resolver_history():
         return err(str(e), 500)
 
 
-
-@app.route("/api/grid/cycle/start", methods=["POST","GET"])
-def api_grid_cycle_start():
-    """Alias for frontend compatibility.
-    Frontend expects /api/grid/cycle/start.
-    """
-    # Allow GET to avoid 405 if frontend mistakenly uses GET.
-    if request.method == "GET":
-        # Convert query params to JSON-ish for api_grid_start
-        body = {
-            "item": request.args.get("item") or request.args.get("item_id") or request.args.get("chainKey"),
-            "wallet": request.args.get("wallet") or request.args.get("addr") or request.args.get("wallet_address"),
-            "budget_usd": request.args.get("budget_usd"),
-            "invest_usd": request.args.get("invest_usd"),
-            "price": request.args.get("price"),
-            "order_mode": request.args.get("order_mode") or "MANUAL",
-        }
-        # Monkeypatch request json by calling underlying logic directly is messy; instead call api_grid_start with manual parsing:
-        # We'll emulate a POST by temporarily using payload in a local variable inside api_grid_start when request is GET.
-        request._cached_json = (body, body)
-    return api_grid_start()
-
 @app.route("/api/grid/start", methods=["POST"])
 def api_grid_start():
     body = request.get_json(silent=True) or {}
@@ -3931,7 +3905,7 @@ def api_grid_start():
     if e_access:
         return e_access
     item_id = body.get("item") or body.get("item_id") or body.get("id")
-    addr = body.get("addr") or body.get("wallet_address") or body.get("wallet") or body.get("address")
+    addr = body.get("addr") or body.get("wallet_address")
     mode = (body.get("mode") or "SAFE").upper()
     order_mode = str(body.get("order_mode") or body.get("orders_mode") or body.get("grid_order_mode") or "MANUAL").upper().strip()
 
@@ -4055,6 +4029,12 @@ def api_grid_start():
         })
     except Exception as e:
         return err(str(e), 500)
+
+
+# Frontend compatibility alias (some UIs call /api/grid/cycle/start)
+@app.route("/api/grid/cycle/start", methods=["POST", "GET"])
+def api_grid_cycle_start():
+    return api_grid_start()
 
 @app.route("/api/grid/tick", methods=["GET", "POST"])
 def api_grid_tick():
@@ -4328,67 +4308,59 @@ def api_grid_reset_all():
     _persist_grid_state()
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
-
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
     """Return grid orders.
 
-    Supports:
-      - legacy:   GET /api/grid/orders?item=POL
-      - frontend: GET /api/grid/orders?chainKey=POL&wallet=0x...
+    - If ?item=... is provided: return orders for that item.
+    - If no item is provided: return ALL orders across items (for multi-coin table).
     """
     wa = _require_auth()
 
-    # Frontend compatibility: allow read-only access by explicit wallet query param
-    # even if Bearer auth isn't wired yet (integration phase).
-    wallet_q = request.args.get("wallet") or request.args.get("addr") or request.args.get("wallet_address") or request.args.get("address")
-    if not wa and wallet_q:
-        wa = _norm_addr(wallet_q)
-
-    item_id = request.args.get("item") or request.args.get("item_id") or request.args.get("chainKey")
-
-    # If still not authenticated and no wallet provided, return empty list (legacy behavior).
+    # Early UX: if the user isn't authenticated yet, return an empty list instead
+    # of spamming 401s / triggering CORS errors in the UI.
     if not wa:
+        item_id = request.args.get("item") or request.args.get("item_id")
         if item_id:
             item_id = str(item_id).strip()
             return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
 
-    # Single item
+    item_id = request.args.get("item") or request.args.get("item_id")
+
     if item_id:
         item_id = str(item_id).strip()
         session = _get_owned_session(item_id, wa)
         if not session:
             return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
-
         orders = session.get("orders") if isinstance(session, dict) else []
-        out = []
+        # ensure item field
+        out=[]
         for o in (orders or []):
             if isinstance(o, dict):
-                oo = dict(o)
-                oo["item"] = oo.get("item") or item_id
+                oo=dict(o)
+                oo["item"]=oo.get("item") or item_id
                 out.append(oo)
-        return jsonify({"status": "ok", "item": item_id, "orders": out, "ts": now_ts()})
+        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
 
-    # All items for this wallet (or legacy sessions with no owner)
-    all_orders = []
+    # all items
+    all_orders=[]
     for it, sess in (GRID_SESSIONS or {}).items():
-        if not isinstance(sess, dict):
-            continue
-        owner = _norm_addr(sess.get("wallet_address") or "")
+        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
         if owner and owner != _norm_addr(wa):
+            continue
+        if not isinstance(sess, dict):
             continue
         for o in (sess.get("orders") or []):
             if isinstance(o, dict):
-                oo = dict(o)
-                oo["item"] = oo.get("item") or it
+                oo=dict(o)
+                oo["item"]=oo.get("item") or it
                 all_orders.append(oo)
-    return jsonify({"status": "ok", "orders": all_orders, "ts": now_ts()})
+    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
 
 
 
-@app.route("/api/grid/budgets"
-, methods=["GET"])
+@app.route("/api/grid/budgets", methods=["GET"])
 def api_grid_budgets():
     """Return per-item budget state for the authenticated wallet.
 
@@ -4529,7 +4501,7 @@ def api_grid_budgets_by_chain():
 
 
 
-@app.route("/api/grid/order/stop", methods=["POST","GET"])
+@app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
     """Stop (cancel) a single order.
     Accepts (any):
@@ -4605,7 +4577,7 @@ def api_grid_order_stop():
     })
 
 
-@app.route("/api/grid/order/delete", methods=["POST","DELETE"])
+@app.route("/api/grid/order/delete", methods=["POST", "DELETE"])
 def api_grid_order_delete():
     """Delete a single order from a grid session.
     Accepts:
@@ -4615,7 +4587,7 @@ def api_grid_order_delete():
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
 
-    payload = (request.get_json(silent=True) or {}) if request.method != "DELETE" else ((request.get_json(silent=True) or {}) or (request.args.to_dict() or {}))
+    payload = request.get_json(silent=True) or {}
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
         return jsonify({"error": "missing item"}), 400
