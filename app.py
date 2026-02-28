@@ -875,6 +875,21 @@ def _require_auth() -> Optional[str]:
 
     token = auth.split(" ", 1)[1].strip()
 
+    # ✅ Allow anonymous for Grid + AI endpoints EVEN if a Bearer token is present (Privy sends it always)
+    allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
+    if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
+        body = request.get_json(silent=True) or {}
+        wa = (
+            body.get("wallet")
+            or body.get("wallet_address")
+            or body.get("walletAddress")
+            or request.headers.get("X-Wallet-Address")
+            or request.args.get("wallet")
+            or request.args.get("wallet_address")
+        )
+        if isinstance(wa, str) and _looks_like_evm_addr(wa):
+            return _norm_addr(wa)
+
     # (1) Internal server API key
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     api_key_hdr = (request.headers.get("X-API-Key") or request.headers.get("x-api-key") or "").strip()
