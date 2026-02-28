@@ -18,6 +18,9 @@ import requests
 import random
 import math
 from typing import Optional, Dict, Any
+# --- Defaults for manual orders ---
+DEFAULT_SLIPPAGE_BPS = int(os.getenv("DEFAULT_SLIPPAGE_BPS", "500"))   # 500 bps = 5%
+DEFAULT_DEADLINE_MINUTES = int(os.getenv("DEFAULT_DEADLINE_MINUTES", "1200"))  # actually seconds in this code (20min)
 
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
