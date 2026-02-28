@@ -824,7 +824,7 @@ def _require_auth() -> Optional[str]:
         pass
 
     # (3) Privy-style JWT (best-effort: decode without verification)
-    wa = _extract_wallet_from_jwt_best_effort(token)
+    wa = _try_extract_wallet_from_jwt(token)
     if isinstance(wa, str) and _looks_like_evm_addr(wa):
         return _norm_addr(wa)
 
