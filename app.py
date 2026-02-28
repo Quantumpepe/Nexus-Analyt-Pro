@@ -4791,12 +4791,23 @@ def api_grid_manual_add():
         if qty_f <= 0:
             return jsonify({"error": "qty must be > 0"}), 400
 
-        slippage = payload.get("slippage")
-        deadline = payload.get("deadline")
+        # Slippage: prefer slippage_bps (UI sends this), fallback to slippage (pct), else default 5%
+        slippage_bps = payload.get("slippage_bps")
+        slippage = payload.get("slippage")  # percent (e.g. 0.05 = 5%)
+
+        DEFAULT_SLIPPAGE_BPS = int(os.getenv("DEFAULT_SLIPPAGE_BPS", "500"))  # 5%
+
         try:
-            slip_f = float(slippage) if slippage is not None else float(DEFAULT_SLIPPAGE_PCT)
+            if slippage_bps is not None:
+                slip_f = float(int(slippage_bps)) / 10000.0  # bps -> fraction
+            elif slippage is not None:
+                slip_f = float(slippage)  # already fraction
+            else:
+                slip_f = float(DEFAULT_SLIPPAGE_BPS) / 10000.0
         except Exception:
-            slip_f = float(DEFAULT_SLIPPAGE_PCT)
+            slip_f = float(DEFAULT_SLIPPAGE_BPS) / 10000.0
+
+        deadline = payload.get("deadline") or payload.get("deadline_sec")
         try:
             deadline_i = int(deadline) if deadline is not None else int(DEFAULT_DEADLINE_MINUTES)
         except Exception:
