@@ -812,36 +812,17 @@ def _require_auth() -> Optional[str]:
 
     Behavior:
     - If Authorization: Bearer <token> is present:
-        * token == NEXUS_API_KEY -> authorized; wallet must be provided via header/query/body
+        * token == NEXUS_API_KEY  -> authorized; wallet must be provided via header/query/body
         * token is a legacy itsdangerous signed token -> authorized; wallet is inside token payload
         * token looks like a JWT (Privy style) -> best-effort decode (no verify) to extract wallet
+        * DEV/SAFE fallback: if GRID_ALLOW_ANON=1 and path is /api/grid/* or /api/ai/*, accept X-Wallet-Address
     - If no Bearer token:
-        * allow anonymous access to /api/grid/* AND /api/ai/* only when GRID_ALLOW_ANON=1 AND wallet is provided
+        * allow anonymous access to /api/grid/* AND /api/ai/* only when GRID_ALLOW_ANON=1 and wallet is provided
     """
     auth = (request.headers.get("Authorization") or "").strip()
+    allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
 
-    # ✅ Anonymous bypass for Grid + AI endpoints (DEV / SAFE mode)
-    if not auth.lower().startswith("bearer "):
-        allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
-        if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
-            body = request.get_json(silent=True) or {}
-            wa = (
-                body.get("wallet")
-                or body.get("wallet_address")
-                or body.get("walletAddress")
-                or request.headers.get("X-Wallet-Address")
-                or request.args.get("wallet")
-                or request.args.get("wallet_address")
-            )
-            if isinstance(wa, str) and _looks_like_evm_addr(wa):
-                return _norm_addr(wa)
-        return None
-
-    token = auth.split(" ", 1)[1].strip()
-
-    # (1) Internal server API key
-    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
-    if server_key and token == server_key:
+    def _pick_wallet_from_request() -> Optional[str]:
         body = request.get_json(silent=True) or {}
         wa = (
             body.get("wallet")
@@ -854,6 +835,24 @@ def _require_auth() -> Optional[str]:
         if isinstance(wa, str) and _looks_like_evm_addr(wa):
             return _norm_addr(wa)
         return None
+
+    # ✅ Anonymous bypass (dev / SAFE mode) when NO bearer token
+    if not auth.lower().startswith("bearer "):
+        if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
+            return _pick_wallet_from_request()
+        return None
+
+    token = auth.split(" ", 1)[1].strip()
+
+    # (1) Internal server API key
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    api_key_hdr = (request.headers.get("X-API-Key") or request.headers.get("x-api-key") or "").strip()
+    if server_key and api_key_hdr and secrets.compare_digest(api_key_hdr, server_key):
+        token = server_key
+
+    if server_key and secrets.compare_digest(token, server_key):
+        wa = _pick_wallet_from_request()
+        return wa  # wa is already normalized or None
 
     # (2) Legacy signed token issued by this backend
     try:
@@ -870,6 +869,10 @@ def _require_auth() -> Optional[str]:
     wa = _extract_wallet_from_jwt_best_effort(token)
     if isinstance(wa, str) and _looks_like_evm_addr(wa):
         return _norm_addr(wa)
+
+    # ✅ DEV/SAFE fallback even WITH bearer token (Privy token may not contain 0x wallet)
+    if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
+        return _pick_wallet_from_request()
 
     return None
 
