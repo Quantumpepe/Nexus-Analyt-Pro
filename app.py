@@ -807,24 +807,38 @@ def _extract_wallet_from_jwt_best_effort(token: str):
     except Exception:
         return None
 
+def _pick_wallet_from_request() -> Optional[str]:
+    body = request.get_json(silent=True) or {}
+
+    candidates = [
+        body.get("wallet"),
+        body.get("wallet_address"),
+        body.get("walletAddress"),
+        request.headers.get("X-Wallet-Address"),
+        request.args.get("wallet"),
+        request.args.get("wallet_address"),
+    ]
+
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            # Robust: pick first real EVM address even if header contains commas/quotes/etc
+            m = re.search(r"0x[a-fA-F0-9]{40}", c)
+            if m:
+                return _norm_addr(m.group(0))
+
+    return None        
+
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None."""
 
     # ✅ DEV/SAFE bypass: allow anonymous access to /api/grid/* and /api/ai/*
-    #    when GRID_ALLOW_ANON=1 and a wallet is provided (header/body/query).
+    # when GRID_ALLOW_ANON=1 and a wallet is provided (header/body/query).
     allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
-    if allow_anon and (request.path.startswith("/api/grid/") or request.path.startswith("/api/ai/")):
-        body = request.get_json(silent=True) or {}
-        wa = (
-            body.get("wallet")
-            or body.get("wallet_address")
-            or body.get("walletAddress")
-            or request.headers.get("X-Wallet-Address")
-            or request.args.get("wallet")
-            or request.args.get("wallet_address")
-        )
+    if allow_anon and (request.path.startswith("/api/grid") or request.path.startswith("/api/ai/")):
+        wa = _pick_wallet_from_request()
         if isinstance(wa, str) and _looks_like_evm_addr(wa):
-            return _norm_addr(wa)
+            return wa
+        return None
 
     # --- normal auth flow below ---
     auth = (request.headers.get("Authorization") or "").strip()
@@ -832,7 +846,6 @@ def _require_auth() -> Optional[str]:
         return None
 
     token = auth.split(" ", 1)[1].strip()
-
     # (1) Internal server API key
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     if server_key and token == server_key:
