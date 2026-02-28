@@ -75,7 +75,7 @@ if GridConfig is None:
 # -------------------------
 # App init
 # -------------------------
-
+app = Flask(__name__)
 app.url_map.strict_slashes = False
 
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
