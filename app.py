@@ -765,45 +765,45 @@ def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
         return None
         
     def _extract_wallet_from_jwt_best_effort(token: str):
-    """
-    Best-effort: decode JWT payload WITHOUT verifying signature.
-    Walk nested payload to find an EVM address (Privy-style tokens often nest wallet/address).
-    """
-    try:
-        parts = (token or "").split(".")
-        if len(parts) < 2:
+        """
+        Best-effort: decode JWT payload WITHOUT verifying signature.
+        Walk nested payload to find an EVM address (Privy-style tokens often nest wallet/address).
+        """
+        try:
+            parts = (token or "").split(".")
+            if len(parts) < 2:
+                return None
+
+            payload_b64 = parts[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+
+            import base64, json
+            payload = json.loads(
+                base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+            )
+
+            candidates = []
+
+            def walk(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        kl = str(k).lower()
+                        if kl in ("wallet", "wallet_address", "walletaddress", "address", "sub") and isinstance(v, str):
+                            candidates.append(v)
+                        walk(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        walk(it)
+
+            walk(payload)
+
+            for v in candidates:
+                if isinstance(v, str) and _looks_like_evm_addr(v):
+                    return v
+
             return None
-
-        payload_b64 = parts[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-
-        import base64, json
-        payload = json.loads(
-            base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
-        )
-
-        candidates = []
-
-        def walk(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if kl in ("wallet", "wallet_address", "walletaddress", "address", "sub") and isinstance(v, str):
-                        candidates.append(v)
-                    walk(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    walk(it)
-
-        walk(payload)
-
-        for v in candidates:
-            if isinstance(v, str) and _looks_like_evm_addr(v):
-                return v
-
-        return None
-    except Exception:
-        return None
+        except Exception:
+            return None
 
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None.
