@@ -1,14 +1,7 @@
 # backend/app.py
 import os, time
 
-@app.get("/api/version")
-def api_version():
-    return {
-        "status": "ok",
-        "ts": int(time.time()),
-        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
-        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
-    }
+
 from __future__ import annotations
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -85,7 +78,7 @@ if GridConfig is None:
 # -------------------------
 # App init
 # -------------------------
-app = Flask(__name__)
+
 app.url_map.strict_slashes = False
 
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
@@ -107,6 +100,15 @@ CORS(
     allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
 )
+@app.get("/api/version")
+def api_version():
+    return {
+        "status": "ok",
+        "ts": int(time.time()),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
+    }
+    
 from flask import request
 
 @app.after_request
