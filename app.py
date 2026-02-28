@@ -1,4 +1,14 @@
 # backend/app.py
+import os, time
+
+@app.get("/api/version")
+def api_version():
+    return {
+        "status": "ok",
+        "ts": int(time.time()),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
+    }
 from __future__ import annotations
 from flask import Flask, jsonify, request
 from flask_cors import CORS
