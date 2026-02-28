@@ -769,12 +769,26 @@ def _require_auth() -> Optional[str]:
       2) Privy-style JWT (best-effort decode to extract wallet)
       3) Legacy signed token issued by this backend (itsdangerous serializer)
     """
-    auth = request.headers.get("Authorization", "").strip()
-    if not auth.lower().startswith("bearer "):
-        return None
+    # --- auth header ---
+auth = (request.headers.get("Authorization") or "").strip()
 
-    token = auth.split(" ", 1)[1].strip()
+# ✅ If no Bearer: allow anon for /api/grid/* when GRID_ALLOW_ANON=1 and wallet is present
+if not auth.lower().startswith("bearer "):
+    allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
+    if allow_anon and request.path.startswith("/api/grid/"):
+        body = request.get_json(silent=True) or {}
+        wa = (
+            body.get("wallet")
+            or body.get("wallet_address")
+            or body.get("walletAddress")
+            or request.args.get("wallet")
+        )
+        if isinstance(wa, str) and _looks_like_evm_addr(wa):
+            return _norm_addr(wa)
+    return None
 
+# ✅ Bearer present → continue with existing logic below
+token = auth.split(" ", 1)[1].strip()
     # (1) Internal server API key
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     if server_key and secrets.compare_digest(token, server_key):
