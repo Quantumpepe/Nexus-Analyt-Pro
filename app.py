@@ -763,6 +763,37 @@ def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
         return None
     except Exception:
         return None
+        
+ def _extract_wallet_from_jwt_best_effort(token: str):
+    """
+    Best-effort: decode JWT payload WITHOUT verifying signature.
+    Used for Privy-style tokens to extract wallet address.
+    """
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return None
+
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+
+        import base64, json
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+        )
+
+        if isinstance(payload, dict):
+            wa = (
+                payload.get("wallet")
+                or payload.get("wallet_address")
+                or payload.get("walletAddress")
+            )
+            return wa if isinstance(wa, str) else None
+
+    except Exception:
+        return None
+
+    return None       
 
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None.
