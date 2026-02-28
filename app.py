@@ -764,7 +764,7 @@ def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
     except Exception:
         return None
         
- def _extract_wallet_from_jwt_best_effort(token: str):
+    def _extract_wallet_from_jwt_best_effort(token: str):
     """
     Best-effort: decode JWT payload WITHOUT verifying signature.
     Used for Privy-style tokens to extract wallet address.
