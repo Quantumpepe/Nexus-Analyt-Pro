@@ -787,17 +787,17 @@ def _extract_wallet_from_jwt_best_effort(token: str):
          def walk(obj):
              if isinstance(obj, dict):
                 for k, v in obj.items():
-                kl = str(k).lower()
-                if kl in ("wallet", "wallet_address", "walletaddress", "address", "sub") and isinstance(v, str):
-                    candidates.append(v)
-                walk(v)
-        elif isinstance(obj, list):
-            for it in obj:
-                walk(it)
+                    kl = str(k).lower()
+                    if kl in ("wallet", "wallet_address", "walletaddress", "address", "sub") and isinstance(v, str):
+                        candidates.append(v)
+                    walk(v)
+           elif isinstance(obj, list):
+               for it in obj:
+                   walk(it)
 
-    walk(payload)
+      walk(payload)
 
-    for v in candidates:
+     for v in candidates:
         if isinstance(v, str) and _looks_like_evm_addr(v):
             return v
 
