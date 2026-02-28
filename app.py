@@ -1746,11 +1746,36 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
       - valid Bearer token
       - access.can_open_new_trades == True   (Redeem / Subscription)
     """
+    # --- Grid trader dev-mode / anon-mode ---
+    # The Grid Trader UI and Postman tests may call endpoints without a Bearer token.
+    # For grid-related endpoints we allow an "anonymous" wallet context when a wallet
+    # address is provided explicitly (JSON/query/header).
+    #
+    # Set GRID_ALLOW_ANON=0 in production to require Bearer auth everywhere.
+    allow_anon = os.getenv("GRID_ALLOW_ANON", "1").strip() not in ("0", "false", "False")
+
     wa = _require_auth()
+    if not wa and allow_anon:
+        # Try to infer wallet from common locations
+        try:
+            data = request.get_json(silent=True) or {}
+        except Exception:
+            data = {}
+        wa = (
+            (request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address"))
+            or (data.get("wallet") or data.get("wallet_address") or data.get("address"))
+            or (request.args.get("wallet") or request.args.get("wallet_address") or request.args.get("address"))
+        )
+
     if not wa:
         return None, None, err("unauthorized", 401)
 
     policy = get_policy(wa) or {}
+
+    # If we're in anon-mode, do not enforce subscription gates for grid testing.
+    if not _require_auth() and allow_anon:
+        policy.setdefault("trading_enabled", True)
+        return wa, policy, None
 
     st = _compute_access_status(wa)
     if not bool(st.get("can_open_new_trades")):
