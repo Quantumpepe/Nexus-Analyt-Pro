@@ -791,9 +791,9 @@ def _extract_wallet_from_jwt_best_effort(token: str):
                     if kl in ("wallet", "wallet_address", "walletaddress", "address", "sub") and isinstance(v, str):
                         candidates.append(v)
                     walk(v)
-           elif isinstance(obj, list):
-               for it in obj:
-                   walk(it)
+            elif isinstance(obj, list):
+                for it in obj:
+                    walk(it)
 
       walk(payload)
 
