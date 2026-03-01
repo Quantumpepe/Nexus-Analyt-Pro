@@ -690,18 +690,41 @@ def init_db():
 
 def _grid_db_reserved(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
     cur = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(SUM(qty),0) AS s FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? AND status='OPEN'",
-        (_norm_addr(wallet_address), item_id, chain),
-    )
+    if chain:
+        cur.execute(
+            "SELECT COALESCE(SUM(qty),0) AS s FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? AND status='OPEN'",
+            (_norm_addr(wallet_address), item_id, chain),
+        )
+    else:
+        cur.execute(
+            "SELECT COALESCE(SUM(qty),0) AS s FROM grid_orders WHERE wallet_address=? AND item_id=? AND status='OPEN'",
+            (_norm_addr(wallet_address), item_id),
+        )
     row = cur.fetchone()
     return float(row["s"] if row else 0.0)
 
 def _grid_db_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
     cur = conn.cursor()
+    if chain:
+        cur.execute(
+            "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=? AND chain=?",
+            (_norm_addr(wallet_address), item_id, chain),
+        )
+        row = cur.fetchone()
+        return float(row["vault_total"]) if row and row["vault_total"] is not None else 0.0
+
+    # No chain provided: prefer chain='' if present, otherwise most recently updated row for this wallet+item
     cur.execute(
-        "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=? AND chain=?",
-        (_norm_addr(wallet_address), item_id, chain),
+        "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=? AND chain=''",
+        (_norm_addr(wallet_address), item_id),
+    )
+    row = cur.fetchone()
+    if row and row["vault_total"] is not None:
+        return float(row["vault_total"])
+
+    cur.execute(
+        "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=? ORDER BY updated_ts DESC LIMIT 1",
+        (_norm_addr(wallet_address), item_id),
     )
     row = cur.fetchone()
     return float(row["vault_total"]) if row and row["vault_total"] is not None else 0.0
@@ -718,17 +741,31 @@ def _grid_db_set_vault_total(conn, wallet_address: str, item_id: str, vault_tota
 def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
     cur = conn.cursor()
     if item_id:
-        cur.execute(
-            "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
-            "FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? ORDER BY created_ts ASC",
-            (_norm_addr(wallet_address), item_id, chain),
-        )
+        if chain:
+            cur.execute(
+                "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? ORDER BY created_ts ASC",
+                (_norm_addr(wallet_address), item_id, chain),
+            )
+        else:
+            cur.execute(
+                "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "FROM grid_orders WHERE wallet_address=? AND item_id=? ORDER BY created_ts ASC",
+                (_norm_addr(wallet_address), item_id),
+            )
     else:
-        cur.execute(
-            "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
-            "FROM grid_orders WHERE wallet_address=? AND chain=? ORDER BY created_ts ASC",
-            (_norm_addr(wallet_address), chain),
-        )
+        if chain:
+            cur.execute(
+                "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "FROM grid_orders WHERE wallet_address=? AND chain=? ORDER BY created_ts ASC",
+                (_norm_addr(wallet_address), chain),
+            )
+        else:
+            cur.execute(
+                "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "FROM grid_orders WHERE wallet_address=? ORDER BY created_ts ASC",
+                (_norm_addr(wallet_address),),
+            )
     out = []
     for r in cur.fetchall():
         d = dict(r)
@@ -774,18 +811,30 @@ def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, 
 def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
     nowi = int(time.time())
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
-        (nowi, str(oid), _norm_addr(wallet_address), item_id, chain),
-    )
+    if chain:
+        cur.execute(
+            "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+            (nowi, str(oid), _norm_addr(wallet_address), item_id, chain),
+        )
+    else:
+        cur.execute(
+            "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=?",
+            (nowi, str(oid), _norm_addr(wallet_address), item_id),
+        )
     return cur.rowcount
 
 def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
     cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
-        (str(oid), _norm_addr(wallet_address), item_id, chain),
-    )
+    if chain:
+        cur.execute(
+            "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+            (str(oid), _norm_addr(wallet_address), item_id, chain),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=?",
+            (str(oid), _norm_addr(wallet_address), item_id),
+        )
     return cur.rowcount
 
 
