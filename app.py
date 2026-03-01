@@ -1971,11 +1971,44 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     policy.setdefault("trading_enabled", True)
     return wa, policy, None
 
+
+def _grid_item_variants(item_id: str) -> list:
+    """Return candidate item IDs to improve cross-device compatibility (with/without chain prefix)."""
+    it = (item_id or "").strip()
+    if not it:
+        return []
+    vars = []
+    if it not in vars: vars.append(it)
+    # Strip chain prefix if present (e.g., "POL:POL" -> "POL")
+    if ":" in it:
+        base = it.split(":", 1)[1].strip()
+        if base and base not in vars: vars.append(base)
+    else:
+        # Add common chain prefixes if missing (e.g., "POL" -> "POL:POL")
+        up = it.upper()
+        for ch in ("POL", "BNB", "ETH"):
+            if up == ch:
+                cand = f"{ch}:{ch}"
+                if cand not in vars: vars.append(cand)
+    return vars
+
+
+def _grid_sessions_set(item_id: str, sess: dict) -> None:
+    for it in _grid_item_variants(item_id):
+        GRID_SESSIONS[it] = sess
+
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
-    """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned."""
-    sess = GRID_SESSIONS.get(item_id)
-    if not isinstance(sess, dict):
-        return None
+    """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned.
+    Also tolerates item-id variants to keep orders visible across devices/versions.
+    """
+    for it in _grid_item_variants(item_id):
+        sess = GRID_SESSIONS.get(it)
+        if not isinstance(sess, dict):
+            continue
+        owner = _norm_addr(sess.get("wallet_address") or "")
+        if not owner or owner == _norm_addr(wa):
+            return sess
+    return None
     owner = _norm_addr(sess.get("wallet_address") or "")
     if not owner or owner == _norm_addr(wa):
         return sess
@@ -4153,7 +4186,7 @@ def api_grid_start():
 
 
         GRID_CONFIGS[item_id] = cfg
-        GRID_SESSIONS[item_id] = _trim_grid_session(session)
+        _grid_sessions_set(item_id, _trim_grid_session(session))
         _persist_grid_state()
 
         # --- PnL + demo equity init ---
@@ -4267,7 +4300,7 @@ def api_grid_tick():
         updated = _sim_tick(session, new_price=new_price)
         price_source_label = ("frontend" if price is not None else ("snapshot" if new_price is not None else "none"))
 
-    GRID_SESSIONS[item_id] = _trim_grid_session(updated)
+    _grid_sessions_set(item_id, _trim_grid_session(updated))
     _persist_grid_state()
 
     fills = updated.get("fills") if isinstance(updated, dict) else []
@@ -4405,7 +4438,7 @@ def api_grid_stop():
                 pass
             o["cancelled_ts"] = now
     session["stopped"] = True
-    GRID_SESSIONS[item_id] = _trim_grid_session(session)
+    _grid_sessions_set(item_id, _trim_grid_session(session))
     _persist_grid_state()
     return jsonify({"status": "ok", "item": item_id, "stopped": True, "orders": session.get("orders", []), "ts": now})
 
@@ -4433,7 +4466,7 @@ def api_grid_stop_all():
                     pass
                 o["cancelled_ts"] = now
         session["stopped"] = True
-        GRID_SESSIONS[item_id] = _trim_grid_session(session)
+        _grid_sessions_set(item_id, _trim_grid_session(session))
     _persist_grid_state()
     return jsonify({"status":"ok","stopped_all": True, "ts": now})
 
@@ -4458,7 +4491,7 @@ def api_grid_history_clear():
         sess["orders"] = open_orders
         sess["fills"] = []
         sess.pop("filled_now", None)
-        GRID_SESSIONS[item_id] = sess
+        _grid_sessions_set(item_id, sess)
 
     if clear_all:
         for item_id in list((GRID_SESSIONS or {}).keys()):
@@ -5867,7 +5900,7 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
             if session:
                 p = _get_live_price_for_item(item_id)
                 _sim_tick(session, new_price=p)
-                GRID_SESSIONS[item_id] = _trim_grid_session(session)
+                _grid_sessions_set(item_id, _trim_grid_session(session))
                 _persist_grid_state()
         except Exception:
             pass
