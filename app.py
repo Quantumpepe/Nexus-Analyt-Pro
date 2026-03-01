@@ -427,13 +427,7 @@ def err(msg, code=400):
 # -------------------------
 # Grid persistence (JSON) + limits
 # -------------------------
-def _default_grid_state_path() -> str:
-    # Prefer Render persistent disk if available
-    if os.path.isdir("/data"):
-        return "/data/grid_state.json"
-    return os.path.join(os.path.dirname(__file__), "grid_state.json")
-
-GRID_STATE_PATH = os.getenv("NEXUS_GRID_STATE_PATH", _default_grid_state_path())
+GRID_STATE_PATH = os.getenv('NEXUS_GRID_STATE_PATH', '/data/grid_state.json')
 GRID_MAX_HISTORY = int(os.getenv('NEXUS_GRID_MAX_HISTORY', '500'))
 _GRID_PERSIST_LOCK = threading.Lock()
 
@@ -449,10 +443,9 @@ def _grid_state_load() -> dict:
 
 def _grid_state_save(state: dict) -> None:
     try:
-        # Ensure directory exists (especially when using /data on Render)
-        d = os.path.dirname(GRID_STATE_PATH)
-        if d:
-            os.makedirs(d, exist_ok=True)
+        # Ensure persistent directory exists (Render disk mounts at /data)
+        dirpath = os.path.dirname(GRID_STATE_PATH) or '.'
+        os.makedirs(dirpath, exist_ok=True)
         tmp = GRID_STATE_PATH + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False)
@@ -4162,7 +4155,8 @@ def api_grid_start():
         }
 
         session = _sim_build(cfg)
-        session["wallet_address"] = _norm_addr(addr) if addr else ""
+        # Always bind session to authenticated wallet (addr is optional)
+        session["wallet_address"] = _norm_addr(addr) if addr else _norm_addr(wa)
         # If MANUAL, do not auto-create initial grid orders
         if order_mode == 'MANUAL':
             session.setdefault('orders', [])
@@ -5005,7 +4999,7 @@ def api_grid_manual_add():
         except Exception:
             deadline_i = int(DEFAULT_DEADLINE_MINUTES)
 
-        sess = GRID_SESSIONS.get(item_id)
+        sess = _get_owned_session(item_id, wa)
         if not isinstance(sess, dict):
             return jsonify({"error": f"no grid session for item '{item_id}' - press Start first"}), 404
 
