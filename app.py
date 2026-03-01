@@ -427,7 +427,7 @@ def err(msg, code=400):
 # -------------------------
 # Grid persistence (JSON) + limits
 # -------------------------
-GRID_STATE_PATH = os.getenv('NEXUS_GRID_STATE_PATH', os.path.join(os.path.dirname(__file__), 'grid_state.json'))
+GRID_STATE_PATH = os.getenv('NEXUS_GRID_STATE_PATH', '/data/grid_state.json')
 GRID_MAX_HISTORY = int(os.getenv('NEXUS_GRID_MAX_HISTORY', '500'))
 _GRID_PERSIST_LOCK = threading.Lock()
 
@@ -443,6 +443,9 @@ def _grid_state_load() -> dict:
 
 def _grid_state_save(state: dict) -> None:
     try:
+        _dir = os.path.dirname(GRID_STATE_PATH)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
         tmp = GRID_STATE_PATH + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False)
