@@ -654,244 +654,143 @@ def init_db():
             created_ts INTEGER
         )
     """)
-    # --- Grid persistence (orders + vault) ---
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS grid_vaults (
-            wallet_address TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            vault_total REAL NOT NULL DEFAULT 0,
-            updated_ts INTEGER,
-            PRIMARY KEY (wallet_address, item_id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS grid_orders (
-            order_id TEXT PRIMARY KEY,
-            wallet_address TEXT NOT NULL,
-            item_id TEXT NOT NULL,
-            side TEXT,
-            price REAL,
-            qty REAL,
-            slippage REAL,
-            deadline INTEGER,
-            status TEXT,
-            source TEXT,
-            level TEXT,
-            ts INTEGER,
-            cancelled_ts INTEGER
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
+# --- Grid persistence (orders + vault) ---
+cur.execute('''
+    CREATE TABLE IF NOT EXISTS grid_orders (
+        order_id TEXT PRIMARY KEY,
+        wallet_address TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        chain TEXT DEFAULT '',
+        side TEXT NOT NULL,
+        price REAL,
+        qty REAL,
+        status TEXT DEFAULT 'OPEN',
+        level INTEGER,
+        meta_json TEXT DEFAULT '{}',
+        created_ts INTEGER,
+        updated_ts INTEGER
+    )
+''')
+cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
+
+cur.execute('''
+    CREATE TABLE IF NOT EXISTS grid_vaults (
+        wallet_address TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        chain TEXT DEFAULT '',
+        vault_total REAL DEFAULT 0,
+        updated_ts INTEGER,
+        PRIMARY KEY (wallet_address, item_id, chain)
+    )
+''')
 
     conn.commit()
     conn.close()
 
+def _grid_db_reserved(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COALESCE(SUM(qty),0) AS s FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? AND status='OPEN'",
+        (_norm_addr(wallet_address), item_id, chain),
+    )
+    row = cur.fetchone()
+    return float(row["s"] if row else 0.0)
 
+def _grid_db_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=? AND chain=?",
+        (_norm_addr(wallet_address), item_id, chain),
+    )
+    row = cur.fetchone()
+    return float(row["vault_total"]) if row and row["vault_total"] is not None else 0.0
 
+def _grid_db_set_vault_total(conn, wallet_address: str, item_id: str, vault_total: float, chain: str = "") -> None:
+    nowi = int(time.time())
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO grid_vaults(wallet_address,item_id,chain,vault_total,updated_ts) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(wallet_address,item_id,chain) DO UPDATE SET vault_total=excluded.vault_total, updated_ts=excluded.updated_ts",
+        (_norm_addr(wallet_address), item_id, chain, float(vault_total), nowi),
+    )
 
-# -------------------------
-# Grid persistence helpers (SQLite)
-# -------------------------
-
-def _grid_db_get_vault_total(wallet_address: str, item_id: str) -> float:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    if not wa or not iid:
-        return 0.0
-    conn = _db()
-    try:
-        cur = conn.cursor()
+def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
+    cur = conn.cursor()
+    if item_id:
         cur.execute(
-            "SELECT vault_total FROM grid_vaults WHERE wallet_address=? AND item_id=?",
-            (wa, iid),
+            "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+            "FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? ORDER BY created_ts ASC",
+            (_norm_addr(wallet_address), item_id, chain),
         )
-        row = cur.fetchone()
-        return float(row["vault_total"]) if row and row["vault_total"] is not None else 0.0
-    finally:
-        conn.close()
-
-def _grid_db_set_vault_total(wallet_address: str, item_id: str, vault_total: float) -> None:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    if not wa or not iid:
-        return
-    try:
-        v = float(vault_total)
-        if not math.isfinite(v) or v < 0:
-            v = 0.0
-    except Exception:
-        v = 0.0
-    with DB_WRITE_LOCK:
-        conn = _db()
+    else:
+        cur.execute(
+            "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+            "FROM grid_orders WHERE wallet_address=? AND chain=? ORDER BY created_ts ASC",
+            (_norm_addr(wallet_address), chain),
+        )
+    out = []
+    for r in cur.fetchall():
+        d = dict(r)
+        d["id"] = d.pop("order_id")
+        if "item_id" in d:
+            d["item"] = d.pop("item_id")
         try:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO grid_vaults(wallet_address,item_id,vault_total,updated_ts) VALUES(?,?,?,?) "
-                "ON CONFLICT(wallet_address,item_id) DO UPDATE SET vault_total=excluded.vault_total, updated_ts=excluded.updated_ts",
-                (wa, iid, v, int(time.time())),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-def _grid_db_list_orders(wallet_address: str, item_id: Optional[str] = None) -> list[dict]:
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return []
-    conn = _db()
-    try:
-        cur = conn.cursor()
-        if item_id:
-            iid = str(item_id).strip()
-            cur.execute(
-                "SELECT * FROM grid_orders WHERE wallet_address=? AND item_id=? ORDER BY ts DESC",
-                (wa, iid),
-            )
-        else:
-            cur.execute(
-                "SELECT * FROM grid_orders WHERE wallet_address=? ORDER BY ts DESC",
-                (wa,),
-            )
-        rows = cur.fetchall() or []
-        out = []
-        for r in rows:
-            out.append({
-                "id": r["order_id"],
-                "side": r["side"],
-                "price": r["price"],
-                "qty": r["qty"],
-                "slippage": r["slippage"],
-                "deadline": r["deadline"],
-                "status": r["status"],
-                "source": r["source"],
-                "level": r["level"],
-                "ts": r["ts"],
-                "cancelled_ts": r["cancelled_ts"],
-            })
-        return out
-    finally:
-        conn.close()
-
-def _grid_db_insert_order(wallet_address: str, item_id: str, order: dict) -> None:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    if not wa or not iid or not isinstance(order, dict):
-        return
-    oid = str(order.get("id") or order.get("_id") or "").strip()
-    if not oid:
-        return
-    with DB_WRITE_LOCK:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                """INSERT OR REPLACE INTO grid_orders
-                    (order_id, wallet_address, item_id, side, price, qty, slippage, deadline, status, source, level, ts, cancelled_ts)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    oid, wa, iid,
-                    order.get("side"),
-                    float(order.get("price")) if order.get("price") is not None else None,
-                    float(order.get("qty")) if order.get("qty") is not None else None,
-                    float(order.get("slippage")) if order.get("slippage") is not None else None,
-                    int(order.get("deadline")) if order.get("deadline") is not None else None,
-                    order.get("status"),
-                    order.get("source"),
-                    order.get("level"),
-                    int(order.get("ts") or time.time()),
-                    int(order.get("cancelled_ts")) if order.get("cancelled_ts") is not None else None,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-def _grid_db_cancel_order(wallet_address: str, item_id: str, order_id: str) -> bool:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    oid = str(order_id or "").strip()
-    if not wa or not iid or not oid:
-        return False
-    with DB_WRITE_LOCK:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=? WHERE wallet_address=? AND item_id=? AND order_id=? AND status='OPEN'",
-                (int(time.time()), wa, iid, oid),
-            )
-            conn.commit()
-            return (cur.rowcount or 0) > 0
-        finally:
-            conn.close()
-
-def _grid_db_delete_order(wallet_address: str, item_id: str, order_id: str) -> bool:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    oid = str(order_id or "").strip()
-    if not wa or not iid or not oid:
-        return False
-    with DB_WRITE_LOCK:
-        conn = _db()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM grid_orders WHERE wallet_address=? AND item_id=? AND order_id=?",
-                (wa, iid, oid),
-            )
-            conn.commit()
-            return (cur.rowcount or 0) > 0
-        finally:
-            conn.close()
-
-def _grid_db_find_open_order_by_signature(wallet_address: str, item_id: str, side: str, level: str, price: Optional[float]) -> Optional[str]:
-    wa = _norm_addr(wallet_address or "")
-    iid = str(item_id or "").strip()
-    if not wa or not iid:
-        return None
-    s = str(side or "").upper().strip()
-    lvl = str(level or "").strip()
-    if not s or not lvl:
-        return None
-    conn = _db()
-    try:
-        cur = conn.cursor()
-        if price is None:
-            cur.execute(
-                "SELECT order_id FROM grid_orders WHERE wallet_address=? AND item_id=? AND status='OPEN' AND UPPER(COALESCE(side,''))=? AND COALESCE(level,'')=? ORDER BY ts DESC LIMIT 1",
-                (wa, iid, s, lvl),
-            )
-        else:
-            try:
-                pf = float(price)
-            except Exception:
-                pf = None
-            if pf is None:
-                cur.execute(
-                    "SELECT order_id FROM grid_orders WHERE wallet_address=? AND item_id=? AND status='OPEN' AND UPPER(COALESCE(side,''))=? AND COALESCE(level,'')=? ORDER BY ts DESC LIMIT 1",
-                    (wa, iid, s, lvl),
-                )
-            else:
-                cur.execute(
-                    "SELECT order_id FROM grid_orders WHERE wallet_address=? AND item_id=? AND status='OPEN' AND UPPER(COALESCE(side,''))=? AND COALESCE(level,'')=? AND ABS(COALESCE(price,0) - ?) < 1e-12 ORDER BY ts DESC LIMIT 1",
-                    (wa, iid, s, lvl, pf),
-                )
-        row = cur.fetchone()
-        return row["order_id"] if row else None
-    finally:
-        conn.close()
-
-def _grid_calc_reserved_free(vault_total: float, orders: list[dict]) -> dict:
-    reserved = 0.0
-    for o in orders or []:
-        try:
-            if str(o.get("status") or "").upper() == "OPEN":
-                reserved += float(o.get("qty") or 0.0)
+            meta = json.loads(d.get("meta_json") or "{}")
         except Exception:
-            continue
-    free = max(0.0, float(vault_total or 0.0) - reserved)
-    return {"vault_total": float(vault_total or 0.0), "reserved": round(reserved, 12), "free": round(free, 12)}
+            meta = {}
+        d.pop("meta_json", None)
+        if isinstance(meta, dict):
+            for k, v in meta.items():
+                if k not in d:
+                    d[k] = v
+        out.append(d)
+    return out
+
+def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, chain: str = "") -> str:
+    nowi = int(time.time())
+    oid = str(order.get("id") or order.get("order_id") or order.get("orderId") or uuid.uuid4().hex)
+    side = str(order.get("side") or "").upper()
+    price = order.get("price")
+    qty = order.get("qty") if order.get("qty") is not None else order.get("amount")
+    status = str(order.get("status") or "OPEN").upper()
+    level = order.get("level")
+    core_keys = {"id","order_id","orderId","side","price","qty","amount","status","level","item","item_id"}
+    meta = {k:v for k,v in (order or {}).items() if k not in core_keys}
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO grid_orders(order_id,wallet_address,item_id,chain,side,price,qty,status,level,meta_json,created_ts,updated_ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT created_ts FROM grid_orders WHERE order_id=?),?),?)",
+        (oid, _norm_addr(wallet_address), item_id, chain, side,
+         float(price) if price is not None else None,
+         float(qty) if qty is not None else None,
+         status,
+         int(level) if level is not None else None,
+         json.dumps(meta, separators=(",",":")),
+         oid, nowi, nowi),
+    )
+    return oid
+
+def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
+    nowi = int(time.time())
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+        (nowi, str(oid), _norm_addr(wallet_address), item_id, chain),
+    )
+    return cur.rowcount
+
+def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+        (str(oid), _norm_addr(wallet_address), item_id, chain),
+    )
+    return cur.rowcount
+
+
+
+
 
 def _ai_mem_get(wallet_address: str):
     wa = _norm_addr(wallet_address or "")
@@ -4443,18 +4342,6 @@ def api_grid_start():
         except Exception:
             pass
 
-        # --- Grid DB persistence: ensure vault_total + load orders for this wallet/item ---
-        try:
-            initc = float(session.get("initial_capital_usd") or 0.0)
-        except Exception:
-            initc = 0.0
-        try:
-            if _grid_db_get_vault_total(session.get("wallet_address"), item_id) <= 0 and initc > 0:
-                _grid_db_set_vault_total(session.get("wallet_address"), item_id, initc)
-            session["orders"] = _grid_db_list_orders(session.get("wallet_address"), item_id)
-        except Exception as e:
-            print("[WARN] grid db init failed:", e)
-
         return jsonify({
             "status": "ok",
             "item": item_id,
@@ -4764,15 +4651,15 @@ def api_grid_reset_all():
 
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
-    """Return grid orders (persistent).
+    """Return grid orders (SQLite-backed).
 
-    - If ?item=... is provided: return orders for that item.
-    - If no item is provided: return ALL orders across items (for multi-coin table).
-    Also returns vault_total/reserved/free (qty-based) for the selected item when item is provided.
+    - If ?item=... is provided: return orders for that item for this wallet.
+    - If no item is provided: return ALL orders across items for this wallet.
+
+    When item is provided we also return: vault_total, reserved, free.
     """
     wa = _require_auth()
 
-    # Friendly empty response if not logged in
     if not wa:
         item_id = request.args.get("item") or request.args.get("item_id")
         if item_id:
@@ -4781,23 +4668,60 @@ def api_grid_orders():
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
 
     item_id = request.args.get("item") or request.args.get("item_id")
+    chain = str(request.args.get("chain") or "").strip()
+
+    conn = _db()
+    try:
+        if item_id:
+            item_id = str(item_id).strip()
+            orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+            vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            free = max(0.0, float(vault_total) - float(reserved))
+            for o in orders:
+                o["item"] = o.get("item") or item_id
+            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+
+        orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
+        return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
+    finally:
+        conn.close()
+
+        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+
+    item_id = request.args.get("item") or request.args.get("item_id")
+
     if item_id:
         item_id = str(item_id).strip()
-        orders = _grid_db_list_orders(wa, item_id)
-        vt = _grid_db_get_vault_total(wa, item_id)
-        calc = _grid_calc_reserved_free(vt, orders)
-        return jsonify({
-            "status": "ok",
-            "item": item_id,
-            "orders": orders,
-            "vault_total": calc["vault_total"],
-            "reserved": calc["reserved"],
-            "free": calc["free"],
-            "ts": now_ts(),
-        })
+        session = _get_owned_session(item_id, wa)
+        if not session:
+            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
+        orders = session.get("orders") if isinstance(session, dict) else []
+        # ensure item field
+        out=[]
+        for o in (orders or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or item_id
+                out.append(oo)
+        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
 
-    orders = _grid_db_list_orders(wa, None)
-    return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
+    # all items
+    all_orders=[]
+    for it, sess in (GRID_SESSIONS or {}).items():
+        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
+        if owner and owner != _norm_addr(wa):
+            continue
+        if not isinstance(sess, dict):
+            continue
+        for o in (sess.get("orders") or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or it
+                all_orders.append(oo)
+    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
+
+
 
 @app.route("/api/grid/budgets", methods=["GET"])
 def api_grid_budgets():
@@ -4942,60 +4866,9 @@ def api_grid_budgets_by_chain():
 
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
-    """Stop (cancel) a single order (persistent)."""
-    wa = _require_auth()
-    if not wa:
-        return jsonify({"error": "unauthorized"}), 401
+    """Stop (cancel) a single order (SQLite-backed).
 
-    payload = request.get_json(silent=True) or {}
-    item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
-    if not item_id:
-        return jsonify({"error": "missing item"}), 400
-
-    oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
-    side = payload.get("side")
-    price = payload.get("price")
-    level = payload.get("level")
-
-    order_id = None
-    if oid is not None and str(oid).strip() != "":
-        order_id = str(oid).strip()
-    else:
-        if side is None or level is None:
-            return jsonify({"error": "missing id or (side+level)"}), 400
-        order_id = _grid_db_find_open_order_by_signature(wa, item_id, str(side), str(level), price)
-        if not order_id:
-            return jsonify({"error": "order not found or not open"}), 404
-
-    ok_cancel = _grid_db_cancel_order(wa, item_id, order_id)
-    if not ok_cancel:
-        return jsonify({"error": "order not found or not open"}), 404
-
-    # Best-effort update in-memory session (if running)
-    try:
-        sess = _get_owned_session(item_id, wa)
-        if isinstance(sess, dict) and isinstance(sess.get("orders"), list):
-            for o in sess["orders"]:
-                if str(o.get("id")) == str(order_id):
-                    o["status"] = "CANCELLED"
-                    o["cancelled_ts"] = int(time.time())
-                    break
-            _trim_grid_session(sess)
-            _persist_grid_state()
-    except Exception:
-        pass
-
-    orders_db = _grid_db_list_orders(wa, item_id)
-    return jsonify({
-        "status": "ok",
-        "orders": orders_db,
-        "ts": now_ts(),
-    })
-
-
-@app.route("/api/grid/order/delete", methods=["POST", "DELETE"])
-def api_grid_order_delete():
-    """Delete a single order from a grid session.
+    Works even if the grid session is not running.
     Accepts:
       {item, id} OR {item, orderId/order_id} OR {item, side, price, level}
     """
@@ -5008,60 +4881,111 @@ def api_grid_order_delete():
     if not item_id:
         return jsonify({"error": "missing item"}), 400
 
-    sess = GRID_SESSIONS.get(item_id)
-    if not isinstance(sess, dict):
-        return jsonify({"error": f"no grid session for item '{item_id}'"}), 404
-
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     side = payload.get("side")
     price = payload.get("price")
     level = payload.get("level")
+    chain = str(payload.get("chain") or "").strip()
 
-    orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+    # Update RAM session if present (fast UI feedback)
+    sess = GRID_SESSIONS.get(item_id)
+    if isinstance(sess, dict):
+        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+        def _match(o: dict) -> bool:
+            if not isinstance(o, dict): return False
+            if o.get("status") != "OPEN": return False
+            if oid is not None and str(oid).strip() != "":
+                return str(o.get("id")) == str(oid)
+            if side is None or level is None: return False
+            if str(o.get("side")) != str(side): return False
+            if o.get("level") != level: return False
+            if price is None: return True
+            try:
+                return float(o.get("price")) == float(price)
+            except Exception:
+                return o.get("price") == price
 
-    def _match(o: dict) -> bool:
-        if not isinstance(o, dict):
-            return False
+        for o in orders:
+            if _match(o):
+                o["status"] = "CANCELLED"
+                o["cancelled_ts"] = int(time.time())
+                break
+        sess["orders"] = orders
 
-        if oid is not None and str(oid).strip() != "":
-            return str(o.get("id")) == str(oid)
+    if oid is None or str(oid).strip() == "":
+        return jsonify({"error": "missing id"}), 400
 
-        if side is None or level is None:
-            return False
-        if str(o.get("side")) != str(side):
-            return False
-        if o.get("level") != level:
-            return False
-        if price is None:
-            return True
-        try:
-            return float(o.get("price")) == float(price)
-        except Exception:
-            return o.get("price") == price
-
-    before = len(orders)
-    orders = [o for o in orders if not _match(o)]
-    after = len(orders)
-
-    if after == before:
-        return jsonify({"error": "order not found"}), 404
-
-    sess["orders"] = orders
-
+    # Authoritative DB update
+    conn = _db()
     try:
-        _trim_grid_session(sess)
-        _persist_grid_state()
-    except Exception as e:
-        print("[WARN] delete order post-processing failed:", e)
+        with DB_WRITE_LOCK:
+            rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
+            conn.commit()
 
-    return jsonify({
-        "status": "ok",
-        "orders": sess.get("orders", []),
-        "fills": sess.get("fills", []),
-        "tick": sess.get("ticks", 0),
-        "price": sess.get("price")
-    })
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        free = max(0.0, float(vault_total) - float(reserved))
 
+        if rc <= 0:
+            return jsonify({"error": "order not found"}), 404
+        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+    finally:
+        conn.close()
+
+@app.route("/api/grid/order/delete", methods=["POST", "DELETE"])
+def api_grid_order_delete():
+    """Permanently delete a single order (SQLite-backed).
+
+    Works even if the grid session is not running.
+    Accepts:
+      {item, id} OR {item, orderId/order_id}
+    """
+    wa = _require_auth()
+    if not wa:
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+    if not item_id:
+        return jsonify({"error": "missing item"}), 400
+
+    oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
+    if oid is None or str(oid).strip() == "":
+        return jsonify({"error": "missing id"}), 400
+
+    chain = str(payload.get("chain") or "").strip()
+
+    # Remove from RAM session if present
+    sess = GRID_SESSIONS.get(item_id)
+    if isinstance(sess, dict) and isinstance(sess.get("orders"), list):
+        sess["orders"] = [o for o in sess["orders"] if not (isinstance(o, dict) and str(o.get("id")) == str(oid))]
+
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
+            conn.commit()
+
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        free = max(0.0, float(vault_total) - float(reserved))
+
+        if rc <= 0:
+            return jsonify({"error": "order not found"}), 404
+        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+    finally:
+        conn.close()
+
+
+@app.route("/api/grid/order/cancel", methods=["POST"])
+def api_grid_order_cancel_alias():
+    return api_grid_order_stop()
+
+@app.route("/api/grid/order/remove", methods=["POST", "DELETE"])
+def api_grid_order_remove_alias():
+    return api_grid_order_delete()
 
 @app.route("/api/grid/config", methods=["GET"])
 def api_grid_config():
@@ -5229,16 +5153,8 @@ def api_grid_manual_add():
             sess["orders"] = []
         sess["orders"].insert(0, order)
 
-        try:
-            _grid_db_insert_order(wa, item_id, order)
-        except Exception as e:
-            print("[WARN] grid db insert_order failed:", e)
-
         _trim_grid_session(sess)
         _persist_grid_state()
-
-        # Return authoritative orders from DB
-        orders_db = _grid_db_list_orders(wa, item_id)
 
         return jsonify({
             "status": "ok",
