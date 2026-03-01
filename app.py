@@ -654,8 +654,8 @@ def init_db():
             created_ts INTEGER
         )
     """)
-# --- Grid persistence (orders + vault) ---
-cur.execute('''
+    # --- Grid persistence (orders + vault) ---
+    cur.execute('''
     CREATE TABLE IF NOT EXISTS grid_orders (
         order_id TEXT PRIMARY KEY,
         wallet_address TEXT NOT NULL,
@@ -671,10 +671,10 @@ cur.execute('''
         updated_ts INTEGER
     )
 ''')
-cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
 
-cur.execute('''
+    cur.execute('''
     CREATE TABLE IF NOT EXISTS grid_vaults (
         wallet_address TEXT NOT NULL,
         item_id TEXT NOT NULL,
