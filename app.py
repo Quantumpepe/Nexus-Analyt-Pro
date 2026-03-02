@@ -4699,22 +4699,27 @@ def api_grid_reset_all():
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
 @app.route("/api/grid/orders", methods=["GET"])
+
 def api_grid_orders():
-    """Return grid orders (SQLite-backed).
+    """
+    Return grid orders (SQLite-backed).
 
-    - If ?item=... is provided: return orders for that item for this wallet.
-    - If no item is provided: return ALL orders across items for this wallet.
+    Query params:
+      - item or item_id (optional): if provided, return orders + vault/reserved/free for that item.
+      - chain (optional): filter by chain (POL/BNB/ETH/etc). If empty, returns all chains.
 
-    When item is provided we also return: vault_total, reserved, free.
+    Auth:
+      - requires _require_auth() (wallet address via auth headers / token).
     """
     wa = _require_auth()
 
+    # If not authenticated, always return empty but OK (frontend can show "connect wallet")
     if not wa:
         item_id = request.args.get("item") or request.args.get("item_id")
+        payload = {"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()}
         if item_id:
-            item_id = str(item_id).strip()
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+            payload["item"] = str(item_id).strip()
+        return jsonify(payload)
 
     item_id = request.args.get("item") or request.args.get("item_id")
     chain = str(request.args.get("chain") or "").strip()
@@ -4727,49 +4732,29 @@ def api_grid_orders():
             vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
+
+            # Ensure item field on every order
             for o in orders:
-                o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+                if isinstance(o, dict):
+                    o["item"] = o.get("item") or item_id
+
+            return jsonify({
+                "status": "ok",
+                "item": item_id,
+                "orders": orders,
+                "vault_total": vault_total,
+                "reserved": reserved,
+                "free": free,
+                "ts": now_ts(),
+            })
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
     finally:
-        conn.close()
-
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
-
-    item_id = request.args.get("item") or request.args.get("item_id")
-
-    if item_id:
-        item_id = str(item_id).strip()
-        session = _get_owned_session(item_id, wa)
-        if not session:
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
-        orders = session.get("orders") if isinstance(session, dict) else []
-        # ensure item field
-        out=[]
-        for o in (orders or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or item_id
-                out.append(oo)
-        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
-
-    # all items
-    all_orders=[]
-    for it, sess in (GRID_SESSIONS or {}).items():
-        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
-        if owner and owner != _norm_addr(wa):
-            continue
-        if not isinstance(sess, dict):
-            continue
-        for o in (sess.get("orders") or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or it
-                all_orders.append(oo)
-    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
-
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.route("/api/grid/budgets", methods=["GET"])
