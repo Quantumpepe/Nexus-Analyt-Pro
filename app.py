@@ -4698,6 +4698,7 @@ def api_grid_reset_all():
     _persist_grid_state()
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
+
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
     """Return grid orders (SQLite-backed).
@@ -4709,15 +4710,14 @@ def api_grid_orders():
     """
     wa = _require_auth()
 
+    item_id = request.args.get("item") or request.args.get("item_id")
+    chain = str(request.args.get("chain") or "").strip()
+
     if not wa:
-        item_id = request.args.get("item") or request.args.get("item_id")
         if item_id:
             item_id = str(item_id).strip()
             return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
-
-    item_id = request.args.get("item") or request.args.get("item_id")
-    chain = str(request.args.get("chain") or "").strip()
 
     conn = _db()
     try:
@@ -4729,48 +4729,20 @@ def api_grid_orders():
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+            return jsonify({
+                "status": "ok",
+                "item": item_id,
+                "orders": orders,
+                "vault_total": vault_total,
+                "reserved": reserved,
+                "free": free,
+                "ts": now_ts()
+            })
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
     finally:
         conn.close()
-
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
-
-    item_id = request.args.get("item") or request.args.get("item_id")
-
-    if item_id:
-        item_id = str(item_id).strip()
-        session = _get_owned_session(item_id, wa)
-        if not session:
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
-        orders = session.get("orders") if isinstance(session, dict) else []
-        # ensure item field
-        out=[]
-        for o in (orders or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or item_id
-                out.append(oo)
-        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
-
-    # all items
-    all_orders=[]
-    for it, sess in (GRID_SESSIONS or {}).items():
-        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
-        if owner and owner != _norm_addr(wa):
-            continue
-        if not isinstance(sess, dict):
-            continue
-        for o in (sess.get("orders") or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or it
-                all_orders.append(oo)
-    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
-
-
 
 @app.route("/api/grid/budgets", methods=["GET"])
 def api_grid_budgets():
@@ -5201,6 +5173,20 @@ def api_grid_manual_add():
         if not isinstance(sess.get("orders"), list):
             sess["orders"] = []
         sess["orders"].insert(0, order)
+
+        # Persist manual order into SQLite so UI refresh/poll shows it consistently (Render Disk /data)
+        chain = str(payload.get("chain") or "").strip()
+        try:
+            with DB_WRITE_LOCK:
+                conn = _db()
+                try:
+                    _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:
+            # Do not fail the request if DB insert fails; we still keep it in grid_state.json
+            print("[WARN] DB insert grid_orders failed:", e)
 
         _trim_grid_session(sess)
         _persist_grid_state()
