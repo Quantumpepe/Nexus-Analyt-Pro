@@ -503,6 +503,52 @@ def _db():
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
 
+
+def _db_table_columns(conn, table_name: str):
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table_name})")
+    # row: (cid, name, type, notnull, dflt_value, pk)
+    return {row[1]: row for row in cur.fetchall()}
+
+def _db_ensure_columns(conn, table_name: str, columns_sql: dict):
+    """Ensure columns exist in an existing SQLite table (safe migration for persistent /data DB)."""
+    existing = _db_table_columns(conn, table_name)
+    cur = conn.cursor()
+    for col, col_sql in columns_sql.items():
+        if col in existing:
+            continue
+        # SQLite supports ALTER TABLE ADD COLUMN <definition>
+        try:
+            cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_sql}")
+            print(f"[DB] Migrated {table_name}: added column {col}")
+        except Exception as e:
+            print(f"[DB] WARNING: could not add column {col} to {table_name}: {e}")
+
+def _db_migrate_schema(conn):
+    """One-time additive migrations for older DBs."""
+    # grid_orders: older deployments may miss newer columns like meta_json/created_ts/updated_ts
+    _db_ensure_columns(conn, "grid_orders", {
+        "chain": "chain TEXT DEFAULT ''",
+        "side": "side TEXT",
+        "price": "price REAL",
+        "qty": "qty REAL",
+        "status": "status TEXT DEFAULT 'OPEN'",
+        "level": "level INTEGER",
+        "meta_json": "meta_json TEXT DEFAULT '{}'",
+        "created_ts": "created_ts INTEGER",
+        "updated_ts": "updated_ts INTEGER",
+        "cancelled_ts": "cancelled_ts INTEGER",
+    })
+    # grid_vaults: ensure chain exists for multi-chain deployments
+    _db_ensure_columns(conn, "grid_vaults", {
+        "chain": "chain TEXT DEFAULT ''",
+        "vault_total": "vault_total REAL DEFAULT 0",
+        "updated_ts": "updated_ts INTEGER",
+    })
+
+
+
+
 def init_db():
     conn = _db()
     cur = conn.cursor()
@@ -673,17 +719,6 @@ def init_db():
 ''')
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
-    # --- Migration: older DBs may miss newer columns (e.g., meta_json) ---
-    try:
-        cur.execute("PRAGMA table_info(grid_orders)")
-        existing_cols = [row[1] for row in cur.fetchall()]
-        if "meta_json" not in existing_cols:
-            print("[DB] Migrating grid_orders: adding meta_json")
-            cur.execute("ALTER TABLE grid_orders ADD COLUMN meta_json TEXT DEFAULT '{}'")  # SQLite only supports ADD COLUMN
-    except Exception as _e:
-        # Best-effort migration; do not crash app if ALTER fails on some environments
-        print("[DB] grid_orders migration warning:", _e)
-
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS grid_vaults (
@@ -695,6 +730,9 @@ def init_db():
         PRIMARY KEY (wallet_address, item_id, chain)
     )
 ''')
+
+    # Auto-migrate persistent DB schema on Render disk (/data)
+    _db_migrate_schema(conn)
 
     conn.commit()
     conn.close()
@@ -4709,7 +4747,6 @@ def api_grid_reset_all():
     _persist_grid_state()
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
-
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
     """Return grid orders (SQLite-backed).
@@ -4721,14 +4758,15 @@ def api_grid_orders():
     """
     wa = _require_auth()
 
-    item_id = request.args.get("item") or request.args.get("item_id")
-    chain = str(request.args.get("chain") or "").strip()
-
     if not wa:
+        item_id = request.args.get("item") or request.args.get("item_id")
         if item_id:
             item_id = str(item_id).strip()
             return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+
+    item_id = request.args.get("item") or request.args.get("item_id")
+    chain = str(request.args.get("chain") or "").strip()
 
     conn = _db()
     try:
@@ -4740,20 +4778,48 @@ def api_grid_orders():
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({
-                "status": "ok",
-                "item": item_id,
-                "orders": orders,
-                "vault_total": vault_total,
-                "reserved": reserved,
-                "free": free,
-                "ts": now_ts()
-            })
+            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
     finally:
         conn.close()
+
+        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+
+    item_id = request.args.get("item") or request.args.get("item_id")
+
+    if item_id:
+        item_id = str(item_id).strip()
+        session = _get_owned_session(item_id, wa)
+        if not session:
+            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
+        orders = session.get("orders") if isinstance(session, dict) else []
+        # ensure item field
+        out=[]
+        for o in (orders or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or item_id
+                out.append(oo)
+        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
+
+    # all items
+    all_orders=[]
+    for it, sess in (GRID_SESSIONS or {}).items():
+        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
+        if owner and owner != _norm_addr(wa):
+            continue
+        if not isinstance(sess, dict):
+            continue
+        for o in (sess.get("orders") or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or it
+                all_orders.append(oo)
+    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
+
+
 
 @app.route("/api/grid/budgets", methods=["GET"])
 def api_grid_budgets():
@@ -5184,20 +5250,6 @@ def api_grid_manual_add():
         if not isinstance(sess.get("orders"), list):
             sess["orders"] = []
         sess["orders"].insert(0, order)
-
-        # Persist manual order into SQLite so UI refresh/poll shows it consistently (Render Disk /data)
-        chain = str(payload.get("chain") or "").strip()
-        try:
-            with DB_WRITE_LOCK:
-                conn = _db()
-                try:
-                    _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
-                    conn.commit()
-                finally:
-                    conn.close()
-        except Exception as e:
-            # Do not fail the request if DB insert fails; we still keep it in grid_state.json
-            print("[WARN] DB insert grid_orders failed:", e)
 
         _trim_grid_session(sess)
         _persist_grid_state()
