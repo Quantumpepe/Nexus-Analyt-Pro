@@ -673,6 +673,17 @@ def init_db():
 ''')
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
+    # --- Migration: older DBs may miss newer columns (e.g., meta_json) ---
+    try:
+        cur.execute("PRAGMA table_info(grid_orders)")
+        existing_cols = [row[1] for row in cur.fetchall()]
+        if "meta_json" not in existing_cols:
+            print("[DB] Migrating grid_orders: adding meta_json")
+            cur.execute("ALTER TABLE grid_orders ADD COLUMN meta_json TEXT DEFAULT '{}'")  # SQLite only supports ADD COLUMN
+    except Exception as _e:
+        # Best-effort migration; do not crash app if ALTER fails on some environments
+        print("[DB] grid_orders migration warning:", _e)
+
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS grid_vaults (
