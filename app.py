@@ -792,13 +792,13 @@ def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, 
     if item_id:
         if chain:
             cur.execute(
-                "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
                 "FROM grid_orders WHERE wallet_address=? AND item_id=? AND chain=? ORDER BY created_ts ASC",
                 (_norm_addr(wallet_address), item_id, chain),
             )
         else:
             cur.execute(
-                "SELECT order_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
+                "SELECT order_id, item_id, side, price, qty, status, level, meta_json, created_ts, updated_ts "
                 "FROM grid_orders WHERE wallet_address=? AND item_id=? ORDER BY created_ts ASC",
                 (_norm_addr(wallet_address), item_id),
             )
@@ -858,19 +858,41 @@ def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, 
     return oid
 
 def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
+    """
+    Cancel an order. Primary key is (wallet_address, order_id).
+    We keep item_id/chain filters for fast-path, but fall back to order_id-only
+    to tolerate UI/backend item_id mismatches.
+    """
     nowi = int(time.time())
     cur = conn.cursor()
+    wa = _norm_addr(wallet_address)
+
+    # Fast-path: match the expected item_id (+ optional chain)
     if chain:
         cur.execute(
-            "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
-            (nowi, str(oid), _norm_addr(wallet_address), item_id, chain),
+            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+            (nowi, nowi, str(oid), wa, item_id, chain),
         )
     else:
         cur.execute(
-            "UPDATE grid_orders SET status='CANCELLED', updated_ts=? WHERE order_id=? AND wallet_address=? AND item_id=?",
-            (nowi, str(oid), _norm_addr(wallet_address), item_id),
+            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=?",
+            (nowi, nowi, str(oid), wa, item_id),
         )
-    return cur.rowcount
+    rc = cur.rowcount
+
+    # Fallback: cancel by (wallet_address, order_id) only
+    if rc <= 0:
+        cur.execute(
+            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=?",
+            (nowi, nowi, str(oid), wa),
+        )
+        rc = cur.rowcount
+
+    return rc
+
 
 def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
     cur = conn.cursor()
