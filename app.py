@@ -714,7 +714,8 @@ def init_db():
         level INTEGER,
         meta_json TEXT DEFAULT '{}',
         created_ts INTEGER,
-        updated_ts INTEGER
+        updated_ts INTEGER,
+        cancelled_ts INTEGER
     )
 ''')
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
@@ -895,18 +896,34 @@ def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, cha
 
 
 def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
+    """Delete an order.
+
+    We try the strict match (wallet+item+optional chain) first, then fall back to (wallet+order_id)
+    to tolerate item_id mismatches between UI and backend.
+    """
     cur = conn.cursor()
+    wa = _norm_addr(wallet_address)
+
     if chain:
         cur.execute(
             "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
-            (str(oid), _norm_addr(wallet_address), item_id, chain),
+            (str(oid), wa, item_id, chain),
         )
     else:
         cur.execute(
             "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=? AND item_id=?",
-            (str(oid), _norm_addr(wallet_address), item_id),
+            (str(oid), wa, item_id),
         )
-    return cur.rowcount
+    rc = cur.rowcount
+
+    if rc <= 0:
+        cur.execute(
+            "DELETE FROM grid_orders WHERE order_id=? AND wallet_address=?",
+            (str(oid), wa),
+        )
+        rc = cur.rowcount
+
+    return rc
 
 
 
@@ -5031,7 +5048,6 @@ def api_grid_order_stop():
                 o["cancelled_ts"] = int(time.time())
                 break
         sess["orders"] = orders
-        _persist_grid_state()
 
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
@@ -5081,7 +5097,6 @@ def api_grid_order_delete():
     sess = GRID_SESSIONS.get(item_id)
     if isinstance(sess, dict) and isinstance(sess.get("orders"), list):
         sess["orders"] = [o for o in sess["orders"] if not (isinstance(o, dict) and str(o.get("id")) == str(oid))]
-        _persist_grid_state()
 
     conn = _db()
     try:
@@ -5253,10 +5268,6 @@ def api_grid_manual_add():
         except Exception:
             deadline_i = int(DEFAULT_DEADLINE_MINUTES)
 
-        sess = _get_owned_session(item_id, wa)
-        if not isinstance(sess, dict):
-            return jsonify({"error": f"no grid session for item '{item_id}' - press Start first"}), 404
-
         # Create order
         order = {
             "id": str(uuid.uuid4()),
@@ -5271,40 +5282,57 @@ def api_grid_manual_add():
             "level": payload.get("level", None),  # optional
         }
 
-        if not isinstance(sess.get("orders"), list):
-            sess["orders"] = []
-        sess["orders"].insert(0, order)
-
-        _trim_grid_session(sess)
-        _persist_grid_state()
-
-        # --- Persist to SQLite so manual orders survive refresh/restart ---
+        # Persist to DB (authoritative)
         chain = str(payload.get("chain") or "").strip()
+
         db_saved = True
         db_error = None
+        conn = _db()
         try:
-            conn = _db()
-            try:
-                with DB_WRITE_LOCK:
-                    _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
-                    conn.commit()
-            finally:
-                conn.close()
+            with DB_WRITE_LOCK:
+                _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
+                conn.commit()
         except Exception as e:
             db_saved = False
             db_error = str(e)
-            print("[WARN] grid_orders DB insert failed:", e)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+        # Optional: mirror into in-memory session if it exists (executor may use it)
+        sess = GRID_SESSIONS.get(item_id)
+        if isinstance(sess, dict):
+            if not isinstance(sess.get("orders"), list):
+                sess["orders"] = []
+            sess["orders"].insert(0, order)
+            _trim_grid_session(sess)
+            _persist_grid_state()
+
+        # Return DB view
+        conn = _db()
+        try:
+            orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+            vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            free = max(0.0, float(vault_total) - float(reserved))
+        finally:
+            conn.close()
 
         return jsonify({
             "status": "ok",
             "order": order,
-            "orders": sess.get("orders", []),
-            "fills": sess.get("fills", []),
-            "tick": sess.get("ticks", 0),
-            "price": sess.get("price"),
+            "orders": orders_db,
+            "vault_total": vault_total,
+            "reserved": reserved,
+            "free": free,
             "db_saved": db_saved,
-            "db_error": db_error
+            "db_error": db_error,
+            "ts": now_ts(),
         })
+
     except Exception as e:
         print("[ERROR] manual add failed:", e)
         return jsonify({"error": "internal_error", "detail": str(e)}), 500
