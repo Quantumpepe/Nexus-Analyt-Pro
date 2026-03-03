@@ -5031,6 +5031,7 @@ def api_grid_order_stop():
                 o["cancelled_ts"] = int(time.time())
                 break
         sess["orders"] = orders
+        _persist_grid_state()
 
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
@@ -5080,6 +5081,7 @@ def api_grid_order_delete():
     sess = GRID_SESSIONS.get(item_id)
     if isinstance(sess, dict) and isinstance(sess.get("orders"), list):
         sess["orders"] = [o for o in sess["orders"] if not (isinstance(o, dict) and str(o.get("id")) == str(oid))]
+        _persist_grid_state()
 
     conn = _db()
     try:
@@ -5276,13 +5278,32 @@ def api_grid_manual_add():
         _trim_grid_session(sess)
         _persist_grid_state()
 
+        # --- Persist to SQLite so manual orders survive refresh/restart ---
+        chain = str(payload.get("chain") or "").strip()
+        db_saved = True
+        db_error = None
+        try:
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
+                    conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            db_saved = False
+            db_error = str(e)
+            print("[WARN] grid_orders DB insert failed:", e)
+
         return jsonify({
             "status": "ok",
             "order": order,
             "orders": sess.get("orders", []),
             "fills": sess.get("fills", []),
             "tick": sess.get("ticks", 0),
-            "price": sess.get("price")
+            "price": sess.get("price"),
+            "db_saved": db_saved,
+            "db_error": db_error
         })
     except Exception as e:
         print("[ERROR] manual add failed:", e)
