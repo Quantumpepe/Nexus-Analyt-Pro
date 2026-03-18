@@ -788,6 +788,68 @@ def _grid_db_set_vault_total(conn, wallet_address: str, item_id: str, vault_tota
         (_norm_addr(wallet_address), item_id, chain, float(vault_total), nowi),
     )
 
+def _grid_chain_key(item_id: str, chain: str = "") -> str:
+    ch = str(chain or "").strip().upper()
+    if ch:
+        return ch
+    it = str(item_id or "").strip().upper()
+    if ":" in it:
+        pref = it.split(":", 1)[0].strip().upper()
+        if pref in _CHAIN_ID_BY_KEY:
+            return pref
+    if it in _CHAIN_ID_BY_KEY:
+        return it
+    return ""
+
+def _native_balance_for_wallet(wallet_address: str, chain: str = "", item_id: str = "") -> float:
+    wa = _norm_addr(wallet_address or "")
+    if not wa or not _looks_like_evm_addr(wa):
+        return 0.0
+    ch = _grid_chain_key(item_id=item_id, chain=chain)
+    cid = int(_CHAIN_ID_BY_KEY.get(ch, 0) or 0)
+    if cid <= 0:
+        return 0.0
+    try:
+        raw = _rpc_call(cid, "eth_getBalance", [wa, "latest"])
+        wei = _hex_to_int(raw or "0x0")
+        if wei <= 0:
+            return 0.0
+        return float(wei) / 1e18
+    except Exception:
+        return 0.0
+
+def _grid_effective_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
+    """Return authoritative vault total for grid UI.
+
+    Priority:
+      1) explicit grid_vaults row
+      2) on-chain native wallet balance fallback (POL/BNB/ETH)
+
+    The fallback is important for fresh sessions/manual orders where grid_vaults
+    has not been initialized yet. We persist the discovered on-chain balance back
+    into grid_vaults as a cache so subsequent reads are stable across devices.
+    """
+    vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
+    try:
+        vt_f = float(vt or 0.0)
+    except Exception:
+        vt_f = 0.0
+    if vt_f > 0:
+        return vt_f
+
+    bal = _native_balance_for_wallet(wallet_address, chain=chain, item_id=item_id)
+    try:
+        bal_f = float(bal or 0.0)
+    except Exception:
+        bal_f = 0.0
+    if bal_f > 0:
+        try:
+            _grid_db_set_vault_total(conn, wallet_address, item_id, bal_f, chain=chain)
+        except Exception:
+            pass
+        return bal_f
+    return 0.0
+
 def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
     cur = conn.cursor()
     if item_id:
@@ -4463,6 +4525,22 @@ def api_grid_start():
         _grid_sessions_set(item_id, _trim_grid_session(session))
         _persist_grid_state()
 
+        # Seed authoritative grid vault from on-chain native wallet balance (POL/BNB/ETH)
+        # so Vault/Reserved/Free are correct immediately after Start and after refresh.
+        try:
+            chain_key = str(body.get("chain") or "").strip()
+            conn = _db()
+            try:
+                native_total = _native_balance_for_wallet(session.get("wallet_address") or wa, chain=chain_key, item_id=item_id)
+                if native_total > 0:
+                    with DB_WRITE_LOCK:
+                        _grid_db_set_vault_total(conn, wa, item_id, native_total, chain=chain_key)
+                        conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
         # --- PnL + demo equity init ---
         try:
             _ensure_pnl(session)
@@ -4812,7 +4890,7 @@ def api_grid_orders():
         if item_id:
             item_id = str(item_id).strip()
             orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
@@ -5060,7 +5138,7 @@ def api_grid_order_stop():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5105,7 +5183,7 @@ def api_grid_order_delete():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5315,9 +5393,13 @@ def api_grid_manual_add():
         conn = _db()
         try:
             orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_db_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
+            try:
+                conn.commit()
+            except Exception:
+                pass
         finally:
             conn.close()
 
