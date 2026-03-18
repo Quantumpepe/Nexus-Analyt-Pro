@@ -822,6 +822,15 @@ def init_db():
     )
 ''')
 
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS grid_ui_state (
+        wallet_address TEXT PRIMARY KEY,
+        active_chain TEXT DEFAULT '',
+        active_item TEXT DEFAULT '',
+        updated_ts INTEGER
+    )
+''')
+
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
 
@@ -890,6 +899,75 @@ def _grid_chain_key(item_id: str, chain: str = "") -> str:
     if it in _CHAIN_ID_BY_KEY:
         return it
     return ""
+
+def _grid_default_item_for_chain(chain_key: str) -> str:
+    ck = str(chain_key or "POL").strip().upper() or "POL"
+    return f"{ck}:{ck}"
+
+def _grid_ui_state_get(conn, wallet_address: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
+    cur = conn.cursor()
+    cur.execute("SELECT active_chain, active_item, updated_ts FROM grid_ui_state WHERE wallet_address=?", (wa,))
+    row = cur.fetchone()
+    if not row:
+        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
+    active_chain = str(row["active_chain"] or "").strip().upper() or "POL"
+    active_item = str(row["active_item"] or "").strip() or _grid_default_item_for_chain(active_chain)
+    return {
+        "active_chain": active_chain,
+        "active_item": active_item,
+        "updated_ts": int(row["updated_ts"] or 0),
+    }
+
+def _grid_ui_state_put(conn, wallet_address: str, active_chain: str = "", active_item: str = "") -> dict:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
+    ch = str(active_chain or "").strip().upper()
+    it = str(active_item or "").strip()
+    if not ch:
+        ch = _grid_chain_key(it) or "POL"
+    if not it:
+        it = _grid_default_item_for_chain(ch)
+    nowi = int(time.time())
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO grid_ui_state(wallet_address, active_chain, active_item, updated_ts) VALUES (?,?,?,?) "
+        "ON CONFLICT(wallet_address) DO UPDATE SET active_chain=excluded.active_chain, active_item=excluded.active_item, updated_ts=excluded.updated_ts",
+        (wa, ch, it, nowi),
+    )
+    return {"active_chain": ch, "active_item": it, "updated_ts": nowi}
+
+def _grid_best_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
+    # Prefer explicit stored grid vault total. If missing, try vault contract for native items.
+    vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
+    try:
+        vt_f = float(vt or 0.0)
+    except Exception:
+        vt_f = 0.0
+    if vt_f > 0:
+        return vt_f
+
+    ck = _grid_chain_key(item_id=item_id, chain=chain)
+    sym = str(item_id or "").split(":", 1)[-1].strip().upper()
+    if ck in ("POL", "BNB", "ETH") and sym == ck:
+        try:
+            vstate = _vault_state_read(wallet_address, ck)
+            contract_total = float(vstate.get("vault_balance") or 0.0)
+            if contract_total >= 0:
+                try:
+                    with DB_WRITE_LOCK:
+                        _grid_db_set_vault_total(conn, wallet_address, item_id, contract_total, chain=chain or ck)
+                except Exception:
+                    pass
+                return contract_total
+        except Exception:
+            pass
+
+    # final fallback for backwards compatibility
+    return _grid_effective_vault_total(conn, wallet_address, item_id, chain=chain)
 
 def _native_balance_for_wallet(wallet_address: str, chain: str = "", item_id: str = "") -> float:
     wa = _norm_addr(wallet_address or "")
@@ -4546,6 +4624,7 @@ def api_grid_start():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
+    chain_key_req = str(body.get("chain") or _grid_chain_key(item_id) or "").strip().upper()
 
     # ✅ Use real price if provided or from cached watchlist snapshot
     start_price = body.get("price") or body.get("start_price")
@@ -4615,10 +4694,21 @@ def api_grid_start():
         _grid_sessions_set(item_id, _trim_grid_session(session))
         _persist_grid_state()
 
+        try:
+            conn_ui = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    _grid_ui_state_put(conn_ui, wa, active_chain=(chain_key_req or _grid_chain_key(item_id) or "POL"), active_item=item_id)
+                    conn_ui.commit()
+            finally:
+                conn_ui.close()
+        except Exception:
+            pass
+
         # Seed authoritative grid vault from on-chain native wallet balance (POL/BNB/ETH)
         # so Vault/Reserved/Free are correct immediately after Start and after refresh.
         try:
-            chain_key = str(body.get("chain") or "").strip()
+            chain_key = str(body.get("chain") or chain_key_req or "").strip()
             conn = _db()
             try:
                 native_total = _native_balance_for_wallet(session.get("wallet_address") or wa, chain=chain_key, item_id=item_id)
@@ -4859,6 +4949,16 @@ def api_grid_stop():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
+    try:
+        conn_ui = _db()
+        try:
+            with DB_WRITE_LOCK:
+                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id) or "POL"), active_item=item_id)
+                conn_ui.commit()
+        finally:
+            conn_ui.close()
+    except Exception:
+        pass
     session = GRID_SESSIONS.get(item_id)
     if not isinstance(session, dict):
         return err("grid not started (press Start first)", 404)
@@ -4954,6 +5054,85 @@ def api_grid_reset_all():
     _persist_grid_state()
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
+@app.route("/api/grid/ui/state", methods=["GET", "POST"])
+def api_grid_ui_state():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return jsonify({"status": "error", "error": "unauthorized", "ts": now_ts()}), 401
+
+    conn = _db()
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            active_chain = str(body.get("chain") or body.get("active_chain") or "").strip().upper()
+            active_item = str(body.get("item") or body.get("active_item") or "").strip()
+            with DB_WRITE_LOCK:
+                state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
+                conn.commit()
+            return jsonify({"status": "ok", **state, "wallet_address": _norm_addr(wa), "ts": now_ts()})
+
+        state = _grid_ui_state_get(conn, wa)
+        return jsonify({"status": "ok", **state, "wallet_address": _norm_addr(wa), "ts": now_ts()})
+    finally:
+        conn.close()
+
+@app.route("/api/grid/init", methods=["GET"])
+def api_grid_init():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return jsonify({"status": "error", "error": "unauthorized", "ts": now_ts()}), 401
+
+    req_chain = str(request.args.get("chain") or request.args.get("active_chain") or "").strip().upper()
+    req_item = str(request.args.get("item") or request.args.get("item_id") or request.args.get("active_item") or "").strip()
+
+    conn = _db()
+    try:
+        state = _grid_ui_state_get(conn, wa)
+        active_chain = req_chain or state.get("active_chain") or "POL"
+        active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
+
+        with DB_WRITE_LOCK:
+            state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
+            conn.commit()
+
+        chain = state["active_chain"]
+        item_id = state["active_item"]
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        free = max(0.0, float(vault_total) - float(reserved))
+
+        session = _get_owned_session(item_id, wa)
+        tick = int(session.get("ticks") or 0) if isinstance(session, dict) else 0
+        price = float(session.get("price") or 0.0) if isinstance(session, dict) and session.get("price") is not None else None
+        running = bool(session.get("running")) and not bool(session.get("stopped")) if isinstance(session, dict) else False
+
+        vault_state = None
+        try:
+            vault_state = _vault_state_read(wa, chain)
+        except Exception:
+            vault_state = None
+
+        return jsonify({
+            "status": "ok",
+            "wallet_address": _norm_addr(wa),
+            "active_chain": chain,
+            "active_item": item_id,
+            "active_coin": str(item_id).split(":", 1)[-1].upper() if item_id else chain,
+            "item": item_id,
+            "orders": orders,
+            "vault_total": vault_total,
+            "reserved": reserved,
+            "free": free,
+            "tick": tick,
+            "price": price,
+            "running": running,
+            "vault_state": vault_state,
+            "ts": now_ts(),
+        })
+    finally:
+        conn.close()
+
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
     """Return grid orders (SQLite-backed).
@@ -4979,13 +5158,20 @@ def api_grid_orders():
     try:
         if item_id:
             item_id = str(item_id).strip()
+            if item_id:
+                try:
+                    with DB_WRITE_LOCK:
+                        _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                        conn.commit()
+                except Exception:
+                    pass
             orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+            return jsonify({"status": "ok", "item": item_id, "active_chain": (_grid_chain_key(item_id, chain) or chain or "POL"), "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
@@ -5191,6 +5377,16 @@ def api_grid_order_stop():
     price = payload.get("price")
     level = payload.get("level")
     chain = str(payload.get("chain") or "").strip()
+    try:
+        conn_ui = _db()
+        try:
+            with DB_WRITE_LOCK:
+                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                conn_ui.commit()
+        finally:
+            conn_ui.close()
+    except Exception:
+        pass
 
     # Update RAM session if present (fast UI feedback)
     sess = GRID_SESSIONS.get(item_id)
@@ -5228,7 +5424,7 @@ def api_grid_order_stop():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5260,6 +5456,16 @@ def api_grid_order_delete():
         return jsonify({"error": "missing id"}), 400
 
     chain = str(payload.get("chain") or "").strip()
+    try:
+        conn_ui = _db()
+        try:
+            with DB_WRITE_LOCK:
+                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                conn_ui.commit()
+        finally:
+            conn_ui.close()
+    except Exception:
+        pass
 
     # Remove from RAM session if present
     sess = GRID_SESSIONS.get(item_id)
@@ -5273,7 +5479,7 @@ def api_grid_order_delete():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5451,7 +5657,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = str(payload.get("chain") or "").strip()
+        chain = str(payload.get("chain") or _grid_chain_key(item_id) or "").strip()
 
         db_saved = True
         db_error = None
@@ -5482,8 +5688,14 @@ def api_grid_manual_add():
         # Return DB view
         conn = _db()
         try:
+            try:
+                with DB_WRITE_LOCK:
+                    _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                    conn.commit()
+            except Exception:
+                pass
             orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
             try:
