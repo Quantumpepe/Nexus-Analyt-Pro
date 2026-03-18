@@ -317,6 +317,96 @@ def api_contracts():
         }
     return jsonify(out)
 
+
+def _hex_to_bool(h: str) -> bool:
+    try:
+        return int(str(h or "0x0"), 16) != 0
+    except Exception:
+        return False
+
+
+def _vault_balance_selector_for_chain(chain_key: str) -> str:
+    ck = str(chain_key or "").strip().upper()
+    if ck == "POL":
+        return "0x7754e652"  # polBalance(address)
+    if ck == "BNB":
+        return "0x7f4d17bf"  # bnbBalance(address)
+    return "0x87f38d31"      # ethBalance(address)
+
+
+def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    ck = str(chain_key or "").strip().upper()
+    cid = int(_CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    if not wa or not _looks_like_evm_addr(wa):
+        raise RuntimeError("invalid wallet")
+    if cid <= 0:
+        raise RuntimeError("invalid chain")
+    vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
+    if not vault_addr:
+        raise RuntimeError(f"vault not configured for {ck}")
+
+    balance_sel = _vault_balance_selector_for_chain(ck)
+    in_cycle_sel = "0x7870293e"      # inCycle(address)
+    held_token_sel = "0x90ba1a44"    # heldToken(address)
+    held_token_bal_sel = "0x4ad59fe9" # heldTokenBal(address)
+    is_operator_for_sel = "0xd95b6371" # isOperatorFor(address,address)
+
+    balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
+    in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
+    held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
+    held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
+
+    operator_addr = (_EXECUTOR_BY_CHAIN.get(cid) or "").strip()
+    operator_enabled = False
+    if _looks_like_evm_addr(operator_addr):
+        op_hex = _eth_call(
+            cid,
+            vault_addr,
+            is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
+        )
+        operator_enabled = _hex_to_bool(op_hex)
+
+    balance_wei = _hex_to_int(balance_hex or "0x0")
+    held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
+    return {
+        "status": "ok",
+        "wallet": wa,
+        "chain": ck,
+        "chainId": cid,
+        "vault": vault_addr,
+        "operator": operator_addr if _looks_like_evm_addr(operator_addr) else "",
+        "vault_balance_wei": str(balance_wei),
+        "vault_balance": float(balance_wei) / 1e18,
+        "inCycle": _hex_to_bool(in_cycle_hex),
+        "heldToken": _topic_to_addr(held_token_hex) if str(held_token_hex or "").startswith("0x") else "",
+        "heldTokenBalWei": str(held_bal_raw),
+        "heldTokenBal": float(held_bal_raw) / 1e18,
+        "operatorEnabled": bool(operator_enabled),
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/vault/state", methods=["GET"])
+def api_vault_state():
+    try:
+        wallet = (
+            request.args.get("wallet")
+            or request.args.get("wallet_address")
+            or request.headers.get("X-Wallet-Address")
+            or ""
+        )
+        chain = (request.args.get("chain") or request.args.get("chain_key") or "POL").strip().upper()
+        if chain not in _CHAIN_ID_BY_KEY:
+            return jsonify({"status": "error", "error": "invalid chain", "ts": now_ts()}), 400
+        if chain in _ENABLED_EVM_CHAINS or not _ENABLED_EVM_CHAINS:
+            pass
+        else:
+            return jsonify({"status": "error", "error": "chain not enabled", "ts": now_ts()}), 400
+        return jsonify(_vault_state_read(wallet, chain))
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
+
 @app.route("/api/coingecko/simple_price", methods=["GET"])
 def coingecko_simple_price():
     # Pass-through query params (ids, vs_currencies, include_* etc.)
