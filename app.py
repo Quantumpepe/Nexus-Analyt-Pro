@@ -5257,7 +5257,7 @@ def api_grid_orders():
 
     When item is provided we also return: vault_total, reserved, free.
     """
-    wa = _require_auth()
+    wa = _require_auth() or _pick_wallet_from_request()
 
     if not wa:
         item_id = request.args.get("item") or request.args.get("item_id")
