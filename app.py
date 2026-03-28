@@ -5657,7 +5657,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = str(payload.get("chain") or _grid_chain_key(item_id) or "").strip()
+        chain = (_grid_chain_key(item_id, payload.get("chain")) or "POL").strip().upper()
 
         db_saved = True
         db_error = None
