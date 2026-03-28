@@ -940,40 +940,6 @@ def _grid_ui_state_put(conn, wallet_address: str, active_chain: str = "", active
     )
     return {"active_chain": ch, "active_item": it, "updated_ts": nowi}
 
-
-def _grid_resolve_ui_context(conn, wallet_address: str, item_id: str = "", chain: str = "") -> dict:
-    """Resolve the effective grid chain/item for a wallet.
-
-    Priority:
-      1) explicit request values
-      2) persisted backend UI state
-      3) derived defaults
-
-    This makes desktop/mobile consistent and prevents loading orders on the wrong chain.
-    """
-    wa = _norm_addr(wallet_address or "")
-    req_item = str(item_id or "").strip()
-    req_chain = str(chain or "").strip().upper()
-
-    state = _grid_ui_state_get(conn, wa) if wa else {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
-    active_chain = req_chain or _grid_chain_key(req_item) or str(state.get("active_chain") or "").strip().upper() or "POL"
-    active_item = req_item or str(state.get("active_item") or "").strip() or _grid_default_item_for_chain(active_chain)
-
-    derived_chain = _grid_chain_key(active_item, active_chain) or active_chain or "POL"
-    return {
-        "active_chain": derived_chain,
-        "active_item": active_item,
-    }
-
-def _grid_open_orders(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
-    orders = _grid_db_list_orders(conn, wallet_address, item_id=item_id, chain=chain)
-    out = []
-    for o in orders:
-        status = str((o or {}).get("status") or "").upper().strip()
-        if status == "OPEN":
-            out.append(o)
-    return out
-
 def _grid_best_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
     # Prefer explicit stored grid vault total. If missing, try vault contract for native items.
     vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
@@ -4983,13 +4949,11 @@ def api_grid_stop():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
-    chain = str(body.get("chain") or "").strip().upper()
-    chain = _grid_chain_key(item_id, chain) or chain or "POL"
     try:
         conn_ui = _db()
         try:
             with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=chain, active_item=item_id)
+                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id) or "POL"), active_item=item_id)
                 conn_ui.commit()
         finally:
             conn_ui.close()
@@ -5100,11 +5064,10 @@ def api_grid_ui_state():
     try:
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            req_chain = str(body.get("chain") or body.get("active_chain") or "").strip().upper()
-            req_item = str(body.get("item") or body.get("active_item") or "").strip()
-            ctx = _grid_resolve_ui_context(conn, wa, item_id=req_item, chain=req_chain)
+            active_chain = str(body.get("chain") or body.get("active_chain") or "").strip().upper()
+            active_item = str(body.get("item") or body.get("active_item") or "").strip()
             with DB_WRITE_LOCK:
-                state = _grid_ui_state_put(conn, wa, active_chain=ctx["active_chain"], active_item=ctx["active_item"])
+                state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
                 conn.commit()
             return jsonify({"status": "ok", **state, "wallet_address": _norm_addr(wa), "ts": now_ts()})
 
@@ -5124,15 +5087,17 @@ def api_grid_init():
 
     conn = _db()
     try:
-        ctx = _grid_resolve_ui_context(conn, wa, item_id=req_item, chain=req_chain)
+        state = _grid_ui_state_get(conn, wa)
+        active_chain = req_chain or state.get("active_chain") or "POL"
+        active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
 
         with DB_WRITE_LOCK:
-            state = _grid_ui_state_put(conn, wa, active_chain=ctx["active_chain"], active_item=ctx["active_item"])
+            state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
             conn.commit()
 
         chain = state["active_chain"]
         item_id = state["active_item"]
-        orders = _grid_open_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -5170,12 +5135,12 @@ def api_grid_init():
 
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
-    """Return authoritative grid orders for the effective wallet/item/chain context.
+    """Return grid orders (SQLite-backed).
 
-    Behavior:
-      - If ?item=... is provided: use that item and the explicit/provided chain if any.
-      - If no item is provided: fall back to the persisted backend UI state.
-      - Response orders are OPEN-only to avoid ghost/cancelled/deleted orders reappearing on other devices.
+    - If ?item=... is provided: return orders for that item for this wallet.
+    - If no item is provided: return ALL orders across items for this wallet.
+
+    When item is provided we also return: vault_total, reserved, free.
     """
     wa = _require_auth()
 
@@ -5186,40 +5151,209 @@ def api_grid_orders():
             return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
 
-    req_item = str(request.args.get("item") or request.args.get("item_id") or "").strip()
-    req_chain = str(request.args.get("chain") or "").strip().upper()
+    item_id = request.args.get("item") or request.args.get("item_id")
+    chain = str(request.args.get("chain") or "").strip()
 
     conn = _db()
     try:
-        ctx = _grid_resolve_ui_context(conn, wa, item_id=req_item, chain=req_chain)
+        if item_id:
+            item_id = str(item_id).strip()
+            if item_id:
+                try:
+                    with DB_WRITE_LOCK:
+                        _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                        conn.commit()
+                except Exception:
+                    pass
+            orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            free = max(0.0, float(vault_total) - float(reserved))
+            for o in orders:
+                o["item"] = o.get("item") or item_id
+            return jsonify({"status": "ok", "item": item_id, "active_chain": (_grid_chain_key(item_id, chain) or chain or "POL"), "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
 
-        with DB_WRITE_LOCK:
-            state = _grid_ui_state_put(conn, wa, active_chain=ctx["active_chain"], active_item=ctx["active_item"])
-            conn.commit()
-
-        item_id = state["active_item"]
-        chain = state["active_chain"]
-
-        orders = _grid_open_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
-        free = max(0.0, float(vault_total) - float(reserved))
-        for o in orders:
-            o["item"] = o.get("item") or item_id
-
-        return jsonify({
-            "status": "ok",
-            "item": item_id,
-            "active_chain": chain,
-            "active_item": item_id,
-            "orders": orders,
-            "vault_total": vault_total,
-            "reserved": reserved,
-            "free": free,
-            "ts": now_ts(),
-        })
+        orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
+        return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
     finally:
         conn.close()
+
+        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+
+    item_id = request.args.get("item") or request.args.get("item_id")
+
+    if item_id:
+        item_id = str(item_id).strip()
+        session = _get_owned_session(item_id, wa)
+        if not session:
+            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
+        orders = session.get("orders") if isinstance(session, dict) else []
+        # ensure item field
+        out=[]
+        for o in (orders or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or item_id
+                out.append(oo)
+        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
+
+    # all items
+    all_orders=[]
+    for it, sess in (GRID_SESSIONS or {}).items():
+        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
+        if owner and owner != _norm_addr(wa):
+            continue
+        if not isinstance(sess, dict):
+            continue
+        for o in (sess.get("orders") or []):
+            if isinstance(o, dict):
+                oo=dict(o)
+                oo["item"]=oo.get("item") or it
+                all_orders.append(oo)
+    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
+
+
+
+@app.route("/api/grid/budgets", methods=["GET"])
+def api_grid_budgets():
+    """Return per-item budget state for the authenticated wallet.
+
+    This powers the Wallet UI split:
+      - Total (on-chain) remains the vault/privy balance
+      - In bots (reserved) is derived from active grid sessions (USD-based budget lock)
+      - Available is informational (USD-based) and does NOT affect on-chain balances
+
+    Response:
+      { status:"ok", items:[{item, locked_usd, available_usd, initial_capital_usd, mode, order_mode}],
+        totals:{locked_usd, available_usd} }
+    """
+    wa = _require_auth()
+    if not wa:
+        return ok({"items": [], "totals": {"locked_usd": 0.0, "available_usd": 0.0}})
+
+    wa_n = _norm_addr(wa)
+    items = []
+    locked_total = 0.0
+    avail_total = 0.0
+
+    try:
+        for item_id, sess in (GRID_SESSIONS or {}).items():
+            if not isinstance(sess, dict):
+                continue
+            if _norm_addr(sess.get("wallet_address") or "") != wa_n:
+                continue
+
+            locked = float(sess.get("wallet_locked_usd") or 0.0)
+            avail = float(sess.get("wallet_available_usd") or 0.0)
+            initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+
+            locked_total += max(0.0, locked)
+            avail_total += max(0.0, avail)
+
+            items.append({
+                "item": item_id,
+                "locked_usd": max(0.0, locked),
+                "available_usd": max(0.0, avail),
+                "initial_capital_usd": max(0.0, initc),
+                "mode": sess.get("mode"),
+                "order_mode": sess.get("order_mode"),
+            })
+    except Exception:
+        items = []
+        locked_total = 0.0
+        avail_total = 0.0
+
+    return ok({
+        "items": items,
+        "totals": {
+            "locked_usd": round(locked_total, 6),
+            "available_usd": round(avail_total, 6),
+        }
+    })
+
+
+@app.route("/api/grid/budgets_by_chain", methods=["GET"])
+def api_grid_budgets_by_chain():
+    """Return grid budget locks grouped by chain symbol (ETH/BNB/POL).
+
+    Response:
+      { items:[...], totals:{locked_usd, available_usd}, by_chain:{ETH:{locked_usd,available_usd},...} }
+    """
+    wa = _require_auth()
+    if not wa:
+        return ok({"items": [], "totals": {"locked_usd": 0.0, "available_usd": 0.0}, "by_chain": {}})
+
+    wa_n = _norm_addr(wa)
+    items = []
+    locked_total = 0.0
+    avail_total = 0.0
+    by_chain = {}
+
+    def _item_chain(item_id: str) -> str:
+        s = (item_id or "").strip()
+        if ":" in s:
+            pref = s.split(":", 1)[0].upper()
+            if pref in ("ETH", "BNB", "POL"):
+                return pref
+        up = s.upper()
+        if up in ("ETH", "BNB", "POL"):
+            return up
+        # Default: treat unknown as ETH (keeps UI stable). Change to "UNKNOWN" if you prefer.
+        return "ETH"
+
+    try:
+        for item_id, sess in (GRID_SESSIONS or {}).items():
+            if not isinstance(sess, dict):
+                continue
+            if _norm_addr(sess.get("wallet_address") or "") != wa_n:
+                continue
+
+            locked = float(sess.get("wallet_locked_usd") or 0.0)
+            avail = float(sess.get("wallet_available_usd") or 0.0)
+            initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+
+            locked = max(0.0, locked)
+            avail = max(0.0, avail)
+            locked_total += locked
+            avail_total += avail
+
+            ch = _item_chain(str(item_id))
+            if ch not in by_chain:
+                by_chain[ch] = {"locked_usd": 0.0, "available_usd": 0.0}
+            by_chain[ch]["locked_usd"] += locked
+            by_chain[ch]["available_usd"] += avail
+
+            items.append({
+                "item": item_id,
+                "locked_usd": locked,
+                "available_usd": avail,
+                "initial_capital_usd": max(0.0, initc),
+                "mode": sess.get("mode"),
+                "order_mode": sess.get("order_mode"),
+                "chain": ch,
+            })
+    except Exception:
+        items = []
+        locked_total = 0.0
+        avail_total = 0.0
+        by_chain = {}
+
+    for ch in list(by_chain.keys()):
+        by_chain[ch]["locked_usd"] = round(by_chain[ch]["locked_usd"], 6)
+        by_chain[ch]["available_usd"] = round(by_chain[ch]["available_usd"], 6)
+
+    return ok({
+        "items": items,
+        "totals": {
+            "locked_usd": round(locked_total, 6),
+            "available_usd": round(avail_total, 6),
+        },
+        "by_chain": by_chain
+    })
+
+
+
+
 
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
@@ -5242,8 +5376,7 @@ def api_grid_order_stop():
     side = payload.get("side")
     price = payload.get("price")
     level = payload.get("level")
-    chain = str(payload.get("chain") or "").strip().upper()
-    chain = _grid_chain_key(item_id, chain) or chain or "POL"
+    chain = str(payload.get("chain") or "").strip()
     try:
         conn_ui = _db()
         try:
@@ -5290,7 +5423,7 @@ def api_grid_order_stop():
             rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_open_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -5322,8 +5455,7 @@ def api_grid_order_delete():
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
-    chain = str(payload.get("chain") or "").strip().upper()
-    chain = _grid_chain_key(item_id, chain) or chain or "POL"
+    chain = str(payload.get("chain") or "").strip()
     try:
         conn_ui = _db()
         try:
@@ -5346,7 +5478,7 @@ def api_grid_order_delete():
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_open_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -5525,8 +5657,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = str(payload.get("chain") or "").strip().upper()
-        chain = _grid_chain_key(item_id, chain) or chain or "POL"
+        chain = str(payload.get("chain") or _grid_chain_key(item_id) or "").strip()
 
         db_saved = True
         db_error = None
