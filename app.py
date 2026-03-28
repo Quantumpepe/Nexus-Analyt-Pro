@@ -325,6 +325,65 @@ def _hex_to_bool(h: str) -> bool:
         return False
 
 
+
+def _normalize_chain_key(raw: str) -> str:
+    s = str(raw or "").strip().upper()
+    if ":" in s:
+        s = s.split(":", 1)[0].strip().upper()
+    alias = {
+        "137": "POL",
+        "POLYGON": "POL",
+        "MATIC": "POL",
+        "56": "BNB",
+        "BSC": "BNB",
+        "1": "ETH",
+        "ETHEREUM": "ETH",
+    }
+    return alias.get(s, s)
+
+def _rpc_url_for_chain(chain_id: int) -> str:
+    cid = int(chain_id or 0)
+
+    # Existing configured map first
+    direct = (_RPC_URL_BY_CHAIN.get(cid) or "").strip()
+    if direct:
+        return direct
+
+    # Alternate env names seen across deployments
+    env_fallbacks = {
+        1: [
+            os.getenv("ALCHEMY_RPC_ETH"),
+            os.getenv("RPC_URL_ETH"),
+            os.getenv("RPC_URL_1"),
+        ],
+        56: [
+            os.getenv("ALCHEMY_RPC_BNB"),
+            os.getenv("RPC_URL_BNB"),
+            os.getenv("RPC_URL_56"),
+        ],
+        137: [
+            os.getenv("ALCHEMY_RPC_POL"),
+            os.getenv("RPC_URL_POL"),
+            os.getenv("RPC_URL_POLYGON"),
+            os.getenv("RPC_URL_137"),
+        ],
+    }
+    for v in env_fallbacks.get(cid, []):
+        if str(v or "").strip():
+            return str(v).strip()
+
+    # Last-resort Alchemy construction from a single key
+    alchemy_key = str(os.getenv("ALCHEMY_KEY") or "").strip()
+    if alchemy_key:
+        if cid == 1:
+            return f"https://eth-mainnet.g.alchemy.com/v2/{alchemy_key}"
+        if cid == 56:
+            return f"https://bnb-mainnet.g.alchemy.com/v2/{alchemy_key}"
+        if cid == 137:
+            return f"https://polygon-mainnet.g.alchemy.com/v2/{alchemy_key}"
+
+    return ""
+
 def _vault_balance_selector_for_chain(chain_key: str) -> str:
     ck = str(chain_key or "").strip().upper()
     if ck == "POL":
@@ -336,7 +395,7 @@ def _vault_balance_selector_for_chain(chain_key: str) -> str:
 
 def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
     wa = _norm_addr(wallet_address or "")
-    ck = str(chain_key or "").strip().upper()
+    ck = _normalize_chain_key(chain_key)
     cid = int(_CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     if not wa or not _looks_like_evm_addr(wa):
         raise RuntimeError("invalid wallet")
@@ -352,20 +411,26 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
     held_token_bal_sel = "0x4ad59fe9" # heldTokenBal(address)
     is_operator_for_sel = "0xd95b6371" # isOperatorFor(address,address)
 
-    balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
-    in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
-    held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
-    held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
+    try:
+        balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
+        in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
+        held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
+        held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
+    except Exception as e:
+        raise RuntimeError(f"vault eth_call failed for {ck}: {e}")
 
     operator_addr = (_EXECUTOR_BY_CHAIN.get(cid) or "").strip()
     operator_enabled = False
     if _looks_like_evm_addr(operator_addr):
-        op_hex = _eth_call(
-            cid,
-            vault_addr,
-            is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
-        )
-        operator_enabled = _hex_to_bool(op_hex)
+        try:
+            op_hex = _eth_call(
+                cid,
+                vault_addr,
+                is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
+            )
+            operator_enabled = _hex_to_bool(op_hex)
+        except Exception:
+            operator_enabled = False
 
     balance_wei = _hex_to_int(balance_hex or "0x0")
     held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
@@ -389,23 +454,38 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
 
 @app.route("/api/vault/state", methods=["GET"])
 def api_vault_state():
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("chain_key") or "POL")
+
+    if not _looks_like_evm_addr(wallet):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": _norm_addr(wallet), "chain": chain, "ts": now_ts()})
+
+    if chain not in _CHAIN_ID_BY_KEY:
+        return jsonify({"status": "error", "error": "invalid chain", "wallet": _norm_addr(wallet), "chain": chain, "ts": now_ts()})
+
+    if _ENABLED_EVM_CHAINS and chain not in _ENABLED_EVM_CHAINS:
+        return jsonify({"status": "error", "error": "chain not enabled", "wallet": _norm_addr(wallet), "chain": chain, "ts": now_ts()})
+
     try:
-        wallet = (
-            request.args.get("wallet")
-            or request.args.get("wallet_address")
-            or request.headers.get("X-Wallet-Address")
-            or ""
-        )
-        chain = (request.args.get("chain") or request.args.get("chain_key") or "POL").strip().upper()
-        if chain not in _CHAIN_ID_BY_KEY:
-            return jsonify({"status": "error", "error": "invalid chain", "ts": now_ts()}), 400
-        if chain in _ENABLED_EVM_CHAINS or not _ENABLED_EVM_CHAINS:
-            pass
-        else:
-            return jsonify({"status": "error", "error": "chain not enabled", "ts": now_ts()}), 400
         return jsonify(_vault_state_read(wallet, chain))
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
+        cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "wallet": _norm_addr(wallet),
+            "chain": chain,
+            "chainId": cid,
+            "rpc_configured": bool(_rpc_url_for_chain(cid)),
+            "vault_configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
+            "executor_configured": bool((_EXECUTOR_BY_CHAIN.get(cid) or "").strip()),
+            "ts": now_ts(),
+        })
 
 @app.route("/api/coingecko/simple_price", methods=["GET"])
 def coingecko_simple_price():
@@ -1933,15 +2013,38 @@ def _rpc_call(chain_id: int, method: str, params: list):
     cid = int(chain_id) or 0
     if _ENABLED_CHAIN_IDS and cid not in _ENABLED_CHAIN_IDS:
         raise RuntimeError(f"chain_id not enabled: {cid}")
-    url = _RPC_URL_BY_CHAIN.get(cid)
+
+    url = _rpc_url_for_chain(cid)
     if not url:
         raise RuntimeError(f"rpc url not configured for chain_id={chain_id}")
+
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = requests.post(url, json=payload, timeout=25)
-    r.raise_for_status()
-    j = r.json() or {}
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+    except Exception as e:
+        raise RuntimeError(f"rpc request failed for chain_id={cid}: {e}")
+
+    if not r.ok:
+        body = ""
+        try:
+            body = (r.text or "")[:240]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"rpc http {r.status_code} for chain_id={cid}: {body}")
+
+    try:
+        j = r.json() or {}
+    except Exception:
+        raise RuntimeError(f"rpc returned non-json for chain_id={cid}")
+
     if j.get("error"):
-        raise RuntimeError(str(j.get("error")))
+        err = j.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or json.dumps(err, ensure_ascii=False)
+        else:
+            msg = str(err)
+        raise RuntimeError(f"rpc error for chain_id={cid}: {msg}")
+
     return j.get("result")
 
 def _topic_to_addr(topic_hex: str) -> str:
