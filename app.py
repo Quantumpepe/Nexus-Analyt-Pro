@@ -5167,8 +5167,11 @@ def api_grid_ui_state():
     try:
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            active_chain = str(body.get("chain") or body.get("active_chain") or "").strip().upper()
+            active_chain = _normalize_chain_key(body.get("chain") or body.get("active_chain") or "")
             active_item = str(body.get("item") or body.get("active_item") or "").strip()
+            active_chain = _grid_chain_key(active_item, active_chain) or active_chain or "POL"
+            if active_item and ":" not in active_item:
+                active_item = f"{active_chain}:{str(active_item).strip().upper()}"
             with DB_WRITE_LOCK:
                 state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
                 conn.commit()
@@ -5193,7 +5196,6 @@ def api_grid_init():
         state = _grid_ui_state_get(conn, wa)
         active_chain = _grid_chain_key(req_item, req_chain or state.get("active_chain") or "POL") or "POL"
         active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
-
         if active_item and ":" not in active_item:
             active_item = f"{active_chain}:{str(active_item).strip().upper()}"
 
@@ -5238,6 +5240,9 @@ def api_grid_init():
             "price": price,
             "running": running,
             "vault_state": vault_state,
+            "loaded_item_id": item_id,
+            "loaded_chain": chain,
+            "orders_count": len(orders or []),
             "ts": now_ts(),
         })
     finally:
@@ -5268,16 +5273,16 @@ def api_grid_orders():
     try:
         if item_id:
             item_id = str(item_id).strip()
+            chain_eff = _grid_chain_key(item_id, chain) or "POL"
+            if item_id and ":" not in item_id:
+                item_id = f"{chain_eff}:{str(item_id).strip().upper()}"
             if item_id:
                 try:
                     with DB_WRITE_LOCK:
-                        _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or "POL"), active_item=(item_id if ":" in str(item_id) else f"{(_grid_chain_key(item_id, chain) or "POL")}:{str(item_id).strip().upper()}"))
+                        _grid_ui_state_put(conn, wa, active_chain=chain_eff, active_item=item_id)
                         conn.commit()
                 except Exception:
                     pass
-            chain_eff = _grid_chain_key(item_id, chain) or "POL"
-            if item_id and ":" not in str(item_id):
-                item_id = f"{chain_eff}:{str(item_id).strip().upper()}"
             orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain_eff)
             if not orders:
                 orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain="")
@@ -5701,7 +5706,7 @@ def api_grid_manual_add():
     - This endpoint only stores the order + reserves Qty logically.
     - Execution happens asynchronously by the grid executor (backend) when cycle is running.
     """
-    wa = _require_auth()
+    wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
 
@@ -5710,6 +5715,9 @@ def api_grid_manual_add():
     try:
         payload = request.get_json(silent=True) or {}
         item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+        chain = _grid_chain_key(item_id, payload.get("chain")) or "POL"
+        if item_id and ":" not in item_id:
+            item_id = f"{chain}:{str(item_id).strip().upper()}"
         if not item_id:
             return jsonify({"error": "missing item"}), 400
 
@@ -5774,7 +5782,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = (_grid_chain_key(item_id, payload.get("chain")) or "POL").strip().upper()
+        chain = _grid_chain_key(item_id, payload.get("chain")) or "POL"
 
         db_saved = True
         db_error = None
@@ -5807,7 +5815,7 @@ def api_grid_manual_add():
         try:
             try:
                 with DB_WRITE_LOCK:
-                    _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                    _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or "POL"), active_item=item_id)
                     conn.commit()
             except Exception:
                 pass
@@ -5835,6 +5843,9 @@ def api_grid_manual_add():
             "free": free,
             "db_saved": db_saved,
             "db_error": db_error,
+            "saved_item_id": item_id,
+            "saved_chain": chain,
+            "orders_count": len(orders_db or []),
             "ts": now_ts(),
         })
 
