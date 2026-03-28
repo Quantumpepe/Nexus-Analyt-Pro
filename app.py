@@ -317,96 +317,6 @@ def api_contracts():
         }
     return jsonify(out)
 
-
-def _hex_to_bool(h: str) -> bool:
-    try:
-        return int(str(h or "0x0"), 16) != 0
-    except Exception:
-        return False
-
-
-def _vault_balance_selector_for_chain(chain_key: str) -> str:
-    ck = str(chain_key or "").strip().upper()
-    if ck == "POL":
-        return "0x7754e652"  # polBalance(address)
-    if ck == "BNB":
-        return "0x7f4d17bf"  # bnbBalance(address)
-    return "0x87f38d31"      # ethBalance(address)
-
-
-def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
-    wa = _norm_addr(wallet_address or "")
-    ck = str(chain_key or "").strip().upper()
-    cid = int(_CHAIN_ID_BY_KEY.get(ck, 0) or 0)
-    if not wa or not _looks_like_evm_addr(wa):
-        raise RuntimeError("invalid wallet")
-    if cid <= 0:
-        raise RuntimeError("invalid chain")
-    vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
-    if not vault_addr:
-        raise RuntimeError(f"vault not configured for {ck}")
-
-    balance_sel = _vault_balance_selector_for_chain(ck)
-    in_cycle_sel = "0x7870293e"      # inCycle(address)
-    held_token_sel = "0x90ba1a44"    # heldToken(address)
-    held_token_bal_sel = "0x4ad59fe9" # heldTokenBal(address)
-    is_operator_for_sel = "0xd95b6371" # isOperatorFor(address,address)
-
-    balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
-    in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
-    held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
-    held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
-
-    operator_addr = (_EXECUTOR_BY_CHAIN.get(cid) or "").strip()
-    operator_enabled = False
-    if _looks_like_evm_addr(operator_addr):
-        op_hex = _eth_call(
-            cid,
-            vault_addr,
-            is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
-        )
-        operator_enabled = _hex_to_bool(op_hex)
-
-    balance_wei = _hex_to_int(balance_hex or "0x0")
-    held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
-    return {
-        "status": "ok",
-        "wallet": wa,
-        "chain": ck,
-        "chainId": cid,
-        "vault": vault_addr,
-        "operator": operator_addr if _looks_like_evm_addr(operator_addr) else "",
-        "vault_balance_wei": str(balance_wei),
-        "vault_balance": float(balance_wei) / 1e18,
-        "inCycle": _hex_to_bool(in_cycle_hex),
-        "heldToken": _topic_to_addr(held_token_hex) if str(held_token_hex or "").startswith("0x") else "",
-        "heldTokenBalWei": str(held_bal_raw),
-        "heldTokenBal": float(held_bal_raw) / 1e18,
-        "operatorEnabled": bool(operator_enabled),
-        "ts": now_ts(),
-    }
-
-
-@app.route("/api/vault/state", methods=["GET"])
-def api_vault_state():
-    try:
-        wallet = (
-            request.args.get("wallet")
-            or request.args.get("wallet_address")
-            or request.headers.get("X-Wallet-Address")
-            or ""
-        )
-        chain = (request.args.get("chain") or request.args.get("chain_key") or "POL").strip().upper()
-        if chain not in _CHAIN_ID_BY_KEY:
-            return jsonify({"status": "error", "error": "invalid chain", "ts": now_ts()}), 400
-        if chain in _ENABLED_EVM_CHAINS or not _ENABLED_EVM_CHAINS:
-            pass
-        else:
-            return jsonify({"status": "error", "error": "chain not enabled", "ts": now_ts()}), 400
-        return jsonify(_vault_state_read(wallet, chain))
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
-
 @app.route("/api/coingecko/simple_price", methods=["GET"])
 def coingecko_simple_price():
     # Pass-through query params (ids, vs_currencies, include_* etc.)
@@ -822,15 +732,6 @@ def init_db():
     )
 ''')
 
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS grid_ui_state (
-        wallet_address TEXT PRIMARY KEY,
-        active_chain TEXT DEFAULT '',
-        active_item TEXT DEFAULT '',
-        updated_ts INTEGER
-    )
-''')
-
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
 
@@ -899,75 +800,6 @@ def _grid_chain_key(item_id: str, chain: str = "") -> str:
     if it in _CHAIN_ID_BY_KEY:
         return it
     return ""
-
-def _grid_default_item_for_chain(chain_key: str) -> str:
-    ck = str(chain_key or "POL").strip().upper() or "POL"
-    return f"{ck}:{ck}"
-
-def _grid_ui_state_get(conn, wallet_address: str) -> dict:
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
-    cur = conn.cursor()
-    cur.execute("SELECT active_chain, active_item, updated_ts FROM grid_ui_state WHERE wallet_address=?", (wa,))
-    row = cur.fetchone()
-    if not row:
-        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
-    active_chain = str(row["active_chain"] or "").strip().upper() or "POL"
-    active_item = str(row["active_item"] or "").strip() or _grid_default_item_for_chain(active_chain)
-    return {
-        "active_chain": active_chain,
-        "active_item": active_item,
-        "updated_ts": int(row["updated_ts"] or 0),
-    }
-
-def _grid_ui_state_put(conn, wallet_address: str, active_chain: str = "", active_item: str = "") -> dict:
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return {"active_chain": "POL", "active_item": _grid_default_item_for_chain("POL")}
-    ch = str(active_chain or "").strip().upper()
-    it = str(active_item or "").strip()
-    if not ch:
-        ch = _grid_chain_key(it) or "POL"
-    if not it:
-        it = _grid_default_item_for_chain(ch)
-    nowi = int(time.time())
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO grid_ui_state(wallet_address, active_chain, active_item, updated_ts) VALUES (?,?,?,?) "
-        "ON CONFLICT(wallet_address) DO UPDATE SET active_chain=excluded.active_chain, active_item=excluded.active_item, updated_ts=excluded.updated_ts",
-        (wa, ch, it, nowi),
-    )
-    return {"active_chain": ch, "active_item": it, "updated_ts": nowi}
-
-def _grid_best_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
-    # Prefer explicit stored grid vault total. If missing, try vault contract for native items.
-    vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
-    try:
-        vt_f = float(vt or 0.0)
-    except Exception:
-        vt_f = 0.0
-    if vt_f > 0:
-        return vt_f
-
-    ck = _grid_chain_key(item_id=item_id, chain=chain)
-    sym = str(item_id or "").split(":", 1)[-1].strip().upper()
-    if ck in ("POL", "BNB", "ETH") and sym == ck:
-        try:
-            vstate = _vault_state_read(wallet_address, ck)
-            contract_total = float(vstate.get("vault_balance") or 0.0)
-            if contract_total >= 0:
-                try:
-                    with DB_WRITE_LOCK:
-                        _grid_db_set_vault_total(conn, wallet_address, item_id, contract_total, chain=chain or ck)
-                except Exception:
-                    pass
-                return contract_total
-        except Exception:
-            pass
-
-    # final fallback for backwards compatibility
-    return _grid_effective_vault_total(conn, wallet_address, item_id, chain=chain)
 
 def _native_balance_for_wallet(wallet_address: str, chain: str = "", item_id: str = "") -> float:
     wa = _norm_addr(wallet_address or "")
@@ -1738,6 +1570,45 @@ _RPC_URL_BY_CHAIN = {
     137: os.getenv("RPC_URL_POL") or os.getenv("RPC_URL_POLYGON") or os.getenv("RPC_URL_137"),
 }
 
+
+def _rpc_url_for_chain_id(chain_id: int) -> str:
+    """Resolve RPC URL lazily so ENV changes/fallback aliases are honored consistently."""
+    cid = int(chain_id or 0)
+    if cid == 137:
+        return (
+            os.getenv("RPC_URL_POL")
+            or os.getenv("RPC_URL_POLYGON")
+            or os.getenv("RPC_URL_137")
+            or os.getenv("ALCHEMY_RPC_POL")
+            or ""
+        ).strip()
+    if cid == 56:
+        return (
+            os.getenv("RPC_URL_BNB")
+            or os.getenv("RPC_URL_56")
+            or os.getenv("ALCHEMY_RPC_BNB")
+            or ""
+        ).strip()
+    if cid == 1:
+        return (
+            os.getenv("RPC_URL_ETH")
+            or os.getenv("RPC_URL_1")
+            or os.getenv("ALCHEMY_RPC_ETH")
+            or ""
+        ).strip()
+    return (_RPC_URL_BY_CHAIN.get(cid) or "").strip()
+
+def resolve_chain(chain) -> tuple[str, int, str]:
+    c = str(chain or "").strip().lower()
+    if c in ("pol", "polygon", "matic", "137"):
+        return "POL", 137, _rpc_url_for_chain_id(137)
+    if c in ("bnb", "bsc", "56"):
+        return "BNB", 56, _rpc_url_for_chain_id(56)
+    if c in ("eth", "ethereum", "1"):
+        return "ETH", 1, _rpc_url_for_chain_id(1)
+    # Safe default for the current app flow
+    return "POL", 137, _rpc_url_for_chain_id(137)
+
 _USDC_BY_CHAIN = {
     1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1"),
     56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56"),
@@ -1930,10 +1801,10 @@ def _nft_activation_put(wallet_address: str, tier: str, contract: str, chain_id:
     conn.close()
 
 def _rpc_call(chain_id: int, method: str, params: list):
-    cid = int(chain_id) or 0
+    cid = int(chain_id or 0)
     if _ENABLED_CHAIN_IDS and cid not in _ENABLED_CHAIN_IDS:
         raise RuntimeError(f"chain_id not enabled: {cid}")
-    url = _RPC_URL_BY_CHAIN.get(cid)
+    url = _rpc_url_for_chain_id(cid)
     if not url:
         raise RuntimeError(f"rpc url not configured for chain_id={chain_id}")
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -1958,6 +1829,90 @@ def _hex_to_int(h: str) -> int:
         return int(h, 16)
     except Exception:
         return 0
+
+def _hex_to_bool(h: str) -> bool:
+    try:
+        return int(str(h or "0x0"), 16) != 0
+    except Exception:
+        return False
+
+def _vault_balance_selector_for_chain(chain_key: str) -> str:
+    ck = str(chain_key or "").strip().upper()
+    if ck == "POL":
+        return "0x7754e652"  # polBalance(address)
+    if ck == "BNB":
+        return "0x7f4d17bf"  # bnbBalance(address)
+    return "0x87f38d31"      # ethBalance(address)
+
+def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    chain_key, cid, rpc_url = resolve_chain(chain_key)
+    if not wa or not _looks_like_evm_addr(wa):
+        raise RuntimeError("invalid wallet")
+    if _ENABLED_CHAIN_IDS and cid not in _ENABLED_CHAIN_IDS:
+        raise RuntimeError(f"chain not enabled: {chain_key}")
+    if not rpc_url:
+        raise RuntimeError(f"rpc url not configured for chain {chain_key}")
+
+    vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
+    if not vault_addr:
+        raise RuntimeError(f"vault not configured for {chain_key}")
+
+    balance_sel = _vault_balance_selector_for_chain(chain_key)
+    in_cycle_sel = "0x7870293e"       # inCycle(address)
+    held_token_sel = "0x90ba1a44"     # heldToken(address)
+    held_token_bal_sel = "0x4ad59fe9" # heldTokenBal(address)
+    is_operator_for_sel = "0xd95b6371"  # isOperatorFor(address,address)
+
+    balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
+    in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
+    held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
+    held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
+
+    operator_addr = (_EXECUTOR_BY_CHAIN.get(cid) or "").strip()
+    operator_enabled = False
+    if _looks_like_evm_addr(operator_addr):
+        op_hex = _eth_call(
+            cid,
+            vault_addr,
+            is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
+        )
+        operator_enabled = _hex_to_bool(op_hex)
+
+    balance_wei = _hex_to_int(balance_hex or "0x0")
+    held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
+    return {
+        "status": "ok",
+        "wallet": wa,
+        "chain": chain_key,
+        "chainId": cid,
+        "rpc": rpc_url,
+        "vault": vault_addr,
+        "operator": operator_addr if _looks_like_evm_addr(operator_addr) else "",
+        "vault_balance_wei": str(balance_wei),
+        "vault_balance": float(balance_wei) / 1e18,
+        "inCycle": _hex_to_bool(in_cycle_hex),
+        "heldToken": _topic_to_addr(held_token_hex) if str(held_token_hex or "").startswith("0x") else "",
+        "heldTokenBalWei": str(held_bal_raw),
+        "heldTokenBal": float(held_bal_raw) / 1e18,
+        "operatorEnabled": bool(operator_enabled),
+        "ts": now_ts(),
+    }
+
+@app.route("/api/vault/state", methods=["GET"])
+def api_vault_state():
+    try:
+        wallet = (
+            request.args.get("wallet")
+            or request.args.get("wallet_address")
+            or request.headers.get("X-Wallet-Address")
+            or ""
+        )
+        chain_in = request.args.get("chain") or request.args.get("chain_key") or "POL"
+        chain_key, _, _ = resolve_chain(chain_in)
+        return jsonify(_vault_state_read(wallet, chain_key))
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
 
 def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
     """
@@ -4624,7 +4579,6 @@ def api_grid_start():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
-    chain_key_req = str(body.get("chain") or _grid_chain_key(item_id) or "").strip().upper()
 
     # ✅ Use real price if provided or from cached watchlist snapshot
     start_price = body.get("price") or body.get("start_price")
@@ -4694,21 +4648,10 @@ def api_grid_start():
         _grid_sessions_set(item_id, _trim_grid_session(session))
         _persist_grid_state()
 
-        try:
-            conn_ui = _db()
-            try:
-                with DB_WRITE_LOCK:
-                    _grid_ui_state_put(conn_ui, wa, active_chain=(chain_key_req or _grid_chain_key(item_id) or "POL"), active_item=item_id)
-                    conn_ui.commit()
-            finally:
-                conn_ui.close()
-        except Exception:
-            pass
-
         # Seed authoritative grid vault from on-chain native wallet balance (POL/BNB/ETH)
         # so Vault/Reserved/Free are correct immediately after Start and after refresh.
         try:
-            chain_key = str(body.get("chain") or chain_key_req or "").strip()
+            chain_key = str(body.get("chain") or "").strip()
             conn = _db()
             try:
                 native_total = _native_balance_for_wallet(session.get("wallet_address") or wa, chain=chain_key, item_id=item_id)
@@ -4949,16 +4892,6 @@ def api_grid_stop():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id) or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
     session = GRID_SESSIONS.get(item_id)
     if not isinstance(session, dict):
         return err("grid not started (press Start first)", 404)
@@ -5054,85 +4987,6 @@ def api_grid_reset_all():
     _persist_grid_state()
     return jsonify({"status":"ok","reset_all": True, "ts": now_ts()})
 
-@app.route("/api/grid/ui/state", methods=["GET", "POST"])
-def api_grid_ui_state():
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return jsonify({"status": "error", "error": "unauthorized", "ts": now_ts()}), 401
-
-    conn = _db()
-    try:
-        if request.method == "POST":
-            body = request.get_json(silent=True) or {}
-            active_chain = str(body.get("chain") or body.get("active_chain") or "").strip().upper()
-            active_item = str(body.get("item") or body.get("active_item") or "").strip()
-            with DB_WRITE_LOCK:
-                state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
-                conn.commit()
-            return jsonify({"status": "ok", **state, "wallet_address": _norm_addr(wa), "ts": now_ts()})
-
-        state = _grid_ui_state_get(conn, wa)
-        return jsonify({"status": "ok", **state, "wallet_address": _norm_addr(wa), "ts": now_ts()})
-    finally:
-        conn.close()
-
-@app.route("/api/grid/init", methods=["GET"])
-def api_grid_init():
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return jsonify({"status": "error", "error": "unauthorized", "ts": now_ts()}), 401
-
-    req_chain = str(request.args.get("chain") or request.args.get("active_chain") or "").strip().upper()
-    req_item = str(request.args.get("item") or request.args.get("item_id") or request.args.get("active_item") or "").strip()
-
-    conn = _db()
-    try:
-        state = _grid_ui_state_get(conn, wa)
-        active_chain = req_chain or state.get("active_chain") or "POL"
-        active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
-
-        with DB_WRITE_LOCK:
-            state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
-            conn.commit()
-
-        chain = state["active_chain"]
-        item_id = state["active_item"]
-        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
-        free = max(0.0, float(vault_total) - float(reserved))
-
-        session = _get_owned_session(item_id, wa)
-        tick = int(session.get("ticks") or 0) if isinstance(session, dict) else 0
-        price = float(session.get("price") or 0.0) if isinstance(session, dict) and session.get("price") is not None else None
-        running = bool(session.get("running")) and not bool(session.get("stopped")) if isinstance(session, dict) else False
-
-        vault_state = None
-        try:
-            vault_state = _vault_state_read(wa, chain)
-        except Exception:
-            vault_state = None
-
-        return jsonify({
-            "status": "ok",
-            "wallet_address": _norm_addr(wa),
-            "active_chain": chain,
-            "active_item": item_id,
-            "active_coin": str(item_id).split(":", 1)[-1].upper() if item_id else chain,
-            "item": item_id,
-            "orders": orders,
-            "vault_total": vault_total,
-            "reserved": reserved,
-            "free": free,
-            "tick": tick,
-            "price": price,
-            "running": running,
-            "vault_state": vault_state,
-            "ts": now_ts(),
-        })
-    finally:
-        conn.close()
-
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
     """Return grid orders (SQLite-backed).
@@ -5158,20 +5012,13 @@ def api_grid_orders():
     try:
         if item_id:
             item_id = str(item_id).strip()
-            if item_id:
-                try:
-                    with DB_WRITE_LOCK:
-                        _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                        conn.commit()
-                except Exception:
-                    pass
             orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "active_chain": (_grid_chain_key(item_id, chain) or chain or "POL"), "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+            return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
@@ -5377,16 +5224,6 @@ def api_grid_order_stop():
     price = payload.get("price")
     level = payload.get("level")
     chain = str(payload.get("chain") or "").strip()
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
 
     # Update RAM session if present (fast UI feedback)
     sess = GRID_SESSIONS.get(item_id)
@@ -5424,7 +5261,7 @@ def api_grid_order_stop():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5456,16 +5293,6 @@ def api_grid_order_delete():
         return jsonify({"error": "missing id"}), 400
 
     chain = str(payload.get("chain") or "").strip()
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
 
     # Remove from RAM session if present
     sess = GRID_SESSIONS.get(item_id)
@@ -5479,7 +5306,7 @@ def api_grid_order_delete():
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+        vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
@@ -5657,7 +5484,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = str(payload.get("chain") or _grid_chain_key(item_id) or "").strip()
+        chain = str(payload.get("chain") or "").strip()
 
         db_saved = True
         db_error = None
@@ -5688,14 +5515,8 @@ def api_grid_manual_add():
         # Return DB view
         conn = _db()
         try:
-            try:
-                with DB_WRITE_LOCK:
-                    _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                    conn.commit()
-            except Exception:
-                pass
             orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+            vault_total = _grid_effective_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
             free = max(0.0, float(vault_total) - float(reserved))
             try:
