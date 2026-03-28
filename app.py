@@ -968,16 +968,17 @@ def _grid_db_set_vault_total(conn, wallet_address: str, item_id: str, vault_tota
     )
 
 def _grid_chain_key(item_id: str, chain: str = "") -> str:
-    ch = str(chain or "").strip().upper()
-    if ch:
+    ch = _normalize_chain_key(chain)
+    if ch and ch in _CHAIN_ID_BY_KEY:
         return ch
     it = str(item_id or "").strip().upper()
     if ":" in it:
-        pref = it.split(":", 1)[0].strip().upper()
+        pref = _normalize_chain_key(it.split(":", 1)[0].strip().upper())
         if pref in _CHAIN_ID_BY_KEY:
             return pref
-    if it in _CHAIN_ID_BY_KEY:
-        return it
+    it_norm = _normalize_chain_key(it)
+    if it_norm in _CHAIN_ID_BY_KEY:
+        return it_norm
     return ""
 
 def _grid_default_item_for_chain(chain_key: str) -> str:
@@ -1143,6 +1144,45 @@ def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, 
                     d[k] = v
         out.append(d)
     return out
+
+
+def _grid_db_list_orders_fallback(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
+    """Robust order lookup for refresh/device changes.
+
+    Tries:
+      1) exact wallet + item + chain
+      2) same item with normalized chain
+      3) same item without chain filter
+      4) item variants (e.g. POL vs POL:POL)
+    """
+    wa = _norm_addr(wallet_address)
+    chain_norm = _grid_chain_key(item_id=item_id or "", chain=chain)
+
+    # no specific item -> keep original behavior, but normalize chain
+    if not item_id:
+        return _grid_db_list_orders(conn, wa, item_id=None, chain=chain_norm)
+
+    variants = []
+    for cand in _grid_item_variants(item_id):
+        c = str(cand or "").strip()
+        if c and c not in variants:
+            variants.append(c)
+    if str(item_id).strip() not in variants:
+        variants.insert(0, str(item_id).strip())
+
+    # exact / normalized chain first
+    for cand in variants:
+        rows = _grid_db_list_orders(conn, wa, item_id=cand, chain=chain_norm)
+        if rows:
+            return rows
+
+    # then ignore chain filter to catch older rows stored with chain=''
+    for cand in variants:
+        rows = _grid_db_list_orders(conn, wa, item_id=cand, chain="")
+        if rows:
+            return rows
+
+    return []
 
 def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, chain: str = "") -> str:
     nowi = int(time.time())
@@ -5185,22 +5225,22 @@ def api_grid_init():
     if not wa:
         return jsonify({"status": "error", "error": "unauthorized", "ts": now_ts()}), 401
 
-    req_chain = str(request.args.get("chain") or request.args.get("active_chain") or "").strip().upper()
+    req_chain = _normalize_chain_key(request.args.get("chain") or request.args.get("active_chain") or "")
     req_item = str(request.args.get("item") or request.args.get("item_id") or request.args.get("active_item") or "").strip()
 
     conn = _db()
     try:
         state = _grid_ui_state_get(conn, wa)
-        active_chain = req_chain or state.get("active_chain") or "POL"
+        active_chain = _grid_chain_key(req_item, req_chain or state.get("active_chain") or "POL") or "POL"
         active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
 
         with DB_WRITE_LOCK:
             state = _grid_ui_state_put(conn, wa, active_chain=active_chain, active_item=active_item)
             conn.commit()
 
-        chain = state["active_chain"]
+        chain = _grid_chain_key(state["active_item"], state["active_chain"]) or "POL"
         item_id = state["active_item"]
-        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders_fallback(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -5245,7 +5285,7 @@ def api_grid_orders():
 
     When item is provided we also return: vault_total, reserved, free.
     """
-    wa = _require_auth()
+    wa = _require_auth() or _pick_wallet_from_request()
 
     if not wa:
         item_id = request.args.get("item") or request.args.get("item_id")
@@ -5255,26 +5295,29 @@ def api_grid_orders():
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
 
     item_id = request.args.get("item") or request.args.get("item_id")
-    chain = str(request.args.get("chain") or "").strip()
+    chain = _normalize_chain_key(request.args.get("chain") or "")
 
     conn = _db()
     try:
         if item_id:
             item_id = str(item_id).strip()
+            chain_eff = _grid_chain_key(item_id, chain) or "POL"
             if item_id:
                 try:
                     with DB_WRITE_LOCK:
-                        _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                        _grid_ui_state_put(conn, wa, active_chain=chain_eff, active_item=item_id)
                         conn.commit()
                 except Exception:
                     pass
-            orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            orders = _grid_db_list_orders_fallback(conn, wa, item_id=item_id, chain=chain_eff)
+            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain_eff)
+            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain_eff)
+            if not reserved:
+                reserved = _grid_db_reserved(conn, wa, item_id, chain="")
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "active_chain": (_grid_chain_key(item_id, chain) or chain or "POL"), "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+            return jsonify({"status": "ok", "item": item_id, "active_chain": chain_eff, "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
@@ -5466,7 +5509,7 @@ def api_grid_order_stop():
     Accepts:
       {item, id} OR {item, orderId/order_id} OR {item, side, price, level}
     """
-    wa = _require_auth()
+    wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
 
@@ -5695,7 +5738,11 @@ def api_grid_manual_add():
 
     try:
         payload = request.get_json(silent=True) or {}
-        item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+        raw_item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+        chain = _grid_chain_key(raw_item_id, payload.get("chain")) or "POL"
+        item_id = raw_item_id or _grid_default_item_for_chain(chain)
+        if ":" not in item_id:
+            item_id = f"{chain}:{str(item_id).strip().upper()}"
         if not item_id:
             return jsonify({"error": "missing item"}), 400
 
@@ -5760,7 +5807,7 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = (_grid_chain_key(item_id, payload.get("chain")) or "POL").strip().upper()
+        chain = _grid_chain_key(item_id, payload.get("chain")) or "POL"
 
         db_saved = True
         db_error = None
@@ -5797,9 +5844,11 @@ def api_grid_manual_add():
                     conn.commit()
             except Exception:
                 pass
-            orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+            orders_db = _grid_db_list_orders_fallback(conn, wa, item_id=item_id, chain=chain)
             vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            if not reserved:
+                reserved = _grid_db_reserved(conn, wa, item_id, chain="")
             free = max(0.0, float(vault_total) - float(reserved))
             try:
                 conn.commit()
