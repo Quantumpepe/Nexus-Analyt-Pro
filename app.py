@@ -422,7 +422,8 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
     # IMPORTANT:
     # Do NOT fail the whole vault read when one selector reverts or returns weird data.
     # Read each field best-effort.
-    balance_hex = _safe_call(balance_sel + _addr_to_32(wa), "0x0")
+    raw = _rpc_call(cid, "eth_getBalance", [vault_addr, "latest"])
+    balance_wei = _hex_to_int(raw or "0x0")
     in_cycle_hex = _safe_call(in_cycle_sel + _addr_to_32(wa), "0x0")
 
     # heldToken can safely default to zero-address if not set / call fails
@@ -442,7 +443,7 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         )
         operator_enabled = _hex_to_bool(op_hex)
 
-    balance_wei = _hex_to_int(balance_hex or "0x0")
+    # balance_wei already set from eth_getBalance
     held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
 
     held_token_addr = ""
