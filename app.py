@@ -5194,8 +5194,25 @@ def api_grid_init():
     conn = _db()
     try:
         state = _grid_ui_state_get(conn, wa)
-        active_chain = _grid_chain_key(req_item, req_chain or state.get("active_chain") or "POL") or "POL"
-        active_item = req_item or state.get("active_item") or _grid_default_item_for_chain(active_chain)
+        requested_chain = _grid_chain_key(req_item, req_chain or "") or req_chain or ""
+        saved_chain = _grid_chain_key(state.get("active_item") or "", state.get("active_chain") or "") or "POL"
+        active_chain = requested_chain or saved_chain or "POL"
+
+        if req_item:
+            active_item = req_item
+        else:
+            saved_item = str(state.get("active_item") or "").strip()
+            saved_item_chain = _grid_chain_key(saved_item, state.get("active_chain") or "") or saved_chain
+            # IMPORTANT:
+            # If the caller explicitly requested a different chain, do NOT reuse the previous
+            # active_item from another chain (e.g. active_chain=POL with active_item=BNB:BNB).
+            # That stale cross-chain combination caused the UI to need a manual BNB -> POL
+            # toggle before the correct vault/orders appeared after refresh.
+            if requested_chain and saved_item_chain != active_chain:
+                active_item = _grid_default_item_for_chain(active_chain)
+            else:
+                active_item = saved_item or _grid_default_item_for_chain(active_chain)
+
         if active_item and ":" not in active_item:
             active_item = f"{active_chain}:{str(active_item).strip().upper()}"
 
