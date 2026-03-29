@@ -401,39 +401,58 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         raise RuntimeError("invalid wallet")
     if cid <= 0:
         raise RuntimeError("invalid chain")
+
     vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
     if not vault_addr:
         raise RuntimeError(f"vault not configured for {ck}")
 
     balance_sel = _vault_balance_selector_for_chain(ck)
-    in_cycle_sel = "0x7870293e"      # inCycle(address)
-    held_token_sel = "0x90ba1a44"    # heldToken(address)
+    in_cycle_sel = "0x7870293e"       # inCycle(address)
+    held_token_sel = "0x90ba1a44"     # heldToken(address)
     held_token_bal_sel = "0x4ad59fe9" # heldTokenBal(address)
     is_operator_for_sel = "0xd95b6371" # isOperatorFor(address,address)
 
-    try:
-        balance_hex = _eth_call(cid, vault_addr, balance_sel + _addr_to_32(wa))
-        in_cycle_hex = _eth_call(cid, vault_addr, in_cycle_sel + _addr_to_32(wa))
-        held_token_hex = _eth_call(cid, vault_addr, held_token_sel + _addr_to_32(wa))
-        held_bal_hex = _eth_call(cid, vault_addr, held_token_bal_sel + _addr_to_32(wa))
-    except Exception as e:
-        raise RuntimeError(f"vault eth_call failed for {ck}: {e}")
+    def _safe_call(data: str, default: str = "0x0") -> str:
+        try:
+            out = _eth_call(cid, vault_addr, data)
+            return out if str(out or "").startswith("0x") else default
+        except Exception:
+            return default
+
+    # IMPORTANT:
+    # Do NOT fail the whole vault read when one selector reverts or returns weird data.
+    # Read each field best-effort.
+    balance_hex = _safe_call(balance_sel + _addr_to_32(wa), "0x0")
+    in_cycle_hex = _safe_call(in_cycle_sel + _addr_to_32(wa), "0x0")
+
+    # heldToken can safely default to zero-address if not set / call fails
+    held_token_hex = _safe_call(
+        held_token_sel + _addr_to_32(wa),
+        "0x" + ("0" * 64),
+    )
+
+    held_bal_hex = _safe_call(held_token_bal_sel + _addr_to_32(wa), "0x0")
 
     operator_addr = (_EXECUTOR_BY_CHAIN.get(cid) or "").strip()
     operator_enabled = False
     if _looks_like_evm_addr(operator_addr):
-        try:
-            op_hex = _eth_call(
-                cid,
-                vault_addr,
-                is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
-            )
-            operator_enabled = _hex_to_bool(op_hex)
-        except Exception:
-            operator_enabled = False
+        op_hex = _safe_call(
+            is_operator_for_sel + _addr_to_32(wa) + _addr_to_32(operator_addr),
+            "0x0",
+        )
+        operator_enabled = _hex_to_bool(op_hex)
 
     balance_wei = _hex_to_int(balance_hex or "0x0")
     held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
+
+    held_token_addr = ""
+    try:
+        held_token_addr = _topic_to_addr(held_token_hex) if str(held_token_hex or "").startswith("0x") else ""
+        if held_token_addr.lower() == "0x0000000000000000000000000000000000000000":
+            held_token_addr = ""
+    except Exception:
+        held_token_addr = ""
+
     return {
         "status": "ok",
         "wallet": wa,
@@ -444,7 +463,7 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         "vault_balance_wei": str(balance_wei),
         "vault_balance": float(balance_wei) / 1e18,
         "inCycle": _hex_to_bool(in_cycle_hex),
-        "heldToken": _topic_to_addr(held_token_hex) if str(held_token_hex or "").startswith("0x") else "",
+        "heldToken": held_token_addr,
         "heldTokenBalWei": str(held_bal_raw),
         "heldTokenBal": float(held_bal_raw) / 1e18,
         "operatorEnabled": bool(operator_enabled),
