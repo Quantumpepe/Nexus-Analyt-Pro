@@ -420,13 +420,16 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
             return default
 
     # IMPORTANT:
-    # Do NOT fail the whole vault read when one selector reverts or returns weird data.
-    # Read each field best-effort.
-    raw = _rpc_call(cid, "eth_getBalance", [vault_addr, "latest"])
-    balance_wei = _hex_to_int(raw or "0x0")
+    # Vault balance must be wallet-bound, not contract-global.
+    # Use the vault contract's per-wallet selector:
+    #   POL -> polBalance(address)
+    #   BNB -> bnbBalance(address)
+    #   ETH -> ethBalance(address)
+    balance_hex = _safe_call(balance_sel + _addr_to_32(wa), "0x0")
+    balance_wei = _hex_to_int(balance_hex or "0x0")
+
     in_cycle_hex = _safe_call(in_cycle_sel + _addr_to_32(wa), "0x0")
 
-    # heldToken can safely default to zero-address if not set / call fails
     held_token_hex = _safe_call(
         held_token_sel + _addr_to_32(wa),
         "0x" + ("0" * 64),
@@ -443,7 +446,6 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         )
         operator_enabled = _hex_to_bool(op_hex)
 
-    # balance_wei already set from eth_getBalance
     held_bal_raw = _hex_to_int(held_bal_hex or "0x0")
 
     held_token_addr = ""
@@ -470,7 +472,6 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         "operatorEnabled": bool(operator_enabled),
         "ts": now_ts(),
     }
-
 
 @app.route("/api/vault/state", methods=["GET"])
 def api_vault_state():
@@ -1041,7 +1042,7 @@ def _grid_ui_state_put(conn, wallet_address: str, active_chain: str = "", active
     return {"active_chain": ch, "active_item": it, "updated_ts": nowi}
 
 def _grid_best_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
-    # Prefer explicit stored grid vault total. If missing, try vault contract for native items.
+    # Prefer explicit stored grid vault total. If missing, try wallet-bound vault balance for native items.
     vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
     try:
         vt_f = float(vt or 0.0)
@@ -1055,18 +1056,17 @@ def _grid_best_vault_total(conn, wallet_address: str, item_id: str, chain: str =
     if ck in ("POL", "BNB", "ETH") and sym == ck:
         try:
             vstate = _vault_state_read(wallet_address, ck)
-            contract_total = float(vstate.get("vault_balance") or 0.0)
-            if contract_total >= 0:
+            wallet_vault_total = float(vstate.get("vault_balance") or 0.0)
+            if wallet_vault_total >= 0:
                 try:
                     with DB_WRITE_LOCK:
-                        _grid_db_set_vault_total(conn, wallet_address, item_id, contract_total, chain=chain or ck)
+                        _grid_db_set_vault_total(conn, wallet_address, item_id, wallet_vault_total, chain=chain or ck)
                 except Exception:
                     pass
-                return contract_total
+                return wallet_vault_total
         except Exception:
             pass
 
-    # final fallback for backwards compatibility
     return _grid_effective_vault_total(conn, wallet_address, item_id, chain=chain)
 
 def _native_balance_for_wallet(wallet_address: str, chain: str = "", item_id: str = "") -> float:
@@ -1087,15 +1087,16 @@ def _native_balance_for_wallet(wallet_address: str, chain: str = "", item_id: st
         return 0.0
 
 def _grid_effective_vault_total(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
-    """Return authoritative vault total for grid UI.
+    """Return authoritative wallet-bound vault total for grid UI.
 
     Priority:
       1) explicit grid_vaults row
-      2) on-chain native wallet balance fallback (POL/BNB/ETH)
+      2) on-chain wallet-bound vault balance from the vault contract
+      3) final fallback = 0.0
 
-    The fallback is important for fresh sessions/manual orders where grid_vaults
-    has not been initialized yet. We persist the discovered on-chain balance back
-    into grid_vaults as a cache so subsequent reads are stable across devices.
+    IMPORTANT:
+    Do NOT fall back to the wallet's native chain balance here, because the grid vault
+    is supposed to reflect deposited vault funds, not the user's normal wallet balance.
     """
     vt = _grid_db_vault_total(conn, wallet_address, item_id, chain=chain)
     try:
@@ -1105,17 +1106,21 @@ def _grid_effective_vault_total(conn, wallet_address: str, item_id: str, chain: 
     if vt_f > 0:
         return vt_f
 
-    bal = _native_balance_for_wallet(wallet_address, chain=chain, item_id=item_id)
-    try:
-        bal_f = float(bal or 0.0)
-    except Exception:
-        bal_f = 0.0
-    if bal_f > 0:
+    ck = _grid_chain_key(item_id=item_id, chain=chain)
+    sym = str(item_id or "").split(":", 1)[-1].strip().upper()
+    if ck in ("POL", "BNB", "ETH") and sym == ck:
         try:
-            _grid_db_set_vault_total(conn, wallet_address, item_id, bal_f, chain=chain)
+            vstate = _vault_state_read(wallet_address, ck)
+            wallet_vault_total = float(vstate.get("vault_balance") or 0.0)
+            if wallet_vault_total >= 0:
+                try:
+                    _grid_db_set_vault_total(conn, wallet_address, item_id, wallet_vault_total, chain=chain or ck)
+                except Exception:
+                    pass
+                return wallet_vault_total
         except Exception:
             pass
-        return bal_f
+
     return 0.0
 
 def _grid_db_list_orders(conn, wallet_address: str, item_id: str | None = None, chain: str = "") -> list[dict]:
