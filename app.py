@@ -1260,6 +1260,55 @@ def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, cha
 
     return rc
 
+def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: list, chain: str = "") -> None:
+    """Mirror in-memory session order statuses into SQLite so /api/grid/orders stays authoritative."""
+    wa = _norm_addr(wallet_address or "")
+    if not wa or not item_id or not isinstance(orders, list):
+        return
+
+    chain_eff = _grid_chain_key(item_id, chain) or chain or ""
+    nowi = int(time.time())
+
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        with DB_WRITE_LOCK:
+            for o in orders:
+                if not isinstance(o, dict):
+                    continue
+                oid = str(o.get("id") or o.get("order_id") or "").strip()
+                if not oid:
+                    continue
+                status = str(o.get("status") or "OPEN").upper()
+                meta = {
+                    "fill_price": o.get("fill_price"),
+                    "filled_ts": o.get("filled_ts"),
+                    "cancelled_ts": o.get("cancelled_ts"),
+                    "usd": o.get("usd"),
+                    "source": o.get("source"),
+                }
+                meta_json = json.dumps({k: v for k, v in meta.items() if v is not None}, separators=(",", ":"))
+                cur.execute(
+                    "UPDATE grid_orders SET status=?, meta_json=CASE "
+                    "WHEN COALESCE(meta_json,'')='' OR meta_json='{}' THEN ? "
+                    "ELSE json_patch(meta_json, ?) END, updated_ts=?, cancelled_ts=CASE WHEN ?='CANCELLED' THEN COALESCE(cancelled_ts, ?) ELSE cancelled_ts END "
+                    "WHERE order_id=? AND wallet_address=? AND item_id=? AND (?='' OR chain=?)",
+                    (status, meta_json, meta_json, nowi, status, nowi, oid, wa, item_id, chain_eff, chain_eff),
+                )
+                if cur.rowcount <= 0:
+                    # fallback without chain filter
+                    cur.execute(
+                        "UPDATE grid_orders SET status=?, meta_json=CASE "
+                        "WHEN COALESCE(meta_json,'')='' OR meta_json='{}' THEN ? "
+                        "ELSE json_patch(meta_json, ?) END, updated_ts=?, cancelled_ts=CASE WHEN ?='CANCELLED' THEN COALESCE(cancelled_ts, ?) ELSE cancelled_ts END "
+                        "WHERE order_id=? AND wallet_address=? AND item_id=?",
+                        (status, meta_json, meta_json, nowi, status, nowi, oid, wa, item_id),
+                    )
+            conn.commit()
+    finally:
+        conn.close()
+
+
 
 
 
@@ -4786,6 +4835,8 @@ def api_grid_start():
         session = _sim_build(cfg)
         # Always bind session to authenticated wallet (addr is optional)
         session["wallet_address"] = _norm_addr(addr) if addr else _norm_addr(wa)
+        session["running"] = True
+        session["stopped"] = False
         # If MANUAL, do not auto-create initial grid orders
         if order_mode == 'MANUAL':
             session.setdefault('orders', [])
@@ -4963,6 +5014,11 @@ def api_grid_tick():
     _grid_sessions_set(item_id, _trim_grid_session(updated))
     _persist_grid_state()
 
+    try:
+        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, updated.get("orders") or [], chain=_grid_chain_key(item_id))
+    except Exception:
+        pass
+
     fills = updated.get("fills") if isinstance(updated, dict) else []
     # --- PnL update (simulation) + wallet budget (simple) ---
     try:
@@ -5108,7 +5164,12 @@ def api_grid_stop():
                 pass
             o["cancelled_ts"] = now
     session["stopped"] = True
+    session["running"] = False
     _grid_sessions_set(item_id, _trim_grid_session(session))
+    try:
+        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, session.get("orders") or [], chain=_grid_chain_key(item_id))
+    except Exception:
+        pass
     _persist_grid_state()
     return jsonify({"status": "ok", "item": item_id, "stopped": True, "orders": session.get("orders", []), "ts": now})
 
@@ -5335,7 +5396,21 @@ def api_grid_orders():
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            return jsonify({"status": "ok", "item": item_id, "active_chain": chain_eff, "active_item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+            sess = _get_owned_session(item_id, wa)
+            return jsonify({
+                "status": "ok",
+                "item": item_id,
+                "active_chain": chain_eff,
+                "active_item": item_id,
+                "orders": orders,
+                "vault_total": vault_total,
+                "reserved": reserved,
+                "free": free,
+                "tick": int(sess.get("ticks") or 0) if isinstance(sess, dict) else 0,
+                "price": float(sess.get("price") or 0.0) if isinstance(sess, dict) and sess.get("price") is not None else None,
+                "running": bool(sess.get("running")) and not bool(sess.get("stopped")) if isinstance(sess, dict) else False,
+                "ts": now_ts(),
+            })
 
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
         return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
@@ -6760,10 +6835,14 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
     while not stop_evt.is_set():
         try:
             session = GRID_SESSIONS.get(item_id)
-            if session:
+            if session and bool(session.get("running", True)) and not bool(session.get("stopped", False)):
                 p = _get_live_price_for_item(item_id)
                 _sim_tick(session, new_price=p)
                 _grid_sessions_set(item_id, _trim_grid_session(session))
+                try:
+                    _grid_sync_session_orders_to_db(session.get("wallet_address") or "", item_id, session.get("orders") or [], chain=_grid_chain_key(item_id))
+                except Exception:
+                    pass
                 _persist_grid_state()
         except Exception:
             pass
