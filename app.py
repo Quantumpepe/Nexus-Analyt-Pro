@@ -4952,6 +4952,12 @@ def api_grid_start():
 def api_grid_cycle_start():
     return api_grid_start()
 
+@app.route("/api/grid/execute", methods=["POST", "GET"])
+def api_grid_execute():
+    # Frontend compatibility alias:
+    # execute = one tick / one execution pass
+    return api_grid_tick()
+
 @app.route("/api/grid/tick", methods=["GET", "POST"])
 def api_grid_tick():
     if request.method == "GET":
