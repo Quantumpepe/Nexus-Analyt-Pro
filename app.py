@@ -165,7 +165,6 @@ FRONTEND_ORIGINS = [
     "http://127.0.0.1:5173",
     "https://nexus-analyt-ui.onrender.com",
     "https://www.nexus-analyt-ui.onrender.com",
-    "https://www.nexus-analyt.com",
 ]
 
 # Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
@@ -2695,6 +2694,102 @@ def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
         return sess
     return None
 
+
+
+def _grid_db_list_orders_any_variant(conn, wallet_address: str, item_id: str, chain: str = "") -> list[dict]:
+    """Load orders for item_id and compatible variants (e.g. POL and POL:POL)."""
+    seen = set()
+    out = []
+    chain_eff = _grid_chain_key(item_id, chain) or chain or ""
+    for it in _grid_item_variants(item_id):
+        try:
+            item_eff = str(it).strip()
+            if item_eff and ":" not in item_eff:
+                ck = _grid_chain_key(item_eff, chain_eff) or chain_eff or "POL"
+                item_eff = f"{ck}:{item_eff.upper()}"
+            rows = _grid_db_list_orders(conn, wallet_address, item_id=item_eff, chain=chain_eff)
+            if not rows:
+                rows = _grid_db_list_orders(conn, wallet_address, item_id=item_eff, chain="")
+            if not rows and ":" in item_eff:
+                base = item_eff.split(":", 1)[1].strip().upper()
+                rows = _grid_db_list_orders(conn, wallet_address, item_id=base, chain=chain_eff)
+                if not rows:
+                    rows = _grid_db_list_orders(conn, wallet_address, item_id=base, chain="")
+            for o in rows or []:
+                oid = str(o.get("id") or o.get("order_id") or "")
+                if oid and oid in seen:
+                    continue
+                if oid:
+                    seen.add(oid)
+                out.append(o)
+        except Exception:
+            continue
+    return out
+
+def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
+    """Rebuild a minimal grid session from DB orders/UI state when RAM session is missing or empty."""
+    conn = _db()
+    try:
+        chain_eff = _grid_chain_key(item_id) or "POL"
+        item_eff = str(item_id or "").strip()
+        if item_eff and ":" not in item_eff:
+            item_eff = f"{chain_eff}:{item_eff.upper()}"
+
+        orders = _grid_db_list_orders_any_variant(conn, wa, item_eff, chain=chain_eff)
+        existing = _get_owned_session(item_eff, wa)
+        sess = existing if isinstance(existing, dict) else {}
+
+        if not orders and not sess:
+            return None
+
+        if not isinstance(sess, dict):
+            sess = {}
+
+        sess["wallet_address"] = _norm_addr(wa)
+        sess["item"] = item_eff
+        sess["item_id"] = item_eff
+        sess.setdefault("running", True)
+        sess.setdefault("stopped", False)
+        sess.setdefault("ticks", 0)
+        sess.setdefault("fills", [])
+        sess.setdefault("filled_now", 0)
+        sess.setdefault("order_mode", "MANUAL")
+        sess.setdefault("initial_capital_usd", float(sess.get("initial_capital_usd") or 0.0) or float(_grid_best_vault_total(conn, wa, item_eff, chain=chain_eff) or 0.0) or 30.0)
+
+        if orders:
+            sess["orders"] = orders
+
+        # Try to attach a live market snapshot so execute can use real prices.
+        try:
+            snap = SNAPSHOTS.get(item_eff)
+            if not isinstance(snap, dict):
+                snap = None
+            if not snap:
+                sym = str(item_eff).split(":", 1)[-1].strip().upper()
+                cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
+                if cg_id:
+                    live = _cg_market_snapshot(str(cg_id))
+                    p = float(live.get("price") or 0.0)
+                    if p > 0:
+                        SNAPSHOTS[item_eff] = {
+                            "ts": now_ts(),
+                            "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
+                        }
+                        if not sess.get("price"):
+                            sess["price"] = p
+        except Exception:
+            pass
+
+        _ensure_pnl(sess)
+        _grid_sessions_set(item_eff, _trim_grid_session(sess))
+        try:
+            _persist_grid_state()
+        except Exception:
+            pass
+        return sess
+    finally:
+        conn.close()
+
 def create_intent(
     wallet_address: str,
     chain_id: int,
@@ -4973,17 +5068,17 @@ def api_grid_tick():
         return err("missing 'item' in body", 400)
 
     item_id = str(item_id).strip()
-    wa = _require_auth()
+    wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("unauthorized", 401)
-    # Only owner can tick a session manually
+    # Prefer existing RAM session, but auto-hydrate from DB orders when session is missing/empty.
     session = _get_owned_session(item_id, wa)
-    if not session:
-        return err("forbidden", 403)
+    if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
+        session = _hydrate_grid_session_from_db(item_id, wa)
     if not session:
         return err("grid not started (press Start first)", 404)
 
-    # ✅ Prefer explicit live price from frontend; otherwise use cached snapshot price.
+    # ✅ Prefer explicit live price from frontend; otherwise use cached snapshot/live market price.
     new_price = None
     if price is not None and price != "":
         try:
@@ -4992,12 +5087,41 @@ def api_grid_tick():
             new_price = None
 
     if new_price is None:
-        snap = SNAPSHOTS.get(item_id)
-        if snap and isinstance(snap.get("data"), dict):
+        for it in _grid_item_variants(item_id):
+            snap = SNAPSHOTS.get(it)
+            if snap and isinstance(snap.get("data"), dict):
+                try:
+                    new_price = float(snap["data"].get("price"))
+                    if new_price and new_price > 0:
+                        break
+                except Exception:
+                    new_price = None
+
+    if new_price is None:
+        # Try a fresh live lookup using snapshot metadata / static CoinGecko mapping.
+        for it in _grid_item_variants(item_id):
             try:
-                new_price = float(snap["data"].get("price"))
+                p = _get_live_price_for_item(it)
+                if p is not None and float(p) > 0:
+                    new_price = float(p)
+                    break
             except Exception:
-                new_price = None
+                pass
+        if new_price is None:
+            try:
+                sym = str(item_id).split(":", 1)[-1].strip().upper()
+                cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
+                if cg_id:
+                    live = _cg_market_snapshot(str(cg_id))
+                    p = float(live.get("price") or 0.0)
+                    if p > 0:
+                        new_price = p
+                        SNAPSHOTS[str(session.get("item_id") or item_id).strip()] = {
+                            "ts": now_ts(),
+                            "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
+                        }
+            except Exception:
+                pass
 
     # ✅ If we have a real historical series attached, Tick advances through it (real backtest),
     # otherwise we use live price (frontend or snapshot).
