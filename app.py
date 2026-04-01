@@ -2908,6 +2908,7 @@ def _ledger_record_pnl_event(
 SNAPSHOTS: Dict[str, Dict[str, Any]] = {}   # key: item_id -> {"ts":..., "data": {...}}
 GRID_SESSIONS: Dict[str, Dict[str, Any]] = {}    # key: item_id -> GridState
 GRID_CONFIGS: Dict[str, GridConfig] = {}    # key: item_id -> GridConfig
+GRID_AUTORUN: Dict[str, Dict[str, Any]] = {}  # item_id -> autorun worker state
 
 # Load persisted grid sessions/configs (best-effort)
 try:
@@ -5752,6 +5753,7 @@ def api_grid_config():
 
 
 
+
 @app.route("/api/grid/autorun", methods=["POST"])
 def api_grid_autorun():
     """
@@ -5759,22 +5761,20 @@ def api_grid_autorun():
     Body: { item, enable: true/false, interval: seconds }
     """
     body = request.get_json(silent=True) or {}
+
     wa, policy, e = _require_trading_enabled()
     if e:
-        return e
-    access = _compute_access_status(wa)
-    if not bool(access.get("can_open_new_trades")):
-        return err("access required (no new trades allowed)", 403)
-    item_id = str(body.get("item") or "").strip()
+        wa = _pick_wallet_from_request()
+        if not wa:
+            return e
+
+    item_id = str(body.get("item") or body.get("item_id") or "").strip()
+    if not item_id:
+        return err("missing 'item' in body", 400)
+
     session = _get_owned_session(item_id, wa)
     if not session:
         return err("forbidden", 403)
-    # Only the owner wallet may control autorun for this grid session
-    sess = _get_owned_session(item_id, wa)
-    if sess is None:
-        return err("forbidden", 403)
-    if not item_id:
-        return err("missing 'item' in body", 400)
 
     enable = bool(body.get("enable", True))
     interval = body.get("interval", 10)
@@ -5785,7 +5785,6 @@ def api_grid_autorun():
     except Exception:
         interval = 10.0
 
-    # stop existing if any
     cur = GRID_AUTORUN.pop(item_id, None)
     if cur and cur.get("stop"):
         try:
@@ -5793,8 +5792,16 @@ def api_grid_autorun():
         except Exception:
             pass
 
+    try:
+        session["autorun"] = bool(enable)
+        session["autorun_interval"] = interval
+        _grid_sessions_set(item_id, session)
+        _persist_grid_state()
+    except Exception:
+        pass
+
     if not enable:
-        return jsonify({"status": "ok", "item": item_id, "autorun": False})
+        return jsonify({"status": "ok", "item": item_id, "autorun": False, "interval": interval})
 
     stop_evt = threading.Event()
     th = threading.Thread(target=_autorun_loop, args=(item_id, stop_evt, interval), daemon=True)
@@ -5802,7 +5809,6 @@ def api_grid_autorun():
     th.start()
 
     return jsonify({"status": "ok", "item": item_id, "autorun": True, "interval": interval})
-
 
 
 @app.route("/api/grid/manual/add", methods=["POST"])
