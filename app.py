@@ -2652,6 +2652,18 @@ def _require_trading_enabled() -> tuple[Optional[str], Optional[dict], Optional[
     return wa, policy, None
 
 
+
+
+def _symbol_from_item(item_id: str) -> str:
+    """Extract tradable symbol from item id like POL:POL -> POL."""
+    try:
+        s = str(item_id or "").strip()
+        if ":" in s:
+            s = s.split(":", 1)[1]
+        return s.strip().upper()
+    except Exception:
+        return str(item_id or "").strip().upper()
+
 def _grid_item_variants(item_id: str) -> list:
     """Return candidate item IDs to improve cross-device compatibility (with/without chain prefix)."""
     it = (item_id or "").strip()
@@ -2765,16 +2777,20 @@ def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
             if not isinstance(snap, dict):
                 snap = None
             if not snap:
-                sym = str(item_eff).split(":", 1)[-1].strip().upper()
+                sym = _symbol_from_item(item_eff)
                 cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
                 if cg_id:
                     live = _cg_market_snapshot(str(cg_id))
-                    p = float(live.get("price") or 0.0)
+                    p = float((live or {}).get("price") or 0.0)
+                    if p <= 0 and isinstance(live, dict):
+                        p = float(live.get("current_price") or 0.0)
                     if p > 0:
-                        SNAPSHOTS[item_eff] = {
+                        snap_data = {
                             "ts": now_ts(),
                             "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
                         }
+                        for it in _grid_item_variants(item_eff):
+                            SNAPSHOTS[it] = snap_data
                         if not sess.get("price"):
                             sess["price"] = p
         except Exception:
@@ -5109,17 +5125,22 @@ def api_grid_tick():
                 pass
         if new_price is None:
             try:
-                sym = str(item_id).split(":", 1)[-1].strip().upper()
+                sym = _symbol_from_item(item_id)
                 cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
                 if cg_id:
                     live = _cg_market_snapshot(str(cg_id))
-                    p = float(live.get("price") or 0.0)
+                    p = float((live or {}).get("price") or 0.0)
+                    if p <= 0 and isinstance(live, dict):
+                        p = float(live.get("current_price") or 0.0)
                     if p > 0:
                         new_price = p
-                        SNAPSHOTS[str(session.get("item_id") or item_id).strip()] = {
+                        canonical_item = str(session.get("item_id") or item_id).strip()
+                        snap_data = {
                             "ts": now_ts(),
                             "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
                         }
+                        for it in _grid_item_variants(canonical_item):
+                            SNAPSHOTS[it] = snap_data
             except Exception:
                 pass
 
@@ -5141,7 +5162,12 @@ def api_grid_tick():
         price_source_label = "history"
     else:
         updated = _sim_tick(session, new_price=new_price)
-        price_source_label = ("frontend" if price is not None else ("snapshot" if new_price is not None else "none"))
+        if price is not None:
+            price_source_label = "frontend"
+        elif new_price is not None:
+            price_source_label = "market"
+        else:
+            price_source_label = "none"
 
     _grid_sessions_set(item_id, _trim_grid_session(updated))
     _persist_grid_state()
