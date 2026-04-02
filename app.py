@@ -6970,6 +6970,13 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
+# INIT WATCHLIST TABLE ON START
+try:
+    _ensure_watchlist_table()
+except Exception as e:
+    print("init watchlist failed:", e)
+
+
 
 if __name__ == "__main__":
 
@@ -6996,9 +7003,7 @@ def _ensure_watchlist_table():
     except Exception as e:
         print("watchlist table error:", e)
 
-@app.before_request
-def init_watchlist():
-    _ensure_watchlist_table()
+
 
 @app.route("/api/watchlist", methods=["GET"])
 def get_watchlist_api():
