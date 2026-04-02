@@ -183,8 +183,8 @@ def _is_allowed_origin(origin: str) -> bool:
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": "*"}},
-    supports_credentials=False,
+    origins=FRONTEND_ORIGINS,
+    supports_credentials=True,
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
@@ -196,28 +196,16 @@ from flask import make_response
 
 
 @app.after_request
-def _add_cors_headers(resp):
-    """Ensure every /api response has correct CORS headers.
-
-    The frontend uses fetch(..., credentials: 'include'), therefore:
-      - Access-Control-Allow-Origin must be the requesting origin (not '*')
-      - Access-Control-Allow-Credentials must be 'true'
-    """
+def add_cors_headers(resp):
     try:
         origin = request.headers.get("Origin")
 
-        if origin and origin in FRONTEND_ORIGINS_SET:
+        if origin in FRONTEND_ORIGINS_SET:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             resp.headers["Vary"] = "Origin"
-        else:
-            # Non-browser clients (no Origin) are fine. For unknown origins, don't enable credentials.
-            if origin:
-                resp.headers["Access-Control-Allow-Origin"] = origin
-                resp.headers["Vary"] = "Origin"
-
-        resp.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-        resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     except Exception:
         pass
     return resp
