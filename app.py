@@ -6996,8 +6996,9 @@ def _ensure_watchlist_table():
     except Exception as e:
         print("watchlist table error:", e)
 
-_ensure_watchlist_table()
-
+@app.before_request
+def init_watchlist():
+    _ensure_watchlist_table()
 
 @app.route("/api/watchlist", methods=["GET"])
 def get_watchlist_api():
