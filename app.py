@@ -84,53 +84,65 @@ app.url_map.strict_slashes = False
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
 
 
-# Enable CORS for all API routes (UI is on a different domain)
 # ---- CORS ----
-# Frontend and backend are on different domains. The frontend uses fetch(..., credentials: 'include'),
-# so we MUST:
-#  - echo a concrete Origin (not '*')
-#  - set Access-Control-Allow-Credentials: true
-FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("FRONTEND_ORIGINS") or "https://nexus-analyt-ui.onrender.com,http://localhost:5173,http://localhost:3000").split(",") if o.strip()]
+# Frontend and backend are on different domains. The frontend uses
+# fetch(..., credentials='include'), so we must echo a concrete allowed Origin
+# and allow credentials on both preflight and normal responses.
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "https://nexus-analyt-ui.onrender.com",
+    "https://www.nexus-analyt-ui.onrender.com",
+    "https://nexus-analyt-pro.onrender.com",
+    "https://www.nexus-analyt-pro.onrender.com",
+    "https://www.nexus-analyt.com",
+    "https://nexus-analyt.com",
+]
+
+# Allow env override/extension without creating duplicate conflicting blocks.
+_env_frontend_origins = [
+    o.strip()
+    for o in (os.getenv("FRONTEND_ORIGINS") or "").split(",")
+    if o.strip()
+]
+if _env_frontend_origins:
+    seen = set()
+    FRONTEND_ORIGINS = [
+        o for o in (_env_frontend_origins + FRONTEND_ORIGINS)
+        if not (o in seen or seen.add(o))
+    ]
 FRONTEND_ORIGINS_SET = set(FRONTEND_ORIGINS)
+
+# Allow-list matcher (defensive): some proxy/error paths can omit CORS headers.
+_FRONTEND_ORIGIN_RE = re.compile(r"^https://(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
+
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in FRONTEND_ORIGINS_SET:
+        return True
+    return bool(_FRONTEND_ORIGIN_RE.match(origin))
 
 CORS(
     app,
-    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
+    origins=FRONTEND_ORIGINS,
     supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Wallet-Address",
+        "x-wallet-address",
+        "X-API-Key",
+        "x-api-key",
+    ],
+    expose_headers=["Content-Type"],
+    max_age=86400,
 )
 
-@app.get("/api/version")
-def api_version():
-    return {
-        "status": "ok",
-        "ts": int(time.time()),
-        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
-        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
-    }
-
-from flask import request
-
-@app.after_request
-def _na_add_cors(resp):
-    origin = request.headers.get("Origin")
-    if origin and origin in FRONTEND_ORIGINS_SET:
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Credentials"] = "true"
-        resp.headers["Access-Control-Allow-Headers"] = (
-           "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
-        )
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    return resp
-
-@app.route("/api/<path:_path>", methods=["OPTIONS"])
-def _na_cors_preflight(_path):
-    return ("", 204)
-    
 import traceback
-from flask import jsonify
+from flask import jsonify, make_response
 
 @app.errorhandler(Exception)
 def _all_errors(e):
@@ -143,68 +155,25 @@ def ping():
     return "ok", 200
 
 @app.get("/api/version")
-def version():
-    import os
-    return {"version": os.getenv("RENDER_GIT_COMMIT", "unknown")}, 200
-
-
-"""CORS
-
-Frontend (Vite) calls the backend from http://localhost:5173 and uses
-fetch(..., { credentials: 'include' }).
-
-That requires:
-  - Access-Control-Allow-Origin must NOT be '*'
-  - Access-Control-Allow-Credentials must be 'true'
-  - Preflight (OPTIONS) must include the same headers
-"""
-
-# IMPORTANT: when supports_credentials=True, origins cannot be '*'
-FRONTEND_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "https://nexus-analyt-ui.onrender.com",
-    "https://www.nexus-analyt-ui.onrender.com",
-    "https://www.nexus-analyt.com",
-    "https://nexus-analyt.com",
-]
-
-# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
-# We therefore also mirror headers manually for known frontend origins.
-_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
-
-def _is_allowed_origin(origin: str) -> bool:
-    if not origin:
-        return False
-    if origin in FRONTEND_ORIGINS:
-        return True
-    # Accept Render subdomains for this project (ui/pro)
-    return bool(_FRONTEND_ORIGIN_RE.match(origin))
-
-CORS(
-    app,
-    origins=FRONTEND_ORIGINS,
-    supports_credentials=True,
-    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
-    expose_headers=["Content-Type"],
-    max_age=86400,
-)
-
-
-from flask import make_response
-
+def api_version():
+    return {
+        "status": "ok",
+        "ts": int(time.time()),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
+    }
 
 @app.after_request
 def add_cors_headers(resp):
     try:
         origin = request.headers.get("Origin")
-
-        if origin in FRONTEND_ORIGINS_SET:
+        if _is_allowed_origin(origin):
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+            resp.headers["Access-Control-Allow-Headers"] = (
+                "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
+            )
             resp.headers["Vary"] = "Origin"
     except Exception:
         pass
@@ -219,17 +188,15 @@ def _handle_options_preflight():
     origin = request.headers.get("Origin")
     resp = make_response("", 204)
 
-    if origin and origin in FRONTEND_ORIGINS_SET:
+    if _is_allowed_origin(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Vary"] = "Origin"
-    else:
-        if origin:
-            resp.headers["Access-Control-Allow-Origin"] = origin
-            resp.headers["Vary"] = "Origin"
 
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
+    )
     return resp
 
 
