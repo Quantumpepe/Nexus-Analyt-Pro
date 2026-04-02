@@ -6977,3 +6977,68 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host=host, port=port, debug=True)
+
+# =========================
+# WATCHLIST PERSISTENCE
+# =========================
+
+def _ensure_watchlist_table():
+    try:
+        conn = get_db()
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlists (
+            wallet_address TEXT PRIMARY KEY,
+            items_json TEXT,
+            updated_ts INTEGER
+        )
+        """)
+        conn.commit()
+    except Exception as e:
+        print("watchlist table error:", e)
+
+_ensure_watchlist_table()
+
+
+@app.route("/api/watchlist", methods=["GET"])
+def get_watchlist_api():
+    wallet = request.args.get("wallet")
+    if not wallet:
+        return jsonify({"items": []})
+
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT items_json FROM watchlists WHERE wallet_address = ?",
+            (wallet,)
+        ).fetchone()
+
+        if row and row["items_json"]:
+            import json
+            return jsonify({"items": json.loads(row["items_json"])})
+    except Exception as e:
+        print("watchlist get error:", e)
+
+    return jsonify({"items": []})
+
+
+@app.route("/api/watchlist", methods=["POST"])
+def save_watchlist_api():
+    data = request.get_json(force=True) or {}
+    wallet = data.get("wallet")
+    items = data.get("items", [])
+
+    if not wallet:
+        return jsonify({"ok": False, "error": "missing wallet"}), 400
+
+    try:
+        import json, time
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO watchlists (wallet_address, items_json, updated_ts) VALUES (?, ?, ?)",
+            (wallet, json.dumps(items), int(time.time()))
+        )
+        conn.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        print("watchlist save error:", e)
+        return jsonify({"ok": False}), 500
