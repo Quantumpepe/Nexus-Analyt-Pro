@@ -6984,7 +6984,7 @@ if __name__ == "__main__":
 
 def _ensure_watchlist_table():
     try:
-        conn = get_db()
+        conn = _db()
         conn.execute("""
         CREATE TABLE IF NOT EXISTS watchlists (
             wallet_address TEXT PRIMARY KEY,
