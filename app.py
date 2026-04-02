@@ -166,6 +166,7 @@ FRONTEND_ORIGINS = [
     "https://nexus-analyt-ui.onrender.com",
     "https://www.nexus-analyt-ui.onrender.com",
     "https://www.nexus-analyt.com",
+    "https://nexus-analyt.com",
 ]
 
 # Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
