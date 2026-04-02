@@ -7007,7 +7007,7 @@ def get_watchlist_api():
         return jsonify({"items": []})
 
     try:
-        conn = get_db()
+        conn = _db()
         row = conn.execute(
             "SELECT items_json FROM watchlists WHERE wallet_address = ?",
             (wallet,)
@@ -7033,7 +7033,7 @@ def save_watchlist_api():
 
     try:
         import json, time
-        conn = get_db()
+        conn = _db()
         conn.execute(
             "INSERT OR REPLACE INTO watchlists (wallet_address, items_json, updated_ts) VALUES (?, ?, ?)",
             (wallet, json.dumps(items), int(time.time()))
