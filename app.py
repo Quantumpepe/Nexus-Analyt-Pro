@@ -940,6 +940,15 @@ def init_db():
     )
 ''')
 
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS watchlists (
+        wallet_address TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL DEFAULT '[]',
+        updated_ts INTEGER
+    )
+''')
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_watchlists_updated_ts ON watchlists(updated_ts)")
+
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
 
@@ -4236,18 +4245,135 @@ def api_market_test():
             return jsonify(cached)
         return err(str(e), 500)
 
-@app.route("/api/watchlist", methods=["GET"])
+
+
+def _watchlist_normalize_items(items):
+    arr = items if isinstance(items, list) else []
+    out = []
+    seen = set()
+    for it in arr:
+        if not isinstance(it, dict):
+            continue
+        mode = str(it.get("mode") or "market").strip().lower()
+        if mode == "dex":
+            contract = str(it.get("contract") or it.get("tokenAddress") or "").strip().lower()
+            if not contract:
+                continue
+            item = {
+                "mode": "dex",
+                "contract": contract,
+                "tokenAddress": contract,
+                "symbol": str(it.get("symbol") or contract[:10]).strip().upper(),
+                "chain": str(it.get("chain") or "pol").strip(),
+                "name": str(it.get("name") or it.get("symbol") or contract[:10]).strip(),
+            }
+            key = f"dex|{contract}"
+        else:
+            cg_id = str(it.get("coingecko_id") or it.get("id") or "").strip().lower()
+            symbol = str(it.get("symbol") or "").strip().upper()
+            if not cg_id or not symbol:
+                continue
+            item = {
+                "mode": "market",
+                "id": cg_id,
+                "coingecko_id": cg_id,
+                "symbol": symbol,
+                "name": str(it.get("name") or symbol).strip(),
+            }
+            key = f"market|{symbol}|{cg_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _watchlist_get_db(wallet_address: str):
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return None
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT items_json, updated_ts FROM watchlists WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            items = json.loads(row["items_json"] or "[]")
+        except Exception:
+            items = []
+        return {
+            "wallet": wa,
+            "items": _watchlist_normalize_items(items),
+            "updated_ts": int(row["updated_ts"] or 0),
+        }
+    finally:
+        conn.close()
+
+
+def _watchlist_put_db(wallet_address: str, items):
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        raise ValueError("missing wallet")
+    normalized = _watchlist_normalize_items(items)
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO watchlists(wallet_address, items_json, updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET items_json=excluded.items_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(normalized, separators=(",", ":")), nowi),
+            )
+            conn.commit()
+        return {"wallet": wa, "items": normalized, "updated_ts": nowi}
+    finally:
+        conn.close()
+
+@app.route("/api/watchlist", methods=["GET", "POST"])
 def api_watchlist():
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        wallet = body.get("wallet") or request.args.get("wallet") or request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
+        items = body.get("items")
+        if not wallet:
+            return err("missing wallet", 400)
+        if not isinstance(items, list):
+            return err("missing items", 400)
+        saved = _watchlist_put_db(wallet, items)
+        resp = jsonify({"status": "ok", "wallet": saved["wallet"], "items": saved["items"], "updated_ts": saved["updated_ts"], "source": "db"})
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
+    wallet = request.args.get("wallet") or request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
+    if wallet:
+        stored = _watchlist_get_db(wallet)
+        if stored is not None:
+            resp = jsonify({"status": "ok", "wallet": stored["wallet"], "items": stored["items"], "updated_ts": stored["updated_ts"], "source": "db"})
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
+
     cache_key = "watchlist"
     try:
         data = get_watchlist()
-        resp = {"status": "ok", "items": data}
-        _gen_cache_set(cache_key, resp)
-        return jsonify(resp)
+        items = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        items = _watchlist_normalize_items(items)
+        resp = jsonify({"status": "ok", "items": items, "source": "default"})
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        _gen_cache_set(cache_key, {"status": "ok", "items": items, "source": "default"})
+        return resp
     except Exception as e:
         cached = _gen_cache_get_any(cache_key)
         if cached is not None:
-            return jsonify(cached)
+            resp = jsonify(cached)
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
         return err(str(e), 500)
 
 @app.route("/api/watchlist/live", methods=["GET"])
