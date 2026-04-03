@@ -4744,8 +4744,8 @@ def _downsample_points(prices, max_points: int = 240):
     n = len(prices)
     if n <= max_points:
         return prices
+
     import math
-import hashlib
     step = int(math.ceil(n / max_points))
     out = prices[::step]
     # ensure last point is included
