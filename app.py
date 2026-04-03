@@ -923,24 +923,43 @@ def init_db():
     )
 ''')
 
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS user_watchlists (
-        wallet_address TEXT PRIMARY KEY,
-        items_json TEXT DEFAULT '[]',
-        updated_ts INTEGER
-    )
-''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_watchlists (
+            wallet_address TEXT PRIMARY KEY,
+            items_json TEXT NOT NULL,
+            updated_ts INTEGER
+        )
+    """)
 
-    cur.execute('''
-    CREATE TABLE IF NOT EXISTS user_app_state (
-        wallet_address TEXT PRIMARY KEY,
-        state_json TEXT DEFAULT '{}',
-        updated_ts INTEGER
-    )
-''')
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_app_state (
+            wallet_address TEXT PRIMARY KEY,
+            compare_json TEXT DEFAULT '[]',
+            timeframe TEXT DEFAULT '90D',
+            index_mode INTEGER DEFAULT 1,
+            ai_selected_json TEXT DEFAULT '[]',
+            updated_ts INTEGER
+        )
+    """)
 
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
+
+    # Additive migrations for app sync tables
+    try:
+        _db_ensure_columns(conn, "user_watchlists", {
+            "items_json": "items_json TEXT DEFAULT '[]'",
+            "updated_ts": "updated_ts INTEGER",
+        })
+        _db_ensure_columns(conn, "user_app_state", {
+            "compare_json": "compare_json TEXT DEFAULT '[]'",
+            "timeframe": "timeframe TEXT DEFAULT '90D'",
+            "index_mode": "index_mode INTEGER DEFAULT 1",
+            "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
+            "updated_ts": "updated_ts INTEGER",
+        })
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -4235,236 +4254,216 @@ def api_market_test():
             return jsonify(cached)
         return err(str(e), 500)
 
-def _watchlist_normalize_items(items):
+def _watch_items_normalize(items):
     arr = items if isinstance(items, list) else []
     out = []
     seen = set()
     for it in arr:
-        if not isinstance(it, dict):
-            continue
-        mode = str(it.get("mode") or "market").strip().lower()
-        if mode == "dex":
-            contract = str(it.get("contract") or it.get("tokenAddress") or "").strip().lower()
-            if not contract:
+        if isinstance(it, str):
+            sym = it.strip().upper()
+            if not sym:
                 continue
-            item = {
-                "mode": "dex",
-                "contract": contract,
-                "tokenAddress": contract,
-                "symbol": str(it.get("symbol") or "").strip().upper(),
-                "chain": str(it.get("chain") or "pol").strip(),
-                "name": str(it.get("name") or it.get("symbol") or "").strip(),
-            }
+            row = {"symbol": sym, "mode": "market"}
+        elif isinstance(it, dict):
+            mode = str(it.get("mode") or "market").strip().lower()
+            if mode == "dex":
+                contract = str(it.get("contract") or it.get("tokenAddress") or "").strip().lower()
+                if not contract:
+                    continue
+                row = {
+                    "mode": "dex",
+                    "contract": contract,
+                    "tokenAddress": contract,
+                    "symbol": str(it.get("symbol") or contract[:10]).strip().upper(),
+                    "chain": str(it.get("chain") or "pol").strip().lower(),
+                    "name": str(it.get("name") or it.get("symbol") or contract[:10]).strip(),
+                }
+            else:
+                sym = str(it.get("symbol") or "").strip().upper()
+                cid = str(it.get("coingecko_id") or it.get("id") or "").strip().lower()
+                if not sym:
+                    continue
+                if not cid:
+                    try:
+                        cid = str(_cg_resolve_symbol(sym) or "").strip().lower()
+                    except Exception:
+                        cid = ""
+                row = {
+                    "mode": "market",
+                    "symbol": sym,
+                    "id": cid,
+                    "coingecko_id": cid,
+                    "name": str(it.get("name") or sym).strip(),
+                }
         else:
-            cg_id = str(it.get("coingecko_id") or it.get("id") or "").strip().lower()
-            symbol = str(it.get("symbol") or "").strip().upper()
-            if not cg_id or not symbol:
-                continue
-            item = {
-                "mode": "market",
-                "id": cg_id,
-                "coingecko_id": cg_id,
-                "symbol": symbol,
-                "name": str(it.get("name") or symbol).strip(),
-            }
-        key = (item.get("mode"), item.get("symbol"), item.get("contract") or item.get("coingecko_id") or item.get("id") or "")
+            continue
+        key = (row.get("mode"), row.get("symbol"), row.get("contract") or row.get("id") or row.get("coingecko_id") or "")
         if key in seen:
             continue
         seen.add(key)
-        out.append(item)
+        out.append(row)
     return out
 
-def _watchlist_default_items():
-    try:
-        data = get_watchlist()
-        if isinstance(data, dict):
-            items = data.get("items", [])
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = []
-    except Exception:
-        items = []
-    return _watchlist_normalize_items(items)
 
-def _watchlist_get_db(conn, wallet_address: str):
+def _db_get_user_watchlist(wallet_address: str) -> tuple[list, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return []
-    cur = conn.cursor()
-    cur.execute("SELECT items_json FROM user_watchlists WHERE wallet_address=?", (wa,))
-    row = cur.fetchone()
-    if not row:
-        return []
-    try:
-        return _watchlist_normalize_items(json.loads(row["items_json"] or "[]"))
-    except Exception:
-        return []
-
-def _watchlist_put_db(conn, wallet_address: str, items):
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return []
-    norm = _watchlist_normalize_items(items)
-    nowi = int(time.time())
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO user_watchlists(wallet_address, items_json, updated_ts) VALUES (?,?,?) "
-        "ON CONFLICT(wallet_address) DO UPDATE SET items_json=excluded.items_json, updated_ts=excluded.updated_ts",
-        (wa, json.dumps(norm, separators=(",",":")), nowi),
-    )
-    return norm
-
-def _app_state_default():
-    return {
-        "compareSet": [],
-        "timeframe": "90D",
-        "indexMode": True,
-        "aiSelected": [],
-        "updated_ts": 0,
-    }
-
-def _app_state_normalize(payload):
-    base = _app_state_default()
-    data = payload if isinstance(payload, dict) else {}
-    cmp = []
-    for s in (data.get("compareSet") or []):
-        sym = str(s or "").strip().upper()
-        if sym and sym not in cmp:
-            cmp.append(sym)
-    base["compareSet"] = cmp[:10]
-    tf = str(data.get("timeframe") or base["timeframe"]).strip().upper()
-    allowed_tf = {"1D", "7D", "30D", "90D", "1Y", "2Y"}
-    base["timeframe"] = tf if tf in allowed_tf else "90D"
-    base["indexMode"] = bool(data.get("indexMode", base["indexMode"]))
-    ai = []
-    for s in (data.get("aiSelected") or []):
-        sym = str(s or "").strip().upper()
-        if sym and sym not in ai:
-            ai.append(sym)
-    base["aiSelected"] = ai[:6]
-    try:
-        base["updated_ts"] = int(data.get("updated_ts") or 0)
-    except Exception:
-        base["updated_ts"] = 0
-    return base
-
-def _app_state_get_db(conn, wallet_address: str):
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return _app_state_default()
-    cur = conn.cursor()
-    cur.execute("SELECT state_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
-    row = cur.fetchone()
-    if not row:
-        return _app_state_default()
-    try:
-        data = json.loads(row["state_json"] or "{}")
-    except Exception:
-        data = {}
-    out = _app_state_normalize(data)
-    try:
-        out["updated_ts"] = int(row["updated_ts"] or out.get("updated_ts") or 0)
-    except Exception:
-        pass
-    return out
-
-def _app_state_put_db(conn, wallet_address: str, payload):
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return _app_state_default()
-    norm = _app_state_normalize(payload)
-    nowi = int(time.time())
-    norm["updated_ts"] = nowi
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO user_app_state(wallet_address, state_json, updated_ts) VALUES (?,?,?) "
-        "ON CONFLICT(wallet_address) DO UPDATE SET state_json=excluded.state_json, updated_ts=excluded.updated_ts",
-        (wa, json.dumps(norm, separators=(",",":")), nowi),
-    )
-    return norm
-
-@app.route("/api/watchlist", methods=["GET", "POST"])
-def api_watchlist():
-    wallet = _pick_wallet_from_request() or request.args.get("wallet") or request.headers.get("X-Wallet-Address") or ""
-    wallet = _norm_addr(wallet or "") if wallet else ""
-
-    if request.method == "POST":
-        if not wallet:
-            return err("missing wallet", 400)
-        body = request.get_json(silent=True) or {}
-        items = body.get("items", [])
-        conn = _db()
-        try:
-            with DB_WRITE_LOCK:
-                saved = _watchlist_put_db(conn, wallet, items)
-                conn.commit()
-            resp = jsonify({"status": "ok", "wallet": wallet, "items": saved, "ts": int(time.time())})
-            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            return resp
-        except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            return err(str(e), 500)
-        finally:
-            conn.close()
-
-    if wallet:
-        conn = _db()
-        try:
-            items = _watchlist_get_db(conn, wallet)
-            if not items:
-                items = _watchlist_default_items()
-            resp = jsonify({"status": "ok", "wallet": wallet, "items": items, "ts": int(time.time())})
-            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            return resp
-        finally:
-            conn.close()
-
-    cache_key = "watchlist"
-    try:
-        data = _watchlist_default_items()
-        resp = {"status": "ok", "items": data}
-        _gen_cache_set(cache_key, resp)
-        return jsonify(resp)
-    except Exception as e:
-        cached = _gen_cache_get_any(cache_key)
-        if cached is not None:
-            return jsonify(cached)
-        return err(str(e), 500)
-
-@app.route("/api/app-state", methods=["GET", "POST"])
-def api_app_state():
-    wallet = _pick_wallet_from_request() or request.args.get("wallet") or request.headers.get("X-Wallet-Address") or ""
-    wallet = _norm_addr(wallet or "") if wallet else ""
-    if not wallet:
-        return err("missing wallet", 400)
-
+        return [], 0
     conn = _db()
     try:
-        if request.method == "POST":
-            body = request.get_json(silent=True) or {}
-            payload = body.get("state") if isinstance(body.get("state"), dict) else body
-            with DB_WRITE_LOCK:
-                state = _app_state_put_db(conn, wallet, payload)
-                conn.commit()
-        else:
-            state = _app_state_get_db(conn, wallet)
-        resp = jsonify({"status": "ok", "wallet": wallet, "state": state, "ts": int(time.time())})
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-    except Exception as e:
+        cur = conn.cursor()
+        cur.execute("SELECT items_json, updated_ts FROM user_watchlists WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        if not row:
+            return [], 0
         try:
-            conn.rollback()
+            items = json.loads(row["items_json"] or "[]")
         except Exception:
-            pass
-        return err(str(e), 500)
+            items = []
+        return _watch_items_normalize(items), int(row["updated_ts"] or 0)
     finally:
         conn.close()
 
+
+def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return [], 0
+    clean = _watch_items_normalize(items)
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO user_watchlists(wallet_address, items_json, updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET items_json=excluded.items_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(clean, separators=(",", ":")), nowi),
+            )
+            conn.commit()
+        return clean, nowi
+    finally:
+        conn.close()
+
+
+def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        if not row:
+            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        try:
+            compare = json.loads(row["compare_json"] or "[]")
+        except Exception:
+            compare = []
+        try:
+            ai_selected = json.loads(row["ai_selected_json"] or "[]")
+        except Exception:
+            ai_selected = []
+        return {
+            "compare": [str(x).strip().upper() for x in (compare if isinstance(compare, list) else []) if str(x).strip()],
+            "timeframe": str(row["timeframe"] or "90D"),
+            "indexMode": bool(int(row["index_mode"] or 0)),
+            "aiSelected": [str(x).strip().upper() for x in (ai_selected if isinstance(ai_selected, list) else []) if str(x).strip()],
+        }, int(row["updated_ts"] or 0)
+    finally:
+        conn.close()
+
+
+def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+    base, _ = _db_get_user_app_state(wa)
+    compare = payload.get("compare") if isinstance(payload, dict) else None
+    timeframe = payload.get("timeframe") if isinstance(payload, dict) else None
+    index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
+    ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
+    if isinstance(compare, list):
+        base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:10]
+    if isinstance(timeframe, str) and timeframe.strip():
+        base["timeframe"] = timeframe.strip().upper()
+    if index_mode is not None:
+        base["indexMode"] = bool(index_mode)
+    if isinstance(ai_selected, list):
+        base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, updated_ts) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), nowi),
+            )
+            conn.commit()
+        return base, nowi
+    finally:
+        conn.close()
+
+
+@app.route("/api/watchlist", methods=["GET", "POST"])
+def api_watchlist():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        items = body.get("items") if isinstance(body, dict) else []
+        if not wa:
+            return err("wallet required", 401)
+        clean, updated_ts = _db_set_user_watchlist(wa, items or [])
+        resp = {"status": "ok", "wallet": wa, "items": clean, "updated_ts": updated_ts, "ts": now_ts()}
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+
+    if wa:
+        items, updated_ts = _db_get_user_watchlist(wa)
+        resp = {"status": "ok", "wallet": wa, "items": items, "updated_ts": updated_ts, "ts": now_ts()}
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+
+    cache_key = "watchlist"
+    try:
+        data = get_watchlist()
+        resp = {"status": "ok", "items": data}
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    except Exception as e:
+        cached = _gen_cache_get_any(cache_key)
+        if cached is not None:
+            out = jsonify(cached)
+            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return out
+        return err(str(e), 500)
+
+
+@app.route("/api/app-state", methods=["GET", "POST"])
+def api_app_state():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        state, updated_ts = _db_set_user_app_state(wa, body if isinstance(body, dict) else {})
+        out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    state, updated_ts = _db_get_user_app_state(wa)
+    out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
+
+
 @app.route("/api/watchlist/live", methods=["GET"])
+
 def api_watchlist_live():
     item = request.args.get("item")
     addr = request.args.get("addr")
@@ -4604,11 +4603,19 @@ def api_watchlist_snapshot():
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
             items = body.get("items")
+            if (not isinstance(items, list) or items is None):
+                wa = _require_auth() or _pick_wallet_from_request() or body.get("wallet")
+                if wa:
+                    items, _ = _db_get_user_watchlist(wa)
 
-        if not isinstance(items, list) or not items:
-            # Fallback to server-side watchlist for GET (or empty POST)
-            wl = get_watchlist()
-            items = wl.get("items", []) if isinstance(wl, dict) else []
+        if not isinstance(items, list):
+            wa = _require_auth() or _pick_wallet_from_request()
+            if wa:
+                items, _ = _db_get_user_watchlist(wa)
+            else:
+                # Fallback to server-side watchlist for unauthenticated GET
+                wl = get_watchlist()
+                items = wl.get("items", []) if isinstance(wl, dict) else []
 
         # ---- Normalize input items ----
         norm_items = []
