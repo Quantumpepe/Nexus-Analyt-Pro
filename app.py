@@ -3948,17 +3948,20 @@ def _compute_history_metrics(points):
     ret_pct = ((last - first) / first) * 100.0 if first else None
 
     rets = []
-for i in range(1, len(vals)):
-    a, b = vals[i - 1], vals[i]
-    if a > 0 and b > 0:
-        rets.append(math.log(b / a))
-
-if rets:
-    mean = sum(rets) / len(rets)
-    var = sum((x - mean) ** 2 for x in rets) / len(rets)
-    vol = (math.sqrt(var) * 100.0)
-else:
-    vol = None
+    for i in range(1, len(vals)):
+        a, b = vals[i - 1], vals[i]
+        if a > 0 and b > 0:
+            import math
+import hashlib
+            rets.append(math.log(b / a))
+    if rets:
+        mean = sum(rets) / len(rets)
+        varr = sum((x - mean) ** 2 for x in rets) / len(rets)
+        import math
+import hashlib
+        vol = (math.sqrt(varr) * 100.0)
+    else:
+        vol = None
 
     peak = vals[0]
     max_dd = 0.0
@@ -4744,8 +4747,8 @@ def _downsample_points(prices, max_points: int = 240):
     n = len(prices)
     if n <= max_points:
         return prices
-
     import math
+import hashlib
     step = int(math.ceil(n / max_points))
     out = prices[::step]
     # ensure last point is included
