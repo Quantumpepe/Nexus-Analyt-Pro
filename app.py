@@ -17,7 +17,6 @@ import uuid
 import requests
 import random
 import math
-import hashlib
 from typing import Optional, Dict, Any
 # --- Defaults for manual orders ---
 DEFAULT_SLIPPAGE_BPS = int(os.getenv("DEFAULT_SLIPPAGE_BPS", "500"))   # 500 bps = 5%
@@ -258,132 +257,6 @@ COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL") or (
 )
 
 # -------------------------
-# GoPlus token security (vault-deposit precheck)
-# -------------------------
-GOPLUS_APP_KEY = str(os.getenv("GOPLUS_APP_KEY") or "").strip()
-GOPLUS_APP_SECRET = str(os.getenv("GOPLUS_APP_SECRET") or "").strip()
-GOPLUS_BASE = str(os.getenv("GOPLUS_BASE_URL") or "https://api.gopluslabs.io/api/v1").rstrip("/")
-GOPLUS_TIMEOUT_SEC = float(os.getenv("GOPLUS_TIMEOUT_SEC", "8"))
-GOPLUS_BLOCK_BUY_TAX_PCT = float(os.getenv("GOPLUS_BLOCK_BUY_TAX_PCT", "20"))
-GOPLUS_BLOCK_SELL_TAX_PCT = float(os.getenv("GOPLUS_BLOCK_SELL_TAX_PCT", "20"))
-GOPLUS_BLOCK_HONEYPOT = str(os.getenv("GOPLUS_BLOCK_HONEYPOT", "1")).strip() not in ("0", "false", "False", "no", "NO")
-GOPLUS_ALLOWLIST = {x.strip().lower() for x in str(os.getenv("GOPLUS_ALLOWLIST", "")).split(",") if x.strip()}
-# Format in allowlist: 137:0xTokenAddress , 56:0xTokenAddress
-
-def _goplus_chain_id_from_key(raw: str) -> int:
-    s = str(raw or "").strip().upper()
-    return {"ETH": 1, "BNB": 56, "POL": 137, "POLYGON": 137, "MATIC": 137}.get(s, 0)
-
-def _goplus_is_allowlisted(chain_id: int, token_address: str) -> bool:
-    ta = str(token_address or "").strip().lower()
-    if not ta:
-        return False
-    return f"{int(chain_id)}:{ta}" in GOPLUS_ALLOWLIST
-
-def _goplus_sign(ts: int) -> str:
-    raw = f"{GOPLUS_APP_KEY}{int(ts)}{GOPLUS_APP_SECRET}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-def _goplus_get_access_token() -> str:
-    if not (GOPLUS_APP_KEY and GOPLUS_APP_SECRET):
-        return ""
-    ts = int(time.time())
-    sign = _goplus_sign(ts)
-    try:
-        r = requests.post(
-            f"{GOPLUS_BASE}/token",
-            json={"app_key": GOPLUS_APP_KEY, "time": ts, "sign": sign},
-            headers={"accept": "*/*", "content-type": "application/json"},
-            timeout=GOPLUS_TIMEOUT_SEC,
-        )
-        if r.ok:
-            j = r.json() or {}
-            token = j.get("result", {}).get("access_token") or j.get("access_token") or j.get("token") or ""
-            return str(token or "")
-    except Exception:
-        return ""
-    return ""
-
-def _to_float_safe(v, default=0.0):
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
-
-def _goplus_token_security(chain_id: int, token_address: str) -> dict:
-    ta = _norm_addr(token_address or "")
-    if not ta or not _looks_like_evm_addr(ta):
-        raise ValueError("invalid token address")
-
-    headers = {"accept": "application/json"}
-    access_token = _goplus_get_access_token()
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
-
-    url = f"{GOPLUS_BASE}/token_security/{int(chain_id)}"
-    r = requests.get(url, params={"contract_addresses": ta}, headers=headers, timeout=GOPLUS_TIMEOUT_SEC)
-    r.raise_for_status()
-    j = r.json() or {}
-    result = j.get("result") or {}
-    token = result.get(ta.lower()) or result.get(ta) or {}
-    return token if isinstance(token, dict) else {}
-
-def _goplus_eval_token(chain_id: int, token_address: str) -> dict:
-    ta = _norm_addr(token_address or "")
-    if _goplus_is_allowlisted(chain_id, ta):
-        return {
-            "allowed": True,
-            "source": "override",
-            "reason": "allowlisted override",
-            "token_address": ta,
-            "chain_id": int(chain_id),
-            "flags": {},
-        }
-
-    token = _goplus_token_security(chain_id, ta)
-    honeypot = str(token.get("is_honeypot") or "0") == "1"
-    buy_tax = _to_float_safe(token.get("buy_tax"), 0.0)
-    sell_tax = _to_float_safe(token.get("sell_tax"), 0.0)
-    hidden_owner = str(token.get("hidden_owner") or "0") == "1"
-    cannot_sell_all = str(token.get("cannot_sell_all") or "0") == "1"
-    is_blacklisted = str(token.get("is_blacklisted") or "0") == "1"
-
-    reasons = []
-    allowed = True
-    if GOPLUS_BLOCK_HONEYPOT and honeypot:
-        allowed = False
-        reasons.append("honeypot")
-    if buy_tax > GOPLUS_BLOCK_BUY_TAX_PCT:
-        allowed = False
-        reasons.append(f"buy tax {buy_tax:g}%")
-    if sell_tax > GOPLUS_BLOCK_SELL_TAX_PCT:
-        allowed = False
-        reasons.append(f"sell tax {sell_tax:g}%")
-    if cannot_sell_all:
-        allowed = False
-        reasons.append("cannot sell all")
-    if is_blacklisted:
-        allowed = False
-        reasons.append("blacklisted")
-
-    return {
-        "allowed": bool(allowed),
-        "source": "goplus",
-        "reason": ", ".join(reasons) if reasons else "ok",
-        "token_address": ta,
-        "chain_id": int(chain_id),
-        "flags": {
-            "honeypot": honeypot,
-            "buy_tax": buy_tax,
-            "sell_tax": sell_tax,
-            "hidden_owner": hidden_owner,
-            "cannot_sell_all": cannot_sell_all,
-            "blacklisted": is_blacklisted,
-            "raw": token,
-        },
-    }
-
-# -------------------------
 # CoinGecko proxy (avoid browser CORS + basic throttling)
 # -------------------------
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
@@ -403,43 +276,6 @@ def _cg_get(url: str) -> dict:
     _CG_CACHE[url] = (now, data)
     return data
 
-
-@app.route("/api/security/token-check", methods=["POST"])
-def api_security_token_check():
-    body = request.get_json(silent=True) or {}
-    chain = body.get("chain") or body.get("chain_key") or body.get("network") or ""
-    token_address = body.get("token_address") or body.get("address") or body.get("contract") or ""
-    symbol = str(body.get("symbol") or "").strip().upper()
-    is_native = bool(body.get("is_native") or body.get("native") or False)
-
-    chain_key = _normalize_chain_key(chain)
-    chain_id = int(body.get("chain_id") or _CHAIN_ID_BY_KEY.get(chain_key, 0) or _goplus_chain_id_from_key(chain_key) or 0)
-
-    if is_native:
-        return jsonify({
-            "status": "ok",
-            "allowed": True,
-            "bypass": True,
-            "reason": "native asset bypass",
-            "chain": chain_key or chain,
-            "chain_id": chain_id,
-            "symbol": symbol or chain_key,
-            "ts": now_ts(),
-        })
-
-    if chain_id <= 0:
-        return jsonify({"status": "error", "error": "invalid chain", "ts": now_ts()}), 400
-    if not _looks_like_evm_addr(token_address):
-        return jsonify({"status": "error", "error": "invalid token_address", "ts": now_ts()}), 400
-
-    try:
-        verdict = _goplus_eval_token(chain_id, token_address)
-        code = 200 if verdict.get("allowed") else 403
-        return jsonify({"status": "ok", "chain": chain_key or chain, **verdict, "ts": now_ts()}), code
-    except requests.HTTPError as e:
-        return jsonify({"status": "error", "error": f"goplus http error: {e}", "ts": now_ts()}), 502
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
 
 @app.route("/api/contracts", methods=["GET"])
 def api_contracts():
@@ -1087,8 +923,43 @@ def init_db():
     )
 ''')
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_watchlists (
+            wallet_address TEXT PRIMARY KEY,
+            items_json TEXT NOT NULL,
+            updated_ts INTEGER
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_app_state (
+            wallet_address TEXT PRIMARY KEY,
+            compare_json TEXT DEFAULT '[]',
+            timeframe TEXT DEFAULT '90D',
+            index_mode INTEGER DEFAULT 1,
+            ai_selected_json TEXT DEFAULT '[]',
+            updated_ts INTEGER
+        )
+    """)
+
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
+
+    # Additive migrations for app sync tables
+    try:
+        _db_ensure_columns(conn, "user_watchlists", {
+            "items_json": "items_json TEXT DEFAULT '[]'",
+            "updated_ts": "updated_ts INTEGER",
+        })
+        _db_ensure_columns(conn, "user_app_state", {
+            "compare_json": "compare_json TEXT DEFAULT '[]'",
+            "timeframe": "timeframe TEXT DEFAULT '90D'",
+            "index_mode": "index_mode INTEGER DEFAULT 1",
+            "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
+            "updated_ts": "updated_ts INTEGER",
+        })
+    except Exception:
+        pass
 
     conn.commit()
     conn.close()
@@ -3952,13 +3823,11 @@ def _compute_history_metrics(points):
         a, b = vals[i - 1], vals[i]
         if a > 0 and b > 0:
             import math
-import hashlib
             rets.append(math.log(b / a))
     if rets:
         mean = sum(rets) / len(rets)
         varr = sum((x - mean) ** 2 for x in rets) / len(rets)
         import math
-import hashlib
         vol = (math.sqrt(varr) * 100.0)
     else:
         vol = None
@@ -4385,21 +4254,216 @@ def api_market_test():
             return jsonify(cached)
         return err(str(e), 500)
 
-@app.route("/api/watchlist", methods=["GET"])
+def _watch_items_normalize(items):
+    arr = items if isinstance(items, list) else []
+    out = []
+    seen = set()
+    for it in arr:
+        if isinstance(it, str):
+            sym = it.strip().upper()
+            if not sym:
+                continue
+            row = {"symbol": sym, "mode": "market"}
+        elif isinstance(it, dict):
+            mode = str(it.get("mode") or "market").strip().lower()
+            if mode == "dex":
+                contract = str(it.get("contract") or it.get("tokenAddress") or "").strip().lower()
+                if not contract:
+                    continue
+                row = {
+                    "mode": "dex",
+                    "contract": contract,
+                    "tokenAddress": contract,
+                    "symbol": str(it.get("symbol") or contract[:10]).strip().upper(),
+                    "chain": str(it.get("chain") or "pol").strip().lower(),
+                    "name": str(it.get("name") or it.get("symbol") or contract[:10]).strip(),
+                }
+            else:
+                sym = str(it.get("symbol") or "").strip().upper()
+                cid = str(it.get("coingecko_id") or it.get("id") or "").strip().lower()
+                if not sym:
+                    continue
+                if not cid:
+                    try:
+                        cid = str(_cg_resolve_symbol(sym) or "").strip().lower()
+                    except Exception:
+                        cid = ""
+                row = {
+                    "mode": "market",
+                    "symbol": sym,
+                    "id": cid,
+                    "coingecko_id": cid,
+                    "name": str(it.get("name") or sym).strip(),
+                }
+        else:
+            continue
+        key = (row.get("mode"), row.get("symbol"), row.get("contract") or row.get("id") or row.get("coingecko_id") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def _db_get_user_watchlist(wallet_address: str) -> tuple[list, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return [], 0
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT items_json, updated_ts FROM user_watchlists WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        if not row:
+            return [], 0
+        try:
+            items = json.loads(row["items_json"] or "[]")
+        except Exception:
+            items = []
+        return _watch_items_normalize(items), int(row["updated_ts"] or 0)
+    finally:
+        conn.close()
+
+
+def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return [], 0
+    clean = _watch_items_normalize(items)
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO user_watchlists(wallet_address, items_json, updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET items_json=excluded.items_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(clean, separators=(",", ":")), nowi),
+            )
+            conn.commit()
+        return clean, nowi
+    finally:
+        conn.close()
+
+
+def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        if not row:
+            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        try:
+            compare = json.loads(row["compare_json"] or "[]")
+        except Exception:
+            compare = []
+        try:
+            ai_selected = json.loads(row["ai_selected_json"] or "[]")
+        except Exception:
+            ai_selected = []
+        return {
+            "compare": [str(x).strip().upper() for x in (compare if isinstance(compare, list) else []) if str(x).strip()],
+            "timeframe": str(row["timeframe"] or "90D"),
+            "indexMode": bool(int(row["index_mode"] or 0)),
+            "aiSelected": [str(x).strip().upper() for x in (ai_selected if isinstance(ai_selected, list) else []) if str(x).strip()],
+        }, int(row["updated_ts"] or 0)
+    finally:
+        conn.close()
+
+
+def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+    base, _ = _db_get_user_app_state(wa)
+    compare = payload.get("compare") if isinstance(payload, dict) else None
+    timeframe = payload.get("timeframe") if isinstance(payload, dict) else None
+    index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
+    ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
+    if isinstance(compare, list):
+        base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:10]
+    if isinstance(timeframe, str) and timeframe.strip():
+        base["timeframe"] = timeframe.strip().upper()
+    if index_mode is not None:
+        base["indexMode"] = bool(index_mode)
+    if isinstance(ai_selected, list):
+        base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, updated_ts) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), nowi),
+            )
+            conn.commit()
+        return base, nowi
+    finally:
+        conn.close()
+
+
+@app.route("/api/watchlist", methods=["GET", "POST"])
 def api_watchlist():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        items = body.get("items") if isinstance(body, dict) else []
+        if not wa:
+            return err("wallet required", 401)
+        clean, updated_ts = _db_set_user_watchlist(wa, items or [])
+        resp = {"status": "ok", "wallet": wa, "items": clean, "updated_ts": updated_ts, "ts": now_ts()}
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+
+    if wa:
+        items, updated_ts = _db_get_user_watchlist(wa)
+        resp = {"status": "ok", "wallet": wa, "items": items, "updated_ts": updated_ts, "ts": now_ts()}
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+
     cache_key = "watchlist"
     try:
         data = get_watchlist()
         resp = {"status": "ok", "items": data}
-        _gen_cache_set(cache_key, resp)
-        return jsonify(resp)
+        out = jsonify(resp)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
     except Exception as e:
         cached = _gen_cache_get_any(cache_key)
         if cached is not None:
-            return jsonify(cached)
+            out = jsonify(cached)
+            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return out
         return err(str(e), 500)
 
+
+@app.route("/api/app-state", methods=["GET", "POST"])
+def api_app_state():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        state, updated_ts = _db_set_user_app_state(wa, body if isinstance(body, dict) else {})
+        out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    state, updated_ts = _db_get_user_app_state(wa)
+    out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
+
+
 @app.route("/api/watchlist/live", methods=["GET"])
+
 def api_watchlist_live():
     item = request.args.get("item")
     addr = request.args.get("addr")
@@ -4535,15 +4599,30 @@ def api_watchlist_snapshot():
     """
     try:
         items = None
+        body = {}
+        explicit_items = False
 
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            items = body.get("items")
+            explicit_items = isinstance(body, dict) and ("items" in body)
+            items = body.get("items") if isinstance(body, dict) else None
+            # IMPORTANT:
+            # When the client explicitly sends items: [] (for example after deleting the
+            # last coin or after logout), we must respect that exact empty list and must
+            # NOT fall back to the server/global watchlist.
+            if (not explicit_items) or (items is not None and not isinstance(items, list)):
+                wa = _require_auth() or _pick_wallet_from_request() or body.get("wallet")
+                if wa:
+                    items, _ = _db_get_user_watchlist(wa)
 
-        if not isinstance(items, list) or not items:
-            # Fallback to server-side watchlist for GET (or empty POST)
-            wl = get_watchlist()
-            items = wl.get("items", []) if isinstance(wl, dict) else []
+        if not isinstance(items, list):
+            wa = _require_auth() or _pick_wallet_from_request()
+            if wa:
+                items, _ = _db_get_user_watchlist(wa)
+            else:
+                # Fallback to server-side watchlist for unauthenticated GET
+                wl = get_watchlist()
+                items = wl.get("items", []) if isinstance(wl, dict) else []
 
         # ---- Normalize input items ----
         norm_items = []
@@ -4566,8 +4645,10 @@ def api_watchlist_snapshot():
 
             # market extras
             if row["mode"] == "market":
-                if it.get("id"):
-                    row["id"] = str(it.get("id")).strip()
+                cid_raw = it.get("id") or it.get("coingecko_id")
+                if cid_raw:
+                    row["id"] = str(cid_raw).strip()
+                    row["coingecko_id"] = str(cid_raw).strip()
 
             # dex extras
             if row["mode"] == "dex":
@@ -4605,14 +4686,45 @@ def api_watchlist_snapshot():
 
         for it in market_items:
             sym = it["symbol"]
-            cid = it.get("id")
+            cid = (it.get("id") or it.get("coingecko_id") or "").strip()
             if not cid:
-                cid = _cg_resolve_symbol(sym)
+                cid = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym) or _cg_resolve_symbol(sym)
             if cid:
                 ids_by_symbol[sym] = cid
                 coin_ids.append(cid)
 
         snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+
+        # Backfill any misses one-by-one and finally via the generic price router.
+        for it in market_items:
+            sym = it.get("symbol")
+            cid = ids_by_symbol.get(sym) or (it.get("id") or it.get("coingecko_id") or "").strip()
+            if not cid:
+                continue
+            if cid not in snaps_by_id:
+                try:
+                    snap1 = _cg_market_snapshot(cid)
+                    if isinstance(snap1, dict) and snap1.get("price") not in (None, "", 0):
+                        snap1 = dict(snap1)
+                        snap1.setdefault("id", cid)
+                        snaps_by_id[cid] = snap1
+                except Exception:
+                    pass
+            if cid not in snaps_by_id:
+                try:
+                    p = _price_multi(sym)
+                    if isinstance(p, dict) and p.get("price") not in (None, "", 0):
+                        snaps_by_id[cid] = {
+                            "id": cid,
+                            "symbol": sym,
+                            "price": p.get("price"),
+                            "change24": None,
+                            "volume24": None,
+                            "liquidity": None,
+                            "source": p.get("source") or "market-price",
+                        }
+                except Exception:
+                    pass
 
         # ---- Build results (normalized keys expected by frontend) ----
         results = []
@@ -4663,13 +4775,32 @@ def api_watchlist_snapshot():
                 continue
 
             # market
-            cid = ids_by_symbol.get(sym) or it.get("id")
+            cid = ids_by_symbol.get(sym) or it.get("id") or it.get("coingecko_id")
             snap = snaps_by_id.get(cid) if cid else None
-            if snap:
+            if (not snap or snap.get("price") in (None, "", 0)) and cid:
+                try:
+                    snap = _cg_market_snapshot(cid)
+                except Exception:
+                    snap = snap or None
+            if (not snap or snap.get("price") in (None, "", 0)):
+                try:
+                    p = _price_multi(sym)
+                    if isinstance(p, dict) and p.get("price") not in (None, "", 0):
+                        cid = cid or p.get("id") or cid
+                        snap = {
+                            "price": p.get("price"),
+                            "change24h": None,
+                            "volume24h": None,
+                            "source": p.get("source") or "market-price",
+                        }
+                except Exception:
+                    pass
+            if snap and snap.get("price") not in (None, "", 0):
                 results.append({
                     "symbol": sym,
                     "mode": "market",
                     "id": cid,
+                    "coingecko_id": cid,
                     "price": snap.get("price"),
                     "change24h": snap.get("change24") if "change24" in snap else snap.get("change24h"),
                     "volume24h": snap.get("volume24") if "volume24" in snap else snap.get("volume24h"),
@@ -4681,6 +4812,7 @@ def api_watchlist_snapshot():
                     "symbol": sym,
                     "mode": "market",
                     "id": cid,
+                    "coingecko_id": cid,
                     "price": None,
                     "change24h": None,
                     "volume24h": None,
@@ -4748,7 +4880,6 @@ def _downsample_points(prices, max_points: int = 240):
     if n <= max_points:
         return prices
     import math
-import hashlib
     step = int(math.ceil(n / max_points))
     out = prices[::step]
     # ensure last point is included
