@@ -4645,8 +4645,10 @@ def api_watchlist_snapshot():
 
             # market extras
             if row["mode"] == "market":
-                if it.get("id"):
-                    row["id"] = str(it.get("id")).strip()
+                cid_raw = it.get("id") or it.get("coingecko_id")
+                if cid_raw:
+                    row["id"] = str(cid_raw).strip()
+                    row["coingecko_id"] = str(cid_raw).strip()
 
             # dex extras
             if row["mode"] == "dex":
@@ -4684,14 +4686,45 @@ def api_watchlist_snapshot():
 
         for it in market_items:
             sym = it["symbol"]
-            cid = it.get("id")
+            cid = (it.get("id") or it.get("coingecko_id") or "").strip()
             if not cid:
-                cid = _cg_resolve_symbol(sym)
+                cid = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym) or _cg_resolve_symbol(sym)
             if cid:
                 ids_by_symbol[sym] = cid
                 coin_ids.append(cid)
 
         snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+
+        # Backfill any misses one-by-one and finally via the generic price router.
+        for it in market_items:
+            sym = it.get("symbol")
+            cid = ids_by_symbol.get(sym) or (it.get("id") or it.get("coingecko_id") or "").strip()
+            if not cid:
+                continue
+            if cid not in snaps_by_id:
+                try:
+                    snap1 = _cg_market_snapshot(cid)
+                    if isinstance(snap1, dict) and snap1.get("price") not in (None, "", 0):
+                        snap1 = dict(snap1)
+                        snap1.setdefault("id", cid)
+                        snaps_by_id[cid] = snap1
+                except Exception:
+                    pass
+            if cid not in snaps_by_id:
+                try:
+                    p = _price_multi(sym)
+                    if isinstance(p, dict) and p.get("price") not in (None, "", 0):
+                        snaps_by_id[cid] = {
+                            "id": cid,
+                            "symbol": sym,
+                            "price": p.get("price"),
+                            "change24": None,
+                            "volume24": None,
+                            "liquidity": None,
+                            "source": p.get("source") or "market-price",
+                        }
+                except Exception:
+                    pass
 
         # ---- Build results (normalized keys expected by frontend) ----
         results = []
@@ -4742,13 +4775,32 @@ def api_watchlist_snapshot():
                 continue
 
             # market
-            cid = ids_by_symbol.get(sym) or it.get("id")
+            cid = ids_by_symbol.get(sym) or it.get("id") or it.get("coingecko_id")
             snap = snaps_by_id.get(cid) if cid else None
-            if snap:
+            if (not snap or snap.get("price") in (None, "", 0)) and cid:
+                try:
+                    snap = _cg_market_snapshot(cid)
+                except Exception:
+                    snap = snap or None
+            if (not snap or snap.get("price") in (None, "", 0)):
+                try:
+                    p = _price_multi(sym)
+                    if isinstance(p, dict) and p.get("price") not in (None, "", 0):
+                        cid = cid or p.get("id") or cid
+                        snap = {
+                            "price": p.get("price"),
+                            "change24h": None,
+                            "volume24h": None,
+                            "source": p.get("source") or "market-price",
+                        }
+                except Exception:
+                    pass
+            if snap and snap.get("price") not in (None, "", 0):
                 results.append({
                     "symbol": sym,
                     "mode": "market",
                     "id": cid,
+                    "coingecko_id": cid,
                     "price": snap.get("price"),
                     "change24h": snap.get("change24") if "change24" in snap else snap.get("change24h"),
                     "volume24h": snap.get("volume24") if "volume24" in snap else snap.get("volume24h"),
@@ -4760,6 +4812,7 @@ def api_watchlist_snapshot():
                     "symbol": sym,
                     "mode": "market",
                     "id": cid,
+                    "coingecko_id": cid,
                     "price": None,
                     "change24h": None,
                     "volume24h": None,
