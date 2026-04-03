@@ -4599,11 +4599,18 @@ def api_watchlist_snapshot():
     """
     try:
         items = None
+        body = {}
+        explicit_items = False
 
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            items = body.get("items")
-            if (not isinstance(items, list) or items is None):
+            explicit_items = isinstance(body, dict) and ("items" in body)
+            items = body.get("items") if isinstance(body, dict) else None
+            # IMPORTANT:
+            # When the client explicitly sends items: [] (for example after deleting the
+            # last coin or after logout), we must respect that exact empty list and must
+            # NOT fall back to the server/global watchlist.
+            if (not explicit_items) or (items is not None and not isinstance(items, list)):
                 wa = _require_auth() or _pick_wallet_from_request() or body.get("wallet")
                 if wa:
                     items, _ = _db_get_user_watchlist(wa)
