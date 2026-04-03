@@ -1401,6 +1401,278 @@ def _looks_like_evm_addr(s: str) -> bool:
     s = (s or "").strip()
     return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", s))
 
+
+
+# -------------------------
+# GoPlus token security (vault deposit gate)
+# -------------------------
+GOPLUS_APP_KEY = (os.getenv("GOPLUS_APP_KEY") or "").strip()
+GOPLUS_APP_SECRET = (os.getenv("GOPLUS_APP_SECRET") or "").strip()
+GOPLUS_TIMEOUT_SEC = float(os.getenv("GOPLUS_TIMEOUT_SEC", "8") or 8)
+GOPLUS_BLOCK_HONEYPOT = str(os.getenv("GOPLUS_BLOCK_HONEYPOT", "false")).strip().lower() in ("1", "true", "yes", "on")
+_GOPLUS_TOKEN_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+_GOPLUS_AUTH_URL = "https://api.gopluslabs.io/api/v1/token"
+_GOPLUS_TOKEN_CACHE = {"token": None, "expires_at": 0}
+
+def _goplus_allowlist() -> set[tuple[int, str]]:
+    raw = str(os.getenv("GOPLUS_ALLOWLIST", "") or "").strip()
+    out: set[tuple[int, str]] = set()
+    if not raw:
+        return out
+    for part in raw.split(","):
+        p = str(part or "").strip()
+        if not p or ":" not in p:
+            continue
+        cid_s, addr = p.split(":", 1)
+        try:
+            cid = int(str(cid_s).strip())
+        except Exception:
+            continue
+        addr_n = _norm_addr(addr)
+        if cid > 0 and _looks_like_evm_addr(addr_n):
+            out.add((cid, addr_n))
+    return out
+
+def _goplus_chain_id(raw_chain: Any) -> int:
+    s = str(raw_chain or "").strip().upper()
+    if not s:
+        return 0
+    if s.isdigit():
+        try:
+            return int(s)
+        except Exception:
+            return 0
+    aliases = {
+        "ETH": 1,
+        "ETHEREUM": 1,
+        "BNB": 56,
+        "BSC": 56,
+        "POL": 137,
+        "POLYGON": 137,
+        "MATIC": 137,
+    }
+    return int(aliases.get(s, 0) or 0)
+
+def _goplus_native_symbols_for_chain(chain_id: int) -> set[str]:
+    if int(chain_id) == 1:
+        return {"ETH", "WETH"}
+    if int(chain_id) == 56:
+        return {"BNB", "WBNB"}
+    if int(chain_id) == 137:
+        return {"POL", "MATIC", "WMATIC"}
+    return set()
+
+def _goplus_is_native_asset(chain_id: int, symbol: str = "", address: str = "") -> bool:
+    addr = _norm_addr(address)
+    if addr and addr in ("0x0000000000000000000000000000000000000000", "native"):
+        return True
+    sym = str(symbol or "").strip().upper()
+    return bool(sym and sym in _goplus_native_symbols_for_chain(int(chain_id)))
+
+def _goplus_get_access_token() -> Optional[str]:
+    now = int(time.time())
+    cached = _GOPLUS_TOKEN_CACHE.get("token")
+    exp = int(_GOPLUS_TOKEN_CACHE.get("expires_at") or 0)
+    if cached and exp > now + 30:
+        return str(cached)
+
+    if not (GOPLUS_APP_KEY and GOPLUS_APP_SECRET):
+        return None
+
+    payloads = [
+        {"app_key": GOPLUS_APP_KEY, "app_secret": GOPLUS_APP_SECRET},
+        {"appKey": GOPLUS_APP_KEY, "appSecret": GOPLUS_APP_SECRET},
+    ]
+    for payload in payloads:
+        try:
+            r = requests.post(_GOPLUS_AUTH_URL, json=payload, timeout=GOPLUS_TIMEOUT_SEC)
+            if not r.ok:
+                continue
+            data = r.json() or {}
+            token = (
+                data.get("access_token")
+                or (data.get("result") or {}).get("access_token")
+                or (data.get("result") or {}).get("token")
+                or data.get("token")
+            )
+            if token:
+                _GOPLUS_TOKEN_CACHE["token"] = str(token)
+                _GOPLUS_TOKEN_CACHE["expires_at"] = now + 55 * 60
+                return str(token)
+        except Exception:
+            continue
+    return None
+
+def _goplus_fetch_token_security(chain_id: int, token_address: str) -> dict:
+    cid = int(chain_id or 0)
+    addr = _norm_addr(token_address)
+    if cid <= 0:
+        raise RuntimeError("invalid chain_id")
+    if not _looks_like_evm_addr(addr):
+        raise RuntimeError("invalid token address")
+
+    headers = {"Accept": "application/json", "User-Agent": "NexusAnalyt/1.0"}
+    tok = _goplus_get_access_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+
+    url = _GOPLUS_TOKEN_URL.format(chain_id=cid)
+    r = requests.get(url, headers=headers, params={"contract_addresses": addr}, timeout=GOPLUS_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json() or {}
+    result = data.get("result") or {}
+    token_data = None
+    if isinstance(result, dict):
+        token_data = result.get(addr) or result.get(addr.lower()) or result.get(addr.upper())
+        if token_data is None and len(result) == 1:
+            token_data = next(iter(result.values()))
+    if not isinstance(token_data, dict):
+        token_data = {}
+    return token_data
+
+def _goplus_to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _goplus_is_truthy(v: Any) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y")
+
+def _goplus_check_token(chain_id: int, token_address: str, symbol: str = "") -> dict:
+    cid = int(chain_id or 0)
+    addr = _norm_addr(token_address)
+
+    if _goplus_is_native_asset(cid, symbol=symbol, address=addr):
+        return {
+            "ok": True,
+            "allowed": True,
+            "native": True,
+            "override": False,
+            "blocked_by": None,
+            "reason": "native asset",
+            "chain_id": cid,
+            "address": addr or "native",
+            "symbol": str(symbol or "").strip().upper(),
+            "raw": {},
+        }
+
+    if not _looks_like_evm_addr(addr):
+        return {
+            "ok": False,
+            "allowed": False,
+            "native": False,
+            "override": False,
+            "blocked_by": "validation",
+            "reason": "invalid token address",
+            "chain_id": cid,
+            "address": addr,
+            "symbol": str(symbol or "").strip().upper(),
+            "raw": {},
+        }
+
+    if (cid, addr) in _goplus_allowlist():
+        return {
+            "ok": True,
+            "allowed": True,
+            "native": False,
+            "override": True,
+            "blocked_by": None,
+            "reason": "allowlist override",
+            "chain_id": cid,
+            "address": addr,
+            "symbol": str(symbol or "").strip().upper(),
+            "raw": {},
+        }
+
+    raw = _goplus_fetch_token_security(cid, addr)
+    is_honeypot = _goplus_is_truthy(raw.get("is_honeypot"))
+    buy_tax = _goplus_to_float(raw.get("buy_tax"))
+    sell_tax = _goplus_to_float(raw.get("sell_tax"))
+
+    blocked_by = None
+    reason = "ok"
+    if GOPLUS_BLOCK_HONEYPOT and is_honeypot:
+        blocked_by = "honeypot"
+        reason = "blocked by GoPlus honeypot check"
+
+    allowed = blocked_by is None
+    return {
+        "ok": True,
+        "allowed": allowed,
+        "native": False,
+        "override": False,
+        "blocked_by": blocked_by,
+        "reason": reason,
+        "chain_id": cid,
+        "address": addr,
+        "symbol": str(symbol or "").strip().upper(),
+        "checks": {
+            "is_honeypot": is_honeypot,
+            "buy_tax": buy_tax,
+            "sell_tax": sell_tax,
+        },
+        "raw": raw,
+    }
+
+@app.route("/api/security/token-check", methods=["POST"])
+def api_security_token_check():
+    body = request.get_json(silent=True) or {}
+
+    chain_raw = body.get("chain_id") or body.get("chainId") or body.get("chain") or ""
+    token_address = body.get("token_address") or body.get("address") or body.get("contract") or ""
+    symbol = body.get("symbol") or body.get("asset") or ""
+
+    chain_id = _goplus_chain_id(chain_raw)
+    if chain_id <= 0:
+        return jsonify({"status": "error", "error": "invalid chain", "ts": now_ts()}), 400
+
+    try:
+        result = _goplus_check_token(chain_id, str(token_address or ""), str(symbol or ""))
+    except requests.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.response.text[:300]
+        except Exception:
+            detail = str(e)
+        return jsonify({
+            "status": "error",
+            "error": "goplus_request_failed",
+            "detail": detail,
+            "chain_id": chain_id,
+            "address": _norm_addr(token_address),
+            "symbol": str(symbol or "").strip().upper(),
+            "ts": now_ts(),
+        }), 502
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "chain_id": chain_id,
+            "address": _norm_addr(token_address),
+            "symbol": str(symbol or "").strip().upper(),
+            "ts": now_ts(),
+        }), 400
+
+    return jsonify({
+        "status": "ok",
+        "allowed": bool(result.get("allowed")),
+        "native": bool(result.get("native")),
+        "override": bool(result.get("override")),
+        "blocked_by": result.get("blocked_by"),
+        "reason": result.get("reason"),
+        "chain_id": result.get("chain_id"),
+        "address": result.get("address"),
+        "symbol": result.get("symbol"),
+        "checks": result.get("checks") or {},
+        "ts": now_ts(),
+    })
+
 def _try_extract_wallet_from_jwt(token: str) -> Optional[str]:
     """Best-effort decode of a JWT *without* verification to extract an EVM wallet address.
     This is an interim compatibility layer for Privy access tokens.
