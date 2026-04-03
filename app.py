@@ -206,6 +206,14 @@ def add_cors_headers(resp):
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             resp.headers["Vary"] = "Origin"
+
+        # Grid / vault state must never be cached by browser/proxy/CDN.
+        # Stale GET caching was a common reason different devices showed different order states.
+        path = (request.path or "")
+        if path.startswith("/api/grid") or path.startswith("/api/vault/state"):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
     except Exception:
         pass
     return resp
@@ -727,6 +735,13 @@ def _db_migrate_schema(conn):
         "vault_total": "vault_total REAL DEFAULT 0",
         "updated_ts": "updated_ts INTEGER",
     })
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_chain_status ON grid_orders(wallet_address, chain, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_chain_item_status ON grid_orders(wallet_address, chain, item_id, status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_vaults_wallet_chain_item ON grid_vaults(wallet_address, chain, item_id)")
+    except Exception as e:
+        print(f"[DB] WARNING: could not create grid indexes: {e}")
 
 
 
@@ -902,6 +917,8 @@ def init_db():
 ''')
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item ON grid_orders(wallet_address, item_id);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_item_status ON grid_orders(wallet_address, item_id, status);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_chain_status ON grid_orders(wallet_address, chain, status);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_grid_orders_wallet_chain_item_status ON grid_orders(wallet_address, chain, item_id, status);")
 
     cur.execute('''
     CREATE TABLE IF NOT EXISTS grid_vaults (
