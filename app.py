@@ -84,65 +84,53 @@ app.url_map.strict_slashes = False
 # Accept both /path and /path/ to avoid 404s due to trailing slashes
 
 
+# Enable CORS for all API routes (UI is on a different domain)
 # ---- CORS ----
-# Frontend and backend are on different domains. The frontend uses
-# fetch(..., credentials='include'), so we must echo a concrete allowed Origin
-# and allow credentials on both preflight and normal responses.
-FRONTEND_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "https://nexus-analyt-ui.onrender.com",
-    "https://www.nexus-analyt-ui.onrender.com",
-    "https://nexus-analyt-pro.onrender.com",
-    "https://www.nexus-analyt-pro.onrender.com",
-    "https://www.nexus-analyt.com",
-    "https://nexus-analyt.com",
-]
-
-# Allow env override/extension without creating duplicate conflicting blocks.
-_env_frontend_origins = [
-    o.strip()
-    for o in (os.getenv("FRONTEND_ORIGINS") or "").split(",")
-    if o.strip()
-]
-if _env_frontend_origins:
-    seen = set()
-    FRONTEND_ORIGINS = [
-        o for o in (_env_frontend_origins + FRONTEND_ORIGINS)
-        if not (o in seen or seen.add(o))
-    ]
+# Frontend and backend are on different domains. The frontend uses fetch(..., credentials: 'include'),
+# so we MUST:
+#  - echo a concrete Origin (not '*')
+#  - set Access-Control-Allow-Credentials: true
+FRONTEND_ORIGINS = [o.strip() for o in (os.getenv("FRONTEND_ORIGINS") or "https://nexus-analyt-ui.onrender.com,http://localhost:5173,http://localhost:3000").split(",") if o.strip()]
 FRONTEND_ORIGINS_SET = set(FRONTEND_ORIGINS)
-
-# Allow-list matcher (defensive): some proxy/error paths can omit CORS headers.
-_FRONTEND_ORIGIN_RE = re.compile(r"^https://(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
-
-def _is_allowed_origin(origin: str) -> bool:
-    if not origin:
-        return False
-    if origin in FRONTEND_ORIGINS_SET:
-        return True
-    return bool(_FRONTEND_ORIGIN_RE.match(origin))
 
 CORS(
     app,
-    origins=FRONTEND_ORIGINS,
+    resources={r"/api/*": {"origins": FRONTEND_ORIGINS}},
     supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization", "X-Wallet-Address"],
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Content-Type",
-        "Authorization",
-        "X-Wallet-Address",
-        "x-wallet-address",
-        "X-API-Key",
-        "x-api-key",
-    ],
-    expose_headers=["Content-Type"],
-    max_age=86400,
 )
 
+@app.get("/api/version")
+def api_version():
+    return {
+        "status": "ok",
+        "ts": int(time.time()),
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
+    }
+
+from flask import request
+
+@app.after_request
+def _na_add_cors(resp):
+    origin = request.headers.get("Origin")
+    if origin and origin in FRONTEND_ORIGINS_SET:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Access-Control-Allow-Headers"] = (
+           "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
+        )
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    return resp
+
+@app.route("/api/<path:_path>", methods=["OPTIONS"])
+def _na_cors_preflight(_path):
+    return ("", 204)
+    
 import traceback
-from flask import jsonify, make_response
+from flask import jsonify
 
 @app.errorhandler(Exception)
 def _all_errors(e):
@@ -155,25 +143,68 @@ def ping():
     return "ok", 200
 
 @app.get("/api/version")
-def api_version():
-    return {
-        "status": "ok",
-        "ts": int(time.time()),
-        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
-        "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
-    }
+def version():
+    import os
+    return {"version": os.getenv("RENDER_GIT_COMMIT", "unknown")}, 200
+
+
+"""CORS
+
+Frontend (Vite) calls the backend from http://localhost:5173 and uses
+fetch(..., { credentials: 'include' }).
+
+That requires:
+  - Access-Control-Allow-Origin must NOT be '*'
+  - Access-Control-Allow-Credentials must be 'true'
+  - Preflight (OPTIONS) must include the same headers
+"""
+
+# IMPORTANT: when supports_credentials=True, origins cannot be '*'
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://nexus-analyt-ui.onrender.com",
+    "https://www.nexus-analyt-ui.onrender.com",
+    "https://www.nexus-analyt.com",
+    "https://nexus-analyt.com",
+]
+
+# Allow-list matcher (defensive): some proxy error paths can omit CORS headers.
+# We therefore also mirror headers manually for known frontend origins.
+_FRONTEND_ORIGIN_RE = re.compile(r"^(https://)?(www\.)?nexus-analyt-(ui|pro)\.onrender\.com$")
+
+def _is_allowed_origin(origin: str) -> bool:
+    if not origin:
+        return False
+    if origin in FRONTEND_ORIGINS:
+        return True
+    # Accept Render subdomains for this project (ui/pro)
+    return bool(_FRONTEND_ORIGIN_RE.match(origin))
+
+CORS(
+    app,
+    origins=FRONTEND_ORIGINS,
+    supports_credentials=True,
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type"],
+    max_age=86400,
+)
+
+
+from flask import make_response
+
 
 @app.after_request
 def add_cors_headers(resp):
     try:
         origin = request.headers.get("Origin")
-        if _is_allowed_origin(origin):
+
+        if origin in FRONTEND_ORIGINS_SET:
             resp.headers["Access-Control-Allow-Origin"] = origin
             resp.headers["Access-Control-Allow-Credentials"] = "true"
             resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = (
-                "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
-            )
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
             resp.headers["Vary"] = "Origin"
     except Exception:
         pass
@@ -188,15 +219,17 @@ def _handle_options_preflight():
     origin = request.headers.get("Origin")
     resp = make_response("", 204)
 
-    if _is_allowed_origin(origin):
+    if origin and origin in FRONTEND_ORIGINS_SET:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Vary"] = "Origin"
+    else:
+        if origin:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
 
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = (
-        "Content-Type, Authorization, X-Wallet-Address, x-wallet-address, X-API-Key, x-api-key"
-    )
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return resp
 
 
@@ -578,6 +611,7 @@ def err(msg, code=400):
 GRID_STATE_PATH = os.getenv('NEXUS_GRID_STATE_PATH', '/data/grid_state.json')
 GRID_MAX_HISTORY = int(os.getenv('NEXUS_GRID_MAX_HISTORY', '500'))
 _GRID_PERSIST_LOCK = threading.Lock()
+_GRID_EXEC_LOCK = threading.RLock()  # serialize tick/start/stop mutations so tick/order state stays monotonic
 
 def _grid_state_load() -> dict:
     if not os.path.exists(GRID_STATE_PATH):
@@ -2714,12 +2748,27 @@ def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
         if not isinstance(sess, dict):
             sess = {}
 
+        # Preserve the most advanced in-memory tick/price we can find across item variants.
+        best_tick = int(sess.get("ticks") or 0) if isinstance(sess, dict) else 0
+        best_price = sess.get("price") if isinstance(sess, dict) else None
+        for it in _grid_item_variants(item_eff):
+            s2 = GRID_SESSIONS.get(it)
+            if not isinstance(s2, dict):
+                continue
+            t2 = int(s2.get("ticks") or 0)
+            if t2 >= best_tick:
+                best_tick = t2
+                if s2.get("price") is not None:
+                    best_price = s2.get("price")
+
         sess["wallet_address"] = _norm_addr(wa)
         sess["item"] = item_eff
         sess["item_id"] = item_eff
         sess.setdefault("running", True)
         sess.setdefault("stopped", False)
-        sess.setdefault("ticks", 0)
+        sess["ticks"] = max(int(sess.get("ticks") or 0), int(best_tick or 0))
+        if best_price is not None and sess.get("price") is None:
+            sess["price"] = best_price
         sess.setdefault("fills", [])
         sess.setdefault("filled_now", 0)
         sess.setdefault("order_mode", "MANUAL")
@@ -5040,70 +5089,71 @@ def api_grid_tick():
     if not item_id:
         return err("missing 'item' in body", 400)
 
-    item_id = str(item_id).strip()
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return err("unauthorized", 401)
-    # Prefer existing RAM session, but auto-hydrate from DB orders when session is missing/empty.
-    session = _get_owned_session(item_id, wa)
-    if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
-        session = _hydrate_grid_session_from_db(item_id, wa)
-    if not session:
-        return err("grid not started (press Start first)", 404)
-
-    # ✅ Prefer explicit live price from frontend; otherwise use cached snapshot/live market price.
-    new_price = None
-    if price is not None and price != "":
-        try:
-            new_price = float(price)
-        except Exception:
-            new_price = None
-
-    if new_price is None:
-        for it in _grid_item_variants(item_id):
-            snap = SNAPSHOTS.get(it)
-            if snap and isinstance(snap.get("data"), dict):
+    with _GRID_EXEC_LOCK:
+            item_id = str(item_id).strip()
+        wa = _require_auth() or _pick_wallet_from_request()
+        if not wa:
+            return err("unauthorized", 401)
+        # Prefer existing RAM session, but auto-hydrate from DB orders when session is missing/empty.
+        session = _get_owned_session(item_id, wa)
+        if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
+            session = _hydrate_grid_session_from_db(item_id, wa)
+        if not session:
+            return err("grid not started (press Start first)", 404)
+    
+        # ✅ Prefer explicit live price from frontend; otherwise use cached snapshot/live market price.
+        new_price = None
+        if price is not None and price != "":
+            try:
+                new_price = float(price)
+            except Exception:
+                new_price = None
+    
+        if new_price is None:
+            for it in _grid_item_variants(item_id):
+                snap = SNAPSHOTS.get(it)
+                if snap and isinstance(snap.get("data"), dict):
+                    try:
+                        new_price = float(snap["data"].get("price"))
+                        if new_price and new_price > 0:
+                            break
+                    except Exception:
+                        new_price = None
+    
+        if new_price is None:
+            # Try a fresh live lookup using snapshot metadata / static CoinGecko mapping.
+            for it in _grid_item_variants(item_id):
                 try:
-                    new_price = float(snap["data"].get("price"))
-                    if new_price and new_price > 0:
+                    p = _get_live_price_for_item(it)
+                    if p is not None and float(p) > 0:
+                        new_price = float(p)
                         break
                 except Exception:
-                    new_price = None
-
-    if new_price is None:
-        # Try a fresh live lookup using snapshot metadata / static CoinGecko mapping.
-        for it in _grid_item_variants(item_id):
-            try:
-                p = _get_live_price_for_item(it)
-                if p is not None and float(p) > 0:
-                    new_price = float(p)
-                    break
-            except Exception:
-                pass
-        if new_price is None:
-            try:
-                sym = _symbol_from_item(item_id)
-                cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
-                if cg_id:
-                    live = _cg_market_snapshot(str(cg_id))
-                    p = float((live or {}).get("price") or 0.0)
-                    if p <= 0 and isinstance(live, dict):
-                        p = float(live.get("current_price") or 0.0)
-                    if p > 0:
-                        new_price = p
-                        canonical_item = str(session.get("item_id") or item_id).strip()
-                        snap_data = {
-                            "ts": now_ts(),
-                            "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
-                        }
-                        for it in _grid_item_variants(canonical_item):
-                            SNAPSHOTS[it] = snap_data
-            except Exception:
-                pass
-
-    # ✅ If we have a real historical series attached, Tick advances through it (real backtest),
-    # otherwise we use live price (frontend or snapshot).
-    series = None
+                    pass
+            if new_price is None:
+                try:
+                    sym = _symbol_from_item(item_id)
+                    cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
+                    if cg_id:
+                        live = _cg_market_snapshot(str(cg_id))
+                        p = float((live or {}).get("price") or 0.0)
+                        if p <= 0 and isinstance(live, dict):
+                            p = float(live.get("current_price") or 0.0)
+                        if p > 0:
+                            new_price = p
+                            canonical_item = str(session.get("item_id") or item_id).strip()
+                            snap_data = {
+                                "ts": now_ts(),
+                                "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p}
+                            }
+                            for it in _grid_item_variants(canonical_item):
+                                SNAPSHOTS[it] = snap_data
+                except Exception:
+                    pass
+    
+        # ✅ If we have a real historical series attached, Tick advances through it (real backtest),
+        # otherwise we use live price (frontend or snapshot).
+        series = None
     try:
         series = session.get("price_series")
     except Exception:
@@ -5114,7 +5164,15 @@ def api_grid_tick():
         # advance one step
         idx = min(idx + 1, len(series) - 1)
         session["series_idx"] = idx
-        new_price = float(series[idx])
+
+        point = series[idx]
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            new_price = float(point[1])
+        elif isinstance(point, dict):
+            new_price = float(point.get("v") if point.get("v") is not None else point.get("price"))
+        else:
+            new_price = float(point)
+
         updated = _sim_tick(session, new_price=new_price)
         price_source_label = "history"
     else:
@@ -5433,6 +5491,11 @@ def api_grid_init():
         free = max(0.0, float(vault_total) - float(reserved))
 
         session = _get_owned_session(item_id, wa)
+        if not isinstance(session, dict):
+            try:
+                session = _hydrate_grid_session_from_db(item_id, wa)
+            except Exception:
+                session = None
         tick = int(session.get("ticks") or 0) if isinstance(session, dict) else 0
         price = float(session.get("price") or 0.0) if isinstance(session, dict) and session.get("price") is not None else None
         running = bool(session.get("running")) and not bool(session.get("stopped")) if isinstance(session, dict) else False
@@ -6970,13 +7033,6 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
-# INIT WATCHLIST TABLE ON START
-try:
-    _ensure_watchlist_table()
-except Exception as e:
-    print("init watchlist failed:", e)
-
-
 
 if __name__ == "__main__":
 
@@ -6984,67 +7040,3 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host=host, port=port, debug=True)
-
-# =========================
-# WATCHLIST PERSISTENCE
-# =========================
-
-def _ensure_watchlist_table():
-    try:
-        conn = _db()
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS watchlists (
-            wallet_address TEXT PRIMARY KEY,
-            items_json TEXT,
-            updated_ts INTEGER
-        )
-        """)
-        conn.commit()
-    except Exception as e:
-        print("watchlist table error:", e)
-
-
-
-@app.route("/api/watchlist", methods=["GET"])
-def get_watchlist_api():
-    wallet = request.args.get("wallet")
-    if not wallet:
-        return jsonify({"items": []})
-
-    try:
-        conn = _db()
-        row = conn.execute(
-            "SELECT items_json FROM watchlists WHERE wallet_address = ?",
-            (wallet,)
-        ).fetchone()
-
-        if row and row["items_json"]:
-            import json
-            return jsonify({"items": json.loads(row["items_json"])})
-    except Exception as e:
-        print("watchlist get error:", e)
-
-    return jsonify({"items": []})
-
-
-@app.route("/api/watchlist", methods=["POST"])
-def save_watchlist_api():
-    data = request.get_json(force=True) or {}
-    wallet = data.get("wallet")
-    items = data.get("items", [])
-
-    if not wallet:
-        return jsonify({"ok": False, "error": "missing wallet"}), 400
-
-    try:
-        import json, time
-        conn = _db()
-        conn.execute(
-            "INSERT OR REPLACE INTO watchlists (wallet_address, items_json, updated_ts) VALUES (?, ?, ?)",
-            (wallet, json.dumps(items), int(time.time()))
-        )
-        conn.commit()
-        return jsonify({"ok": True})
-    except Exception as e:
-        print("watchlist save error:", e)
-        return jsonify({"ok": False}), 500
