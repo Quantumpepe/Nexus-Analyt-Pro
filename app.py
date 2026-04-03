@@ -5090,11 +5090,11 @@ def api_grid_tick():
         return err("missing 'item' in body", 400)
 
     with _GRID_EXEC_LOCK:
-            item_id = str(item_id).strip()
+        item_id = str(item_id).strip()
         wa = _require_auth() or _pick_wallet_from_request()
         if not wa:
             return err("unauthorized", 401)
-        # Prefer existing RAM session, but auto-hydrate from DB orders when session is missing/empty.
+
         session = _get_owned_session(item_id, wa)
         if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
             session = _hydrate_grid_session_from_db(item_id, wa)
