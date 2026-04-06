@@ -1216,6 +1216,43 @@ def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, cha
     return rc
 
 
+
+
+def _grid_db_resume_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
+    """
+    Resume a previously stopped/cancelled order by setting status back to OPEN.
+
+    Primary key is (wallet_address, order_id). We keep item_id/chain filters for the
+    fast-path, but fall back to order_id-only to tolerate UI/backend item mismatches.
+    """
+    nowi = int(time.time())
+    cur = conn.cursor()
+    wa = _norm_addr(wallet_address)
+
+    if chain:
+        cur.execute(
+            "UPDATE grid_orders SET status='OPEN', cancelled_ts=NULL, updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+            (nowi, str(oid), wa, item_id, chain),
+        )
+    else:
+        cur.execute(
+            "UPDATE grid_orders SET status='OPEN', cancelled_ts=NULL, updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=?",
+            (nowi, str(oid), wa, item_id),
+        )
+    rc = cur.rowcount
+
+    if rc <= 0:
+        cur.execute(
+            "UPDATE grid_orders SET status='OPEN', cancelled_ts=NULL, updated_ts=? "
+            "WHERE order_id=? AND wallet_address=?",
+            (nowi, str(oid), wa),
+        )
+        rc = cur.rowcount
+
+    return rc
+
 def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
     """Delete an order.
 
@@ -6423,6 +6460,72 @@ def api_grid_order_delete():
     try:
         with DB_WRITE_LOCK:
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
+            conn.commit()
+
+        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        free = max(0.0, float(vault_total) - float(reserved))
+
+        if rc <= 0:
+            return jsonify({"error": "order not found"}), 404
+        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+    finally:
+        conn.close()
+
+
+
+
+@app.route("/api/grid/order/resume", methods=["POST"])
+@app.route("/api/grid/order/start", methods=["POST"])
+@app.route("/api/grid/order/restart", methods=["POST"])
+def api_grid_order_resume():
+    """Resume a previously stopped/cancelled order (SQLite-backed).
+
+    Works even if the grid session is not running.
+    Accepts:
+      {item, id} OR {item, orderId/order_id}
+    """
+    wa = _require_auth()
+    if not wa:
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
+    if not item_id:
+        return jsonify({"error": "missing item"}), 400
+
+    oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
+    if oid is None or str(oid).strip() == "":
+        return jsonify({"error": "missing id"}), 400
+
+    chain = str(payload.get("chain") or "").strip()
+    try:
+        conn_ui = _db()
+        try:
+            with DB_WRITE_LOCK:
+                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                conn_ui.commit()
+        finally:
+            conn_ui.close()
+    except Exception:
+        pass
+
+    # Update RAM session if present (fast UI feedback)
+    sess = GRID_SESSIONS.get(item_id)
+    if isinstance(sess, dict):
+        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+        for o in orders:
+            if isinstance(o, dict) and str(o.get("id")) == str(oid):
+                o["status"] = "OPEN"
+                o.pop("cancelled_ts", None)
+                break
+        sess["orders"] = orders
+
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            rc = _grid_db_resume_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
         orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
