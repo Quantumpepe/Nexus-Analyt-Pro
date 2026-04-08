@@ -2187,7 +2187,7 @@ REDEEM_CODES = [
     "NEXUS-H5P1-9DWC",
     "NEXUS-7R2J-3KHC",
     "NEXUS-W9X6-6FVP",
-    "NEXUS-C1N4-R7YA"
+    "NEXUS-C1N4-R7YA",
 ]
 
 # -------------------------
