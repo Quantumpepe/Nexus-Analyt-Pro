@@ -3069,6 +3069,24 @@ def _grid_add_order_to_sessions(item_id: str, order: dict) -> None:
             _trim_grid_session(sess)
             _grid_sessions_set(it, sess)
 
+
+def _grid_replace_session_orders_from_db(item_id: str, orders: list[dict]) -> None:
+    """Make RAM sessions authoritative from DB orders for all compatible item variants.
+    This prevents stale JSON/RAM orders from reappearing after refresh or a new manual add.
+    """
+    safe_orders = [dict(o) for o in (orders or []) if isinstance(o, dict)]
+    changed = False
+    for it, sess in _grid_session_variants(item_id):
+        sess["orders"] = [dict(o) for o in safe_orders]
+        _trim_grid_session(sess)
+        _grid_sessions_set(it, sess)
+        changed = True
+    if changed:
+        try:
+            _persist_grid_state()
+        except Exception:
+            pass
+
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
     """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned.
     Also tolerates item-id variants to keep orders visible across devices/versions.
@@ -6299,6 +6317,10 @@ def api_grid_orders():
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
+            try:
+                _grid_replace_session_orders_from_db(item_id, orders)
+            except Exception:
+                pass
             sess = _get_owned_session(item_id, wa)
             return jsonify({
                 "status": "ok",
@@ -6547,6 +6569,10 @@ def api_grid_order_stop():
     # Update RAM session if present (fast UI feedback) across all compatible item variants
     if oid is not None and str(oid).strip() != "":
         _grid_mark_order_in_sessions(item_id, str(oid), "CANCELLED", cancelled=True)
+        try:
+            _persist_grid_state()
+        except Exception:
+            pass
 
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
@@ -6604,6 +6630,10 @@ def api_grid_order_delete():
 
     # Remove from RAM sessions if present across all compatible item variants
     _grid_remove_order_from_sessions(item_id, str(oid))
+    try:
+        _persist_grid_state()
+    except Exception:
+        pass
 
     conn = _db()
     try:
@@ -6662,6 +6692,10 @@ def api_grid_order_resume():
 
     # Update RAM session if present (fast UI feedback) across all compatible item variants
     _grid_mark_order_in_sessions(item_id, str(oid), "OPEN", cancelled=False)
+    try:
+        _persist_grid_state()
+    except Exception:
+        pass
 
     conn = _db()
     try:
@@ -6894,6 +6928,10 @@ def api_grid_manual_add():
             if not reserved:
                 reserved = _grid_db_reserved(conn, wa, item_id, chain="")
             free = max(0.0, float(vault_total) - float(reserved))
+            try:
+                _grid_replace_session_orders_from_db(item_id, orders_db)
+            except Exception:
+                pass
             try:
                 conn.commit()
             except Exception:
