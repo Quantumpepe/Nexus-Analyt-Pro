@@ -1175,15 +1175,22 @@ def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, 
     meta = {k:v for k,v in (order or {}).items() if k not in core_keys}
     cur = conn.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO grid_orders(order_id,wallet_address,item_id,chain,side,price,qty,status,level,meta_json,created_ts,updated_ts) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,COALESCE((SELECT created_ts FROM grid_orders WHERE order_id=?),?),?)",
+        "SELECT 1 FROM grid_orders WHERE order_id=? AND wallet_address=? LIMIT 1",
+        (oid, _norm_addr(wallet_address)),
+    )
+    if cur.fetchone():
+        return oid
+
+    cur.execute(
+        "INSERT INTO grid_orders(order_id,wallet_address,item_id,chain,side,price,qty,status,level,meta_json,created_ts,updated_ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (oid, _norm_addr(wallet_address), item_id, chain, side,
          float(price) if price is not None else None,
          float(qty) if qty is not None else None,
          status,
          int(level) if level is not None else None,
          json.dumps(meta, separators=(",",":")),
-         oid, nowi, nowi),
+         nowi, nowi),
     )
     return oid
 
@@ -2992,6 +2999,76 @@ def _grid_sessions_set(item_id: str, sess: dict) -> None:
     for it in _grid_item_variants(item_id):
         GRID_SESSIONS[it] = sess
 
+def _grid_session_variants(item_id: str) -> list[tuple[str, dict]]:
+    """Return unique (key, session) pairs for all compatible item-id variants."""
+    seen = set()
+    out = []
+    for it in _grid_item_variants(item_id):
+        sess = GRID_SESSIONS.get(it)
+        if not isinstance(sess, dict):
+            continue
+        sid = id(sess)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append((it, sess))
+    return out
+
+def _grid_remove_order_from_sessions(item_id: str, oid: str) -> None:
+    """Remove an order id from every compatible in-memory grid session."""
+    soid = str(oid)
+    for it, sess in _grid_session_variants(item_id):
+        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+        sess["orders"] = [
+            o for o in orders
+            if not (isinstance(o, dict) and str(o.get("id") or o.get("order_id") or o.get("orderId")) == soid)
+        ]
+        _grid_sessions_set(it, sess)
+
+def _grid_mark_order_in_sessions(item_id: str, oid: str, status: str, cancelled: bool = False) -> None:
+    """Update order status across every compatible in-memory grid session."""
+    soid = str(oid)
+    nowi = int(time.time())
+    for it, sess in _grid_session_variants(item_id):
+        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+        changed = False
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            ooid = str(o.get("id") or o.get("order_id") or o.get("orderId") or "")
+            if ooid != soid:
+                continue
+            o["status"] = str(status)
+            if cancelled:
+                o["cancelled_ts"] = nowi
+            else:
+                o.pop("cancelled_ts", None)
+            changed = True
+        if changed:
+            sess["orders"] = orders
+            _grid_sessions_set(it, sess)
+
+def _grid_add_order_to_sessions(item_id: str, order: dict) -> None:
+    """Add a manual order to every compatible in-memory session exactly once."""
+    oid = str((order or {}).get("id") or (order or {}).get("order_id") or (order or {}).get("orderId") or "")
+    if not oid:
+        return
+    for it, sess in _grid_session_variants(item_id):
+        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
+        exists = False
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            ooid = str(o.get("id") or o.get("order_id") or o.get("orderId") or "")
+            if ooid == oid:
+                exists = True
+                break
+        if not exists:
+            orders.insert(0, dict(order))
+            sess["orders"] = orders
+            _trim_grid_session(sess)
+            _grid_sessions_set(it, sess)
+
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
     """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned.
     Also tolerates item-id variants to keep orders visible across devices/versions.
@@ -3040,6 +3117,19 @@ def _grid_db_list_orders_any_variant(conn, wallet_address: str, item_id: str, ch
         except Exception:
             continue
     return out
+
+def _grid_db_reserved_any_variant(conn, wallet_address: str, item_id: str, chain: str = "") -> float:
+    """Return reserved qty for OPEN orders across compatible item-id variants without double-counting."""
+    orders = _grid_db_list_orders_any_variant(conn, wallet_address, item_id, chain=chain)
+    total = 0.0
+    for o in orders or []:
+        try:
+            if str(o.get("status") or "").upper() != "OPEN":
+                continue
+            total += float(o.get("qty") or o.get("amount") or 0.0)
+        except Exception:
+            continue
+    return float(total)
 
 def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
     """Rebuild a minimal grid session from DB orders/UI state when RAM session is missing or empty."""
@@ -6203,13 +6293,9 @@ def api_grid_orders():
                         conn.commit()
                 except Exception:
                     pass
-            orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain_eff)
-            if not orders:
-                orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain="")
+            orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain_eff)
             vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain_eff)
-            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain_eff)
-            if not reserved:
-                reserved = _grid_db_reserved(conn, wa, item_id, chain="")
+            reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain_eff)
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
@@ -6458,30 +6544,9 @@ def api_grid_order_stop():
     except Exception:
         pass
 
-    # Update RAM session if present (fast UI feedback)
-    sess = GRID_SESSIONS.get(item_id)
-    if isinstance(sess, dict):
-        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
-        def _match(o: dict) -> bool:
-            if not isinstance(o, dict): return False
-            if o.get("status") != "OPEN": return False
-            if oid is not None and str(oid).strip() != "":
-                return str(o.get("id")) == str(oid)
-            if side is None or level is None: return False
-            if str(o.get("side")) != str(side): return False
-            if o.get("level") != level: return False
-            if price is None: return True
-            try:
-                return float(o.get("price")) == float(price)
-            except Exception:
-                return o.get("price") == price
-
-        for o in orders:
-            if _match(o):
-                o["status"] = "CANCELLED"
-                o["cancelled_ts"] = int(time.time())
-                break
-        sess["orders"] = orders
+    # Update RAM session if present (fast UI feedback) across all compatible item variants
+    if oid is not None and str(oid).strip() != "":
+        _grid_mark_order_in_sessions(item_id, str(oid), "CANCELLED", cancelled=True)
 
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
@@ -6493,9 +6558,9 @@ def api_grid_order_stop():
             rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
         if rc <= 0:
@@ -6537,10 +6602,8 @@ def api_grid_order_delete():
     except Exception:
         pass
 
-    # Remove from RAM session if present
-    sess = GRID_SESSIONS.get(item_id)
-    if isinstance(sess, dict) and isinstance(sess.get("orders"), list):
-        sess["orders"] = [o for o in sess["orders"] if not (isinstance(o, dict) and str(o.get("id")) == str(oid))]
+    # Remove from RAM sessions if present across all compatible item variants
+    _grid_remove_order_from_sessions(item_id, str(oid))
 
     conn = _db()
     try:
@@ -6548,9 +6611,9 @@ def api_grid_order_delete():
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
         if rc <= 0:
@@ -6597,16 +6660,8 @@ def api_grid_order_resume():
     except Exception:
         pass
 
-    # Update RAM session if present (fast UI feedback)
-    sess = GRID_SESSIONS.get(item_id)
-    if isinstance(sess, dict):
-        orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
-        for o in orders:
-            if isinstance(o, dict) and str(o.get("id")) == str(oid):
-                o["status"] = "OPEN"
-                o.pop("cancelled_ts", None)
-                break
-        sess["orders"] = orders
+    # Update RAM session if present (fast UI feedback) across all compatible item variants
+    _grid_mark_order_in_sessions(item_id, str(oid), "OPEN", cancelled=False)
 
     conn = _db()
     try:
@@ -6614,9 +6669,9 @@ def api_grid_order_resume():
             rc = _grid_db_resume_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
+        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
 
         if rc <= 0:
@@ -6820,14 +6875,9 @@ def api_grid_manual_add():
         finally:
             conn.close()
 
-        # Optional: mirror into in-memory session if it exists (executor may use it)
-        sess = GRID_SESSIONS.get(item_id)
-        if isinstance(sess, dict):
-            if not isinstance(sess.get("orders"), list):
-                sess["orders"] = []
-            sess["orders"].insert(0, order)
-            _trim_grid_session(sess)
-            _persist_grid_state()
+        # Optional: mirror into compatible in-memory sessions if they exist (executor may use it)
+        _grid_add_order_to_sessions(item_id, order)
+        _persist_grid_state()
 
         # Return DB view
         conn = _db()
@@ -6838,11 +6888,9 @@ def api_grid_manual_add():
                     conn.commit()
             except Exception:
                 pass
-            orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain=chain)
-            if not orders_db:
-                orders_db = _grid_db_list_orders(conn, wa, item_id=item_id, chain="")
+            orders_db = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
             vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-            reserved = _grid_db_reserved(conn, wa, item_id, chain=chain)
+            reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
             if not reserved:
                 reserved = _grid_db_reserved(conn, wa, item_id, chain="")
             free = max(0.0, float(vault_total) - float(reserved))
