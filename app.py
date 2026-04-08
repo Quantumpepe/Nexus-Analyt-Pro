@@ -536,8 +536,16 @@ def coingecko_token_price(platform: str):
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
 _serializer = URLSafeTimedSerializer(app.secret_key)
 
-# Demo/simulation starting capital per asset (USD)
+# Planning / fallback capital basis for grid budgeting (USD).
+# This is only used as a conservative fallback when no wallet/vault-derived budget is available yet.
 INITIAL_CAPITAL_USD = float(os.getenv("NEXUS_INITIAL_CAPITAL_USD", "5000"))
+
+# Runtime mode flags
+# - GRID_LIVE_MODE keeps the public API live-first (no demo/sim labels in responses)
+# - GRID_ENABLE_LEGACY_SIM keeps the existing internal grid engine available during migration
+#   so the frontend and DB flows stay stable until real executor logic fully replaces it.
+GRID_LIVE_MODE = str(os.getenv("GRID_LIVE_MODE", "1")).strip().lower() in ("1", "true", "yes", "on")
+GRID_ENABLE_LEGACY_SIM = str(os.getenv("GRID_ENABLE_LEGACY_SIM", "1")).strip().lower() in ("1", "true", "yes", "on")
 
 # -------------------------
 # Helpers
@@ -3343,14 +3351,90 @@ except Exception as _e:
     print('[WARN] grid_state_load failed:', _e)
 
 # -------------------------
-# Grid PnL helpers (simulation)
+# Grid runtime helpers
+# -------------------------
+def _grid_runtime_payload(sess: dict | None = None) -> dict:
+    sess = sess if isinstance(sess, dict) else {}
+    payload = {
+        "mode": "live" if GRID_LIVE_MODE else "legacy-sim",
+        "uses_real_market_data": True,
+        "engine": "legacy-grid" if GRID_ENABLE_LEGACY_SIM else "executor",
+        "simulation": False if GRID_LIVE_MODE else True,
+    }
+    if not GRID_LIVE_MODE:
+        payload.update({
+            "initial_capital_usd": float(sess.get("initial_capital_usd") or INITIAL_CAPITAL_USD),
+            "equity_usd": float(sess.get("equity_usd") or 0.0),
+            "pnl_pct": float(sess.get("pnl_pct") or 0.0),
+        })
+    return payload
+
+def _grid_budget_baseline(wallet_address: str, item_id: str, chain: str = "") -> float:
+    """Return a safe live-first budget baseline for a grid item.
+
+    Priority:
+      1) wallet-bound vault total
+      2) on-chain native wallet balance
+      3) configured fallback INITIAL_CAPITAL_USD
+    """
+    try:
+        conn = _db()
+        try:
+            vault_total = float(_grid_effective_vault_total(conn, wallet_address, item_id, chain=chain) or 0.0)
+        finally:
+            conn.close()
+    except Exception:
+        vault_total = 0.0
+
+    if vault_total > 0:
+        return vault_total
+
+    native_total = _native_balance_for_wallet(wallet_address, chain=chain, item_id=item_id)
+    if native_total > 0:
+        return float(native_total)
+
+    return float(INITIAL_CAPITAL_USD)
+
+def _grid_sync_session_budget_fields(sess: dict, wallet_address: str, item_id: str, chain: str = "") -> dict:
+    """Keep legacy session budget fields aligned with live wallet/vault totals.
+
+    This preserves existing frontend/backend behavior during migration while preventing
+    the old demo capital defaults from leaking into live responses and budget endpoints.
+    """
+    if not isinstance(sess, dict):
+        return {}
+
+    budget_total = _grid_budget_baseline(wallet_address, item_id, chain=chain)
+
+    try:
+        conn = _db()
+        try:
+            reserved = float(_grid_db_reserved(conn, wallet_address, item_id, chain=chain) or 0.0)
+            if not reserved and chain:
+                reserved = float(_grid_db_reserved(conn, wallet_address, item_id, chain="") or 0.0)
+        finally:
+            conn.close()
+    except Exception:
+        reserved = 0.0
+
+    reserved = max(0.0, reserved)
+    available = max(0.0, float(budget_total) - reserved)
+
+    sess["initial_capital_usd"] = float(budget_total)
+    sess["wallet_total_usd"] = float(budget_total)
+    sess["wallet_locked_usd"] = float(reserved)
+    sess["wallet_available_usd"] = float(available)
+    return sess
+
+# -------------------------
+# Grid PnL helpers (legacy engine compatibility)
 # -------------------------
 
 def _ensure_pnl(sess: dict) -> dict:
-    # Position-based PnL simulation (qty units, average cost) + demo equity/ROI
+    # Position-based PnL tracking (legacy grid engine compatibility)
     if not isinstance(sess, dict):
         return {}
-    # demo capital basis
+    # budget basis (live wallet/vault aligned when available)
     sess.setdefault("initial_capital_usd", INITIAL_CAPITAL_USD)
     # derived fields (kept updated by _pnl_mark)
     sess.setdefault("equity_usd", float(sess.get("initial_capital_usd") or INITIAL_CAPITAL_USD))
@@ -5518,6 +5602,9 @@ def api_grid_start():
             "initial_capital_usd": (body.get("invest_usd") or body.get("initial_capital_usd") or body.get("capital_usd") or body.get("budget_usd")),
         }
 
+        if not GRID_ENABLE_LEGACY_SIM:
+            return err("grid engine is temporarily disabled until real executor mode is enabled", 503)
+
         session = _sim_build(cfg)
         # Always bind session to authenticated wallet (addr is optional)
         session["wallet_address"] = _norm_addr(addr) if addr else _norm_addr(wa)
@@ -5586,19 +5673,15 @@ def api_grid_start():
         except Exception:
             pass
 
-        # --- PnL + demo equity init ---
+        # --- PnL init ---
         try:
             _ensure_pnl(session)
             _pnl_mark(session, session.get("price"))
         except Exception:
             pass
-
-        # --- Wallet demo budget init (Available/Locked) ---
+        # --- Wallet budget init (Available/Locked) ---
         try:
-            if session.get('wallet_available_usd') is None:
-                session['wallet_available_usd'] = float(session.get('initial_capital_usd') or INITIAL_CAPITAL_USD)
-            if session.get('wallet_locked_usd') is None:
-                session['wallet_locked_usd'] = 0.0
+            _grid_sync_session_budget_fields(session, session.get("wallet_address") or wa, item_id, chain=(chain_key_req or _grid_chain_key(item_id) or ""))
         except Exception:
             pass
 
@@ -5610,13 +5693,7 @@ def api_grid_start():
             "price": session.get("price"),
             "tick": int(session.get("ticks") or 0),
             "price_source": ("frontend" if (body.get("price") or body.get("start_price")) is not None else "snapshot"),
-            "sim": {
-                "simulation": True,
-                "uses_real_market_data": True,
-                "initial_capital_usd": float(session.get("initial_capital_usd") or INITIAL_CAPITAL_USD),
-                "equity_usd": float(session.get("equity_usd") or 0.0),
-                "pnl_pct": float(session.get("pnl_pct") or 0.0),
-            },
+            "runtime": _grid_runtime_payload(session),
             "pnl": {
                 "pos": float(session.get("position_qty") or 0.0),
                 "avg_cost": float(session.get("avg_cost") or 0.0),
@@ -5760,7 +5837,7 @@ def api_grid_tick():
         pass
 
     fills = updated.get("fills") if isinstance(updated, dict) else []
-    # --- PnL update (simulation) + wallet budget (simple) ---
+    # --- PnL update + wallet budget sync ---
     try:
         _ensure_pnl(session)
         if isinstance(fills, list):
@@ -5805,6 +5882,7 @@ def api_grid_tick():
                         except Exception:
                             pass
         _pnl_mark(session, updated.get("price") if isinstance(updated, dict) else None)
+        _grid_sync_session_budget_fields(session, session.get("wallet_address") or wa, item_id, chain=_grid_chain_key(item_id))
         _persist_grid_state()
     except Exception:
         pass
@@ -5816,13 +5894,7 @@ def api_grid_tick():
         "price": float(updated.get("price") or 0) if isinstance(updated, dict) else 0,
         "price_source": price_source_label,
 
-        "sim": {
-            "simulation": True,
-            "uses_real_market_data": True,
-            "initial_capital_usd": float(session.get("initial_capital_usd") or INITIAL_CAPITAL_USD),
-            "equity_usd": float(session.get("equity_usd") or 0.0),
-            "pnl_pct": float(session.get("pnl_pct") or 0.0),
-        },
+        "runtime": _grid_runtime_payload(session),
 
         "pnl": {
             "pos": float(session.get("position_qty") or 0),
@@ -6204,8 +6276,8 @@ def api_grid_budgets():
 
     This powers the Wallet UI split:
       - Total (on-chain) remains the vault/privy balance
-      - In bots (reserved) is derived from active grid sessions (USD-based budget lock)
-      - Available is informational (USD-based) and does NOT affect on-chain balances
+      - In bots (reserved) is derived from active grid orders / vault reservations
+      - Available is informational and does NOT alter on-chain balances
 
     Response:
       { status:"ok", items:[{item, locked_usd, available_usd, initial_capital_usd, mode, order_mode}],
@@ -6227,9 +6299,23 @@ def api_grid_budgets():
             if _norm_addr(sess.get("wallet_address") or "") != wa_n:
                 continue
 
-            locked = float(sess.get("wallet_locked_usd") or 0.0)
-            avail = float(sess.get("wallet_available_usd") or 0.0)
-            initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+            if GRID_LIVE_MODE:
+                chain = _grid_chain_key(item_id)
+                conn_live = _db()
+                try:
+                    initc = float(_grid_best_vault_total(conn_live, wa_n, item_id, chain=chain) or 0.0)
+                    locked = float(_grid_db_reserved(conn_live, wa_n, item_id, chain=chain) or 0.0)
+                    if not locked and chain:
+                        locked = float(_grid_db_reserved(conn_live, wa_n, item_id, chain="") or 0.0)
+                    avail = max(0.0, initc - locked)
+                finally:
+                    conn_live.close()
+                if initc <= 0:
+                    initc = float(sess.get("wallet_total_usd") or sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
+            else:
+                locked = float(sess.get("wallet_locked_usd") or 0.0)
+                avail = float(sess.get("wallet_available_usd") or 0.0)
+                initc = float(sess.get("initial_capital_usd") or sess.get("initial_capital") or 0.0)
 
             locked_total += max(0.0, locked)
             avail_total += max(0.0, avail)
@@ -7454,7 +7540,7 @@ def _sim_build(cfg: dict) -> dict:
     except Exception:
         base_price = 1.0
 
-    # Defaults tuned for demo
+    # Defaults kept conservative during live migration
     step_pct = float(cfg.get("grid_step_pct") or (0.25 if mode == "AGGRESSIVE" else 0.5))
     levels_each_side = int(cfg.get("levels") or cfg.get("grid_levels_each_side") or (12 if mode == "AGGRESSIVE" else 10))
     tp_pct = float(cfg.get("take_profit_pct") or (30.0 if mode == "AGGRESSIVE" else 50.0))
@@ -7528,7 +7614,7 @@ def _sim_build(cfg: dict) -> dict:
 
 def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
     """
-    One simulation step using REAL price (frontend/snapshot/history).
+    One grid-engine step using REAL price (frontend/snapshot/history).
 
     - Uses prev_price = session["price"] as the previous tick reference.
     - If new_price is None, falls back to SNAPSHOTS[item]["data"]["price"] (if available).
@@ -7647,7 +7733,7 @@ def _get_live_price_for_item(item_id: str) -> Optional[float]:
 
 
 def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
-    """Background loop: refresh live price and tick the simulation."""
+    """Background loop: refresh live price and tick the current grid engine."""
     while not stop_evt.is_set():
         try:
             session = GRID_SESSIONS.get(item_id)
