@@ -3069,24 +3069,6 @@ def _grid_add_order_to_sessions(item_id: str, order: dict) -> None:
             _trim_grid_session(sess)
             _grid_sessions_set(it, sess)
 
-
-def _grid_replace_session_orders_from_db(item_id: str, orders: list[dict]) -> None:
-    """Make RAM sessions authoritative from DB orders for all compatible item variants.
-    This prevents stale JSON/RAM orders from reappearing after refresh or a new manual add.
-    """
-    safe_orders = [dict(o) for o in (orders or []) if isinstance(o, dict)]
-    changed = False
-    for it, sess in _grid_session_variants(item_id):
-        sess["orders"] = [dict(o) for o in safe_orders]
-        _trim_grid_session(sess)
-        _grid_sessions_set(it, sess)
-        changed = True
-    if changed:
-        try:
-            _persist_grid_state()
-        except Exception:
-            pass
-
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
     """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned.
     Also tolerates item-id variants to keep orders visible across devices/versions.
@@ -6317,10 +6299,6 @@ def api_grid_orders():
             free = max(0.0, float(vault_total) - float(reserved))
             for o in orders:
                 o["item"] = o.get("item") or item_id
-            try:
-                _grid_replace_session_orders_from_db(item_id, orders)
-            except Exception:
-                pass
             sess = _get_owned_session(item_id, wa)
             return jsonify({
                 "status": "ok",
@@ -6569,10 +6547,6 @@ def api_grid_order_stop():
     # Update RAM session if present (fast UI feedback) across all compatible item variants
     if oid is not None and str(oid).strip() != "":
         _grid_mark_order_in_sessions(item_id, str(oid), "CANCELLED", cancelled=True)
-        try:
-            _persist_grid_state()
-        except Exception:
-            pass
 
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
@@ -6630,10 +6604,6 @@ def api_grid_order_delete():
 
     # Remove from RAM sessions if present across all compatible item variants
     _grid_remove_order_from_sessions(item_id, str(oid))
-    try:
-        _persist_grid_state()
-    except Exception:
-        pass
 
     conn = _db()
     try:
@@ -6692,10 +6662,6 @@ def api_grid_order_resume():
 
     # Update RAM session if present (fast UI feedback) across all compatible item variants
     _grid_mark_order_in_sessions(item_id, str(oid), "OPEN", cancelled=False)
-    try:
-        _persist_grid_state()
-    except Exception:
-        pass
 
     conn = _db()
     try:
@@ -6929,10 +6895,6 @@ def api_grid_manual_add():
                 reserved = _grid_db_reserved(conn, wa, item_id, chain="")
             free = max(0.0, float(vault_total) - float(reserved))
             try:
-                _grid_replace_session_orders_from_db(item_id, orders_db)
-            except Exception:
-                pass
-            try:
                 conn.commit()
             except Exception:
                 pass
@@ -7131,6 +7093,101 @@ def _build_ai_market_context(symbols: list[str], profile: str = "conservative", 
     }
 
 
+def _normalize_ai_timeframe(raw: str) -> str:
+    tf = str(raw or "90D").strip().upper()
+    allowed = {"1D", "7D", "30D", "90D", "1Y", "2Y", "24H"}
+    if tf == "24H":
+        tf = "1D"
+    return tf if tf in allowed else "90D"
+
+
+def _ai_num(v):
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _sanitize_series_stats(raw_stats: dict, allowed_symbols: list[str]) -> dict:
+    out = {}
+    if not isinstance(raw_stats, dict):
+        return out
+    allowed = {str(s or "").strip().upper() for s in (allowed_symbols or []) if str(s or "").strip()}
+    for sym, stats in raw_stats.items():
+        sym_u = str(sym or "").strip().upper()
+        if not sym_u or sym_u not in allowed or not isinstance(stats, dict):
+            continue
+        clean = {
+            "first": _ai_num(stats.get("first")),
+            "last": _ai_num(stats.get("last")),
+            "changePct": _ai_num(stats.get("changePct")),
+            "volPct": _ai_num(stats.get("volPct")),
+            "maxDDPct": _ai_num(stats.get("maxDDPct")),
+            "min": _ai_num(stats.get("min")),
+            "max": _ai_num(stats.get("max")),
+        }
+        try:
+            pts = int(stats.get("points"))
+        except Exception:
+            pts = 0
+        clean["points"] = max(0, pts)
+        out[sym_u] = clean
+    return out
+
+
+def _build_ai_timeframe_context(symbols: list[str], timeframe: str, series_stats: dict | None, index_mode: bool = False) -> dict:
+    requested = _normalize_ai_timeframe(timeframe)
+    stats = _sanitize_series_stats(series_stats or {}, symbols)
+
+    available_symbols = []
+    missing_symbols = []
+    weak_symbols = []
+    for sym in symbols:
+        st = stats.get(sym)
+        if not st:
+            missing_symbols.append(sym)
+            continue
+        pts = int(st.get("points") or 0)
+        if pts >= 2:
+            available_symbols.append(sym)
+        else:
+            weak_symbols.append(sym)
+
+    complete = (len(available_symbols) == len(symbols)) and not missing_symbols and not weak_symbols and len(symbols) > 0
+    if complete:
+        actual = requested
+        note = f"Timeframe-aligned series stats are available for all selected coins for {requested}."
+    elif available_symbols:
+        actual = "PARTIAL"
+        note = (
+            f"Requested timeframe was {requested}, but complete series stats were not available for all selected coins. "
+            f"Available timeframe stats exist for: {', '.join(available_symbols)}. "
+            + (f"Missing: {', '.join(missing_symbols)}. " if missing_symbols else "")
+            + (f"Insufficient points: {', '.join(weak_symbols)}. " if weak_symbols else "")
+            + "Do not claim a full timeframe analysis for missing or incomplete coins."
+        )
+    else:
+        actual = "SNAPSHOT_ONLY"
+        note = (
+            f"Requested timeframe was {requested}, but no usable timeframe series stats were provided. "
+            "Only snapshot context is available. Do not claim this is a strict timeframe analysis."
+        )
+
+    return {
+        "requested_timeframe": requested,
+        "actual_timeframe_used": actual,
+        "timeframe_match": bool(actual == requested),
+        "index_mode": bool(index_mode),
+        "series_stats": stats,
+        "available_symbols": available_symbols,
+        "missing_symbols": missing_symbols,
+        "insufficient_points_symbols": weak_symbols,
+        "coverage_note": note,
+    }
+
+
 def _ai_kind_instructions(kind: str) -> str:
     k = (kind or "").strip().lower()
     if k in ("quick_overview", "overview"):
@@ -7154,7 +7211,10 @@ def api_ai_run():
         "symbols": ["BTC","ETH", ...]  (max 6),
         "profile": "conservative"|"balanced"|"volatility",
         "include_health": true|false,
-        "question": "..." (optional; required for kind=ask)
+        "question": "..." (optional; required for kind=ask),
+        "timeframe": "1D"|"7D"|"30D"|"90D"|"1Y"|"2Y",
+        "series_stats": { "BTC": { ... } },
+        "index_mode": true|false
       }
 
     Returns: {status, answer, model, context_used}
@@ -7180,6 +7240,9 @@ def api_ai_run():
 
     include_health = bool(body.get("include_health", True))
     question = str(body.get("question") or "").strip()
+    timeframe = _normalize_ai_timeframe(body.get("timeframe") or "90D")
+    index_mode = bool(body.get("index_mode", False))
+    raw_series_stats = body.get("series_stats") or {}
 
     # Enforce max 6 coins server-side
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
@@ -7192,7 +7255,8 @@ def api_ai_run():
     # Auth is optional for AI, but if present we use it for memory scoping
     wa = _require_auth()
 
-    context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
+    market_context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
+    timeframe_context = _build_ai_timeframe_context(sym_norm, timeframe, raw_series_stats, index_mode=index_mode)
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
 
@@ -7203,6 +7267,15 @@ Rules:
 3) Provide informational analysis only. No financial advice. No buy/sell instructions.
 4) Do NOT output exact trade entries/exits or prescriptive price levels. If asked, provide an educational template instead.
 5) The app is MANUAL-only: never suggest automatic order placement; focus on manual decision support.
+6) Timeframe integrity is mandatory:
+   - requested_timeframe = what the user selected.
+   - actual_timeframe_used = what data is truly available.
+   - If actual_timeframe_used differs from requested_timeframe, you MUST say so clearly.
+   - If timeframe stats are partial or missing, explicitly mention that the analysis is partial or snapshot-based.
+   - NEVER claim a 30D/90D/1Y analysis unless the provided timeframe context says that timeframe was actually used.
+7) When timeframe_context.series_stats are available, treat them as the PRIMARY source for timeframe analysis.
+   Snapshot market_context is supplemental only and must not override timeframe_context.
+8) Do NOT infer missing 30D values from 90D snapshots or 24h data.
 
 Task:
 {_ai_kind_instructions(kind)}
@@ -7213,7 +7286,12 @@ Task:
         "question": question,
         "profile": profile,
         "include_health": include_health,
-        "context": context,
+        "requested_timeframe": timeframe_context.get("requested_timeframe"),
+        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
+        "coverage_note": timeframe_context.get("coverage_note"),
+        "index_mode": bool(index_mode),
+        "timeframe_context": timeframe_context,
+        "market_context": market_context,
     }
 
     resp, err_pair = _ai_call_openai(sys, user_payload, wallet_address=wa, mem_msgs=_ai_mem_get(wa) if wa else None)
@@ -7221,8 +7299,16 @@ Task:
         msg, code = err_pair
         return err(msg, code)
 
-    # Return a small echo of which symbols were used for transparency
-    resp["context_used"] = {"symbols": sym_norm, "profile": profile, "include_health": include_health}
+    # Return a small echo of which symbols/timeframe were used for transparency
+    resp["context_used"] = {
+        "symbols": sym_norm,
+        "profile": profile,
+        "include_health": include_health,
+        "requested_timeframe": timeframe_context.get("requested_timeframe"),
+        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
+        "timeframe_match": timeframe_context.get("timeframe_match"),
+        "coverage_note": timeframe_context.get("coverage_note"),
+    }
     return jsonify(resp)
 
 # -------------------------
