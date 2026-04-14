@@ -8219,3 +8219,498 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "5000"))
     app.run(host=host, port=port, debug=True)
+
+
+# -------------------------
+# AI Pair Insight (backend-native)
+# -------------------------
+def _pair_parse_symbols(body: dict) -> tuple[str, str]:
+    pair = str(body.get("pair") or body.get("selectedPair") or "").strip().upper()
+    if "/" in pair:
+        a, b = pair.split("/", 1)
+        return a.strip().upper(), b.strip().upper()
+    a = str(body.get("symbol_a") or body.get("symbolA") or body.get("a") or "").strip().upper()
+    b = str(body.get("symbol_b") or body.get("symbolB") or body.get("b") or "").strip().upper()
+    return a, b
+
+
+def _cg_market_chart_points(cg_id: str, days: int = 365) -> list[dict]:
+    j = _cg_market_chart_usd(cg_id, max(30, min(730, int(days or 365)))) or {}
+    pts = []
+    for p in (j.get("prices") or []):
+        try:
+            ts = int(float(p[0]))
+            val = float(p[1])
+            if ts > 0 and math.isfinite(val) and val > 0:
+                pts.append({"t": ts, "v": val})
+        except Exception:
+            continue
+    return pts
+
+
+def _daily_close_map(points: list[dict]) -> dict[str, float]:
+    out = {}
+    for p in (points or []):
+        try:
+            ts = int(p.get("t"))
+            v = float(p.get("v"))
+            if ts <= 0 or not math.isfinite(v) or v <= 0:
+                continue
+            d = time.gmtime(ts / 1000.0)
+            key = f"{d.tm_year:04d}-{d.tm_mon:02d}-{d.tm_mday:02d}"
+            out[key] = v  # last point of the day wins
+        except Exception:
+            continue
+    return out
+
+
+def _aligned_daily_pair(points_a: list[dict], points_b: list[dict], max_days: int = 365) -> list[dict]:
+    ma = _daily_close_map(points_a)
+    mb = _daily_close_map(points_b)
+    common = sorted(set(ma.keys()) & set(mb.keys()))
+    if max_days and len(common) > int(max_days):
+        common = common[-int(max_days):]
+    out = []
+    for day in common:
+        try:
+            va = float(ma[day]); vb = float(mb[day])
+            if va > 0 and vb > 0:
+                out.append({"day": day, "a": va, "b": vb})
+        except Exception:
+            continue
+    return out
+
+
+def _series_stats_from_points(points: list[dict]) -> dict:
+    vals = []
+    for p in (points or []):
+        try:
+            v = float(p.get("v"))
+            if math.isfinite(v) and v > 0:
+                vals.append(v)
+        except Exception:
+            continue
+    if len(vals) < 2:
+        return {}
+    first = vals[0]
+    last = vals[-1]
+    change_pct = ((last - first) / first) * 100.0 if first else None
+    rets = []
+    for i in range(1, len(vals)):
+        prev = vals[i - 1]
+        cur = vals[i]
+        if prev > 0 and cur > 0:
+            rets.append((cur / prev) - 1.0)
+    vol_pct = None
+    if len(rets) >= 2:
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / len(rets)
+        vol_pct = math.sqrt(max(0.0, var)) * 100.0
+    peak = vals[0]
+    max_dd = 0.0
+    for v in vals:
+        if v > peak:
+            peak = v
+        dd = ((v / peak) - 1.0) * 100.0 if peak > 0 else 0.0
+        if dd < max_dd:
+            max_dd = dd
+    return {
+        "first": round(first, 8),
+        "last": round(last, 8),
+        "changePct": round(change_pct, 4) if change_pct is not None else None,
+        "volPct": round(vol_pct, 4) if vol_pct is not None else None,
+        "maxDDPct": round(max_dd, 4),
+        "min": round(min(vals), 8),
+        "max": round(max(vals), 8),
+        "points": len(vals),
+    }
+
+
+def _slice_days(points: list[dict], n_days: int) -> list[dict]:
+    if not points:
+        return []
+    closes = _daily_close_map(points)
+    keys = sorted(closes.keys())
+    if n_days and len(keys) > int(n_days):
+        keys = keys[-int(n_days):]
+    return [{"t": idx, "v": closes[k], "day": k} for idx, k in enumerate(keys)]
+
+
+def _pair_windows(points_a: list[dict], points_b: list[dict]) -> dict:
+    defs = {"7D": 7, "30D": 30, "90D": 90, "1Y": 365}
+    out = {}
+    for label, days in defs.items():
+        out[label] = {
+            "a": _series_stats_from_points(_slice_days(points_a, days)),
+            "b": _series_stats_from_points(_slice_days(points_b, days)),
+        }
+    return out
+
+
+def _pair_spread_series(aligned_daily: list[dict], days: int = 30) -> list[dict]:
+    rows = aligned_daily[-int(days):] if days and len(aligned_daily) > int(days) else list(aligned_daily)
+    if len(rows) < 2:
+        return []
+    base_a = float(rows[0]["a"])
+    base_b = float(rows[0]["b"])
+    out = []
+    for r in rows:
+        try:
+            ra = ((float(r["a"]) / base_a) - 1.0) * 100.0 if base_a > 0 else None
+            rb = ((float(r["b"]) / base_b) - 1.0) * 100.0 if base_b > 0 else None
+            d = (ra - rb) if (ra is not None and rb is not None) else None
+            out.append({
+                "day": r["day"],
+                "a_ret": round(ra, 4) if ra is not None else None,
+                "b_ret": round(rb, 4) if rb is not None else None,
+                "spread": round(d, 4) if d is not None else None,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _pearson_from_aligned_daily(aligned_daily: list[dict]) -> float | None:
+    xs = []
+    ys = []
+    for i in range(1, len(aligned_daily)):
+        try:
+            a0 = float(aligned_daily[i - 1]["a"])
+            a1 = float(aligned_daily[i]["a"])
+            b0 = float(aligned_daily[i - 1]["b"])
+            b1 = float(aligned_daily[i]["b"])
+            if a0 > 0 and a1 > 0 and b0 > 0 and b1 > 0:
+                xs.append((a1 / a0) - 1.0)
+                ys.append((b1 / b0) - 1.0)
+        except Exception:
+            continue
+    n = min(len(xs), len(ys))
+    if n < 5:
+        return None
+    mx = sum(xs[:n]) / n
+    my = sum(ys[:n]) / n
+    num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    denx = math.sqrt(sum((xs[i] - mx) ** 2 for i in range(n)))
+    deny = math.sqrt(sum((ys[i] - my) ** 2 for i in range(n)))
+    den = denx * deny
+    if den <= 0:
+        return None
+    return round(num / den, 4)
+
+
+def _pair_setup_payload(symbol_a: str, symbol_b: str, corr: float | None, windows: dict, snap_a: dict, snap_b: dict) -> dict:
+    def _get_ret(sym_key: str, tf: str):
+        st = ((windows.get(tf) or {}).get(sym_key) or {})
+        v = st.get("changePct")
+        return float(v) if isinstance(v, (int, float)) else None
+
+    ra30 = _get_ret("a", "30D")
+    rb30 = _get_ret("b", "30D")
+    winner = symbol_a if (ra30 is not None and rb30 is not None and ra30 >= rb30) else (symbol_b if (ra30 is not None and rb30 is not None) else None)
+    loser = symbol_b if winner == symbol_a else (symbol_a if winner == symbol_b else None)
+    spread = (ra30 - rb30) if (ra30 is not None and rb30 is not None) else None
+
+    def classify(v):
+        if v is None:
+            return "n/a"
+        if v >= 8:
+            return "bullish"
+        if v <= -8:
+            return "bearish"
+        return "neutral"
+
+    def avg_ret(tf: str):
+        aa = _get_ret("a", tf)
+        bb = _get_ret("b", tf)
+        vals = [v for v in (aa, bb) if v is not None]
+        return (sum(vals) / len(vals)) if vals else None
+
+    trend_structure = " · ".join(f"{tf} {classify(avg_ret(tf))}" for tf in ("7D", "30D", "90D", "1Y"))
+    short_bias = classify(avg_ret("30D"))
+    long_bias = classify(avg_ret("1Y"))
+    if short_bias == "bearish" and long_bias == "bullish":
+        momentum_shift = "Short-term weakness inside a stronger long-term structure."
+    elif short_bias == "bullish" and long_bias == "bearish":
+        momentum_shift = "Short-term recovery attempt against a weaker long-term backdrop."
+    elif short_bias == long_bias and short_bias != "n/a":
+        momentum_shift = f"Short-term and long-term momentum are aligned {short_bias}."
+    else:
+        momentum_shift = "Momentum is mixed across timeframes."
+
+    setup = "NEUTRAL"
+    confidence = 5.4
+    confidence_label = "MEDIUM"
+    risk = "Medium"
+    action = "Watch this pair and wait for a cleaner setup."
+    grid_mode = "Standard"
+    grid_range = "2–4%"
+    verdict_text = "This pair is interesting, but the signal is not strong enough for a clear grid bias yet."
+    why = []
+    invalidation = []
+
+    corr_v = float(corr) if isinstance(corr, (int, float)) else None
+    vol_a = ((windows.get("30D") or {}).get("a") or {}).get("volPct")
+    vol_b = ((windows.get("30D") or {}).get("b") or {}).get("volPct")
+    avg_vol = None
+    vv = [float(v) for v in (vol_a, vol_b) if isinstance(v, (int, float))]
+    if vv:
+        avg_vol = sum(vv) / len(vv)
+
+    if spread is not None and corr_v is not None:
+        if abs(spread) >= 6 and corr_v >= 0.65:
+            setup = "MEAN REVERSION"
+            confidence = 8.8 if abs(spread) >= 10 else 8.1
+            risk = "Medium-High"
+            action = f"SELL {winner} / BUY {loser}" if winner and loser else "Rebalance the outperformer against the laggard."
+            grid_mode = "Wide"
+            grid_range = "4–6%"
+            verdict_text = f"{winner} has clearly outperformed {loser} over 30D while correlation stayed relatively high. This supports a mean-reversion style setup rather than a pure momentum chase." if winner and loser else verdict_text
+            why = [
+                f"30D spread is {spread:.2f}%, which is large enough to create a usable imbalance.",
+                f"Correlation is {corr_v:.2f}, so both assets still move with meaningful relationship.",
+                f"{winner} is the stronger side and {loser} is the weaker side over the 30D window." if winner and loser else "Relative strength is asymmetric across the pair.",
+            ]
+            invalidation = [
+                "If the spread keeps expanding instead of stabilizing, mean reversion weakens.",
+                "If correlation breaks down, pair logic becomes less reliable.",
+            ]
+        elif abs(spread) >= 6 and corr_v < 0.45:
+            setup = "AVOID"
+            confidence = 7.5
+            risk = "High"
+            action = "Avoid pair-based grid logic until correlation improves."
+            grid_mode = "Off"
+            grid_range = "—"
+            verdict_text = "The spread is large, but the relationship between both assets is too weak. That makes pair reversion logic unreliable."
+            why = [
+                f"Spread is large ({spread:.2f}%), but correlation is only {corr_v:.2f}.",
+                "Low co-movement increases breakdown risk for pair-based setups.",
+            ]
+            invalidation = ["Re-check only if correlation recovers and spread remains tradable."]
+        elif corr_v >= 0.65 and abs(spread) < 3:
+            setup = "BALANCED RANGE"
+            confidence = 7.2
+            risk = "Medium"
+            action = "Use a tighter manual grid and smaller sizing."
+            grid_mode = "Tight"
+            grid_range = "2–4%"
+            verdict_text = "Both assets remain closely linked and the current spread is modest. This looks more like a balanced range than a strong dislocation."
+            why = [
+                f"Correlation is healthy at {corr_v:.2f}.",
+                f"Spread is only {spread:.2f}%, so range conditions matter more than reversion edge.",
+            ]
+            invalidation = ["If volatility spikes or the spread widens sharply, the setup changes."]
+
+    if avg_vol is not None and avg_vol >= 7.5 and risk != "High":
+        risk = "High"
+        confidence = max(4.8, confidence - 0.7)
+        why.append("30D volatility is elevated, so execution risk is higher.")
+
+    confidence_label = "HIGH" if confidence >= 8 else ("MEDIUM" if confidence >= 6 else "LOW")
+
+    return {
+        "setup": setup,
+        "confidence": round(confidence, 1),
+        "confidenceLabel": confidence_label,
+        "risk": risk,
+        "action": action,
+        "gridMode": grid_mode,
+        "gridRange": grid_range,
+        "winner": winner,
+        "loser": loser,
+        "spread30d": round(spread, 4) if spread is not None else None,
+        "trendStructure": trend_structure,
+        "momentumShift": momentum_shift,
+        "verdictText": verdict_text,
+        "why": why,
+        "invalidation": invalidation,
+    }
+
+
+@app.route("/api/ai/pair-insight", methods=["GET", "POST"])
+def api_ai_pair_insight():
+    body = request.get_json(silent=True) or {}
+    args = request.args or {}
+    merged = {}
+    merged.update({k: v for k, v in args.items()})
+    if isinstance(body, dict):
+        merged.update(body)
+
+    symbol_a, symbol_b = _pair_parse_symbols(merged)
+    if not symbol_a or not symbol_b:
+        return jsonify({"status": "error", "error": "missing pair symbols", "ts": now_ts()}), 400
+
+    coin_id_a = str(merged.get("coin_id_a") or merged.get("coinIdA") or merged.get("id_a") or merged.get("idA") or "").strip()
+    coin_id_b = str(merged.get("coin_id_b") or merged.get("coinIdB") or merged.get("id_b") or merged.get("idB") or "").strip()
+    try:
+        days = max(90, min(730, int(merged.get("days") or 365)))
+    except Exception:
+        days = 365
+    try:
+        indicator_days = max(30, min(365, int(merged.get("indicator_days") or 120)))
+    except Exception:
+        indicator_days = 120
+    try:
+        period = max(7, min(21, int(merged.get("period") or 14)))
+    except Exception:
+        period = 14
+
+    resolved_a = _resolve_cg_id_for_indicator(symbol=symbol_a, coin_id=coin_id_a)
+    resolved_b = _resolve_cg_id_for_indicator(symbol=symbol_b, coin_id=coin_id_b)
+    if not resolved_a or not resolved_b:
+        return jsonify({
+            "status": "error",
+            "error": "coin_not_resolved",
+            "symbol_a": symbol_a,
+            "symbol_b": symbol_b,
+            "coin_id_a": resolved_a or coin_id_a,
+            "coin_id_b": resolved_b or coin_id_b,
+            "ts": now_ts(),
+        }), 404
+
+    cache_key = f"pair-insight|{symbol_a}|{symbol_b}|{resolved_a}|{resolved_b}|{days}|{indicator_days}|{period}"
+    fresh = _gen_cache_get_fresh(cache_key)
+    if fresh is not None:
+        return jsonify(fresh)
+
+    try:
+        pts_a = _cg_market_chart_points(resolved_a, days=days)
+        pts_b = _cg_market_chart_points(resolved_b, days=days)
+        aligned = _aligned_daily_pair(pts_a, pts_b, max_days=days)
+        if len(aligned) < 20:
+            return jsonify({
+                "status": "error",
+                "error": "insufficient_overlap_history",
+                "pair": f"{symbol_a}/{symbol_b}",
+                "points": len(aligned),
+                "ts": now_ts(),
+            }), 400
+
+        series_a_indicator = _cg_price_series(resolved_a, days=indicator_days)
+        series_b_indicator = _cg_price_series(resolved_b, days=indicator_days)
+        rsi_a = _calc_rsi_from_prices(series_a_indicator, period=period)
+        rsi_b = _calc_rsi_from_prices(series_b_indicator, period=period)
+
+        windows = _pair_windows(pts_a, pts_b)
+        corr = _pearson_from_aligned_daily(aligned)
+        spread_series = _pair_spread_series(aligned, days=30)
+        latest_spread = spread_series[-1].get("spread") if spread_series else None
+        prev_spread = spread_series[-2].get("spread") if len(spread_series) >= 2 else None
+        direction = None
+        interpretation = "Spread is mixed."
+        if latest_spread is not None and prev_spread is not None:
+            if latest_spread > prev_spread:
+                direction = "rising"
+                interpretation = "Spread is expanding, which points more to trend continuation than mean reversion."
+            elif latest_spread < prev_spread:
+                direction = "falling"
+                interpretation = "Spread is compressing, which supports a mean-reversion reading."
+            else:
+                direction = "flat"
+                interpretation = "Spread is stable, so confirmation is still limited."
+
+        snap_map = _cg_market_snapshots_batch([resolved_a, resolved_b])
+        snap_a = snap_map.get(resolved_a) or _cg_market_snapshot(resolved_a)
+        snap_b = snap_map.get(resolved_b) or _cg_market_snapshot(resolved_b)
+        vol24_a = snap_a.get("volume24") if isinstance(snap_a, dict) else None
+        vol24_b = snap_b.get("volume24") if isinstance(snap_b, dict) else None
+        liq_proxy = min([v for v in (vol24_a, vol24_b) if isinstance(v, (int, float))], default=None)
+        if liq_proxy is None:
+            liquidity_state = "unknown"
+        elif liq_proxy >= 5_000_000:
+            liquidity_state = "strong"
+        elif liq_proxy >= 500_000:
+            liquidity_state = "usable"
+        elif liq_proxy >= 100_000:
+            liquidity_state = "thin"
+        else:
+            liquidity_state = "very_thin"
+
+        grid_fit_a = _grid_fit_state(rsi_a, _volatility_state(((windows.get("30D") or {}).get("a") or {}).get("volPct")), _trend_state(
+            ((windows.get("7D") or {}).get("a") or {}).get("changePct"),
+            ((windows.get("30D") or {}).get("a") or {}).get("changePct"),
+            ((windows.get("1Y") or {}).get("a") or {}).get("changePct"),
+        ))
+        grid_fit_b = _grid_fit_state(rsi_b, _volatility_state(((windows.get("30D") or {}).get("b") or {}).get("volPct")), _trend_state(
+            ((windows.get("7D") or {}).get("b") or {}).get("changePct"),
+            ((windows.get("30D") or {}).get("b") or {}).get("changePct"),
+            ((windows.get("1Y") or {}).get("b") or {}).get("changePct"),
+        ))
+
+        setup = _pair_setup_payload(symbol_a, symbol_b, corr, windows, snap_a, snap_b)
+        out = {
+            "status": "ok",
+            "pair": f"{symbol_a}/{symbol_b}",
+            "symbols": [symbol_a, symbol_b],
+            "coin_ids": [resolved_a, resolved_b],
+            "days": days,
+            "indicator_days": indicator_days,
+            "period": period,
+            "correlation": corr,
+            "spread": {
+                "series": spread_series,
+                "latest": latest_spread,
+                "previous": prev_spread,
+                "direction": direction,
+                "interpretation": interpretation,
+                "zero_line": 0,
+            },
+            "rsi": {
+                symbol_a: {"value": rsi_a, "state": _rsi_state(rsi_a)},
+                symbol_b: {"value": rsi_b, "state": _rsi_state(rsi_b)},
+            },
+            "risk": {
+                symbol_a: {
+                    "volatility30d": ((windows.get("30D") or {}).get("a") or {}).get("volPct"),
+                    "drawdown1y": ((windows.get("1Y") or {}).get("a") or {}).get("maxDDPct"),
+                    "gridFit": grid_fit_a,
+                },
+                symbol_b: {
+                    "volatility30d": ((windows.get("30D") or {}).get("b") or {}).get("volPct"),
+                    "drawdown1y": ((windows.get("1Y") or {}).get("b") or {}).get("maxDDPct"),
+                    "gridFit": grid_fit_b,
+                },
+                "liquidity24h_proxy": liq_proxy,
+                "liquidity_state": liquidity_state,
+            },
+            "windows": {
+                "7D": {
+                    symbol_a: (windows.get("7D") or {}).get("a") or {},
+                    symbol_b: (windows.get("7D") or {}).get("b") or {},
+                },
+                "30D": {
+                    symbol_a: (windows.get("30D") or {}).get("a") or {},
+                    symbol_b: (windows.get("30D") or {}).get("b") or {},
+                },
+                "90D": {
+                    symbol_a: (windows.get("90D") or {}).get("a") or {},
+                    symbol_b: (windows.get("90D") or {}).get("b") or {},
+                },
+                "1Y": {
+                    symbol_a: (windows.get("1Y") or {}).get("a") or {},
+                    symbol_b: (windows.get("1Y") or {}).get("b") or {},
+                },
+            },
+            "market": {
+                symbol_a: snap_a,
+                symbol_b: snap_b,
+            },
+            "insight": setup,
+            "ts": now_ts(),
+        }
+        _gen_cache_set(cache_key, out)
+        return jsonify(out)
+    except Exception as e:
+        stale = _gen_cache_get_any(cache_key)
+        if stale is not None:
+            return jsonify(stale)
+        return jsonify({
+            "status": "error",
+            "error": "pair_insight_failed",
+            "detail": str(e),
+            "pair": f"{symbol_a}/{symbol_b}",
+            "coin_id_a": resolved_a,
+            "coin_id_b": resolved_b,
+            "ts": now_ts(),
+        }), 502
+
