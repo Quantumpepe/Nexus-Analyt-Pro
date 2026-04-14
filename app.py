@@ -3069,32 +3069,6 @@ def _grid_add_order_to_sessions(item_id: str, order: dict) -> None:
             _trim_grid_session(sess)
             _grid_sessions_set(it, sess)
 
-
-def _grid_replace_session_orders(item_id: str, wallet_address: str, orders: list[dict] | None) -> None:
-    """Keep any existing runtime session, but force its order list to match the DB exactly.
-
-    This prevents ghost/resurrected orders from stale RAM sessions while preserving
-    non-order runtime fields like tick, price, fills, running, etc.
-    """
-    wa = _norm_addr(wallet_address or "")
-    normalized = list(orders or []) if isinstance(orders, list) else []
-    changed = False
-    for it, sess in _grid_session_variants(item_id):
-        if not isinstance(sess, dict):
-            continue
-        owner = _norm_addr(sess.get("wallet_address") or "")
-        if owner and wa and owner != wa:
-            continue
-        sess["orders"] = [dict(o) if isinstance(o, dict) else o for o in normalized]
-        _trim_grid_session(sess)
-        _grid_sessions_set(it, sess)
-        changed = True
-    if changed:
-        try:
-            _persist_grid_state()
-        except Exception:
-            pass
-
 def _get_owned_session(item_id: str, wa: str) -> Optional[dict]:
     """Return the grid session if it belongs to wallet `wa`. Legacy sessions without owner are treated as owned.
     Also tolerates item-id variants to keep orders visible across devices/versions.
@@ -3202,7 +3176,8 @@ def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
         sess.setdefault("order_mode", "MANUAL")
         sess.setdefault("initial_capital_usd", float(sess.get("initial_capital_usd") or 0.0) or float(_grid_best_vault_total(conn, wa, item_eff, chain=chain_eff) or 0.0) or 30.0)
 
-        sess["orders"] = list(orders or [])
+        if orders:
+            sess["orders"] = orders
 
         # Try to attach a live market snapshot so execute can use real prices.
         try:
@@ -4523,6 +4498,294 @@ def _cg_price_series(cg_id: str, days: int = 14):
             compact.append(p)
         last = p
     return compact
+
+def _calc_rsi_from_prices(prices, period: int = 14):
+    """Classic Wilder RSI on a close-price series (oldest -> newest)."""
+    try:
+        period = int(period or 14)
+    except Exception:
+        period = 14
+    if period < 2:
+        period = 14
+    vals = []
+    for p in (prices or []):
+        try:
+            fp = float(p)
+            if math.isfinite(fp) and fp > 0:
+                vals.append(fp)
+        except Exception:
+            continue
+    if len(vals) < period + 1:
+        return None
+
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        diff = vals[i] - vals[i - 1]
+        if diff >= 0:
+            gains += diff
+        else:
+            losses += abs(diff)
+
+    avg_gain = gains / period
+    avg_loss = losses / period
+
+    for i in range(period + 1, len(vals)):
+        diff = vals[i] - vals[i - 1]
+        gain = diff if diff > 0 else 0.0
+        loss = abs(diff) if diff < 0 else 0.0
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(float(rsi), 2)
+
+
+def _pct_change_from_series(prices, lookback: int):
+    vals = []
+    for p in (prices or []):
+        try:
+            fp = float(p)
+            if math.isfinite(fp) and fp > 0:
+                vals.append(fp)
+        except Exception:
+            continue
+    if len(vals) <= lookback:
+        return None
+    old = vals[-(lookback + 1)]
+    new = vals[-1]
+    if old <= 0:
+        return None
+    return round(((new - old) / old) * 100.0, 4)
+
+
+def _volatility_from_series(prices, lookback: int = 14):
+    vals = []
+    for p in (prices or []):
+        try:
+            fp = float(p)
+            if math.isfinite(fp) and fp > 0:
+                vals.append(fp)
+        except Exception:
+            continue
+    if len(vals) < max(lookback + 1, 3):
+        return None
+    tail = vals[-(lookback + 1):]
+    rets = []
+    for i in range(1, len(tail)):
+        prev = tail[i - 1]
+        cur = tail[i]
+        if prev > 0:
+            rets.append((cur - prev) / prev)
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var = sum((r - mean) ** 2 for r in rets) / max(1, (len(rets) - 1))
+    std = math.sqrt(max(0.0, var))
+    return round(std * 100.0, 4)
+
+
+def _rsi_state(rsi: float | None) -> str:
+    if rsi is None:
+        return "unknown"
+    if rsi < 25:
+        return "deep_oversold"
+    if rsi < 35:
+        return "oversold"
+    if rsi < 45:
+        return "weak"
+    if rsi <= 55:
+        return "neutral"
+    if rsi <= 70:
+        return "strong"
+    if rsi <= 80:
+        return "overbought"
+    return "extreme_overbought"
+
+
+def _volatility_state(vol_pct: float | None) -> str:
+    if vol_pct is None:
+        return "unknown"
+    if vol_pct < 2.0:
+        return "low"
+    if vol_pct < 5.5:
+        return "healthy"
+    if vol_pct < 9.0:
+        return "high"
+    return "chaotic"
+
+
+def _trend_state(ch7, ch30, ch90) -> str:
+    try:
+        c7 = float(ch7) if ch7 is not None else None
+    except Exception:
+        c7 = None
+    try:
+        c30 = float(ch30) if ch30 is not None else None
+    except Exception:
+        c30 = None
+    try:
+        c90 = float(ch90) if ch90 is not None else None
+    except Exception:
+        c90 = None
+
+    if c30 is None and c90 is None:
+        return "unknown"
+    if (c30 is not None and c30 > 0) and (c90 is None or c90 > 0):
+        if c7 is not None and c7 < 0:
+            return "uptrend_pullback"
+        return "uptrend"
+    if (c30 is not None and c30 < 0) and (c90 is not None and c90 < 0):
+        if c7 is not None and c7 > 0:
+            return "downtrend_bounce"
+        return "downtrend"
+    return "mixed"
+
+
+def _grid_fit_state(rsi, vol_state: str, trend_state: str) -> str:
+    rs = _rsi_state(rsi)
+    if vol_state == "chaotic":
+        return "avoid"
+    if trend_state in ("uptrend_pullback", "mixed") and vol_state in ("healthy", "high") and rs in ("deep_oversold", "oversold", "weak"):
+        return "good"
+    if trend_state == "uptrend" and vol_state == "healthy" and rs in ("neutral", "weak"):
+        return "good"
+    if trend_state in ("downtrend", "downtrend_bounce"):
+        return "cautious"
+    if vol_state == "low":
+        return "weak"
+    return "cautious"
+
+
+def _indicator_summary(symbol: str, rsi, trend_state: str, vol_state: str, grid_fit: str) -> str:
+    sym = str(symbol or "").upper() or "This coin"
+    rs = _rsi_state(rsi)
+    rsi_txt = {
+        "deep_oversold": "looks deeply oversold",
+        "oversold": "looks oversold",
+        "weak": "shows short-term weakness",
+        "neutral": "is neutral on momentum",
+        "strong": "still has positive momentum",
+        "overbought": "looks hot after a strong run",
+        "extreme_overbought": "looks extremely stretched",
+        "unknown": "has incomplete RSI data",
+    }.get(rs, "has mixed momentum")
+    trend_txt = {
+        "uptrend": "while the broader structure remains constructive",
+        "uptrend_pullback": "inside a stronger medium-term uptrend",
+        "downtrend": "inside a broader downtrend",
+        "downtrend_bounce": "during a bounce inside a weaker structure",
+        "mixed": "with a mixed higher-timeframe structure",
+        "unknown": "with limited trend context",
+    }.get(trend_state, "with mixed structure")
+    grid_txt = {
+        "good": "Grid conditions look usable if liquidity is also acceptable.",
+        "cautious": "Grid may be possible, but only with caution and tighter risk control.",
+        "weak": "Grid conditions look weak because movement may be too flat.",
+        "avoid": "Grid conditions look unfavorable right now.",
+    }.get(grid_fit, "Grid fit is unclear.")
+    vol_txt = {
+        "low": "Volatility is low.",
+        "healthy": "Volatility is in a healthy range.",
+        "high": "Volatility is elevated.",
+        "chaotic": "Volatility is chaotic.",
+        "unknown": "Volatility data is limited.",
+    }.get(vol_state, "Volatility is mixed.")
+    return f"{sym} {rsi_txt} {trend_txt}. {vol_txt} {grid_txt}"
+
+
+def _resolve_cg_id_for_indicator(symbol: str = "", coin_id: str = "") -> str | None:
+    cid = str(coin_id or "").strip()
+    if cid:
+        return cid
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+    return _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym) or _cg_resolve_symbol(sym)
+
+
+@app.route("/api/coingecko/market_chart/<coin_id>", methods=["GET"])
+def coingecko_market_chart_proxy(coin_id: str):
+    vs_currency = str(request.args.get("vs_currency") or "usd").strip().lower() or "usd"
+    days = str(request.args.get("days") or "30").strip() or "30"
+    interval = str(request.args.get("interval") or "daily").strip().lower() or "daily"
+    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    try:
+        r = requests.get(
+            url,
+            params={"vs_currency": vs_currency, "days": days, "interval": interval},
+            headers=_cg_headers(),
+            timeout=15,
+        )
+        r.raise_for_status()
+        return jsonify(r.json() or {})
+    except Exception as e:
+        return jsonify({"error": "coingecko_market_chart_failed", "detail": str(e)}), 502
+
+
+@app.route("/api/ai/market-indicators", methods=["GET", "POST"])
+def api_ai_market_indicators():
+    body = request.get_json(silent=True) or {}
+    symbol = str(body.get("symbol") or request.args.get("symbol") or "").strip().upper()
+    coin_id = str(body.get("coin_id") or body.get("coinId") or request.args.get("coin_id") or request.args.get("coinId") or "").strip()
+    days_raw = body.get("days") if body.get("days") is not None else request.args.get("days")
+    period_raw = body.get("period") if body.get("period") is not None else request.args.get("period")
+    try:
+        days = max(30, min(365, int(days_raw or 120)))
+    except Exception:
+        days = 120
+    try:
+        period = max(7, min(21, int(period_raw or 14)))
+    except Exception:
+        period = 14
+
+    resolved_id = _resolve_cg_id_for_indicator(symbol=symbol, coin_id=coin_id)
+    if not resolved_id:
+        return jsonify({"status": "error", "error": "coin_not_resolved", "symbol": symbol, "coin_id": coin_id, "ts": now_ts()}), 404
+
+    try:
+        series = _cg_price_series(str(resolved_id), days=days)
+    except Exception as e:
+        return jsonify({"status": "error", "error": "market_chart_fetch_failed", "detail": str(e), "coin_id": resolved_id, "ts": now_ts()}), 502
+
+    if not series or len(series) < max(period + 1, 20):
+        return jsonify({"status": "error", "error": "insufficient_price_history", "coin_id": resolved_id, "symbol": symbol, "points": len(series or []), "ts": now_ts()}), 400
+
+    latest_price = round(float(series[-1]), 8)
+    rsi = _calc_rsi_from_prices(series, period=period)
+    ch7 = _pct_change_from_series(series, 7)
+    ch30 = _pct_change_from_series(series, 30)
+    ch90 = _pct_change_from_series(series, 90)
+    vol14 = _volatility_from_series(series, lookback=14)
+    trend = _trend_state(ch7, ch30, ch90)
+    vol_state = _volatility_state(vol14)
+    grid_fit = _grid_fit_state(rsi, vol_state, trend)
+    summary = _indicator_summary(symbol or resolved_id, rsi, trend, vol_state, grid_fit)
+
+    return jsonify({
+        "status": "ok",
+        "coin_id": resolved_id,
+        "symbol": symbol or str(resolved_id).upper(),
+        "days": int(days),
+        "period": int(period),
+        "latest_price": latest_price,
+        "points": len(series),
+        "rsi": rsi,
+        "rsi_state": _rsi_state(rsi),
+        "change_7d_pct": ch7,
+        "change_30d_pct": ch30,
+        "change_90d_pct": ch90,
+        "volatility_14d_pct": vol14,
+        "volatility_state": vol_state,
+        "trend_state": trend,
+        "grid_fit": grid_fit,
+        "summary": summary,
+        "ts": now_ts(),
+    })
+
 
 def _clamp(n: float, a: float, b: float) -> float:
     return max(a, min(b, n))
@@ -5855,20 +6118,10 @@ def api_grid_tick():
             return err("unauthorized", 401)
 
         session = _get_owned_session(item_id, wa)
-        if not isinstance(session, dict):
+        if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
             session = _hydrate_grid_session_from_db(item_id, wa)
         if not session:
             return err("grid not started (press Start first)", 404)
-        try:
-            conn_sync = _db()
-            try:
-                db_orders = _grid_db_list_orders_any_variant(conn_sync, wa, item_id=item_id, chain=_grid_chain_key(item_id))
-            finally:
-                conn_sync.close()
-            session["orders"] = list(db_orders or [])
-            _grid_sessions_set(item_id, session)
-        except Exception:
-            pass
     
         # ✅ Prefer explicit live price from frontend; otherwise use cached snapshot/live market price.
         new_price = None
@@ -6579,6 +6832,10 @@ def api_grid_order_stop():
     except Exception:
         pass
 
+    # Update RAM session if present (fast UI feedback) across all compatible item variants
+    if oid is not None and str(oid).strip() != "":
+        _grid_mark_order_in_sessions(item_id, str(oid), "CANCELLED", cancelled=True)
+
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
@@ -6590,7 +6847,6 @@ def api_grid_order_stop():
             conn.commit()
 
         orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        _grid_replace_session_orders(item_id, wa, orders)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -6634,6 +6890,9 @@ def api_grid_order_delete():
     except Exception:
         pass
 
+    # Remove from RAM sessions if present across all compatible item variants
+    _grid_remove_order_from_sessions(item_id, str(oid))
+
     conn = _db()
     try:
         with DB_WRITE_LOCK:
@@ -6641,7 +6900,6 @@ def api_grid_order_delete():
             conn.commit()
 
         orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        _grid_replace_session_orders(item_id, wa, orders)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -6690,6 +6948,9 @@ def api_grid_order_resume():
     except Exception:
         pass
 
+    # Update RAM session if present (fast UI feedback) across all compatible item variants
+    _grid_mark_order_in_sessions(item_id, str(oid), "OPEN", cancelled=False)
+
     conn = _db()
     try:
         with DB_WRITE_LOCK:
@@ -6697,7 +6958,6 @@ def api_grid_order_resume():
             conn.commit()
 
         orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        _grid_replace_session_orders(item_id, wa, orders)
         vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
         reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
         free = max(0.0, float(vault_total) - float(reserved))
@@ -6903,7 +7163,11 @@ def api_grid_manual_add():
         finally:
             conn.close()
 
-        # Return DB view (DB is the single source of truth for orders)
+        # Optional: mirror into compatible in-memory sessions if they exist (executor may use it)
+        _grid_add_order_to_sessions(item_id, order)
+        _persist_grid_state()
+
+        # Return DB view
         conn = _db()
         try:
             try:
@@ -6913,7 +7177,6 @@ def api_grid_manual_add():
             except Exception:
                 pass
             orders_db = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-            _grid_replace_session_orders(item_id, wa, orders_db)
             vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
             reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
             if not reserved:
