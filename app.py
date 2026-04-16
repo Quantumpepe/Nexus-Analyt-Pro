@@ -7851,24 +7851,106 @@ def _ai_kind_instructions(kind: str) -> str:
     return "Answer the user's question based on the provided context."
 
 
+
+def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_health: bool, question: str,
+                       timeframe: str, index_mode: bool, raw_series_stats: dict,
+                       wallet_for_insight: str | None = None, chat_memory_wallet: str | None = None):
+    """
+    Shared AI response builder.
+
+    wallet_for_insight:
+      wallet whose order_memory / insight_profile should be included.
+    chat_memory_wallet:
+      wallet whose ai_memory chat history should be used and updated.
+      Keep this ONLY for AI Analyst / chat style endpoints.
+    """
+    market_context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
+    timeframe_context = _build_ai_timeframe_context(sym_norm, timeframe, raw_series_stats, index_mode=index_mode)
+
+    try:
+        order_memory, insight_profile = _insight_profile_get(wallet_for_insight) if wallet_for_insight else ({}, {})
+        if wallet_for_insight and not order_memory and not insight_profile:
+            order_memory, insight_profile = _refresh_user_insight_profile(wallet_for_insight)
+    except Exception:
+        order_memory, insight_profile = {}, {}
+
+    use_order_memory = bool(wallet_for_insight)
+    use_chat_memory = bool(chat_memory_wallet)
+
+    sys = f"""You are Nexus Analyt AI, a crypto market analyst.
+
+Rules:
+0) Always respond in the same language as the user's question. If the user mixes languages, use the dominant one.
+1) Use ONLY the symbols present in the provided JSON context.
+2) Use ONLY the numbers provided in the JSON (do not invent prices, volumes, metrics, scores, or levels).
+3) Provide informational analysis only. No financial advice. No buy/sell instructions.
+4) Do NOT output exact trade entries/exits or prescriptive price levels. If asked, provide an educational template instead.
+5) The app is MANUAL-only: never suggest automatic order placement; focus on manual decision support.
+6) Timeframe integrity is mandatory:
+   - requested_timeframe = what the user selected.
+   - actual_timeframe_used = what data is truly available.
+   - If actual_timeframe_used differs from requested_timeframe, you MUST say so clearly.
+   - If timeframe stats are partial or missing, explicitly mention that the analysis is partial or snapshot-based.
+   - NEVER claim a 30D/90D/1Y analysis unless the provided timeframe context says that timeframe was actually used.
+7) When timeframe_context.series_stats are available, treat them as the PRIMARY source for timeframe analysis.
+   Snapshot market_context is supplemental only and must not override timeframe_context.
+8) Do NOT infer missing 30D values from 90D snapshots or 24h data.
+9) If wallet-specific order_memory or insight_profile is present, use it only to describe the user's observed setup style, structure, and risk posture.
+10) Never tell the user they must change, place, remove, or move an order. Do not use imperative trading language such as "you must", "set", "buy now", or "sell now".
+11) Never mix AI Analyst chat memory with AI Insight order memory. If order_memory / insight_profile are present, treat them as wallet setup context only, not as a chat transcript.
+12) Do not write as if the user asked for direct instructions. Describe, interpret, compare, and explain only.
+
+Task:
+{_ai_kind_instructions(kind)}
+"""
+
+    user_payload = {
+        "kind": kind,
+        "question": question,
+        "profile": profile,
+        "include_health": include_health,
+        "requested_timeframe": timeframe_context.get("requested_timeframe"),
+        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
+        "coverage_note": timeframe_context.get("coverage_note"),
+        "index_mode": bool(index_mode),
+        "timeframe_context": timeframe_context,
+        "market_context": market_context,
+    }
+
+    if use_order_memory:
+        user_payload["order_memory"] = order_memory
+        user_payload["insight_profile"] = insight_profile
+
+    mem_msgs = _ai_mem_get(chat_memory_wallet) if use_chat_memory else None
+    resp, err_pair = _ai_call_openai(
+        sys,
+        user_payload,
+        wallet_address=chat_memory_wallet if use_chat_memory else None,
+        mem_msgs=mem_msgs,
+    )
+    if err_pair:
+        msg, code = err_pair
+        return None, (msg, code)
+
+    resp["context_used"] = {
+        "symbols": sym_norm,
+        "profile": profile,
+        "include_health": include_health,
+        "requested_timeframe": timeframe_context.get("requested_timeframe"),
+        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
+        "timeframe_match": timeframe_context.get("timeframe_match"),
+        "coverage_note": timeframe_context.get("coverage_note"),
+        "has_order_memory": bool(use_order_memory and order_memory),
+        "has_insight_profile": bool(use_order_memory and insight_profile),
+        "chat_memory_used": bool(use_chat_memory),
+        "insight_memory_used": bool(use_order_memory),
+    }
+    return resp, None
+
+
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """Backend-native AI endpoint. Builds context from symbols and profile/health toggle.
-
-    Expects JSON:
-      {
-        "kind": "quick_overview"|"risk_check"|"compare"|"grid_plan"|"ask",
-        "symbols": ["BTC","ETH", ...]  (max 6),
-        "profile": "conservative"|"balanced"|"volatility",
-        "include_health": true|false,
-        "question": "..." (optional; required for kind=ask),
-        "timeframe": "1D"|"7D"|"30D"|"90D"|"1Y"|"2Y",
-        "series_stats": { "BTC": { ... } },
-        "index_mode": true|false
-      }
-
-    Returns: {status, answer, model, context_used}
-    """
+    """AI Analyst endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
     wa = _require_auth()
     if not wa:
         return err("unauthorized", 401)
@@ -7894,7 +7976,6 @@ def api_ai_run():
     index_mode = bool(body.get("index_mode", False))
     raw_series_stats = body.get("series_stats") or {}
 
-    # Enforce max 6 coins server-side
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
     if len(sym_norm) > 6:
@@ -7902,76 +7983,76 @@ def api_ai_run():
     if not sym_norm:
         return err("no symbols provided", 400)
 
-    # Auth is optional for AI, but if present we use it for memory scoping
-    wa = _require_auth()
-
-    market_context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
-    timeframe_context = _build_ai_timeframe_context(sym_norm, timeframe, raw_series_stats, index_mode=index_mode)
-    try:
-        order_memory, insight_profile = _insight_profile_get(wa) if wa else ({}, {})
-        if wa and not order_memory and not insight_profile:
-            order_memory, insight_profile = _refresh_user_insight_profile(wa)
-    except Exception:
-        order_memory, insight_profile = {}, {}
-
-    sys = f"""You are Nexus Analyt AI, a crypto market analyst.
-
-Rules:
-0) Always respond in the same language as the user's question. If the user mixes languages, use the dominant one.
-1) Use ONLY the symbols present in the provided JSON context.
-2) Use ONLY the numbers provided in the JSON (do not invent prices, volumes, metrics, scores, or levels).
-3) Provide informational analysis only. No financial advice. No buy/sell instructions.
-4) Do NOT output exact trade entries/exits or prescriptive price levels. If asked, provide an educational template instead.
-5) The app is MANUAL-only: never suggest automatic order placement; focus on manual decision support.
-6) Timeframe integrity is mandatory:
-   - requested_timeframe = what the user selected.
-   - actual_timeframe_used = what data is truly available.
-   - If actual_timeframe_used differs from requested_timeframe, you MUST say so clearly.
-   - If timeframe stats are partial or missing, explicitly mention that the analysis is partial or snapshot-based.
-   - NEVER claim a 30D/90D/1Y analysis unless the provided timeframe context says that timeframe was actually used.
-7) When timeframe_context.series_stats are available, treat them as the PRIMARY source for timeframe analysis.
-   Snapshot market_context is supplemental only and must not override timeframe_context.
-8) Do NOT infer missing 30D values from 90D snapshots or 24h data.
-9) If wallet-specific order_memory or insight_profile is present, use it only to describe the user's observed setup style, structure, and risk posture.
-10) Never tell the user they must change, place, remove, or move an order. Do not use imperative trading language such as "you must", "set", "buy now", or "sell now".
-
-Task:
-{_ai_kind_instructions(kind)}
-"""
-
-    user_payload = {
-        "kind": kind,
-        "question": question,
-        "profile": profile,
-        "include_health": include_health,
-        "requested_timeframe": timeframe_context.get("requested_timeframe"),
-        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
-        "coverage_note": timeframe_context.get("coverage_note"),
-        "index_mode": bool(index_mode),
-        "timeframe_context": timeframe_context,
-        "market_context": market_context,
-        "order_memory": order_memory,
-        "insight_profile": insight_profile,
-    }
-
-    resp, err_pair = _ai_call_openai(sys, user_payload, wallet_address=wa, mem_msgs=_ai_mem_get(wa) if wa else None)
+    resp, err_pair = _build_ai_response(
+        kind=kind,
+        sym_norm=sym_norm,
+        profile=profile,
+        include_health=include_health,
+        question=question,
+        timeframe=timeframe,
+        index_mode=index_mode,
+        raw_series_stats=raw_series_stats,
+        wallet_for_insight=None,
+        chat_memory_wallet=wa,
+    )
     if err_pair:
         msg, code = err_pair
         return err(msg, code)
-
-    # Return a small echo of which symbols/timeframe were used for transparency
-    resp["context_used"] = {
-        "symbols": sym_norm,
-        "profile": profile,
-        "include_health": include_health,
-        "requested_timeframe": timeframe_context.get("requested_timeframe"),
-        "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
-        "timeframe_match": timeframe_context.get("timeframe_match"),
-        "coverage_note": timeframe_context.get("coverage_note"),
-        "has_order_memory": bool(order_memory),
-        "has_insight_profile": bool(insight_profile),
-    }
     return jsonify(resp)
+
+
+@app.route("/api/ai/insight", methods=["POST"])
+def api_ai_insight():
+    """AI Insight endpoint. Uses wallet-specific order_memory / insight_profile, never ai_memory chat history."""
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
+    body = request.get_json(silent=True) or {}
+    kind = str(body.get("kind") or "ask")
+    symbols = body.get("symbols") or []
+    if isinstance(symbols, str):
+        symbols = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not isinstance(symbols, list):
+        return err("symbols must be a list or comma-separated string", 400)
+
+    profile = str(body.get("profile") or "conservative").strip().lower()
+    if profile not in ("conservative", "balanced", "volatility"):
+        profile = "conservative"
+
+    include_health = bool(body.get("include_health", True))
+    question = str(body.get("question") or "").strip()
+    timeframe = _normalize_ai_timeframe(body.get("timeframe") or "90D")
+    index_mode = bool(body.get("index_mode", False))
+    raw_series_stats = body.get("series_stats") or {}
+
+    sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
+    sym_norm = list(dict.fromkeys(sym_norm))
+    if len(sym_norm) > 6:
+        return err("max 6 symbols allowed", 400)
+    if not sym_norm:
+        return err("no symbols provided", 400)
+
+    resp, err_pair = _build_ai_response(
+        kind=kind,
+        sym_norm=sym_norm,
+        profile=profile,
+        include_health=include_health,
+        question=question,
+        timeframe=timeframe,
+        index_mode=index_mode,
+        raw_series_stats=raw_series_stats,
+        wallet_for_insight=wa,
+        chat_memory_wallet=None,
+    )
+    if err_pair:
+        msg, code = err_pair
+        return err(msg, code)
+    return jsonify(resp)
+
 
 # -------------------------
 # AI proxy (Frontend -> Backend -> TBP-Advisor -> OpenAI)
