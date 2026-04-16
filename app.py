@@ -7599,6 +7599,7 @@ def _ai_call_openai(
     mem_msgs: list | None = None,
     short_insight_mode: bool = False,
 ):
+    short_insight_mode = bool(user_payload.get("short_insight_mode"))
     """Shared OpenAI call helper used by /api/ai and /api/ai/run."""
     openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
     if not openai_key:
@@ -7975,6 +7976,7 @@ Task:
         "index_mode": bool(index_mode),
         "timeframe_context": timeframe_context,
         "market_context": market_context,
+        "short_insight_mode": bool(short_insight_mode),
     }
 
     if use_order_memory:
