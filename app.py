@@ -7592,7 +7592,13 @@ def api_ai_insight_profile_refresh():
 # AI Run (backend-native context builder)
 # -------------------------
 
-def _ai_call_openai(sys_prompt: str, user_payload: dict, wallet_address: str | None = None, mem_msgs: list | None = None):
+def _ai_call_openai(
+    sys_prompt: str,
+    user_payload: dict,
+    wallet_address: str | None = None,
+    mem_msgs: list | None = None,
+    short_insight_mode: bool = False,
+):
     """Shared OpenAI call helper used by /api/ai and /api/ai/run."""
     openai_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or ""
     if not openai_key:
