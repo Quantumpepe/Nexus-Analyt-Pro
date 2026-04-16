@@ -7611,7 +7611,7 @@ def _ai_call_openai(sys_prompt: str, user_payload: dict, wallet_address: str | N
         "model": model,
         "input": ([{"role": "system", "content": sys_prompt}] + (mem_msgs if isinstance(mem_msgs, list) else []) + [{"role": "user", "content": user}]),
         "temperature": 0.3,
-        "max_output_tokens": 900,
+        "max_output_tokens": 220 if short_insight_mode else 900,
     }
 
     try:
@@ -7854,7 +7854,8 @@ def _ai_kind_instructions(kind: str) -> str:
 
 def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_health: bool, question: str,
                        timeframe: str, index_mode: bool, raw_series_stats: dict,
-                       wallet_for_insight: str | None = None, chat_memory_wallet: str | None = None):
+                       wallet_for_insight: str | None = None, chat_memory_wallet: str | None = None,
+                       short_insight_mode: bool = False):
     """
     Shared AI response builder.
 
@@ -7876,6 +7877,22 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 
     use_order_memory = bool(wallet_for_insight)
     use_chat_memory = bool(chat_memory_wallet)
+
+    insight_length_rules = ""
+    if short_insight_mode:
+        insight_length_rules = """
+13) This is AI Insight, not AI Analyst.
+14) Keep the answer VERY SHORT: max 3 short paragraphs or 4 bullet points total.
+15) Prefer compact UI-friendly language over report style.
+16) Do NOT dump raw stats, long metric lists, repeated timeframe blocks, or full summaries.
+17) Focus only on: setup read, pair/coin structure, risk posture, and wallet-fit.
+18) If useful, keep the structure as:
+    - Short insight
+    - Setup read
+    - Wallet fit
+19) Maximum length target: about 60 to 110 words.
+20) Never write like a long analyst report for AI Insight.
+"""
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
 
@@ -7899,7 +7916,7 @@ Rules:
 10) Never tell the user they must change, place, remove, or move an order. Do not use imperative trading language such as "you must", "set", "buy now", or "sell now".
 11) Never mix AI Analyst chat memory with AI Insight order memory. If order_memory / insight_profile are present, treat them as wallet setup context only, not as a chat transcript.
 12) Do not write as if the user asked for direct instructions. Describe, interpret, compare, and explain only.
-
+{insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
 """
@@ -7994,6 +8011,7 @@ def api_ai_run():
         raw_series_stats=raw_series_stats,
         wallet_for_insight=None,
         chat_memory_wallet=wa,
+        short_insight_mode=False,
     )
     if err_pair:
         msg, code = err_pair
@@ -8047,6 +8065,7 @@ def api_ai_insight():
         raw_series_stats=raw_series_stats,
         wallet_for_insight=wa,
         chat_memory_wallet=None,
+        short_insight_mode=True,
     )
     if err_pair:
         msg, code = err_pair
