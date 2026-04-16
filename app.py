@@ -910,6 +910,15 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_insight_profile (
+            wallet_address TEXT PRIMARY KEY,
+            order_memory_json TEXT DEFAULT '{}',
+            insight_profile_json TEXT DEFAULT '{}',
+            updated_ts INTEGER
+        )
+    """)
+
     # Auto-migrate persistent DB schema on Render disk (/data)
     _db_migrate_schema(conn)
 
@@ -924,6 +933,11 @@ def init_db():
             "timeframe": "timeframe TEXT DEFAULT '90D'",
             "index_mode": "index_mode INTEGER DEFAULT 1",
             "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
+            "updated_ts": "updated_ts INTEGER",
+        })
+        _db_ensure_columns(conn, "user_insight_profile", {
+            "order_memory_json": "order_memory_json TEXT DEFAULT '{}'",
+            "insight_profile_json": "insight_profile_json TEXT DEFAULT '{}'",
             "updated_ts": "updated_ts INTEGER",
         })
     except Exception:
@@ -1405,6 +1419,290 @@ def _ai_mem_append(wallet_address: str, user_text: str, assistant_text: str, max
         mem.append({"role": "assistant", "content": str(assistant_text)})
     mem = mem[-max_msgs:]
     _ai_mem_put(wa, mem)
+
+
+def _json_load_obj(raw: Any, default=None):
+    if default is None:
+        default = {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else default
+        except Exception:
+            return default
+    return default
+
+def _json_load_list(raw: Any, default=None):
+    if default is None:
+        default = []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, list) else default
+        except Exception:
+            return default
+    return default
+
+def _insight_profile_get(wallet_address: str) -> tuple[dict, dict]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {}, {}
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT order_memory_json, insight_profile_json FROM user_insight_profile WHERE wallet_address=?",
+            (wa,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}, {}
+        return _json_load_obj(row["order_memory_json"], {}), _json_load_obj(row["insight_profile_json"], {})
+    finally:
+        conn.close()
+
+def _insight_profile_save(wallet_address: str, order_memory: dict | None, insight_profile: dict | None, conn=None) -> None:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return
+    own_conn = conn is None
+    if own_conn:
+        conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO user_insight_profile(wallet_address, order_memory_json, insight_profile_json, updated_ts) VALUES (?,?,?,?) "
+            "ON CONFLICT(wallet_address) DO UPDATE SET "
+            "order_memory_json=excluded.order_memory_json, "
+            "insight_profile_json=excluded.insight_profile_json, "
+            "updated_ts=excluded.updated_ts",
+            (
+                wa,
+                json.dumps(order_memory or {}, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(insight_profile or {}, ensure_ascii=False, separators=(",", ":")),
+                now_ts(),
+            ),
+        )
+        if own_conn:
+            conn.commit()
+    finally:
+        if own_conn and conn is not None:
+            conn.close()
+
+def _derive_trading_style(avg_distance_pct: float, buy_ratio: float, manual_ratio: float) -> str:
+    try:
+        avg_distance_pct = float(avg_distance_pct or 0.0)
+        buy_ratio = float(buy_ratio or 0.0)
+        manual_ratio = float(manual_ratio or 0.0)
+    except Exception:
+        return "balanced"
+    if avg_distance_pct >= 7.5:
+        return "conservative"
+    if avg_distance_pct <= 2.5 or manual_ratio >= 0.75:
+        return "aggressive"
+    if buy_ratio >= 0.7 and avg_distance_pct >= 4.0:
+        return "accumulation-focused"
+    return "balanced"
+
+def _derive_execution_pattern(status_counts: dict, manual_ratio: float, avg_distance_pct: float, buy_ratio: float) -> str:
+    open_count = int(status_counts.get("OPEN", 0) or 0)
+    cancelled_count = int(status_counts.get("CANCELLED", 0) or 0)
+    if manual_ratio >= 0.75:
+        return "manual execution bias"
+    if open_count >= 6 and avg_distance_pct >= 3.0:
+        return "staggered grid structure"
+    if buy_ratio >= 0.7:
+        return "buy-side accumulation bias"
+    if cancelled_count >= max(3, open_count):
+        return "frequent reworking of orders"
+    return "mixed manual/grid structure"
+
+def _grid_order_memory_from_orders(orders: list[dict]) -> dict:
+    rows = [o for o in (orders or []) if isinstance(o, dict)]
+    if not rows:
+        return {
+            "order_count_total": 0,
+            "open_order_count": 0,
+            "active_item_count": 0,
+            "avg_order_distance_pct": 0.0,
+            "side_bias": "mixed",
+            "preferred_mode": "unknown",
+            "preferred_assets": [],
+            "status_breakdown": {},
+            "source_breakdown": {},
+            "behavior_note": "No persisted order structure yet.",
+        }
+
+    side_counts = {"BUY": 0, "SELL": 0}
+    status_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
+    chain_counts: dict[str, int] = {}
+    item_ids = set()
+    prices = []
+    qty_total = 0.0
+    open_prices = []
+
+    for o in rows:
+        side = str(o.get("side") or "").upper()
+        if side in side_counts:
+            side_counts[side] += 1
+        status = str(o.get("status") or "OPEN").upper()
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+        meta = _json_load_obj(o.get("meta_json"), {})
+        source = str(meta.get("source") or o.get("source") or "GRID").strip().upper() or "GRID"
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+        item_id = str(o.get("item_id") or o.get("item") or "").strip().upper()
+        if item_id:
+            item_ids.add(item_id)
+            chain_guess = item_id.split(":", 1)[0] if ":" in item_id else ""
+            if chain_guess:
+                chain_counts[chain_guess] = chain_counts.get(chain_guess, 0) + 1
+
+        chain = str(o.get("chain") or "").strip().upper()
+        if chain:
+            chain_counts[chain] = chain_counts.get(chain, 0) + 1
+
+        try:
+            px = float(o.get("price"))
+            if px > 0:
+                prices.append(px)
+                if status == "OPEN":
+                    open_prices.append(px)
+        except Exception:
+            pass
+        try:
+            qty_total += float(o.get("qty") or 0.0)
+        except Exception:
+            pass
+
+    prices_sorted = sorted(set(round(p, 12) for p in prices))
+    distance_pcts = []
+    for i in range(1, len(prices_sorted)):
+        prev_px = prices_sorted[i - 1]
+        px = prices_sorted[i]
+        if prev_px > 0:
+            distance_pcts.append(abs(px - prev_px) / prev_px * 100.0)
+    avg_distance_pct = round(sum(distance_pcts) / len(distance_pcts), 4) if distance_pcts else 0.0
+
+    total_sides = max(1, side_counts["BUY"] + side_counts["SELL"])
+    buy_ratio = side_counts["BUY"] / total_sides
+    sell_ratio = side_counts["SELL"] / total_sides
+    if buy_ratio >= 0.65:
+        side_bias = "buy-heavy"
+    elif sell_ratio >= 0.65:
+        side_bias = "sell-heavy"
+    else:
+        side_bias = "mixed"
+
+    total_sources = max(1, sum(source_counts.values()))
+    manual_ratio = source_counts.get("MANUAL", 0) / total_sources
+    if manual_ratio >= 0.65:
+        preferred_mode = "manual"
+    elif source_counts.get("GRID", 0) >= source_counts.get("MANUAL", 0):
+        preferred_mode = "grid"
+    else:
+        preferred_mode = "mixed"
+
+    preferred_assets = [k for k, _v in sorted(chain_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]]
+    open_order_count = int(status_counts.get("OPEN", 0) or 0)
+
+    if preferred_mode == "manual" and avg_distance_pct <= 2.5:
+        behavior_note = "Order structure looks close to current price and manually adjusted."
+    elif preferred_mode == "grid" and avg_distance_pct >= 3.0:
+        behavior_note = "Order structure looks laddered and grid-like rather than single-shot."
+    elif side_bias == "buy-heavy":
+        behavior_note = "Order structure leans more toward accumulation than distribution."
+    elif side_bias == "sell-heavy":
+        behavior_note = "Order structure leans more toward distribution or profit-taking."
+    else:
+        behavior_note = "Order structure looks mixed without a strong single-side bias."
+
+    return {
+        "order_count_total": len(rows),
+        "open_order_count": open_order_count,
+        "active_item_count": len(item_ids),
+        "avg_order_distance_pct": avg_distance_pct,
+        "avg_order_qty": round(qty_total / max(1, len(rows)), 8),
+        "side_bias": side_bias,
+        "preferred_mode": preferred_mode,
+        "preferred_assets": preferred_assets,
+        "status_breakdown": status_counts,
+        "source_breakdown": source_counts,
+        "behavior_note": behavior_note,
+    }
+
+def _derive_insight_profile_from_memory(order_memory: dict) -> dict:
+    om = order_memory or {}
+    avg_distance_pct = float(om.get("avg_order_distance_pct") or 0.0)
+    side_bias = str(om.get("side_bias") or "mixed")
+    preferred_mode = str(om.get("preferred_mode") or "unknown")
+    source_breakdown = om.get("source_breakdown") or {}
+    status_breakdown = om.get("status_breakdown") or {}
+    total_sources = max(1, sum(int(v or 0) for v in source_breakdown.values()))
+    manual_ratio = float(source_breakdown.get("MANUAL", 0) or 0) / total_sources
+    buy_ratio = 0.5 if side_bias == "mixed" else (0.75 if side_bias == "buy-heavy" else 0.25)
+
+    style = _derive_trading_style(avg_distance_pct, buy_ratio, manual_ratio)
+    execution_pattern = _derive_execution_pattern(status_breakdown, manual_ratio, avg_distance_pct, buy_ratio)
+
+    if avg_distance_pct >= 7.5:
+        volatility_tolerance = "low"
+    elif avg_distance_pct >= 3.0:
+        volatility_tolerance = "medium"
+    else:
+        volatility_tolerance = "high"
+
+    if side_bias == "buy-heavy":
+        bias_note = "Current wallet history leans more toward buy-side staging."
+    elif side_bias == "sell-heavy":
+        bias_note = "Current wallet history leans more toward sell-side staging."
+    else:
+        bias_note = "Current wallet history looks balanced between buy and sell orders."
+
+    return {
+        "style": style,
+        "execution_pattern": execution_pattern,
+        "volatility_tolerance": volatility_tolerance,
+        "preferred_mode": preferred_mode,
+        "bias_note": bias_note,
+        "summary": (
+            f"Wallet history suggests a {style} style with {execution_pattern}. "
+            f"Observed side bias is {side_bias}, average order spacing is {avg_distance_pct:.2f}%."
+        ),
+    }
+
+def _refresh_user_insight_profile(wallet_address: str, conn=None) -> tuple[dict, dict]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {}, {}
+
+    own_conn = conn is None
+    if own_conn:
+        conn = _db()
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT order_id, item_id, chain, side, price, qty, status, meta_json, created_ts, updated_ts "
+            "FROM grid_orders WHERE wallet_address=? ORDER BY updated_ts DESC, created_ts DESC",
+            (wa,),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        order_memory = _grid_order_memory_from_orders(rows)
+        insight_profile = _derive_insight_profile_from_memory(order_memory)
+        _insight_profile_save(wa, order_memory, insight_profile, conn=conn)
+        if own_conn:
+            conn.commit()
+        return order_memory, insight_profile
+    finally:
+        if own_conn and conn is not None:
+            conn.close()
 
 def _norm_addr(addr: str) -> str:
     return (addr or "").strip().lower()
@@ -6853,6 +7151,10 @@ def api_grid_order_stop():
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
+        try:
+            _refresh_user_insight_profile(wa)
+        except Exception:
+            pass
         return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
     finally:
         conn.close()
@@ -6906,6 +7208,10 @@ def api_grid_order_delete():
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
+        try:
+            _refresh_user_insight_profile(wa)
+        except Exception:
+            pass
         return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
     finally:
         conn.close()
@@ -6964,6 +7270,10 @@ def api_grid_order_resume():
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
+        try:
+            _refresh_user_insight_profile(wa)
+        except Exception:
+            pass
         return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
     finally:
         conn.close()
@@ -7189,6 +7499,10 @@ def api_grid_manual_add():
         finally:
             conn.close()
 
+        try:
+            _refresh_user_insight_profile(wa)
+        except Exception:
+            pass
         return jsonify({
             "status": "ok",
             "order": order,
@@ -7225,6 +7539,54 @@ def api_add_alias():
 def api_grid_manual_alias():
     return api_grid_manual_add()
 
+
+@app.route("/api/ai/insight-profile", methods=["GET"])
+def api_ai_insight_profile_get():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    st = _compute_access_status(wa)
+    if st.get("plan") != "pro":
+        return err("subscription required for AI", 403)
+
+    wallet_q = str(request.args.get("wallet") or request.args.get("wallet_address") or wa).strip()
+    wallet_q = _norm_addr(wallet_q)
+    if not wallet_q:
+        wallet_q = wa
+    if wallet_q != wa:
+        return err("forbidden", 403)
+
+    order_memory, insight_profile = _insight_profile_get(wallet_q)
+    if not order_memory and not insight_profile:
+        order_memory, insight_profile = _refresh_user_insight_profile(wallet_q)
+
+    return jsonify({
+        "status": "ok",
+        "wallet_address": wallet_q,
+        "order_memory": order_memory,
+        "insight_profile": insight_profile,
+        "ts": now_ts(),
+    })
+
+@app.route("/api/ai/insight-profile/refresh", methods=["POST"])
+def api_ai_insight_profile_refresh():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("unauthorized", 401)
+
+    body = request.get_json(silent=True) or {}
+    wallet_q = _norm_addr(body.get("wallet") or body.get("wallet_address") or wa)
+    if wallet_q != wa:
+        return err("forbidden", 403)
+
+    order_memory, insight_profile = _refresh_user_insight_profile(wallet_q)
+    return jsonify({
+        "status": "ok",
+        "wallet_address": wallet_q,
+        "order_memory": order_memory,
+        "insight_profile": insight_profile,
+        "ts": now_ts(),
+    })
 
 # -------------------------
 # AI Run (backend-native context builder)
@@ -7545,6 +7907,12 @@ def api_ai_run():
 
     market_context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
     timeframe_context = _build_ai_timeframe_context(sym_norm, timeframe, raw_series_stats, index_mode=index_mode)
+    try:
+        order_memory, insight_profile = _insight_profile_get(wa) if wa else ({}, {})
+        if wa and not order_memory and not insight_profile:
+            order_memory, insight_profile = _refresh_user_insight_profile(wa)
+    except Exception:
+        order_memory, insight_profile = {}, {}
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
 
@@ -7564,6 +7932,8 @@ Rules:
 7) When timeframe_context.series_stats are available, treat them as the PRIMARY source for timeframe analysis.
    Snapshot market_context is supplemental only and must not override timeframe_context.
 8) Do NOT infer missing 30D values from 90D snapshots or 24h data.
+9) If wallet-specific order_memory or insight_profile is present, use it only to describe the user's observed setup style, structure, and risk posture.
+10) Never tell the user they must change, place, remove, or move an order. Do not use imperative trading language such as "you must", "set", "buy now", or "sell now".
 
 Task:
 {_ai_kind_instructions(kind)}
@@ -7580,6 +7950,8 @@ Task:
         "index_mode": bool(index_mode),
         "timeframe_context": timeframe_context,
         "market_context": market_context,
+        "order_memory": order_memory,
+        "insight_profile": insight_profile,
     }
 
     resp, err_pair = _ai_call_openai(sys, user_payload, wallet_address=wa, mem_msgs=_ai_mem_get(wa) if wa else None)
@@ -7596,6 +7968,8 @@ Task:
         "actual_timeframe_used": timeframe_context.get("actual_timeframe_used"),
         "timeframe_match": timeframe_context.get("timeframe_match"),
         "coverage_note": timeframe_context.get("coverage_note"),
+        "has_order_memory": bool(order_memory),
+        "has_insight_profile": bool(insight_profile),
     }
     return jsonify(resp)
 
