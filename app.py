@@ -7918,6 +7918,12 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     - "mixed structure with limited setup quality"
     - "current wallet pattern fits / does not fit this structure"
 25) Avoid generic filler like "monitor across multiple windows" unless it adds clear meaning.
+26) Do NOT list timeframe outputs like "7D neutral, 30D neutral, 90D neutral".
+27) Do NOT repeat structures already visible in the UI.
+28) Do NOT use labeled sections like "Trend Structure", "Momentum Shift", or "Risk View".
+29) Always merge all signals into ONE combined interpretation.
+30) Prefer one short paragraph over multiple structured blocks.
+31) Avoid breaking the answer into multiple titled parts.
 """
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
