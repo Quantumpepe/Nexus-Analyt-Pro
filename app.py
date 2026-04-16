@@ -7877,7 +7877,24 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 
     use_order_memory = bool(wallet_for_insight)
     use_chat_memory = bool(chat_memory_wallet)
+ PRO_STYLE_RULES = """
+ STYLE RULES (CRITICAL):
 
+ - Never give direct instructions to the user
+ - Do NOT use: "you should", "you must", "consider buying/selling"
+ - Do NOT speak directly to the user in a commanding tone
+
+ INSTEAD:
+ - Use neutral, system-level interpretation
+ - Describe what the setup suggests, not what the user must do
+ - Keep language calm, analytical, and professional
+
+ TONE:
+ - Calm
+ - Professional
+ - Analytical
+ - Non-instructional
+ """
     insight_length_rules = ""
     if short_insight_mode:
         insight_length_rules = """
@@ -7904,6 +7921,9 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 """
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
+
+{PRO_STYLE_RULES}
+{insight_length_rules}
 
 Rules:
 0) Always respond in the same language as the user's question. If the user mixes languages, use the dominant one.
