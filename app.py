@@ -4451,6 +4451,8 @@ def _cg_market_snapshot(coin_id: str):
                               if c.get("price_change_percentage_24h_in_currency") is not None
                               else _cg_change24h_from_chart(coin_id))),
             "volume24h": c.get("total_volume"),
+            "market_cap": c.get("market_cap"),
+            "marketCap": c.get("market_cap"),
             "liquidity": None,
             "source": "coingecko",
         }
@@ -4512,6 +4514,8 @@ def _cg_market_snapshots_batch(coin_ids):
                     "price": row.get("current_price"),
                     "change24": row.get("price_change_percentage_24h"),
                     "volume24": row.get("total_volume"),
+                    "market_cap": row.get("market_cap"),
+                    "marketCap": row.get("market_cap"),
                     "liquidity": None,
                     "source": "coingecko",
                 }
@@ -5624,7 +5628,7 @@ def api_watchlist_snapshot():
     - GET: Uses server-side configured watchlist (get_watchlist()) for backwards compatibility.
     - POST: Expects JSON: { "items": [{symbol, mode: "market"|"dex", id?, chain?, contract?}, ...] }
             Returns normalized rows for the frontend:
-            { symbol, mode, id, price, change24h, volume24h, liquidity, source }
+            { symbol, mode, id, price, change24h, volume24h, market_cap, liquidity, source }
     """
     try:
         items = None
@@ -5749,6 +5753,8 @@ def api_watchlist_snapshot():
                             "price": p.get("price"),
                             "change24": None,
                             "volume24": None,
+                            "market_cap": p.get("market_cap") or p.get("marketCap"),
+                            "marketCap": p.get("market_cap") or p.get("marketCap"),
                             "liquidity": None,
                             "source": p.get("source") or "market-price",
                         }
@@ -5820,6 +5826,8 @@ def api_watchlist_snapshot():
                             "price": p.get("price"),
                             "change24h": None,
                             "volume24h": None,
+                            "market_cap": p.get("market_cap") or p.get("marketCap"),
+                            "marketCap": p.get("market_cap") or p.get("marketCap"),
                             "source": p.get("source") or "market-price",
                         }
                 except Exception:
@@ -5833,6 +5841,8 @@ def api_watchlist_snapshot():
                     "price": snap.get("price"),
                     "change24h": snap.get("change24") if "change24" in snap else snap.get("change24h"),
                     "volume24h": snap.get("volume24") if "volume24" in snap else snap.get("volume24h"),
+                    "market_cap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
+                    "marketCap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
                     "liquidity": None,
                     "source": snap.get("source") or "coingecko",
                 })
@@ -5845,6 +5855,8 @@ def api_watchlist_snapshot():
                     "price": None,
                     "change24h": None,
                     "volume24h": None,
+                    "market_cap": None,
+                    "marketCap": None,
                     "liquidity": None,
                     "source": "error",
                 })
@@ -9232,4 +9244,3 @@ def api_ai_pair_insight():
             "coin_id_b": resolved_b,
             "ts": now_ts(),
         }), 502
-
