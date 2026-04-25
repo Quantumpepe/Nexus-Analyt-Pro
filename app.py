@@ -911,6 +911,19 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_coin_ratings (
+            wallet_address TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            rating TEXT NOT NULL,
+            rating_date TEXT NOT NULL,
+            created_ts INTEGER,
+            updated_ts INTEGER,
+            PRIMARY KEY (wallet_address, symbol, rating_date)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_coin_ratings_wallet_symbol ON user_coin_ratings(wallet_address, symbol);")
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS user_insight_profile (
             wallet_address TEXT PRIMARY KEY,
             order_memory_json TEXT DEFAULT '{}',
@@ -3033,6 +3046,124 @@ def api_access_status():
 
 
 
+
+
+# -------------------------
+# Watchlist user rating + owner-controlled coin links
+# -------------------------
+_ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "B", "C", "RISK"}
+
+def _today_utc_date() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+def _coin_links_map() -> dict:
+    raw = str(os.getenv("NEXUS_COIN_LINKS_JSON") or "").strip()
+    out = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    sym = str(k or "").strip().upper()
+                    url = str(v or "").strip()
+                    if sym and (url.startswith("https://") or url.startswith("http://")):
+                        out[sym] = url
+        except Exception:
+            pass
+    return out
+
+def _ensure_rating_table(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_coin_ratings (
+            wallet_address TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            rating TEXT NOT NULL,
+            rating_date TEXT NOT NULL,
+            created_ts INTEGER,
+            updated_ts INTEGER,
+            PRIMARY KEY (wallet_address, symbol, rating_date)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_user_coin_ratings_wallet_symbol ON user_coin_ratings(wallet_address, symbol)")
+
+def _coin_rating_summary(symbol: str) -> dict:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"count": 0, "ratings": {}}
+    conn = _db()
+    try:
+        _ensure_rating_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT rating, COUNT(*) AS c FROM user_coin_ratings WHERE symbol=? GROUP BY rating", (sym,))
+        ratings = {str(r["rating"]): int(r["c"] or 0) for r in cur.fetchall()}
+        return {"count": int(sum(ratings.values())), "ratings": ratings}
+    finally:
+        conn.close()
+
+@app.route("/api/ratings/coin", methods=["GET"])
+def api_rating_coin_status():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("unauthorized", 401)
+    sym = str(request.args.get("symbol") or request.args.get("coin") or "").strip().upper()
+    if not sym:
+        return err("missing symbol", 400)
+    today = _today_utc_date()
+    links = _coin_links_map()
+    conn = _db()
+    try:
+        _ensure_rating_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT rating, rating_date, updated_ts FROM user_coin_ratings WHERE wallet_address=? AND symbol=? AND rating_date=? LIMIT 1", (_norm_addr(wa), sym, today))
+        row = cur.fetchone()
+        last = None
+        if not row:
+            cur.execute("SELECT rating, rating_date, updated_ts FROM user_coin_ratings WHERE wallet_address=? AND symbol=? ORDER BY rating_date DESC, updated_ts DESC LIMIT 1", (_norm_addr(wa), sym))
+            last = cur.fetchone()
+        link = links.get(sym, "")
+        return jsonify({
+            "status": "ok", "symbol": sym, "today": today,
+            "can_vote": row is None, "already_voted_today": row is not None,
+            "user_rating_today": row["rating"] if row else None,
+            "last_user_rating": (row["rating"] if row else (last["rating"] if last else None)),
+            "last_rating_date": (row["rating_date"] if row else (last["rating_date"] if last else None)),
+            "link": link, "link_enabled": bool(link),
+            "summary": _coin_rating_summary(sym), "ts": now_ts(),
+        })
+    finally:
+        conn.close()
+
+@app.route("/api/ratings/vote", methods=["POST"])
+def api_rating_vote():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    sym = str(body.get("symbol") or body.get("coin") or "").strip().upper()
+    rating = str(body.get("rating") or "").strip().upper()
+    if not sym:
+        return err("missing symbol", 400)
+    if rating not in _ALLOWED_USER_RATINGS:
+        return err("invalid rating", 400)
+    today = _today_utc_date()
+    nowi = now_ts()
+    conn = _db()
+    try:
+        _ensure_rating_table(conn)
+        cur = conn.cursor()
+        with DB_WRITE_LOCK:
+            cur.execute("SELECT rating FROM user_coin_ratings WHERE wallet_address=? AND symbol=? AND rating_date=? LIMIT 1", (_norm_addr(wa), sym, today))
+            existing = cur.fetchone()
+            if existing:
+                return jsonify({"status": "error", "error": "already rated today", "symbol": sym, "today": today, "user_rating_today": existing["rating"], "can_vote": False, "ts": nowi}), 409
+            cur.execute("INSERT INTO user_coin_ratings(wallet_address, symbol, rating, rating_date, created_ts, updated_ts) VALUES (?,?,?,?,?,?)", (_norm_addr(wa), sym, rating, today, nowi, nowi))
+            conn.commit()
+        links = _coin_links_map()
+        link = links.get(sym, "")
+        return jsonify({"status": "ok", "symbol": sym, "rating": rating, "today": today, "can_vote": False, "already_voted_today": True, "link": link, "link_enabled": bool(link), "summary": _coin_rating_summary(sym), "ts": nowi})
+    finally:
+        conn.close()
 
 @app.route("/api/fees/state", methods=["GET"])
 def api_fees_state():
