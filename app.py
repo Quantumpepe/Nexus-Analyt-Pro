@@ -149,6 +149,14 @@ def add_cors_headers(resp):
             resp.headers["Vary"] = "Origin"
     except Exception:
         pass
+    try:
+        # Avoid mobile/desktop showing stale grid/watchlist/app-state data from browser/proxy cache.
+        if request.path.startswith(("/api/grid", "/api/watchlist", "/api/app-state")):
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+    except Exception:
+        pass
     return resp
 
 @app.before_request
@@ -2975,19 +2983,8 @@ def _require_access_open() -> tuple[str | None, dict | None, tuple | None]:
     # address from JSON/query/header and skip subscription gating.
     allow_anon = os.getenv("GRID_ALLOW_ANON", "0").strip() in ("1", "true", "True")
     if not wa and allow_anon and request.path.startswith("/api/grid/"):
-        body = request.get_json(silent=True) or {}
-        wa = _norm_addr(
-            request.headers.get("X-Wallet-Address")
-            or request.args.get("wallet")
-            or request.args.get("wallet_address")
-            or request.args.get("address")
-            or body.get("wallet")
-            or body.get("wallet_address")
-            or body.get("address")
-            or body.get("addr")
-            or ""
-        )
-        if wa:
+        wa = _pick_wallet_from_request()
+        if isinstance(wa, str) and _looks_like_evm_addr(wa):
             # Minimal access object that allows opening trades during anon grid testing.
             st = _access_defaults()
             st["source"] = "grid_anon"
@@ -4451,8 +4448,6 @@ def _cg_market_snapshot(coin_id: str):
                               if c.get("price_change_percentage_24h_in_currency") is not None
                               else _cg_change24h_from_chart(coin_id))),
             "volume24h": c.get("total_volume"),
-            "market_cap": c.get("market_cap"),
-            "marketCap": c.get("market_cap"),
             "liquidity": None,
             "source": "coingecko",
         }
@@ -4514,8 +4509,6 @@ def _cg_market_snapshots_batch(coin_ids):
                     "price": row.get("current_price"),
                     "change24": row.get("price_change_percentage_24h"),
                     "volume24": row.get("total_volume"),
-                    "market_cap": row.get("market_cap"),
-                    "marketCap": row.get("market_cap"),
                     "liquidity": None,
                     "source": "coingecko",
                 }
@@ -5753,8 +5746,6 @@ def api_watchlist_snapshot():
                             "price": p.get("price"),
                             "change24": None,
                             "volume24": None,
-                            "market_cap": None,
-                            "marketCap": None,
                             "liquidity": None,
                             "source": p.get("source") or "market-price",
                         }
@@ -5826,8 +5817,6 @@ def api_watchlist_snapshot():
                             "price": p.get("price"),
                             "change24h": None,
                             "volume24h": None,
-                            "market_cap": None,
-                            "marketCap": None,
                             "source": p.get("source") or "market-price",
                         }
                 except Exception:
@@ -5841,8 +5830,6 @@ def api_watchlist_snapshot():
                     "price": snap.get("price"),
                     "change24h": snap.get("change24") if "change24" in snap else snap.get("change24h"),
                     "volume24h": snap.get("volume24") if "volume24" in snap else snap.get("volume24h"),
-                    "market_cap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
-                    "marketCap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
                     "liquidity": None,
                     "source": snap.get("source") or "coingecko",
                 })
@@ -5855,8 +5842,6 @@ def api_watchlist_snapshot():
                     "price": None,
                     "change24h": None,
                     "volume24h": None,
-                    "market_cap": None,
-                    "marketCap": None,
                     "liquidity": None,
                     "source": "error",
                 })
@@ -6294,8 +6279,10 @@ def api_grid_start():
             return err("grid engine is temporarily disabled until real executor mode is enabled", 503)
 
         session = _sim_build(cfg)
-        # Always bind session to authenticated wallet (addr is optional)
-        session["wallet_address"] = _norm_addr(addr) if addr else _norm_addr(wa)
+        # Always bind session to the authenticated/request wallet.
+        # Do NOT use `addr` here: in the UI it can be a token/pair address or be missing/different
+        # between devices. Binding to `wa` keeps desktop and mobile on the same DB/session scope.
+        session["wallet_address"] = _norm_addr(wa)
         session["running"] = True
         session["stopped"] = False
         # If MANUAL, do not auto-create initial grid orders
@@ -6868,11 +6855,14 @@ def api_grid_orders():
     wa = _require_auth() or _pick_wallet_from_request()
 
     if not wa:
-        item_id = request.args.get("item") or request.args.get("item_id")
-        if item_id:
-            item_id = str(item_id).strip()
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+        # Do not silently return an empty order list: on mobile this looked like
+        # "not synced" while the real issue was a missing wallet header/body/query.
+        return jsonify({
+            "status": "error",
+            "error": "wallet required",
+            "hint": "Send the same wallet as X-Wallet-Address header, wallet query param, or wallet/wallet_address in JSON body.",
+            "ts": now_ts(),
+        }), 401
 
     item_id = request.args.get("item") or request.args.get("item_id")
     chain = _normalize_chain_key(request.args.get("chain") or "")
@@ -6918,7 +6908,7 @@ def api_grid_orders():
     finally:
         conn.close()
 
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
+        return jsonify({"status": "error", "error": "wallet required", "ts": now_ts()}), 401
 
     item_id = request.args.get("item") or request.args.get("item_id")
 
