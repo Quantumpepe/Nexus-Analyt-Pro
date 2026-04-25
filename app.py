@@ -2079,9 +2079,14 @@ def _pick_wallet_from_request() -> Optional[str]:
         body.get("wallet"),
         body.get("wallet_address"),
         body.get("walletAddress"),
+        body.get("addr"),
+        body.get("address"),
         request.headers.get("X-Wallet-Address"),
+        request.headers.get("x-wallet-address"),
         request.args.get("wallet"),
         request.args.get("wallet_address"),
+        request.args.get("addr"),
+        request.args.get("address"),
     ]
 
     for c in candidates:
@@ -5418,7 +5423,7 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
     index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
     ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
     if isinstance(compare, list):
-        base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:10]
+        base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:20]
     if isinstance(timeframe, str) and timeframe.strip():
         base["timeframe"] = timeframe.strip().upper()
     if index_mode is not None:
@@ -5706,9 +5711,12 @@ def api_watchlist_snapshot():
             return jsonify({"status": "ok", "results": [], "ts": int(time.time())})
 
 
-        # Fast-path cache (avoid repeated upstream calls while user clicks quickly)
+        # Fast-path cache (avoid repeated upstream calls while user clicks quickly).
+        # A forced request bypasses this cache so a second device can hydrate full price/volume/market-cap
+        # data instead of receiving an early partial/pending snapshot.
         wl_cache_key = _key_from_items(ordered)
-        fresh_cached = _cache_get_fresh(_WATCH_SNAP_CACHE, wl_cache_key, _WATCH_SNAP_TTL_SEC)
+        force_refresh = str(request.args.get("force") or request.args.get("refresh") or request.args.get("_") or "").strip() not in ("", "0", "false", "False")
+        fresh_cached = None if force_refresh else _cache_get_fresh(_WATCH_SNAP_CACHE, wl_cache_key, _WATCH_SNAP_TTL_SEC)
         if fresh_cached is not None:
             return jsonify(fresh_cached)
 
@@ -5861,8 +5869,26 @@ def api_watchlist_snapshot():
                     "source": "error",
                 })
 
-        _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, {"status": "ok", "results": results, "ts": int(time.time())})
-        return jsonify({"status": "ok", "results": results, "ts": int(time.time())})
+        resp_payload = {"status": "ok", "results": results, "ts": int(time.time())}
+        # Do not cache partial market rows that are missing price or market cap. Otherwise mobile can
+        # receive a fresh-but-incomplete cache entry after desktop added a coin.
+        cacheable = True
+        for rr in results:
+            if str(rr.get("mode") or "market").lower() == "market":
+                try:
+                    px_ok = float(rr.get("price") or 0) > 0
+                except Exception:
+                    px_ok = False
+                try:
+                    mc_ok = float((rr.get("marketCap") if rr.get("marketCap") is not None else rr.get("market_cap")) or 0) > 0
+                except Exception:
+                    mc_ok = False
+                if not (px_ok and mc_ok):
+                    cacheable = False
+                    break
+        if cacheable:
+            _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, resp_payload)
+        return jsonify(resp_payload)
     except Exception as e:
         # Never hard-fail the UI; return stale cache or an empty-but-OK payload.
         stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key)
