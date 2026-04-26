@@ -3183,6 +3183,292 @@ def api_rating_vote():
     finally:
         conn.close()
 
+
+
+# -------------------------
+# Dynamic On-Chain Signal Layer (CoinGecko -> Contract -> Moralis)
+# -------------------------
+MORALIS_API_KEY = (os.getenv("MORALIS_API_KEY") or "").strip()
+_CG_CONTRACT_CACHE: dict[str, tuple[float, dict]] = {}
+_ONCHAIN_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
+_CG_CONTRACT_TTL_SEC = int(os.getenv("NEXUS_CG_CONTRACT_TTL_SEC", str(12 * 60 * 60)))
+_ONCHAIN_SIGNAL_TTL_SEC = int(os.getenv("NEXUS_ONCHAIN_SIGNAL_TTL_SEC", "300"))
+
+_NATIVE_ONCHAIN = {
+    "BTC": {"type": "native", "chain": "btc", "address": ""},
+    "ETH": {"type": "native", "chain": "eth", "address": ""},
+    "BNB": {"type": "native", "chain": "bsc", "address": ""},
+    "SOL": {"type": "native", "chain": "sol", "address": ""},
+    "XRP": {"type": "native", "chain": "xrp", "address": ""},
+    "ADA": {"type": "native", "chain": "cardano", "address": ""},
+    "AVAX": {"type": "native", "chain": "avalanche", "address": ""},
+    "TON": {"type": "native", "chain": "ton", "address": ""},
+    "POL": {"type": "native", "chain": "polygon", "address": ""},
+    "MATIC": {"type": "native", "chain": "polygon", "address": ""},
+}
+
+_PLATFORM_TO_MORALIS_CHAIN = {
+    "ethereum": "eth",
+    "binance-smart-chain": "bsc",
+    "polygon-pos": "polygon",
+    "arbitrum-one": "arbitrum",
+    "optimistic-ethereum": "optimism",
+    "base": "base",
+    "avalanche": "avalanche",
+}
+
+_CHAIN_PRIORITY = ["ethereum", "polygon-pos", "binance-smart-chain", "base", "arbitrum-one", "optimistic-ethereum", "avalanche"]
+
+def _onchain_empty_signal(symbol: str, reason: str = "") -> dict:
+    sym = str(symbol or "").strip().upper()
+    return {
+        "symbol": sym,
+        "icon": "",
+        "label": "",
+        "score_delta": 0,
+        "signals": {
+            "whale": False,
+            "exchange_inflow": False,
+            "accumulation": False,
+            "volume_spike": False,
+            "liquidity": False,
+        },
+        "contract": None,
+        "summary": reason or "No strong on-chain signal.",
+        "source": "none",
+        "ts": now_ts(),
+    }
+
+def _cg_coin_list_with_platforms() -> list:
+    cache_key = "__coins_list_platforms__"
+    now = time.time()
+    hit = _CG_CONTRACT_CACHE.get(cache_key)
+    if hit and (now - hit[0]) < _CG_CONTRACT_TTL_SEC:
+        data = hit[1].get("data")
+        return data if isinstance(data, list) else []
+    url = f"{COINGECKO_BASE}/coins/list?include_platform=true"
+    data = _cg_get(url)
+    if not isinstance(data, list):
+        data = []
+    _CG_CONTRACT_CACHE[cache_key] = (now, {"data": data})
+    return data
+
+def _contract_from_coingecko_symbol(symbol: str) -> dict | None:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return None
+
+    if sym in _NATIVE_ONCHAIN:
+        d = dict(_NATIVE_ONCHAIN[sym])
+        d["symbol"] = sym
+        d["id"] = sym.lower()
+        return d
+
+    now = time.time()
+    hit = _CG_CONTRACT_CACHE.get(sym)
+    if hit and (now - hit[0]) < _CG_CONTRACT_TTL_SEC:
+        return hit[1] if isinstance(hit[1], dict) else None
+
+    # Optional owner overrides for edge cases, but no longer required.
+    # Format: {"LINK":{"platform":"ethereum","address":"0x...","id":"chainlink"}}
+    raw_overrides = str(os.getenv("NEXUS_TOKEN_CONTRACTS_JSON") or "").strip()
+    if raw_overrides:
+        try:
+            overrides = json.loads(raw_overrides)
+            ov = overrides.get(sym) if isinstance(overrides, dict) else None
+            if isinstance(ov, str):
+                if ov.lower() == "native":
+                    d = {"symbol": sym, "type": "native", "chain": sym.lower(), "address": "", "id": sym.lower()}
+                    _CG_CONTRACT_CACHE[sym] = (now, d)
+                    return d
+                if _looks_like_evm_addr(ov):
+                    d = {"symbol": sym, "type": "erc20", "platform": "ethereum", "chain": "eth", "address": _norm_addr(ov), "id": sym.lower()}
+                    _CG_CONTRACT_CACHE[sym] = (now, d)
+                    return d
+            elif isinstance(ov, dict):
+                addr = _norm_addr(ov.get("address") or ov.get("contract") or "")
+                platform = str(ov.get("platform") or ov.get("chain") or "ethereum").strip()
+                chain = _PLATFORM_TO_MORALIS_CHAIN.get(platform, platform)
+                d = {"symbol": sym, "type": "erc20" if addr else "native", "platform": platform, "chain": chain, "address": addr, "id": str(ov.get("id") or sym.lower())}
+                _CG_CONTRACT_CACHE[sym] = (now, d)
+                return d
+        except Exception:
+            pass
+
+    coins = _cg_coin_list_with_platforms()
+    candidates = []
+    for c in coins:
+        try:
+            if str(c.get("symbol") or "").strip().upper() != sym:
+                continue
+            platforms = c.get("platforms") or {}
+            if not isinstance(platforms, dict):
+                platforms = {}
+            candidates.append((c, platforms))
+        except Exception:
+            continue
+
+    # Prefer known platforms with a real EVM contract.
+    for platform in _CHAIN_PRIORITY:
+        for c, platforms in candidates:
+            addr = _norm_addr(platforms.get(platform) or "")
+            if _looks_like_evm_addr(addr):
+                d = {
+                    "symbol": sym,
+                    "id": str(c.get("id") or "").strip(),
+                    "name": str(c.get("name") or "").strip(),
+                    "type": "erc20",
+                    "platform": platform,
+                    "chain": _PLATFORM_TO_MORALIS_CHAIN.get(platform, platform),
+                    "address": addr,
+                }
+                _CG_CONTRACT_CACHE[sym] = (now, d)
+                return d
+
+    # Fallback: first EVM-looking contract from CoinGecko.
+    for c, platforms in candidates:
+        for platform, addr_raw in platforms.items():
+            addr = _norm_addr(addr_raw or "")
+            if _looks_like_evm_addr(addr):
+                d = {
+                    "symbol": sym,
+                    "id": str(c.get("id") or "").strip(),
+                    "name": str(c.get("name") or "").strip(),
+                    "type": "erc20",
+                    "platform": platform,
+                    "chain": _PLATFORM_TO_MORALIS_CHAIN.get(platform, platform),
+                    "address": addr,
+                }
+                _CG_CONTRACT_CACHE[sym] = (now, d)
+                return d
+
+    _CG_CONTRACT_CACHE[sym] = (now, None)
+    return None
+
+def _moralis_get(path: str, params: dict | None = None) -> dict:
+    if not MORALIS_API_KEY:
+        raise RuntimeError("missing MORALIS_API_KEY")
+    url = "https://deep-index.moralis.io/api/v2.2" + path
+    headers = {
+        "Accept": "application/json",
+        "X-API-Key": MORALIS_API_KEY,
+        "User-Agent": "NexusAnalyt/1.0",
+    }
+    r = requests.get(url, headers=headers, params=params or {}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, dict) else {"result": data}
+
+def _onchain_signal_for_symbol(symbol: str) -> dict:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return _onchain_empty_signal(sym, "Missing symbol.")
+
+    now = time.time()
+    hit = _ONCHAIN_SIGNAL_CACHE.get(sym)
+    if hit and (now - hit[0]) < _ONCHAIN_SIGNAL_TTL_SEC:
+        return hit[1]
+
+    contract = _contract_from_coingecko_symbol(sym)
+    if not contract:
+        out = _onchain_empty_signal(sym, "No CoinGecko contract mapping found yet.")
+        _ONCHAIN_SIGNAL_CACHE[sym] = (now, out)
+        return out
+
+    if contract.get("type") == "native" or not contract.get("address"):
+        out = _onchain_empty_signal(sym, "Native asset: no ERC-20 contract flow available in Phase 1.")
+        out["contract"] = contract
+        out["source"] = "coingecko"
+        _ONCHAIN_SIGNAL_CACHE[sym] = (now, out)
+        return out
+
+    score_delta = 0
+    signals = {
+        "whale": False,
+        "exchange_inflow": False,
+        "accumulation": False,
+        "volume_spike": False,
+        "liquidity": False,
+    }
+    icon = ""
+    label = ""
+    summary = "Contract mapped. No strong on-chain anomaly detected."
+    source = "coingecko"
+
+    # Best-effort Moralis Phase 1:
+    # Keep this conservative. If Moralis/rate-limit fails, return neutral instead of breaking the app.
+    try:
+        chain = str(contract.get("chain") or "eth")
+        addr = str(contract.get("address") or "").lower()
+
+        # Transfers endpoint gives a cheap activity proxy. We do NOT over-trust it.
+        transfers = _moralis_get(f"/erc20/{addr}/transfers", {"chain": chain, "limit": 25})
+        rows = transfers.get("result") or []
+        if not isinstance(rows, list):
+            rows = []
+
+        tx_count = len(rows)
+        large_count = 0
+        for tx in rows:
+            try:
+                val = float(tx.get("value_decimal") or 0)
+                if val >= 100000:
+                    large_count += 1
+            except Exception:
+                continue
+
+        if large_count >= 2:
+            signals["whale"] = True
+            score_delta += 3
+            icon = "🔥"
+            label = "Whale activity"
+            summary = f"{sym}: whale-sized transfers detected in recent token flow."
+        elif tx_count >= 20:
+            signals["volume_spike"] = True
+            score_delta += 1
+            icon = "📊"
+            label = "On-chain activity"
+            summary = f"{sym}: elevated recent on-chain transfer activity."
+
+        source = "moralis"
+    except Exception:
+        # Neutral fallback. The app should never fail just because the data provider is unavailable.
+        pass
+
+    score_delta = max(-5, min(5, int(score_delta)))
+    out = {
+        "symbol": sym,
+        "icon": icon,
+        "label": label,
+        "score_delta": score_delta,
+        "signals": signals,
+        "contract": contract,
+        "summary": summary,
+        "source": source,
+        "ts": now_ts(),
+    }
+    _ONCHAIN_SIGNAL_CACHE[sym] = (now, out)
+    return out
+
+@app.route("/api/onchain/signals", methods=["GET"])
+def api_onchain_signals():
+    raw = request.args.get("symbols") or request.args.get("symbol") or ""
+    symbols = []
+    for part in str(raw or "").split(","):
+        s = str(part or "").strip().upper()
+        if s and s not in symbols:
+            symbols.append(s)
+    symbols = symbols[:50]
+    out = {sym: _onchain_signal_for_symbol(sym) for sym in symbols}
+    return jsonify({
+        "status": "ok",
+        "signals": out,
+        "count": len(out),
+        "moralis_enabled": bool(MORALIS_API_KEY),
+        "contract_mapping": "dynamic_coingecko",
+        "ts": now_ts(),
+    })
+
 @app.route("/api/fees/state", methods=["GET"])
 def api_fees_state():
     """Return lifetime profit + fee state for the authenticated wallet."""
