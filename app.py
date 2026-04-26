@@ -3051,7 +3051,7 @@ def api_access_status():
 # -------------------------
 # Watchlist user rating + owner-controlled coin links
 # -------------------------
-_ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "B", "C", "RISK"}
+_ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "RISK"}
 
 def _today_utc_date() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
@@ -3087,17 +3087,35 @@ def _ensure_rating_table(conn):
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_coin_ratings_wallet_symbol ON user_coin_ratings(wallet_address, symbol)")
 
+_RATING_POINTS = {
+    "AAA": 98,
+    "AA": 90,
+    "A": 80,
+    "BBB": 70,
+    "BB": 60,
+    "B": 50,
+    "CCC": 40,
+    "CC": 30,
+    "C": 20,
+    "RISK": 5,
+}
+
 def _coin_rating_summary(symbol: str) -> dict:
     sym = str(symbol or "").strip().upper()
     if not sym:
-        return {"count": 0, "ratings": {}}
+        return {"count": 0, "ratings": {}, "avg_score": None}
     conn = _db()
     try:
         _ensure_rating_table(conn)
         cur = conn.cursor()
         cur.execute("SELECT rating, COUNT(*) AS c FROM user_coin_ratings WHERE symbol=? GROUP BY rating", (sym,))
         ratings = {str(r["rating"]): int(r["c"] or 0) for r in cur.fetchall()}
-        return {"count": int(sum(ratings.values())), "ratings": ratings}
+        count = int(sum(ratings.values()))
+        total = 0.0
+        for rating, c in ratings.items():
+            total += float(_RATING_POINTS.get(str(rating).upper(), 0)) * int(c or 0)
+        avg_score = round(total / count, 2) if count > 0 else None
+        return {"count": count, "ratings": ratings, "avg_score": avg_score}
     finally:
         conn.close()
 
