@@ -12,6 +12,10 @@ import sqlite3
 import threading
 DB_WRITE_LOCK = threading.RLock()
 
+# Short RPC cache to protect Alchemy quota. Grid execution polling is separate and remains fast.
+_VAULT_STATE_CACHE: dict[str, tuple[float, dict]] = {}
+_VAULT_STATE_CACHE_TTL_SEC = int(os.getenv("NEXUS_VAULT_STATE_CACHE_TTL_SEC", "8"))
+
 import secrets
 import uuid
 import requests
@@ -443,7 +447,19 @@ def api_vault_state():
         return jsonify({"status": "error", "error": "chain not enabled", "wallet": _norm_addr(wallet), "chain": chain, "ts": now_ts()})
 
     try:
-        return jsonify(_vault_state_read(wallet, chain))
+        force_refresh = str(request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes", "on")
+        cache_key = f"{_norm_addr(wallet)}|{chain}"
+        now_f = time.time()
+        if not force_refresh:
+            hit = _VAULT_STATE_CACHE.get(cache_key)
+            if hit and (now_f - hit[0]) < _VAULT_STATE_CACHE_TTL_SEC:
+                cached = dict(hit[1])
+                cached["cached"] = True
+                return jsonify(cached)
+
+        data = _vault_state_read(wallet, chain)
+        _VAULT_STATE_CACHE[cache_key] = (now_f, dict(data))
+        return jsonify(data)
     except Exception as e:
         cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
         return jsonify({
@@ -3192,7 +3208,7 @@ MORALIS_API_KEY = (os.getenv("MORALIS_API_KEY") or "").strip()
 _CG_CONTRACT_CACHE: dict[str, tuple[float, dict]] = {}
 _ONCHAIN_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
 _CG_CONTRACT_TTL_SEC = int(os.getenv("NEXUS_CG_CONTRACT_TTL_SEC", str(12 * 60 * 60)))
-_ONCHAIN_SIGNAL_TTL_SEC = int(os.getenv("NEXUS_ONCHAIN_SIGNAL_TTL_SEC", "300"))
+_ONCHAIN_SIGNAL_TTL_SEC = int(os.getenv("NEXUS_ONCHAIN_SIGNAL_TTL_SEC", "900"))
 
 _NATIVE_ONCHAIN = {
     "BTC": {"type": "native", "chain": "btc", "address": ""},
