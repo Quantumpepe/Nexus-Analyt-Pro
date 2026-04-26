@@ -8378,30 +8378,36 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     insight_length_rules = ""
     if short_insight_mode:
         insight_length_rules = """
-13) This is AI Insight, not AI Analyst.
-14) Keep the answer compact, but make the intelligent data sources visible.
+13) This is AI Insight Level 2, not AI Analyst.
+14) Keep the answer compact, but explain behavior and strategy fit, not just what the metrics are.
 15) Prefer compact UI-friendly language over report style.
 16) Do NOT dump raw stats, long metric lists, repeated timeframe blocks, or full summaries.
 17) Focus on relationships between metrics, not isolated numbers.
-18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, rating, community rating, on-chain signal, and wallet-fit means.
-19) Do NOT describe every metric one by one unless absolutely necessary.
-20) Prioritize only: setup read, structure quality, risk posture, rating/on-chain confirmation, and wallet-fit.
-21) REQUIRED when ai_signal_context is present:
+18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, rating, community rating, on-chain signal, and wallet-fit implies for likely behavior.
+19) REQUIRED Level 2 output:
+    - structure read: what the pair structure currently looks like,
+    - behavior read: range-bound, mean-reversion style, trend-bias, unstable/choppy, or low-conviction,
+    - strategy fit: grid-fit, rotation-style, wait/no-clean-setup, continuation-risk, or volatility-sensitive,
+    - risk reason: why the risk state exists.
+20) REQUIRED when ai_signal_context is present:
     - explicitly mention the visible rating / score quality for both symbols or the pair,
     - explicitly mention community votes or say that community input is still thin/limited,
     - explicitly mention on-chain confirmation; if there is no strong signal, say "on-chain is neutral/no strong signal",
-    - connect these signals to the pair structure instead of listing them mechanically.
-22) Maximum length target: about 90 to 150 words.
+    - connect these signals to behavior and strategy fit instead of listing them mechanically.
+21) Never tell the user what to do. Do not use buy/sell instructions. Describe what the structure favors or does not favor.
+22) Maximum length target: about 110 to 170 words.
 23) Never write like a long analyst report for AI Insight.
 24) Prefer phrases like:
     - "high correlation but weak spread"
     - "rating quality is stronger on one side"
     - "on-chain is neutral, so the setup is mostly price-structure driven"
     - "community input is still thin, so the user-rating layer has limited weight"
+    - "behavior looks range-bound / mean-reversion style / unstable"
+    - "strategy fit is grid-friendly / weak for grid / volatility-sensitive"
 25) Avoid generic filler like "monitor across multiple windows" unless it adds clear meaning.
 26) Do NOT list timeframe outputs like "7D neutral, 30D neutral, 90D neutral".
 27) Do NOT repeat structures already visible in the UI.
-28) Do NOT use labeled sections like "Trend Structure", "Momentum Shift", or "Risk View".
+28) Small labels are allowed only if compact: "Behavior:" and "Strategy fit:".
 29) Always merge all signals into ONE combined interpretation.
 30) Prefer one strong paragraph or up to 4 short bullets.
 31) Avoid breaking the answer into many titled parts.
@@ -8437,6 +8443,7 @@ Rules:
 15) If ai_signal_context is present, merge rating, user/community rating, on-chain signals, watchlist momentum, and pair context into one combined explanation.
 16) Treat on-chain signals as supporting evidence only, not as a standalone reason. Never overstate weak or missing signals.
 17) If on-chain data is neutral/missing for a symbol, say it is neutral only when relevant; do not present it as a failure.
+18) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
