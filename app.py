@@ -8379,31 +8379,32 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     if short_insight_mode:
         insight_length_rules = """
 13) This is AI Insight, not AI Analyst.
-14) Keep the answer VERY SHORT: max 3 short paragraphs or 4 bullet points total.
+14) Keep the answer compact, but make the intelligent data sources visible.
 15) Prefer compact UI-friendly language over report style.
 16) Do NOT dump raw stats, long metric lists, repeated timeframe blocks, or full summaries.
 17) Focus on relationships between metrics, not isolated numbers.
-18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, and wallet-fit means.
+18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, rating, community rating, on-chain signal, and wallet-fit means.
 19) Do NOT describe every metric one by one unless absolutely necessary.
-20) Prioritize only: setup read, structure quality, risk posture, and wallet-fit.
-21) If useful, keep the structure as:
-    - Short insight
-    - Setup read
-    - Wallet fit
-22) Maximum length target: about 60 to 110 words.
+20) Prioritize only: setup read, structure quality, risk posture, rating/on-chain confirmation, and wallet-fit.
+21) REQUIRED when ai_signal_context is present:
+    - explicitly mention the visible rating / score quality for both symbols or the pair,
+    - explicitly mention community votes or say that community input is still thin/limited,
+    - explicitly mention on-chain confirmation; if there is no strong signal, say "on-chain is neutral/no strong signal",
+    - connect these signals to the pair structure instead of listing them mechanically.
+22) Maximum length target: about 90 to 150 words.
 23) Never write like a long analyst report for AI Insight.
 24) Prefer phrases like:
     - "high correlation but weak spread"
-    - "strong momentum without clear divergence"
-    - "mixed structure with limited setup quality"
-    - "current wallet pattern fits / does not fit this structure"
+    - "rating quality is stronger on one side"
+    - "on-chain is neutral, so the setup is mostly price-structure driven"
+    - "community input is still thin, so the user-rating layer has limited weight"
 25) Avoid generic filler like "monitor across multiple windows" unless it adds clear meaning.
 26) Do NOT list timeframe outputs like "7D neutral, 30D neutral, 90D neutral".
 27) Do NOT repeat structures already visible in the UI.
 28) Do NOT use labeled sections like "Trend Structure", "Momentum Shift", or "Risk View".
 29) Always merge all signals into ONE combined interpretation.
-30) Prefer one short paragraph over multiple structured blocks.
-31) Avoid breaking the answer into multiple titled parts.
+30) Prefer one strong paragraph or up to 4 short bullets.
+31) Avoid breaking the answer into many titled parts.
 """
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
@@ -8457,6 +8458,8 @@ Task:
 
     if isinstance(extra_context, dict) and extra_context:
         user_payload["ai_signal_context"] = extra_context
+        user_payload["rating_community_onchain_context"] = extra_context
+        user_payload["must_use_ai_signal_context"] = True
 
     if use_order_memory:
         user_payload["order_memory"] = order_memory
