@@ -8335,7 +8335,7 @@ def _ai_kind_instructions(kind: str) -> str:
 def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_health: bool, question: str,
                        timeframe: str, index_mode: bool, raw_series_stats: dict,
                        wallet_for_insight: str | None = None, chat_memory_wallet: str | None = None,
-                       short_insight_mode: bool = False):
+                       short_insight_mode: bool = False, extra_context: dict | None = None):
     """
     Shared AI response builder.
 
@@ -8433,6 +8433,9 @@ Rules:
 12) Do not write as if the user asked for direct instructions. Describe, interpret, compare, and explain only.
 13) When several metrics point in different directions, explain the conflict briefly instead of listing everything.
 14) Prefer interpretation of structure over enumeration of values.
+15) If ai_signal_context is present, merge rating, user/community rating, on-chain signals, watchlist momentum, and pair context into one combined explanation.
+16) Treat on-chain signals as supporting evidence only, not as a standalone reason. Never overstate weak or missing signals.
+17) If on-chain data is neutral/missing for a symbol, say it is neutral only when relevant; do not present it as a failure.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -8451,6 +8454,9 @@ Task:
         "market_context": market_context,
         "short_insight_mode": bool(short_insight_mode),
     }
+
+    if isinstance(extra_context, dict) and extra_context:
+        user_payload["ai_signal_context"] = extra_context
 
     if use_order_memory:
         user_payload["order_memory"] = order_memory
@@ -8479,6 +8485,7 @@ Task:
         "has_insight_profile": bool(use_order_memory and insight_profile),
         "chat_memory_used": bool(use_chat_memory),
         "insight_memory_used": bool(use_order_memory),
+        "has_ai_signal_context": bool(isinstance(extra_context, dict) and extra_context),
     }
     return resp, None
 
@@ -8510,6 +8517,7 @@ def api_ai_run():
     timeframe = _normalize_ai_timeframe(body.get("timeframe") or "90D")
     index_mode = bool(body.get("index_mode", False))
     raw_series_stats = body.get("series_stats") or {}
+    ai_signal_context = body.get("ai_signal_context") or body.get("ai_context") or {}
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
@@ -8530,6 +8538,7 @@ def api_ai_run():
         wallet_for_insight=None,
         chat_memory_wallet=wa,
         short_insight_mode=False,
+        extra_context=ai_signal_context if isinstance(ai_signal_context, dict) else {},
     )
     if err_pair:
         msg, code = err_pair
@@ -8564,6 +8573,7 @@ def api_ai_insight():
     timeframe = _normalize_ai_timeframe(body.get("timeframe") or "90D")
     index_mode = bool(body.get("index_mode", False))
     raw_series_stats = body.get("series_stats") or {}
+    ai_signal_context = body.get("ai_signal_context") or body.get("ai_context") or {}
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
@@ -8584,6 +8594,7 @@ def api_ai_insight():
         wallet_for_insight=wa,
         chat_memory_wallet=None,
         short_insight_mode=True,
+        extra_context=ai_signal_context if isinstance(ai_signal_context, dict) else {},
     )
     if err_pair:
         msg, code = err_pair
