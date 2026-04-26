@@ -3072,20 +3072,142 @@ _ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "
 def _today_utc_date() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
-def _coin_links_map() -> dict:
-    raw = str(os.getenv("NEXUS_COIN_LINKS_JSON") or "").strip()
-    out = {}
-    if raw:
+# Automatic Coin Info links.
+# No NEXUS_COIN_LINKS_JSON required anymore.
+# Backend resolves Symbol -> CoinGecko ID -> Homepage / CoinGecko page and caches it.
+_COIN_INFO_CACHE: dict[str, tuple[float, dict]] = {}
+_COIN_INFO_TTL_SEC = int(os.getenv("NEXUS_COIN_INFO_TTL_SEC", str(24 * 60 * 60)))
+
+_COIN_INFO_ID_OVERRIDES = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "TON": "the-open-network",
+    "POL": "polygon-ecosystem-token",
+    "MATIC": "matic-network",
+    "LINK": "chainlink",
+}
+
+def _safe_http_url(url: str) -> str:
+    u = str(url or "").strip()
+    if u.startswith("https://") or u.startswith("http://"):
+        return u
+    return ""
+
+def _coin_info_coingecko_page(coin_id: str, symbol: str = "") -> str:
+    cid = str(coin_id or "").strip()
+    if cid:
+        return f"https://www.coingecko.com/en/coins/{cid}"
+    sym = str(symbol or "").strip()
+    if sym:
+        return f"https://www.coingecko.com/en/search?query={requests.utils.quote(sym)}"
+    return "https://www.coingecko.com/"
+
+def _coin_info_id_from_symbol(symbol: str) -> str:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return ""
+
+    # Known native / high-volume assets first.
+    if sym in _COIN_INFO_ID_OVERRIDES:
+        return _COIN_INFO_ID_OVERRIDES[sym]
+
+    # If the on-chain resolver already found a CoinGecko id, reuse it.
+    try:
+        contract = _contract_from_coingecko_symbol(sym)
+        cid = str((contract or {}).get("id") or "").strip()
+        if cid:
+            return cid
+    except Exception:
+        pass
+
+    # Fallback: CoinGecko list search by symbol.
+    try:
+        coins = _cg_coin_list_with_platforms()
+        candidates = []
+        for c in coins if isinstance(coins, list) else []:
+            try:
+                if str(c.get("symbol") or "").strip().upper() == sym:
+                    candidates.append(c)
+            except Exception:
+                continue
+        # Prefer an exact/simple id if possible, otherwise first candidate.
+        for c in candidates:
+            cid = str(c.get("id") or "").strip()
+            if cid and (cid.upper() == sym or cid.lower().replace("-", "") == sym.lower()):
+                return cid
+        if candidates:
+            return str(candidates[0].get("id") or "").strip()
+    except Exception:
+        pass
+
+    return ""
+
+def _coin_info_for_symbol(symbol: str) -> dict:
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"symbol": sym, "link": "", "link_enabled": False, "source": "none"}
+
+    now = time.time()
+    hit = _COIN_INFO_CACHE.get(sym)
+    if hit and (now - hit[0]) < _COIN_INFO_TTL_SEC:
+        return dict(hit[1])
+
+    coin_id = _coin_info_id_from_symbol(sym)
+    coingecko_url = _coin_info_coingecko_page(coin_id, sym)
+
+    homepage = ""
+    explorer = ""
+    name = ""
+    source = "coingecko_search"
+
+    if coin_id:
         try:
-            data = json.loads(raw)
+            detail_url = (
+                f"{COINGECKO_BASE}/coins/{requests.utils.quote(coin_id)}"
+                "?localization=false&tickers=false&market_data=false"
+                "&community_data=false&developer_data=false&sparkline=false"
+            )
+            data = _cg_get(detail_url)
             if isinstance(data, dict):
-                for k, v in data.items():
-                    sym = str(k or "").strip().upper()
-                    url = str(v or "").strip()
-                    if sym and (url.startswith("https://") or url.startswith("http://")):
-                        out[sym] = url
+                name = str(data.get("name") or "").strip()
+                links = data.get("links") or {}
+                if isinstance(links, dict):
+                    homes = links.get("homepage") or []
+                    if isinstance(homes, list):
+                        for u in homes:
+                            homepage = _safe_http_url(u)
+                            if homepage:
+                                break
+                    explorers = links.get("blockchain_site") or []
+                    if isinstance(explorers, list):
+                        for u in explorers:
+                            explorer = _safe_http_url(u)
+                            if explorer:
+                                break
+                source = "coingecko_detail"
         except Exception:
             pass
+
+    link = homepage or coingecko_url
+    out = {
+        "symbol": sym,
+        "coin_id": coin_id,
+        "name": name,
+        "link": link,
+        "link_enabled": bool(link),
+        "homepage": homepage,
+        "coingecko_url": coingecko_url,
+        "explorer": explorer,
+        "source": source,
+        "cached_for_sec": _COIN_INFO_TTL_SEC,
+        "ts": now_ts(),
+    }
+    _COIN_INFO_CACHE[sym] = (now, dict(out))
     return out
 
 def _ensure_rating_table(conn):
@@ -3144,7 +3266,6 @@ def api_rating_coin_status():
     if not sym:
         return err("missing symbol", 400)
     today = _today_utc_date()
-    links = _coin_links_map()
     conn = _db()
     try:
         _ensure_rating_table(conn)
@@ -3155,18 +3276,29 @@ def api_rating_coin_status():
         if not row:
             cur.execute("SELECT rating, rating_date, updated_ts FROM user_coin_ratings WHERE wallet_address=? AND symbol=? ORDER BY rating_date DESC, updated_ts DESC LIMIT 1", (_norm_addr(wa), sym))
             last = cur.fetchone()
-        link = links.get(sym, "")
+        coin_info = _coin_info_for_symbol(sym)
         return jsonify({
             "status": "ok", "symbol": sym, "today": today,
             "can_vote": row is None, "already_voted_today": row is not None,
             "user_rating_today": row["rating"] if row else None,
             "last_user_rating": (row["rating"] if row else (last["rating"] if last else None)),
             "last_rating_date": (row["rating_date"] if row else (last["rating_date"] if last else None)),
-            "link": link, "link_enabled": bool(link),
+            "link": coin_info.get("link") or "",
+            "link_enabled": bool(coin_info.get("link_enabled")),
+            "coin_info": coin_info,
             "summary": _coin_rating_summary(sym), "ts": now_ts(),
         })
     finally:
         conn.close()
+
+@app.route("/api/coin/info", methods=["GET"])
+def api_coin_info():
+    sym = str(request.args.get("symbol") or request.args.get("coin") or "").strip().upper()
+    if not sym:
+        return err("missing symbol", 400)
+    info = _coin_info_for_symbol(sym)
+    return jsonify({"status": "ok", **info})
+
 
 @app.route("/api/ratings/vote", methods=["POST"])
 def api_rating_vote():
@@ -3193,9 +3325,20 @@ def api_rating_vote():
                 return jsonify({"status": "error", "error": "already rated today", "symbol": sym, "today": today, "user_rating_today": existing["rating"], "can_vote": False, "ts": nowi}), 409
             cur.execute("INSERT INTO user_coin_ratings(wallet_address, symbol, rating, rating_date, created_ts, updated_ts) VALUES (?,?,?,?,?,?)", (_norm_addr(wa), sym, rating, today, nowi, nowi))
             conn.commit()
-        links = _coin_links_map()
-        link = links.get(sym, "")
-        return jsonify({"status": "ok", "symbol": sym, "rating": rating, "today": today, "can_vote": False, "already_voted_today": True, "link": link, "link_enabled": bool(link), "summary": _coin_rating_summary(sym), "ts": nowi})
+        coin_info = _coin_info_for_symbol(sym)
+        return jsonify({
+            "status": "ok",
+            "symbol": sym,
+            "rating": rating,
+            "today": today,
+            "can_vote": False,
+            "already_voted_today": True,
+            "link": coin_info.get("link") or "",
+            "link_enabled": bool(coin_info.get("link_enabled")),
+            "coin_info": coin_info,
+            "summary": _coin_rating_summary(sym),
+            "ts": nowi,
+        })
     finally:
         conn.close()
 
