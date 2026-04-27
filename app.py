@@ -608,25 +608,7 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
     #   BNB -> bnbBalance(address)
     #   ETH -> ethBalance(address)
     balance_hex = _safe_call(balance_sel + _addr_to_32(wa), "0x0")
-    wallet_accounting_wei = _hex_to_int(balance_hex or "0x0")
-    balance_wei = wallet_accounting_wei
-
-    # Also read the real native balance held by the Vault contract.
-    # Some older/dev Vault deployments can hold POL in the contract while the
-    # wallet-bound accounting selector still returns 0. In that case the UI
-    # must not show "No vault liquidity" while the contract actually has funds.
-    try:
-        contract_native_hex = _rpc_call(cid, "eth_getBalance", [vault_addr, "latest"])
-        contract_native_wei = _hex_to_int(contract_native_hex or "0x0")
-    except Exception:
-        contract_native_hex = "0x0"
-        contract_native_wei = 0
-
-    balance_source = "wallet_accounting"
-    use_contract_fallback = str(os.getenv("NEXUS_VAULT_FALLBACK_CONTRACT_BALANCE", "1")).strip().lower() in ("1", "true", "yes", "on")
-    if balance_wei <= 0 and contract_native_wei > 0 and use_contract_fallback:
-        balance_wei = contract_native_wei
-        balance_source = "contract_native_fallback"
+    balance_wei = _hex_to_int(balance_hex or "0x0")
 
     in_cycle_hex = _safe_call(in_cycle_sel + _addr_to_32(wa), "0x0")
 
@@ -665,11 +647,6 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         "operator": operator_addr if _looks_like_evm_addr(operator_addr) else "",
         "vault_balance_wei": str(balance_wei),
         "vault_balance": float(balance_wei) / 1e18,
-        "vault_balance_source": balance_source,
-        "wallet_accounting_balance_wei": str(wallet_accounting_wei),
-        "wallet_accounting_balance": float(wallet_accounting_wei) / 1e18,
-        "vault_contract_native_balance_wei": str(contract_native_wei),
-        "vault_contract_native_balance": float(contract_native_wei) / 1e18,
         "inCycle": _hex_to_bool(in_cycle_hex),
         "heldToken": held_token_addr,
         "heldTokenBalWei": str(held_bal_raw),
@@ -753,77 +730,6 @@ def api_wallet_native_balances():
         "balances": out,
         "ts": now_ts(),
     })
-
-
-@app.route("/api/debug/rpc-balance", methods=["GET"])
-def api_debug_rpc_balance():
-    wallet = (
-        request.args.get("wallet")
-        or request.args.get("wallet_address")
-        or request.headers.get("X-Wallet-Address")
-        or ""
-    )
-    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("chain_key") or "POL")
-    wa = _norm_addr(wallet)
-    cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
-
-    out = {
-        "status": "ok",
-        "wallet": wa,
-        "chain": chain,
-        "chainId": cid,
-        "rpc_configured": bool(_rpc_url_for_chain(cid)),
-        "enabled_chains": list(_ENABLED_EVM_CHAINS),
-        "enabled_chain_ids": sorted(list(_ENABLED_CHAIN_IDS)),
-        "ts": now_ts(),
-    }
-
-    rpc_url = _rpc_url_for_chain(cid)
-    out["rpc_url_preview"] = (rpc_url[:42] + "...") if rpc_url else ""
-
-    if not _looks_like_evm_addr(wa):
-        out.update({"status": "error", "error": "invalid wallet"})
-        return jsonify(out), 400
-
-    try:
-        raw = _rpc_call(cid, "eth_getBalance", [wa, "latest"])
-        wei = _hex_to_int(raw or "0x0")
-        out["wallet_native_raw"] = raw
-        out["wallet_native_wei"] = str(wei)
-        out["wallet_native"] = float(wei) / 1e18
-    except Exception as e:
-        out["wallet_native_error"] = str(e)
-
-    vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
-    out["vault"] = vault_addr
-    out["vault_configured"] = bool(vault_addr)
-    if _looks_like_evm_addr(vault_addr):
-        try:
-            vraw = _rpc_call(cid, "eth_getBalance", [vault_addr, "latest"])
-            vwei = _hex_to_int(vraw or "0x0")
-            out["vault_contract_native_raw"] = vraw
-            out["vault_contract_native_wei"] = str(vwei)
-            out["vault_contract_native"] = float(vwei) / 1e18
-        except Exception as e:
-            out["vault_contract_native_error"] = str(e)
-
-        try:
-            selector = _vault_balance_selector_for_chain(chain)
-            araw = _eth_call(cid, vault_addr, selector + _addr_to_32(wa))
-            awei = _hex_to_int(araw or "0x0")
-            out["vault_wallet_accounting_selector"] = selector
-            out["vault_wallet_accounting_raw"] = araw
-            out["vault_wallet_accounting_wei"] = str(awei)
-            out["vault_wallet_accounting"] = float(awei) / 1e18
-        except Exception as e:
-            out["vault_wallet_accounting_error"] = str(e)
-
-        try:
-            out["vault_state"] = _vault_state_read(wa, chain)
-        except Exception as e:
-            out["vault_state_error"] = str(e)
-
-    return jsonify(out)
 
 
 @app.route("/api/wallet/token-balances", methods=["POST"])
@@ -9080,7 +8986,12 @@ Rules:
    - OVEREXTENDED = price far above MA20; describe heat/pullback risk without sounding certain.
    - NORMAL = no strong OE/RVOL anomaly.
 19) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
-20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
+20) If ai_signal_context.grid_trader_context is present, use it as Grid Trader / vault fit context:
+   - mention vault liquidity, allocated exposure, estimated impact and execution risk when relevant,
+   - explain whether the setup looks liquid, underfunded, crowded, or execution-risky,
+   - connect it to strategy fit such as grid-fit, wait/no-clean-setup, route/slippage sensitivity, or low-liquidity caution,
+   - never tell the user to place, stop, buy, sell, or move an order.
+21) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -9134,6 +9045,7 @@ Task:
         "insight_memory_used": bool(use_order_memory),
         "has_ai_signal_context": bool(isinstance(extra_context, dict) and extra_context),
         "has_market_condition_context": any(bool((c or {}).get("market_condition")) for c in (market_context.get("coins") or [])),
+        "has_grid_trader_context": bool(isinstance(extra_context, dict) and extra_context.get("grid_trader_context")),
     }
     return resp, None
 
