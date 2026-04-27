@@ -8603,6 +8603,31 @@ def _build_ai_market_context(symbols: list[str], profile: str = "conservative", 
             except Exception:
                 pass
 
+        # Market Condition (Overextension + RVOL)
+        # This feeds AI Insight / AI Analyst as behavior context:
+        #   OE high + RVOL weak  -> weak/fake move risk
+        #   OE high + RVOL strong -> volume-backed breakout
+        #   OE low + RVOL strong  -> early accumulation / volume build
+        try:
+            mc = _market_condition_for_coin(cid or sym, days=20)
+            item["market_condition"] = {
+                "state": mc.get("state"),
+                "label": mc.get("label"),
+                "level": mc.get("level"),
+                "confidence": mc.get("confidence"),
+                "oe_pct": mc.get("oe_pct"),
+                "rvol": mc.get("rvol"),
+                "score_delta": mc.get("score_delta"),
+                "interpretation": (mc.get("ai_context") or {}).get("interpretation"),
+            }
+        except Exception:
+            item["market_condition"] = {
+                "state": "UNAVAILABLE",
+                "label": "Market condition unavailable",
+                "level": "unknown",
+                "confidence": "LOW",
+            }
+
         coins.append(item)
 
     return {
@@ -8784,6 +8809,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     - explicitly mention the visible rating / score quality for both symbols or the pair,
     - explicitly mention community votes or say that community input is still thin/limited,
     - explicitly mention on-chain confirmation; if there is no strong signal, say "on-chain is neutral/no strong signal",
+    - explicitly mention Market Condition when available: Overextension (OE) + Relative Volume (RVOL), and whether it suggests weak/fake move risk, volume-backed breakout, early accumulation, overextension, or normal conditions,
     - connect these signals to behavior and strategy fit instead of listing them mechanically.
 21) Never tell the user what to do. Do not use buy/sell instructions. Describe what the structure favors or does not favor.
 22) Maximum length target: about 110 to 170 words.
@@ -8834,7 +8860,14 @@ Rules:
 15) If ai_signal_context is present, merge rating, user/community rating, on-chain signals, watchlist momentum, and pair context into one combined explanation.
 16) Treat on-chain signals as supporting evidence only, not as a standalone reason. Never overstate weak or missing signals.
 17) If on-chain data is neutral/missing for a symbol, say it is neutral only when relevant; do not present it as a failure.
-18) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
+18) Market Condition is based on Overextension (distance from MA20) plus Relative Volume (RVOL). Use it as movement-quality context:
+   - FAKE_MOVE = price extended but volume weak; describe possible unstable/weak move risk.
+   - REAL_BREAKOUT = price extended but volume confirms; describe stronger momentum quality.
+   - EARLY_ACCUMULATION = volume is high while price is not yet extended; describe early volume build.
+   - OVEREXTENDED = price far above MA20; describe heat/pullback risk without sounding certain.
+   - NORMAL = no strong OE/RVOL anomaly.
+19) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
+20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -8887,6 +8920,7 @@ Task:
         "chat_memory_used": bool(use_chat_memory),
         "insight_memory_used": bool(use_order_memory),
         "has_ai_signal_context": bool(isinstance(extra_context, dict) and extra_context),
+        "has_market_condition_context": any(bool((c or {}).get("market_condition")) for c in (market_context.get("coins") or [])),
     }
     return resp, None
 
