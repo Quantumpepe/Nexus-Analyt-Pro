@@ -3308,7 +3308,6 @@ def api_rating_vote():
     body = request.get_json(silent=True) or {}
     sym = str(body.get("symbol") or body.get("coin") or "").strip().upper()
     rating = str(body.get("rating") or "").strip().upper().replace("-", "_")
-            rating = f"STAR_{rating}"
     if not sym:
         return err("missing symbol", 400)
     if rating not in _ALLOWED_USER_RATINGS:
