@@ -655,6 +655,125 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         "ts": now_ts(),
     }
 
+def _erc20_balance_of_rpc(chain_key: str, token_address: str, wallet_address: str) -> dict:
+    ch = _normalize_chain_key(chain_key)
+    cid = int(_CHAIN_ID_BY_KEY.get(ch, 0) or 0)
+    token = str(token_address or "").strip().lower()
+    wallet = _norm_addr(wallet_address)
+    if cid <= 0:
+        raise RuntimeError("unsupported chain")
+    if not _looks_like_evm_addr(token):
+        raise RuntimeError("invalid token address")
+    if not _looks_like_evm_addr(wallet):
+        raise RuntimeError("invalid wallet")
+
+    # ERC20 balanceOf(address) selector = 0x70a08231
+    data = "0x70a08231" + wallet.replace("0x", "").rjust(64, "0")
+    raw = _rpc_call(cid, "eth_call", [{"to": token, "data": data}, "latest"])
+    wei = _hex_to_int(raw or "0x0")
+    return {
+        "chain": ch,
+        "chainId": cid,
+        "address": token,
+        "balance_raw": str(wei),
+        "status": "ok",
+    }
+
+
+@app.route("/api/wallet/native-balances", methods=["GET"])
+def api_wallet_native_balances():
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet)
+    if not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    chains_raw = str(request.args.get("chains") or ",".join(_ENABLED_EVM_CHAINS or ["POL"])).strip()
+    chains = [_normalize_chain_key(x) for x in chains_raw.split(",") if str(x or "").strip()]
+    if not chains:
+        chains = list(_ENABLED_EVM_CHAINS or ["POL"])
+
+    out = {}
+    for ch in chains:
+        cid = int(_CHAIN_ID_BY_KEY.get(ch, 0) or 0)
+        if cid <= 0:
+            continue
+        try:
+            raw = _rpc_call(cid, "eth_getBalance", [wa, "latest"])
+            wei = _hex_to_int(raw or "0x0")
+            out[ch] = {
+                "chain": ch,
+                "chainId": cid,
+                "native": float(wei) / 1e18,
+                "native_wei": str(wei),
+                "rpc_configured": bool(_rpc_url_for_chain(cid)),
+                "status": "ok",
+            }
+        except Exception as e:
+            out[ch] = {
+                "chain": ch,
+                "chainId": cid,
+                "native": None,
+                "native_wei": None,
+                "rpc_configured": bool(_rpc_url_for_chain(cid)),
+                "status": "error",
+                "error": str(e),
+            }
+
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "balances": out,
+        "ts": now_ts(),
+    })
+
+
+@app.route("/api/wallet/token-balances", methods=["POST"])
+def api_wallet_token_balances():
+    body = request.get_json(silent=True) or {}
+    wallet = (
+        body.get("wallet")
+        or body.get("wallet_address")
+        or request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet)
+    if not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    chain = _normalize_chain_key(body.get("chain") or request.args.get("chain") or "POL")
+    tokens = body.get("tokens") or []
+    if not isinstance(tokens, list):
+        return jsonify({"status": "error", "error": "tokens must be a list", "ts": now_ts()}), 400
+
+    out = {}
+    for t in tokens[:80]:
+        try:
+            addr = str((t or {}).get("address") or t or "").strip().lower()
+            if not _looks_like_evm_addr(addr):
+                continue
+            out[addr] = _erc20_balance_of_rpc(chain, addr, wa)
+        except Exception as e:
+            out[str((t or {}).get("address") or t or "").strip().lower()] = {
+                "status": "error",
+                "error": str(e),
+            }
+
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "chain": chain,
+        "balances": out,
+        "ts": now_ts(),
+    })
+
+
 @app.route("/api/vault/state", methods=["GET"])
 def api_vault_state():
     wallet = (
