@@ -9075,14 +9075,21 @@ Rules:
 15) If ai_signal_context is present, merge rating, user/community rating, on-chain signals, watchlist momentum, and pair context into one combined explanation.
 16) Treat on-chain signals as supporting evidence only, not as a standalone reason. Never overstate weak or missing signals.
 17) If on-chain data is neutral/missing for a symbol, say it is neutral only when relevant; do not present it as a failure.
-18) Market Condition is based on Overextension (distance from MA20) plus Relative Volume (RVOL). Use it as movement-quality context:
-   - FAKE_MOVE = price extended but volume weak; describe possible unstable/weak move risk.
-   - REAL_BREAKOUT = price extended but volume confirms; describe stronger momentum quality.
-   - EARLY_ACCUMULATION = volume is high while price is not yet extended; describe early volume build.
-   - OVEREXTENDED = price far above MA20; describe heat/pullback risk without sounding certain.
-   - NORMAL = no strong OE/RVOL anomaly.
-19) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
-20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
+18) Market Condition is based on Overextension (distance from MA20) plus Relative Volume (RVOL). Use it as movement-quality context, not as a raw metric list.
+   Interpretation rules:
+   - High overextension + low RVOL -> weak move / fake breakout risk / low conviction.
+   - High overextension + high RVOL -> volume-backed momentum / stronger breakout quality.
+   - Low overextension + rising or high RVOL -> early accumulation / fresh volume build.
+   - High price extension + declining or weak volume -> possible distribution / pullback risk.
+   State mapping:
+   - FAKE_MOVE = price extended but volume weak; explain unstable/weak-move risk and low participation.
+   - REAL_BREAKOUT = price extended but volume confirms; explain stronger momentum quality.
+   - EARLY_ACCUMULATION = volume is high while price is not yet extended; explain early volume build.
+   - OVEREXTENDED = price far above MA20; explain heat/pullback risk without sounding certain.
+   - NORMAL = no strong OE/RVOL anomaly; say the movement quality is not showing a major anomaly.
+19) Do NOT just describe OE/RVOL values. Always translate Market Condition into what it implies about market behavior, participation, conviction, and fake-vs-real move quality.
+20) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
+21) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
