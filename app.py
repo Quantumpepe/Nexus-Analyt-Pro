@@ -8671,6 +8671,65 @@ def api_ai_insight_profile_refresh():
 # AI Run (backend-native context builder)
 # -------------------------
 
+
+def _enforce_ai_insight_structure(text: str) -> str:
+    """Guarantee AI Insight Level 2 output has separate Edge / Risk / Setup bias lines.
+
+    This is intentionally light-touch:
+    - only used for short_insight_mode responses
+    - does not change access, grid, market data, or AI scoring logic
+    - extracts existing labels when the model puts them inline
+    - fills safe neutral defaults only when a required line is missing
+    """
+    s = str(text or "").strip()
+    if not s:
+        return s
+
+    def _extract(label: str) -> str:
+        # Capture content after "Label:" until the next required label or end of text.
+        pattern = rf"(?is)\b{re.escape(label)}\s*:\s*(.*?)(?=\bEdge\s*:|\bRisk\s*:|\bSetup bias\s*:|$)"
+        m = re.search(pattern, s)
+        if not m:
+            return ""
+        val = re.sub(r"\s+", " ", str(m.group(1) or "")).strip(" -:\n\t")
+        return val
+
+    edge = _extract("Edge")
+    risk = _extract("Risk")
+    setup = _extract("Setup bias")
+
+    # Keep the explanatory paragraph separate from the forced label lines.
+    label_positions = [
+        pos for pos in [
+            s.lower().find("edge:"),
+            s.lower().find("risk:"),
+            s.lower().find("setup bias:"),
+        ] if pos >= 0
+    ]
+    paragraph = s[:min(label_positions)].strip() if label_positions else s.strip()
+
+    # Remove accidental trailing label fragments from the paragraph.
+    paragraph = re.sub(r"(?is)\b(edge|risk|setup bias)\s*:.*$", "", paragraph).strip()
+
+    if not edge:
+        edge = "structure favors no clean edge until confirmation improves"
+    if not risk:
+        risk = "weak or missing confirmation can invalidate the setup"
+    if not setup:
+        setup = "no-clean-setup"
+
+    # Prevent duplicated labels inside extracted values.
+    def _clean_value(v: str) -> str:
+        v = re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(v or "")).strip()
+        return v or "not clearly defined"
+
+    edge = _clean_value(edge)
+    risk = _clean_value(risk)
+    setup = _clean_value(setup)
+
+    return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
+
+
 def _ai_call_openai(
     sys_prompt: str,
     user_payload: dict,
@@ -8727,6 +8786,12 @@ def _ai_call_openai(
         if not ans:
             # Fallback: try legacy shape
             ans = (data.get("output_text") or "").strip()
+
+        if short_insight_mode:
+            try:
+                ans = _enforce_ai_insight_structure(ans)
+            except Exception:
+                pass
 
         if wallet_address:
             try:
