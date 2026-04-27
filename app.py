@@ -3067,7 +3067,7 @@ def api_access_status():
 # -------------------------
 # Watchlist user rating + owner-controlled coin links
 # -------------------------
-_ALLOWED_USER_RATINGS = {"STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "RISK"}
+_ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "RISK"}
 
 def _today_utc_date() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
@@ -3226,11 +3226,6 @@ def _ensure_rating_table(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_coin_ratings_wallet_symbol ON user_coin_ratings(wallet_address, symbol)")
 
 _RATING_POINTS = {
-    "STAR_5": 100,
-    "STAR_4": 80,
-    "STAR_3": 60,
-    "STAR_2": 40,
-    "STAR_1": 20,
     "AAA": 98,
     "AA": 90,
     "A": 80,
@@ -3313,8 +3308,7 @@ def api_rating_vote():
     body = request.get_json(silent=True) or {}
     sym = str(body.get("symbol") or body.get("coin") or "").strip().upper()
     rating = str(body.get("rating") or "").strip().upper().replace("-", "_")
-    if rating in {"1", "2", "3", "4", "5"}:
-        rating = f"STAR_{rating}"
+            rating = f"STAR_{rating}"
     if not sym:
         return err("missing symbol", 400)
     if rating not in _ALLOWED_USER_RATINGS:
