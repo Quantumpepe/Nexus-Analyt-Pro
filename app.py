@@ -226,6 +226,12 @@ COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL") or (
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
 _CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "20"))
 
+# -------------------------
+# Market Condition (Overextension + RVOL)
+# -------------------------
+_MARKET_CONDITION_CACHE: dict[str, tuple[float, dict]] = {}
+_MARKET_CONDITION_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_TTL_SEC", "900"))
+
 def _cg_get(url: str) -> dict:
     now = time.time()
     hit = _CG_CACHE.get(url)
@@ -239,6 +245,228 @@ def _cg_get(url: str) -> dict:
     data = r.json()
     _CG_CACHE[url] = (now, data)
     return data
+
+
+def _market_condition_coin_id(raw: str) -> str:
+    """Resolve symbol/CoinGecko id into the best CoinGecko id for market_chart."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+
+    sym = s.upper()
+    overrides = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+        "BNB": "binancecoin",
+        "SOL": "solana",
+        "XRP": "ripple",
+        "ADA": "cardano",
+        "AVAX": "avalanche-2",
+        "TON": "the-open-network",
+        "POL": "polygon-ecosystem-token",
+        "MATIC": "matic-network",
+        "LINK": "chainlink",
+    }
+    if sym in overrides:
+        return overrides[sym]
+
+    # Reuse the later Coin Info resolver if it exists at runtime.
+    try:
+        cid = _coin_info_id_from_symbol(sym)
+        if cid:
+            return str(cid)
+    except Exception:
+        pass
+
+    return s.lower()
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return float(default)
+
+
+def _classify_market_condition(oe_pct: float, rvol: float) -> dict:
+    """Classify OE + RVOL into an AI-ready market condition state."""
+    oe = _safe_float(oe_pct)
+    rv = _safe_float(rvol)
+
+    if oe > 40 and rv < 1.2:
+        return {
+            "state": "FAKE_MOVE",
+            "label": "Weak / fake move risk",
+            "level": "warning",
+            "confidence": "HIGH",
+            "score_delta": -15,
+            "insight": "Price is strongly above its 20-day average, but volume does not confirm the move. Reversal risk is elevated.",
+        }
+
+    if oe > 40 and rv >= 1.5:
+        return {
+            "state": "REAL_BREAKOUT",
+            "label": "Volume-backed breakout",
+            "level": "strong",
+            "confidence": "HIGH",
+            "score_delta": 10,
+            "insight": "Price is extended, but strong relative volume confirms real momentum. Trend continuation is more likely than in a weak-volume pump.",
+        }
+
+    if oe < 10 and rv >= 2.0:
+        return {
+            "state": "EARLY_ACCUMULATION",
+            "label": "Early accumulation / volume build",
+            "level": "positive",
+            "confidence": "MEDIUM",
+            "score_delta": 8,
+            "insight": "Relative volume is high while price is not yet heavily extended. This can indicate early accumulation or a fresh move forming.",
+        }
+
+    if oe > 60 and rv < 1.5:
+        return {
+            "state": "OVEREXTENDED",
+            "label": "Overextended",
+            "level": "caution",
+            "confidence": "MEDIUM",
+            "score_delta": -8,
+            "insight": "Price is far above its 20-day average. Without stronger volume support, pullback risk is increasing.",
+        }
+
+    return {
+        "state": "NORMAL",
+        "label": "Normal trend range",
+        "level": "neutral",
+        "confidence": "LOW",
+        "score_delta": 0,
+        "insight": "No strong overextension or relative-volume anomaly detected.",
+    }
+
+
+def _market_condition_for_coin(coin_or_symbol: str, days: int = 20) -> dict:
+    """Calculate Overextension (OE) and Relative Volume (RVOL) from CoinGecko market_chart."""
+    coin_id = _market_condition_coin_id(coin_or_symbol)
+    if not coin_id:
+        raise RuntimeError("missing coin id or symbol")
+
+    days_i = max(20, min(90, int(days or 20)))
+    cache_key = f"{coin_id}|{days_i}"
+    now_f = time.time()
+    hit = _MARKET_CONDITION_CACHE.get(cache_key)
+    if hit and (now_f - hit[0]) < _MARKET_CONDITION_TTL_SEC:
+        cached = dict(hit[1])
+        cached["cached"] = True
+        return cached
+
+    url = f"{COINGECKO_BASE}/coins/{requests.utils.quote(coin_id)}/market_chart?vs_currency=usd&days={days_i}&interval=daily"
+    data = _cg_get(url)
+
+    prices_raw = data.get("prices") if isinstance(data, dict) else []
+    volumes_raw = data.get("total_volumes") if isinstance(data, dict) else []
+    if not isinstance(prices_raw, list) or not isinstance(volumes_raw, list):
+        raise RuntimeError("invalid CoinGecko market_chart response")
+
+    prices = [_safe_float(p[1]) for p in prices_raw if isinstance(p, list) and len(p) >= 2 and _safe_float(p[1]) > 0]
+    volumes = [_safe_float(v[1]) for v in volumes_raw if isinstance(v, list) and len(v) >= 2 and _safe_float(v[1]) >= 0]
+
+    # CoinGecko daily market_chart can return 21 points for 20 days. Use the latest 20 valid points.
+    prices_20 = prices[-20:]
+    volumes_20 = volumes[-20:]
+
+    if len(prices_20) < 10:
+        raise RuntimeError("not enough price history for market condition")
+    if len(volumes_20) < 10:
+        raise RuntimeError("not enough volume history for market condition")
+
+    current_price = prices_20[-1]
+    current_volume = volumes_20[-1]
+    ma20 = sum(prices_20) / len(prices_20)
+    avg_volume_20d = sum(volumes_20) / len(volumes_20)
+
+    oe_pct = ((current_price - ma20) / ma20) * 100 if ma20 > 0 else 0.0
+    rvol = current_volume / avg_volume_20d if avg_volume_20d > 0 else 0.0
+
+    classification = _classify_market_condition(oe_pct, rvol)
+
+    out = {
+        "status": "ok",
+        "coin_id": coin_id,
+        "input": str(coin_or_symbol or "").strip(),
+        "days": days_i,
+        "current_price": round(current_price, 10),
+        "ma20": round(ma20, 10),
+        "current_volume": round(current_volume, 2),
+        "avg_volume_20d": round(avg_volume_20d, 2),
+        "oe_pct": round(oe_pct, 2),
+        "rvol": round(rvol, 2),
+        "condition": classification,
+        "state": classification.get("state"),
+        "label": classification.get("label"),
+        "level": classification.get("level"),
+        "confidence": classification.get("confidence"),
+        "score_delta": classification.get("score_delta", 0),
+        "ai_context": {
+            "market_condition_state": classification.get("state"),
+            "market_condition_label": classification.get("label"),
+            "overextension_pct": round(oe_pct, 2),
+            "relative_volume": round(rvol, 2),
+            "interpretation": classification.get("insight"),
+        },
+        "cached": False,
+        "ts": now_ts(),
+    }
+
+    _MARKET_CONDITION_CACHE[cache_key] = (now_f, dict(out))
+    return out
+
+
+@app.route("/api/market-condition", methods=["GET"])
+def api_market_condition():
+    coin = (
+        request.args.get("coin_id")
+        or request.args.get("id")
+        or request.args.get("symbol")
+        or request.args.get("coin")
+        or ""
+    )
+    if not str(coin or "").strip():
+        return err("missing coin_id or symbol", 400)
+
+    try:
+        days = int(request.args.get("days") or 20)
+    except Exception:
+        days = 20
+
+    try:
+        return jsonify(_market_condition_for_coin(coin, days=days))
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "input": str(coin or "").strip(),
+            "ts": now_ts(),
+        }), 502
+
+
+@app.route("/api/market-condition/<coin_id>", methods=["GET"])
+def api_market_condition_by_id(coin_id):
+    try:
+        days = int(request.args.get("days") or 20)
+    except Exception:
+        days = 20
+
+    try:
+        return jsonify(_market_condition_for_coin(coin_id, days=days))
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "input": str(coin_id or "").strip(),
+            "ts": now_ts(),
+        }), 502
 
 
 @app.route("/api/contracts", methods=["GET"])
