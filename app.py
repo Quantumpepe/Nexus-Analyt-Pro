@@ -8732,6 +8732,7 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
 
 
 
+
 def _ai_engine_v2_from_context(
     sym_norm: list[str],
     market_context: dict,
@@ -8740,11 +8741,11 @@ def _ai_engine_v2_from_context(
     insight_profile: dict | None = None,
     extra_context: dict | None = None,
 ) -> dict:
-    """Point 5: deterministic AI Insight Engine layer.
+    """AI Engine V2 + Exit Risk + Contradiction Detection.
 
-    This creates a compact decision-support context before the LLM writes text.
-    It does not give trade instructions. It only classifies structure, behavior,
-    risk, confidence, and setup bias from already provided app data.
+    Deterministic decision-support layer used by AI Insight.
+    No trading instructions; it only classifies structure, risk, confidence,
+    contradictions, and pre-exit warning from existing app data.
     """
     extra_context = extra_context if isinstance(extra_context, dict) else {}
     coins = extra_context.get("coins") if isinstance(extra_context.get("coins"), list) else []
@@ -8801,7 +8802,6 @@ def _ai_engine_v2_from_context(
         elif score_b >= score_a + 8 or ch_b >= ch_a + 2:
             rel_strength = b
 
-    mc_states = []
     mc_notes = []
     weak_participation = False
     volume_backed = False
@@ -8814,9 +8814,8 @@ def _ai_engine_v2_from_context(
         oe = mc.get("oe_pct")
         rv = mc.get("rvol")
         if state:
-            mc_states.append(state)
             mc_notes.append(f"{c.get('symbol')}: {label} OE={oe} RVOL={rv}")
-        if state in ("FAKE_MOVE",) or ("LOW" in str(mc.get("interpretation") or "").upper() and "VOLUME" in str(mc.get("interpretation") or "").upper()):
+        if state in ("FAKE_MOVE",):
             weak_participation = True
         if state in ("REAL_BREAKOUT",):
             volume_backed = True
@@ -8840,17 +8839,24 @@ def _ai_engine_v2_from_context(
 
     drivers = []
     warnings = []
+    contradictions = []
+    exit_reasons = []
     tags = []
+
+    price_moving = abs(ch_a) >= 2 or abs(ch_b) >= 2
+    divergent_24h = bool(a and b and abs(ch_a - ch_b) >= 3)
 
     if corr >= 0.8:
         drivers.append("high pair linkage")
         tags.append("high_correlation")
     elif corr < 0.45 and corr != 0:
         warnings.append("weak pair linkage can cause unstable divergence")
+        contradictions.append("pair relationship is weak, so spread signals are less reliable")
         tags.append("weak_correlation")
 
     if abs(spread) >= 8:
         drivers.append("wide relative spread")
+        exit_reasons.append("spread is already stretched")
         tags.append("wide_spread")
     elif abs(spread) < 1 and pair_ctx:
         warnings.append("spread is narrow, reducing edge quality")
@@ -8862,6 +8868,8 @@ def _ai_engine_v2_from_context(
 
     if weak_participation:
         warnings.append("market condition shows weak participation / fake-move risk")
+        contradictions.append("price structure is moving without strong participation")
+        exit_reasons.append("participation is weak behind the move")
         tags.append("weak_participation")
     if volume_backed:
         drivers.append("market condition shows volume-backed momentum")
@@ -8871,18 +8879,64 @@ def _ai_engine_v2_from_context(
         tags.append("accumulation")
     if overextended:
         warnings.append("overextension increases pullback or exhaustion risk")
+        exit_reasons.append("overextension increases exhaustion risk")
         tags.append("overextended")
+
+    if price_moving and onchain_neutral:
+        contradictions.append("price action is moving while on-chain confirmation is neutral")
+        tags.append("price_onchain_divergence")
+    if divergent_24h and corr >= 0.8:
+        contradictions.append("high correlation conflicts with short-term relative divergence")
+        tags.append("correlation_divergence")
+    if (score_a >= 70 or score_b >= 70) and onchain_neutral:
+        contradictions.append("rating quality is not strongly confirmed by on-chain data")
+        tags.append("rating_onchain_mismatch")
 
     if onchain_positive:
         drivers.append("on-chain provides supporting confirmation")
         tags.append("onchain_support")
     elif onchain_neutral:
         warnings.append("on-chain confirmation is neutral / no strong signal")
+        exit_reasons.append("on-chain does not strongly confirm continuation")
         tags.append("onchain_neutral")
 
     if votes_a + votes_b <= 2:
         warnings.append("community input is still thin")
         tags.append("thin_community")
+
+    # Exit Risk / Pre-Exit warning
+    exit_score = 0
+    if weak_participation:
+        exit_score += 2
+    if overextended:
+        exit_score += 2
+    if abs(spread) >= 10:
+        exit_score += 2
+    elif abs(spread) >= 6:
+        exit_score += 1
+    if price_moving and onchain_neutral:
+        exit_score += 1
+    if divergent_24h and corr >= 0.8:
+        exit_score += 1
+    if volume_backed:
+        exit_score -= 1
+    if accumulation:
+        exit_score -= 1
+    exit_score = max(0, exit_score)
+
+    if exit_score >= 5:
+        exit_risk = "High"
+    elif exit_score >= 3:
+        exit_risk = "Medium-High"
+    elif exit_score >= 1:
+        exit_risk = "Medium"
+    else:
+        exit_risk = "Low"
+
+    pre_exit_warning = bool(exit_score >= 3)
+    if pre_exit_warning:
+        tags.append("pre_exit_warning")
+        warnings.append("pre-exit warning: continuation quality is weakening")
 
     # Behavior + setup bias
     if corr >= 0.8 and abs(spread) >= 2:
@@ -8906,7 +8960,7 @@ def _ai_engine_v2_from_context(
         setup_bias = "no-clean-setup / wait-for-confirmation"
         verdict = "LOW CONVICTION"
 
-    # Risk + confidence
+    # Confidence
     confidence = 5.0
     if corr >= 0.8:
         confidence += 1.2
@@ -8926,8 +8980,11 @@ def _ai_engine_v2_from_context(
         confidence -= 0.2
     if votes_a + votes_b <= 2:
         confidence -= 0.3
+    if contradictions:
+        confidence -= min(1.2, 0.3 * len(contradictions))
     confidence = round(max(1.0, min(10.0, confidence)), 1)
 
+    # Risk
     risk_score = 0
     if weak_participation:
         risk_score += 2
@@ -8941,14 +8998,18 @@ def _ai_engine_v2_from_context(
         risk_score += 1
     if votes_a + votes_b <= 2:
         risk_score += 1
+    if contradictions:
+        risk_score += min(2, len(contradictions))
+    if pre_exit_warning:
+        risk_score += 1
     if confidence >= 8 and risk_score > 0:
         risk_score -= 1
 
-    if risk_score >= 5:
+    if risk_score >= 6:
         risk = "High"
-    elif risk_score >= 3:
+    elif risk_score >= 4:
         risk = "Medium-High"
-    elif risk_score >= 1:
+    elif risk_score >= 2:
         risk = "Medium"
     else:
         risk = "Low-Medium"
@@ -8964,6 +9025,8 @@ def _ai_engine_v2_from_context(
     invalidation = "confirmation remains weak or mixed"
     if weak_participation:
         invalidation = "low RVOL / weak participation can turn the move into a fake move"
+    elif contradictions:
+        invalidation = contradictions[0]
     elif onchain_neutral:
         invalidation = "neutral on-chain confirmation weakens conviction"
     elif corr < 0.45 and pair_ctx:
@@ -8972,18 +9035,22 @@ def _ai_engine_v2_from_context(
     summary = (
         f"{verdict}: {behavior}. "
         f"Ratings: {a} {rating_a} ({int(score_a) if score_a else 'n/a'}), {b} {rating_b} ({int(score_b) if score_b else 'n/a'}). "
-        f"Risk is {risk}; confidence {confidence}/10."
-    ) if a and b else f"{verdict}: {behavior}. Risk is {risk}; confidence {confidence}/10."
+        f"Risk is {risk}; exit risk is {exit_risk}; confidence {confidence}/10."
+    ) if a and b else f"{verdict}: {behavior}. Risk is {risk}; exit risk is {exit_risk}; confidence {confidence}/10."
 
     return {
-        "version": "point5_ai_engine_v2",
+        "version": "ai_engine_v2_exit_contradiction",
         "verdict": verdict,
         "confidence": confidence,
         "risk": risk,
+        "exit_risk": exit_risk,
+        "pre_exit_warning": bool(pre_exit_warning),
+        "exit_reasons": exit_reasons[:5],
         "behavior": behavior,
         "setup_bias": setup_bias,
         "edge": edge,
         "invalidation": invalidation,
+        "contradictions": contradictions[:6],
         "drivers": drivers[:6],
         "warnings": warnings[:6],
         "tags": sorted(set(tags)),
