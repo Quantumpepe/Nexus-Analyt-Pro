@@ -8672,7 +8672,7 @@ def api_ai_insight_profile_refresh():
 # -------------------------
 
 
-def _enforce_ai_insight_structure(text: str) -> str:
+def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> str:
     """Guarantee AI Insight Level 2 output has separate Edge / Risk / Setup bias lines.
 
     This is intentionally light-touch:
@@ -8711,12 +8711,13 @@ def _enforce_ai_insight_structure(text: str) -> str:
     # Remove accidental trailing label fragments from the paragraph.
     paragraph = re.sub(r"(?is)\b(edge|risk|setup bias)\s*:.*$", "", paragraph).strip()
 
+    engine_ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
     if not edge:
-        edge = "structure favors no clean edge until confirmation improves"
+        edge = str(engine_ctx.get("edge") or "structure favors no clean edge until confirmation improves")
     if not risk:
-        risk = "weak or missing confirmation can invalidate the setup"
+        risk = str(engine_ctx.get("invalidation") or engine_ctx.get("risk") or "weak or missing confirmation can invalidate the setup")
     if not setup:
-        setup = "no-clean-setup"
+        setup = str(engine_ctx.get("setup_bias") or "no-clean-setup")
 
     # Prevent duplicated labels inside extracted values.
     def _clean_value(v: str) -> str:
@@ -8728,6 +8729,270 @@ def _enforce_ai_insight_structure(text: str) -> str:
     setup = _clean_value(setup)
 
     return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
+
+
+
+def _ai_engine_v2_from_context(
+    sym_norm: list[str],
+    market_context: dict,
+    timeframe_context: dict,
+    order_memory: dict | None = None,
+    insight_profile: dict | None = None,
+    extra_context: dict | None = None,
+) -> dict:
+    """Point 5: deterministic AI Insight Engine layer.
+
+    This creates a compact decision-support context before the LLM writes text.
+    It does not give trade instructions. It only classifies structure, behavior,
+    risk, confidence, and setup bias from already provided app data.
+    """
+    extra_context = extra_context if isinstance(extra_context, dict) else {}
+    coins = extra_context.get("coins") if isinstance(extra_context.get("coins"), list) else []
+    pairs = extra_context.get("relevant_pairs") if isinstance(extra_context.get("relevant_pairs"), list) else []
+
+    def _sf(v, default=0.0):
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else float(default)
+        except Exception:
+            return float(default)
+
+    def _coin(sym: str) -> dict:
+        su = str(sym or "").upper()
+        for c in coins:
+            if isinstance(c, dict) and str(c.get("symbol") or "").upper() == su:
+                return c
+        return {}
+
+    a = str((sym_norm or [""])[0] or "").upper()
+    b = str((sym_norm or ["", ""])[1] if len(sym_norm or []) > 1 else "").upper()
+    ca = _coin(a)
+    cb = _coin(b)
+
+    pair_ctx = {}
+    if a and b:
+        target = f"{a}/{b}"
+        rev = f"{b}/{a}"
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            pp = str(p.get("pair") or "").upper()
+            if pp in (target, rev):
+                pair_ctx = p
+                break
+
+    corr = _sf(pair_ctx.get("corr"), 0.0) if pair_ctx else 0.0
+    spread = _sf(pair_ctx.get("spread_pct"), 0.0) if pair_ctx else 0.0
+    score_pair = _sf(pair_ctx.get("score"), 0.0) if pair_ctx else 0.0
+
+    score_a = _sf(ca.get("score"), 0.0)
+    score_b = _sf(cb.get("score"), 0.0)
+    rating_a = str(ca.get("rating") or "n/a")
+    rating_b = str(cb.get("rating") or "n/a")
+    votes_a = int(_sf(ca.get("user_rating_votes"), 0))
+    votes_b = int(_sf(cb.get("user_rating_votes"), 0))
+    ch_a = _sf(ca.get("change_24h_pct"), 0.0)
+    ch_b = _sf(cb.get("change_24h_pct"), 0.0)
+
+    rel_strength = ""
+    if a and b:
+        if score_a >= score_b + 8 or ch_a >= ch_b + 2:
+            rel_strength = a
+        elif score_b >= score_a + 8 or ch_b >= ch_a + 2:
+            rel_strength = b
+
+    mc_states = []
+    mc_notes = []
+    weak_participation = False
+    volume_backed = False
+    accumulation = False
+    overextended = False
+    for c in (ca, cb):
+        mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
+        state = str(mc.get("state") or "").upper()
+        label = str(mc.get("label") or state or "").strip()
+        oe = mc.get("oe_pct")
+        rv = mc.get("rvol")
+        if state:
+            mc_states.append(state)
+            mc_notes.append(f"{c.get('symbol')}: {label} OE={oe} RVOL={rv}")
+        if state in ("FAKE_MOVE",) or ("LOW" in str(mc.get("interpretation") or "").upper() and "VOLUME" in str(mc.get("interpretation") or "").upper()):
+            weak_participation = True
+        if state in ("REAL_BREAKOUT",):
+            volume_backed = True
+        if state in ("EARLY_ACCUMULATION",):
+            accumulation = True
+        if state in ("OVEREXTENDED",):
+            overextended = True
+
+    onchain_notes = []
+    onchain_positive = False
+    onchain_neutral = True
+    for c in (ca, cb):
+        oc = c.get("onchain") if isinstance(c.get("onchain"), dict) else {}
+        delta = _sf(c.get("onchain_delta"), _sf(oc.get("score_delta"), 0))
+        summary = str(oc.get("summary") or "").strip()
+        if abs(delta) >= 3 or summary:
+            onchain_neutral = False
+            onchain_notes.append(f"{c.get('symbol')}: {summary or ('on-chain delta ' + str(delta))}")
+            if delta > 0:
+                onchain_positive = True
+
+    drivers = []
+    warnings = []
+    tags = []
+
+    if corr >= 0.8:
+        drivers.append("high pair linkage")
+        tags.append("high_correlation")
+    elif corr < 0.45 and corr != 0:
+        warnings.append("weak pair linkage can cause unstable divergence")
+        tags.append("weak_correlation")
+
+    if abs(spread) >= 8:
+        drivers.append("wide relative spread")
+        tags.append("wide_spread")
+    elif abs(spread) < 1 and pair_ctx:
+        warnings.append("spread is narrow, reducing edge quality")
+        tags.append("narrow_spread")
+
+    if rel_strength:
+        drivers.append(f"relative strength favors {rel_strength}")
+        tags.append("relative_strength")
+
+    if weak_participation:
+        warnings.append("market condition shows weak participation / fake-move risk")
+        tags.append("weak_participation")
+    if volume_backed:
+        drivers.append("market condition shows volume-backed momentum")
+        tags.append("volume_backed")
+    if accumulation:
+        drivers.append("market condition shows early accumulation / volume build")
+        tags.append("accumulation")
+    if overextended:
+        warnings.append("overextension increases pullback or exhaustion risk")
+        tags.append("overextended")
+
+    if onchain_positive:
+        drivers.append("on-chain provides supporting confirmation")
+        tags.append("onchain_support")
+    elif onchain_neutral:
+        warnings.append("on-chain confirmation is neutral / no strong signal")
+        tags.append("onchain_neutral")
+
+    if votes_a + votes_b <= 2:
+        warnings.append("community input is still thin")
+        tags.append("thin_community")
+
+    # Behavior + setup bias
+    if corr >= 0.8 and abs(spread) >= 2:
+        behavior = "mean-reversion style with visible relative imbalance"
+        setup_bias = "mean-reversion / grid-friendly"
+        verdict = "MEAN REVERSION"
+    elif rel_strength and (volume_backed or abs(ch_a - ch_b) >= 3):
+        behavior = "rotation / trend-bias with continuation risk"
+        setup_bias = "rotation / continuation-risk"
+        verdict = "TREND BIAS"
+    elif corr < 0.45 and pair_ctx:
+        behavior = "unstable / choppy pair behavior"
+        setup_bias = "no-clean-setup"
+        verdict = "NO CLEAN SETUP"
+    elif accumulation:
+        behavior = "early accumulation / developing structure"
+        setup_bias = "accumulation-watch / volatility-sensitive"
+        verdict = "EARLY ACCUMULATION"
+    else:
+        behavior = "mixed / low-conviction structure"
+        setup_bias = "no-clean-setup / wait-for-confirmation"
+        verdict = "LOW CONVICTION"
+
+    # Risk + confidence
+    confidence = 5.0
+    if corr >= 0.8:
+        confidence += 1.2
+    elif corr < 0.45 and pair_ctx:
+        confidence -= 1.0
+    if abs(spread) >= 2:
+        confidence += 0.7
+    if score_pair >= 75:
+        confidence += 0.8
+    if rel_strength:
+        confidence += 0.4
+    if weak_participation:
+        confidence -= 0.8
+    if onchain_positive:
+        confidence += 0.4
+    if onchain_neutral:
+        confidence -= 0.2
+    if votes_a + votes_b <= 2:
+        confidence -= 0.3
+    confidence = round(max(1.0, min(10.0, confidence)), 1)
+
+    risk_score = 0
+    if weak_participation:
+        risk_score += 2
+    if overextended:
+        risk_score += 2
+    if corr < 0.45 and pair_ctx:
+        risk_score += 2
+    if abs(spread) >= 12:
+        risk_score += 1
+    if onchain_neutral:
+        risk_score += 1
+    if votes_a + votes_b <= 2:
+        risk_score += 1
+    if confidence >= 8 and risk_score > 0:
+        risk_score -= 1
+
+    if risk_score >= 5:
+        risk = "High"
+    elif risk_score >= 3:
+        risk = "Medium-High"
+    elif risk_score >= 1:
+        risk = "Medium"
+    else:
+        risk = "Low-Medium"
+
+    edge = "structure does not show a clean edge yet"
+    if rel_strength and verdict == "TREND BIAS":
+        edge = f"relative strength currently favors {rel_strength}"
+    elif "MEAN REVERSION" in verdict:
+        edge = "structure favors mean-reversion inside the correlated pair"
+    elif accumulation:
+        edge = "volume build favors an early accumulation read"
+
+    invalidation = "confirmation remains weak or mixed"
+    if weak_participation:
+        invalidation = "low RVOL / weak participation can turn the move into a fake move"
+    elif onchain_neutral:
+        invalidation = "neutral on-chain confirmation weakens conviction"
+    elif corr < 0.45 and pair_ctx:
+        invalidation = "weak correlation can break the pair relationship"
+
+    summary = (
+        f"{verdict}: {behavior}. "
+        f"Ratings: {a} {rating_a} ({int(score_a) if score_a else 'n/a'}), {b} {rating_b} ({int(score_b) if score_b else 'n/a'}). "
+        f"Risk is {risk}; confidence {confidence}/10."
+    ) if a and b else f"{verdict}: {behavior}. Risk is {risk}; confidence {confidence}/10."
+
+    return {
+        "version": "point5_ai_engine_v2",
+        "verdict": verdict,
+        "confidence": confidence,
+        "risk": risk,
+        "behavior": behavior,
+        "setup_bias": setup_bias,
+        "edge": edge,
+        "invalidation": invalidation,
+        "drivers": drivers[:6],
+        "warnings": warnings[:6],
+        "tags": sorted(set(tags)),
+        "symbols": [s for s in [a, b] if s],
+        "relative_strength": rel_strength,
+        "market_condition_notes": mc_notes[:4],
+        "onchain_notes": onchain_notes[:4],
+        "summary": summary,
+    }
 
 
 def _ai_call_openai(
@@ -8789,7 +9054,7 @@ def _ai_call_openai(
 
         if short_insight_mode:
             try:
-                ans = _enforce_ai_insight_structure(ans)
+                ans = _enforce_ai_insight_structure(ans, user_payload.get("ai_engine_v2"))
             except Exception:
                 pass
 
@@ -8799,7 +9064,10 @@ def _ai_call_openai(
             except Exception:
                 pass
 
-        return {"status": "ok", "answer": ans, "model": model}, None
+        out_resp = {"status": "ok", "answer": ans, "model": model}
+        if isinstance(user_payload.get("ai_engine_v2"), dict):
+            out_resp["ai_engine_v2"] = user_payload.get("ai_engine_v2")
+        return out_resp, None
 
     except requests.exceptions.HTTPError as e:
         try:
@@ -9051,6 +9319,20 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     except Exception:
         order_memory, insight_profile = {}, {}
 
+    ai_engine_v2 = {}
+    try:
+        if short_insight_mode:
+            ai_engine_v2 = _ai_engine_v2_from_context(
+                sym_norm=sym_norm,
+                market_context=market_context,
+                timeframe_context=timeframe_context,
+                order_memory=order_memory,
+                insight_profile=insight_profile,
+                extra_context=extra_context if isinstance(extra_context, dict) else {},
+            )
+    except Exception:
+        ai_engine_v2 = {}
+
     use_order_memory = bool(wallet_for_insight)
     use_chat_memory = bool(chat_memory_wallet)
     PRO_STYLE_RULES = """
@@ -9086,6 +9368,8 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     - strategy fit: grid-fit, rotation-style, no-clean-setup, continuation-risk, or volatility-sensitive,
     - risk reason: why the risk state exists.
 20) REQUIRED when ai_signal_context is present:
+    - Use ai_engine_v2 as the primary Level 2 interpretation layer when present.
+    - Do not contradict ai_engine_v2.verdict, ai_engine_v2.risk, ai_engine_v2.edge, ai_engine_v2.invalidation, or ai_engine_v2.setup_bias.
     - explicitly mention the visible rating / score quality for both symbols or the pair,
     - explicitly mention community votes or say that community input is still thin/limited,
     - explicitly mention on-chain confirmation; if there is no strong signal, say "on-chain is neutral/no strong signal",
@@ -9198,6 +9482,8 @@ Task:
         "market_context": market_context,
         "short_insight_mode": bool(short_insight_mode),
     }
+    if ai_engine_v2:
+        user_payload["ai_engine_v2"] = ai_engine_v2
 
     if isinstance(extra_context, dict) and extra_context:
         user_payload["ai_signal_context"] = extra_context
@@ -9214,6 +9500,7 @@ Task:
         user_payload,
         wallet_address=chat_memory_wallet if use_chat_memory else None,
         mem_msgs=mem_msgs,
+        short_insight_mode=bool(short_insight_mode),
     )
     if err_pair:
         msg, code = err_pair
@@ -9233,7 +9520,10 @@ Task:
         "insight_memory_used": bool(use_order_memory),
         "has_ai_signal_context": bool(isinstance(extra_context, dict) and extra_context),
         "has_market_condition_context": any(bool((c or {}).get("market_condition")) for c in (market_context.get("coins") or [])),
+        "has_ai_engine_v2": bool(ai_engine_v2),
     }
+    if ai_engine_v2:
+        resp["ai_engine_v2"] = ai_engine_v2
     return resp, None
 
 
