@@ -3067,7 +3067,7 @@ def api_access_status():
 # -------------------------
 # Watchlist user rating + owner-controlled coin links
 # -------------------------
-_ALLOWED_USER_RATINGS = {"AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "RISK"}
+_ALLOWED_USER_RATINGS = {"STAR_5", "STAR_4", "STAR_3", "STAR_2", "STAR_1", "AAA", "AA", "A", "BBB", "BB", "B", "CCC", "CC", "C", "RISK"}
 
 def _today_utc_date() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
@@ -3226,6 +3226,11 @@ def _ensure_rating_table(conn):
     cur.execute("CREATE INDEX IF NOT EXISTS idx_user_coin_ratings_wallet_symbol ON user_coin_ratings(wallet_address, symbol)")
 
 _RATING_POINTS = {
+    "STAR_5": 100,
+    "STAR_4": 80,
+    "STAR_3": 60,
+    "STAR_2": 40,
+    "STAR_1": 20,
     "AAA": 98,
     "AA": 90,
     "A": 80,
@@ -3279,7 +3284,7 @@ def api_rating_coin_status():
         coin_info = _coin_info_for_symbol(sym)
         return jsonify({
             "status": "ok", "symbol": sym, "today": today,
-            "can_vote": row is None, "already_voted_today": row is not None,
+            "can_vote": True, "already_voted_today": row is not None,
             "user_rating_today": row["rating"] if row else None,
             "last_user_rating": (row["rating"] if row else (last["rating"] if last else None)),
             "last_rating_date": (row["rating_date"] if row else (last["rating_date"] if last else None)),
@@ -3307,7 +3312,9 @@ def api_rating_vote():
         return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
     sym = str(body.get("symbol") or body.get("coin") or "").strip().upper()
-    rating = str(body.get("rating") or "").strip().upper()
+    rating = str(body.get("rating") or "").strip().upper().replace("-", "_")
+    if rating in {"1", "2", "3", "4", "5"}:
+        rating = f"STAR_{rating}"
     if not sym:
         return err("missing symbol", 400)
     if rating not in _ALLOWED_USER_RATINGS:
@@ -3322,8 +3329,12 @@ def api_rating_vote():
             cur.execute("SELECT rating FROM user_coin_ratings WHERE wallet_address=? AND symbol=? AND rating_date=? LIMIT 1", (_norm_addr(wa), sym, today))
             existing = cur.fetchone()
             if existing:
-                return jsonify({"status": "error", "error": "already rated today", "symbol": sym, "today": today, "user_rating_today": existing["rating"], "can_vote": False, "ts": nowi}), 409
-            cur.execute("INSERT INTO user_coin_ratings(wallet_address, symbol, rating, rating_date, created_ts, updated_ts) VALUES (?,?,?,?,?,?)", (_norm_addr(wa), sym, rating, today, nowi, nowi))
+                cur.execute(
+                    "UPDATE user_coin_ratings SET rating=?, updated_ts=? WHERE wallet_address=? AND symbol=? AND rating_date=?",
+                    (rating, nowi, _norm_addr(wa), sym, today),
+                )
+            else:
+                cur.execute("INSERT INTO user_coin_ratings(wallet_address, symbol, rating, rating_date, created_ts, updated_ts) VALUES (?,?,?,?,?,?)", (_norm_addr(wa), sym, rating, today, nowi, nowi))
             conn.commit()
         coin_info = _coin_info_for_symbol(sym)
         return jsonify({
@@ -3331,7 +3342,7 @@ def api_rating_vote():
             "symbol": sym,
             "rating": rating,
             "today": today,
-            "can_vote": False,
+            "can_vote": True,
             "already_voted_today": True,
             "link": coin_info.get("link") or "",
             "link_enabled": bool(coin_info.get("link_enabled")),
