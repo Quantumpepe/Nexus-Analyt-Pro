@@ -9054,6 +9054,19 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 30) Always merge all signals into ONE combined interpretation.
 31) Prefer one strong paragraph plus optional compact Edge/Risk/Setup bias lines.
 32) Avoid breaking the answer into many titled parts.
+33) Your output MUST follow this structure:
+    - One compact paragraph (max ~90 words) explaining the situation
+    - Then 3 short lines:
+
+    Edge: what the structure favors (no direct advice)
+    Risk: what can invalidate or weaken the setup
+    Setup bias: mean-reversion / rotation / continuation-risk / grid-friendly / no-clean-setup
+
+34) Strict rules:
+    - Do NOT repeat raw metrics or numbers
+    - Do NOT restate all data points
+    - Focus on interpretation, not description
+    - Keep it tight, clear, and trading-relevant
 """
 
     sys = f"""You are Nexus Analyt AI, a crypto market analyst.
