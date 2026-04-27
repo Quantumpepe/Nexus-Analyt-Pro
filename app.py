@@ -1,6 +1,6 @@
 # backend/app.py
 from __future__ import annotations
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
 import os
@@ -8623,8 +8623,10 @@ def api_ai_insight_profile_get():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     wallet_q = str(request.args.get("wallet") or request.args.get("wallet_address") or wa).strip()
     wallet_q = _norm_addr(wallet_q)
@@ -9145,8 +9147,10 @@ def api_ai_run():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
@@ -9201,8 +9205,10 @@ def api_ai_insight():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
@@ -9261,8 +9267,10 @@ def api_ai_memory_get():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     wa = str(request.args.get("wallet_address") or "").strip()
     mem = _ai_mem_get(wa) if wa else []
@@ -9275,8 +9283,10 @@ def api_ai_memory_clear():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     body = request.get_json(silent=True) or {}
     wa = str(body.get("wallet_address") or "").strip()
@@ -9300,8 +9310,10 @@ def api_ai():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    if st.get("plan") != "pro":
-        return err("subscription required for AI", 403)
+    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
+    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
+    if not bool(st.get("active")):
+        return err("access required for AI", 403)
 
     body = request.get_json(silent=True) or {}
 
