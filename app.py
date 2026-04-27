@@ -608,12 +608,13 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
     #   BNB -> bnbBalance(address)
     #   ETH -> ethBalance(address)
     balance_hex = _safe_call(balance_sel + _addr_to_32(wa), "0x0")
-    balance_wei = _hex_to_int(balance_hex or "0x0")
+    wallet_accounting_wei = _hex_to_int(balance_hex or "0x0")
+    balance_wei = wallet_accounting_wei
 
-    # Native coin actually held by the Vault contract.
-    # Some older/dev Vaults may hold native funds directly while the wallet-bound
-    # accounting selector returns 0. Keep both values visible and optionally use the
-    # contract balance as fallback in single-user/dev deployments.
+    # Also read the real native balance held by the Vault contract.
+    # Some older/dev Vault deployments can hold POL in the contract while the
+    # wallet-bound accounting selector still returns 0. In that case the UI
+    # must not show "No vault liquidity" while the contract actually has funds.
     try:
         contract_native_hex = _rpc_call(cid, "eth_getBalance", [vault_addr, "latest"])
         contract_native_wei = _hex_to_int(contract_native_hex or "0x0")
@@ -665,10 +666,10 @@ def _vault_state_read(wallet_address: str, chain_key: str) -> dict:
         "vault_balance_wei": str(balance_wei),
         "vault_balance": float(balance_wei) / 1e18,
         "vault_balance_source": balance_source,
+        "wallet_accounting_balance_wei": str(wallet_accounting_wei),
+        "wallet_accounting_balance": float(wallet_accounting_wei) / 1e18,
         "vault_contract_native_balance_wei": str(contract_native_wei),
         "vault_contract_native_balance": float(contract_native_wei) / 1e18,
-        "wallet_accounting_balance_wei": str(_hex_to_int(balance_hex or "0x0")),
-        "wallet_accounting_balance": float(_hex_to_int(balance_hex or "0x0")) / 1e18,
         "inCycle": _hex_to_bool(in_cycle_hex),
         "heldToken": held_token_addr,
         "heldTokenBalWei": str(held_bal_raw),
@@ -772,11 +773,13 @@ def api_debug_rpc_balance():
         "chain": chain,
         "chainId": cid,
         "rpc_configured": bool(_rpc_url_for_chain(cid)),
-        "rpc_url_preview": ((_rpc_url_for_chain(cid) or "")[:42] + "...") if _rpc_url_for_chain(cid) else "",
         "enabled_chains": list(_ENABLED_EVM_CHAINS),
         "enabled_chain_ids": sorted(list(_ENABLED_CHAIN_IDS)),
         "ts": now_ts(),
     }
+
+    rpc_url = _rpc_url_for_chain(cid)
+    out["rpc_url_preview"] = (rpc_url[:42] + "...") if rpc_url else ""
 
     if not _looks_like_evm_addr(wa):
         out.update({"status": "error", "error": "invalid wallet"})
