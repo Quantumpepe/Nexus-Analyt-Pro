@@ -6991,6 +6991,232 @@ def api_nexus_compare_scores():
         "ts": now_ts(),
     }), 200
 
+
+# -------------------------
+# Nexus Rotation Engine (planning only, no execution)
+# -------------------------
+def _rotation_eligible(score_item: dict) -> bool:
+    """Asset eligibility for rotation planning. This never executes a trade."""
+    try:
+        score = float(score_item.get("score") or 0)
+    except Exception:
+        score = 0.0
+    risk = str(score_item.get("risk") or "").strip().upper()
+    signal = str(score_item.get("signal") or "").strip().upper()
+    if risk == "HIGH":
+        return False
+    if signal in ("AVOID", "WAIT"):
+        return False
+    return score >= 60
+
+
+def _rotation_weight(score_item: dict) -> float:
+    """Convert score/risk into a relative allocation weight."""
+    try:
+        score = float(score_item.get("score") or 0)
+    except Exception:
+        score = 0.0
+    risk = str(score_item.get("risk") or "").strip().upper()
+    signal = str(score_item.get("signal") or "").strip().upper()
+
+    # Only the upper part of the score earns allocation weight.
+    w = max(0.0, score - 55.0)
+
+    # Strong assets get priority; risky assets are reduced.
+    if signal == "STRONG":
+        w *= 1.25
+    elif signal == "ENTRY":
+        w *= 1.10
+    elif signal == "WATCH":
+        w *= 0.75
+
+    if risk == "MEDIUM":
+        w *= 0.65
+    elif risk == "HIGH":
+        w = 0.0
+
+    return round(max(0.0, w), 6)
+
+
+def _rotation_reason(item: dict, target_pct: float, current_pct: float) -> list[str]:
+    reasons = []
+    symbol = item.get("symbol") or item.get("id") or "Asset"
+    reasons.append(f"{symbol}: Score {item.get('score')} / Rating {item.get('rating')} / Risk {item.get('risk')}")
+    if target_pct > current_pct + 1:
+        reasons.append("Increase allocation because target weight is above current weight.")
+    elif target_pct < current_pct - 1:
+        reasons.append("Reduce allocation because target weight is below current weight.")
+    else:
+        reasons.append("Keep allocation close to current weight.")
+    for r in (item.get("reasons") or [])[:3]:
+        if isinstance(r, str) and r not in reasons:
+            reasons.append(r)
+    return reasons[:5]
+
+
+def build_nexus_rotation_plan(score_items: list[dict], budget_usd: float = 0.0, current_positions: Optional[dict] = None, max_assets: int = 5, min_target_pct: float = 5.0) -> dict:
+    """Build a decision-ready rotation plan from Compare scores.
+
+    Planning only:
+      - no wallet action
+      - no swap
+      - no contract call
+
+    The later Vault can use this as its dry-run / preview foundation.
+    """
+    current_positions = current_positions if isinstance(current_positions, dict) else {}
+    max_assets_i = max(1, min(10, int(max_assets or 5)))
+    min_target_pct_f = max(0.0, min(25.0, float(min_target_pct or 0)))
+
+    clean = []
+    for raw in score_items or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        item["eligible"] = _rotation_eligible(item)
+        item["rotation_weight"] = _rotation_weight(item) if item["eligible"] else 0.0
+        clean.append(item)
+
+    clean.sort(key=lambda x: (float(x.get("rotation_weight") or 0), float(x.get("score") or 0)), reverse=True)
+    selected = [x for x in clean if float(x.get("rotation_weight") or 0) > 0][:max_assets_i]
+    total_weight = sum(float(x.get("rotation_weight") or 0) for x in selected)
+
+    allocations = []
+    if total_weight > 0:
+        for item in selected:
+            symbol = str(item.get("symbol") or item.get("id") or "").upper()
+            weight = float(item.get("rotation_weight") or 0)
+            target_pct = round((weight / total_weight) * 100.0, 2)
+            if target_pct < min_target_pct_f:
+                target_pct = 0.0
+            current_value = _safe_float(current_positions.get(symbol), 0.0)
+            target_value = round((_safe_float(budget_usd) * target_pct / 100.0), 2) if _safe_float(budget_usd) > 0 else 0.0
+            current_pct = round((current_value / _safe_float(budget_usd) * 100.0), 2) if _safe_float(budget_usd) > 0 else 0.0
+            diff_usd = round(target_value - current_value, 2)
+            if target_pct <= 0:
+                action = "SKIP"
+            elif diff_usd > max(10.0, _safe_float(budget_usd) * 0.01):
+                action = "INCREASE"
+            elif diff_usd < -max(10.0, _safe_float(budget_usd) * 0.01):
+                action = "REDUCE"
+            else:
+                action = "HOLD"
+            allocations.append({
+                "symbol": symbol,
+                "rank": len(allocations) + 1,
+                "score": item.get("score"),
+                "rating": item.get("rating"),
+                "signal": item.get("signal"),
+                "risk": item.get("risk"),
+                "target_pct": target_pct,
+                "target_usd": target_value,
+                "current_usd": current_value,
+                "current_pct": current_pct,
+                "delta_usd": diff_usd,
+                "action": action,
+                "reasons": _rotation_reason(item, target_pct, current_pct),
+            })
+
+    excluded = []
+    selected_symbols = {a.get("symbol") for a in allocations}
+    for item in clean:
+        symbol = str(item.get("symbol") or item.get("id") or "").upper()
+        if not symbol or symbol in selected_symbols:
+            continue
+        why = "not eligible"
+        if str(item.get("risk") or "").upper() == "HIGH":
+            why = "high risk"
+        elif float(item.get("score") or 0) < 60:
+            why = "score below rotation threshold"
+        elif str(item.get("signal") or "").upper() in ("AVOID", "WAIT"):
+            why = f"signal {item.get('signal')}"
+        excluded.append({
+            "symbol": symbol,
+            "score": item.get("score"),
+            "rating": item.get("rating"),
+            "signal": item.get("signal"),
+            "risk": item.get("risk"),
+            "reason": why,
+        })
+
+    mode = "READY" if allocations else "WAIT"
+    summary = "Rotation plan ready" if allocations else "No asset currently qualifies for rotation"
+    return {
+        "status": "ok",
+        "mode": mode,
+        "summary": summary,
+        "budget_usd": round(_safe_float(budget_usd), 2),
+        "max_assets": max_assets_i,
+        "min_target_pct": min_target_pct_f,
+        "allocations": allocations,
+        "excluded": excluded[:20],
+        "execution": "disabled_planning_only",
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/rotation-plan", methods=["GET", "POST"])
+def api_nexus_rotation_plan():
+    """Create a Nexus Rotation plan from current Compare scores.
+
+    GET:  /api/nexus/rotation-plan?symbols=BTC,ETH&budget_usd=1000
+    POST: {
+      "symbols": ["BTC", "ETH"],
+      "budget_usd": 1000,
+      "positions": {"BTC": 200},
+      "tokens": {"TBP": {"token":"0x...", "chain":"POL"}}
+    }
+    """
+    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
+
+    raw_symbols = body.get("symbols") if isinstance(body, dict) else None
+    if not isinstance(raw_symbols, list):
+        symbols_raw = (request.args.get("symbols") or request.args.get("symbol") or "").strip()
+        raw_symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+
+    symbols = []
+    for s0 in raw_symbols:
+        s1 = str(s0 or "").strip().upper()
+        if s1 and s1 not in symbols:
+            symbols.append(s1)
+    symbols = symbols[:20]
+    if not symbols:
+        return err("missing symbols", 400)
+
+    budget_usd = _safe_float((body.get("budget_usd") if isinstance(body, dict) else None) or request.args.get("budget_usd") or request.args.get("budget") or 0, 0.0)
+    max_assets = int(_safe_float((body.get("max_assets") if isinstance(body, dict) else None) or request.args.get("max_assets") or 5, 5))
+    min_target_pct = _safe_float((body.get("min_target_pct") if isinstance(body, dict) else None) or request.args.get("min_target_pct") or 5, 5.0)
+    positions = body.get("positions") if isinstance(body, dict) else None
+    if not isinstance(positions, dict):
+        positions = {}
+
+    token_map = body.get("tokens") if isinstance(body, dict) else None
+    if not isinstance(token_map, dict):
+        token_map = {}
+
+    fast = str((body.get("fast") if isinstance(body, dict) else request.args.get("fast")) or "1").strip().lower() in ("1", "true", "yes", "on")
+
+    score_items = []
+    errors = {}
+    for sym in symbols:
+        try:
+            meta = token_map.get(sym) or token_map.get(sym.upper()) or {}
+            token = ""
+            chain = "ETH"
+            if isinstance(meta, dict):
+                token = str(meta.get("token") or meta.get("token_address") or meta.get("contract") or "").strip().lower()
+                chain = _normalize_chain_key(meta.get("chain") or meta.get("network") or "ETH")
+            score_items.append(_nexus_score_for_symbol(symbol=sym, token=token, chain=chain, fast=fast, include_market_condition=True, include_whale=True))
+        except Exception as e:
+            errors[sym] = str(e)
+
+    plan = build_nexus_rotation_plan(score_items, budget_usd=budget_usd, current_positions=positions, max_assets=max_assets, min_target_pct=min_target_pct)
+    plan["symbols"] = symbols
+    plan["errors"] = errors
+    if errors:
+        plan["status"] = "partial"
+    return jsonify(plan), 200
+
 # -------------------------
 # Market test / Market data
 # -------------------------
