@@ -532,7 +532,12 @@ def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h
         action = "buy" if buy_usd > sell_usd else "sell" if sell_usd > buy_usd else "neutral"
         amount = buy_usd if action == "buy" else sell_usd if action == "sell" else max(buy_usd, sell_usd)
         events_sorted = sorted(whale_events, key=lambda x: int(x.get("timeTs") or 0), reverse=True)
-        latest = events_sorted[0] if events_sorted else {}
+        latest = events_sorted[0] if events_sorted else {
+            "amountUsd": 0,
+            "dex": "Unknown",
+            "time": "",
+            "walletShort": "",
+        }
         strength = _whale_strength(amount, dyn_threshold) if action in ("buy", "sell") else "none"
 
         if action == "buy":
@@ -557,10 +562,22 @@ def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h
             "strength": strength,
             "icon": icon,
             "color": color,
-            "amountUsd": round(amount, 2),
+
+            # Frontend popup data: show the latest whale trade amount directly.
+            "amountUsd": round(float(latest.get("amountUsd", amount) or 0), 2),
+
             "buyUsd": round(buy_usd, 2),
             "sellUsd": round(sell_usd, 2),
-            "latest": latest,
+
+            # Clean object for the Whale Activity popup.
+            "latest": {
+                "amountUsd": round(float(latest.get("amountUsd", 0) or 0), 2),
+                "dex": latest.get("dex", "Unknown") or "Unknown",
+                "time": latest.get("time", "") or "",
+                "wallet": latest.get("walletShort", "") or "",
+                "tx": latest.get("tx", "") or "",
+            },
+
             "events": events_sorted[:10],
             "summary": summary,
             "label": summary,
