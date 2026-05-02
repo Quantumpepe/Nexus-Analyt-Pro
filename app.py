@@ -11760,6 +11760,205 @@ def api_nexus_rotation_preview():
     return jsonify({"status": "ok", "plan": plan.get("plan") or [], "previews": previews, "ts": now_ts()})
 
 
+# -------------------------
+# Nexus Execution Safety Layer (SAFE MODE)
+# -------------------------
+# This layer turns previews into a final execution-readiness report for Vault V2.
+# It still does NOT execute swaps. The Vault contract remains the final on-chain validator.
+
+def _nexus_vault_state_safe(wallet: str, chain: str) -> dict:
+    """Best-effort vault state read. Never raises to the execution preview layer."""
+    try:
+        wa = _norm_addr(wallet or "")
+        if not _looks_like_evm_addr(wa):
+            return {"status": "error", "error": "invalid wallet", "vaultReady": False}
+        data = _vault_state_read(wa, chain)
+        return {**data, "vaultReady": str(data.get("status")) == "ok"}
+    except Exception as e:
+        ck = _normalize_chain_key(chain or "POL")
+        cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+        return {
+            "status": "error",
+            "error": str(e),
+            "chain": ck,
+            "chainId": cid,
+            "vaultReady": False,
+            "rpc_configured": bool(_rpc_url_for_chain(cid)),
+            "vault_configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
+            "executor_configured": bool((_EXECUTOR_BY_CHAIN.get(cid) or "").strip()),
+            "ts": now_ts(),
+        }
+
+
+def _nexus_token_allowed_preview(chain: str, token_addr: str, stable_ok: bool = False) -> bool:
+    """Backend-side allowlist preview. Vault V2 must enforce the final allowlist on-chain.
+
+    ENV supported:
+      NEXUS_ALLOWED_TOKENS_POL=0x...,0x...
+      NEXUS_ALLOWED_TOKENS_137=0x...,0x...
+      NEXUS_ALLOWED_TOKENS=0x...,0x...
+
+    Empty allowlist = preview does not block tokens yet (migration-friendly).
+    USDC/USDT can be considered allowed when stable_ok=True.
+    """
+    ck = _normalize_chain_key(chain or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+    tok = str(token_addr or "").strip().lower()
+    if not tok:
+        return False
+    if tok in ("native", "eth", "bnb", "pol"):
+        return True
+    if not _looks_like_evm_addr(tok):
+        return False
+
+    stable = _nexus_stable_address_for_chain(ck)
+    usdc = str((_USDC_BY_CHAIN or {}).get(cid) or "").strip().lower()
+    usdt = str((_USDT_BY_CHAIN or {}).get(cid) or "").strip().lower()
+    if stable_ok and tok in {x for x in [usdc, usdt, str(stable.get("address") or "").lower()] if x}:
+        return True
+
+    raw = ",".join([
+        str(os.getenv(f"NEXUS_ALLOWED_TOKENS_{ck}") or ""),
+        str(os.getenv(f"NEXUS_ALLOWED_TOKENS_{cid}") or ""),
+        str(os.getenv("NEXUS_ALLOWED_TOKENS") or ""),
+    ])
+    allow = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    if not allow:
+        return True
+    return tok in allow
+
+
+def _nexus_execution_safety_check(preview: dict, wallet: str = "", require_vault_balance: bool = True) -> dict:
+    """Final backend safety report before a future Vault call.
+
+    No transaction is submitted here. This produces a clear ready/blocked response.
+    """
+    chain = _normalize_chain_key(preview.get("chain") or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(chain, 0) or 0)
+    wallet_norm = _norm_addr(wallet or preview.get("wallet") or preview.get("wallet_address") or "")
+    amount_usd = _safe_float(preview.get("amountUsd") or preview.get("amount_usd") or 0)
+    token_in = str(preview.get("tokenIn") or "").strip()
+    token_out = str(preview.get("tokenOut") or "").strip()
+    slippage_bps = int(_safe_float(preview.get("slippageBps") or 0))
+    router_addr = str(((preview.get("router") or {}) if isinstance(preview.get("router"), dict) else {}).get("address") or "").strip()
+
+    vault_state = _nexus_vault_state_safe(wallet_norm, chain) if wallet_norm else {"status": "skipped", "vaultReady": False, "error": "wallet missing"}
+    vault_balance_native = _safe_float(vault_state.get("vault_balance") or 0)
+
+    fee_policy = preview.get("feePolicy") or {}
+    fee_settlement = fee_policy.get("settlement") or {}
+
+    checks = {
+        "preview_ready": bool(preview.get("ready_for_vault")),
+        "chain_ok": cid > 0 and chain in (_CHAIN_ID_BY_KEY or {}),
+        "wallet_ok": _looks_like_evm_addr(wallet_norm),
+        "router_ok": _looks_like_evm_addr(router_addr),
+        "slippage_ok": 0 <= slippage_bps <= _NEXUS_MAX_SLIPPAGE_BPS,
+        "amount_ok": amount_usd > 0,
+        "token_in_allowed": _nexus_token_allowed_preview(chain, token_in, stable_ok=True),
+        "token_out_allowed": _nexus_token_allowed_preview(chain, token_out, stable_ok=True) if token_out else True,
+        "fee_stable_ok": bool(fee_settlement.get("stableConfigured")) if bool(fee_policy.get("applies")) else True,
+        "fee_receiver_ok": bool(fee_settlement.get("feeReceiverConfigured")) if bool(fee_policy.get("applies")) else True,
+        "vault_configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
+        "executor_configured": bool((_EXECUTOR_BY_CHAIN.get(cid) or "").strip()),
+        "vault_state_ok": bool(vault_state.get("vaultReady")),
+    }
+
+    # Current old/native vaults are native-balance based. Vault V2 will validate per-asset balances on-chain.
+    if require_vault_balance and wallet_norm and vault_state.get("status") == "ok":
+        # We cannot convert exact native vault balance to USD without a chain native price here reliably.
+        # For now this check is only liquidity-present, not amount-exact.
+        checks["vault_has_liquidity"] = vault_balance_native > 0
+    elif require_vault_balance:
+        checks["vault_has_liquidity"] = False
+
+    blocking = [k for k, v in checks.items() if not bool(v)]
+
+    return {
+        "status": "ok" if not blocking else "blocked",
+        "can_execute": len(blocking) == 0,
+        "safe_mode": True,
+        "message": "SAFE MODE only: no transaction was executed. Use this output to build the future Vault V2 signed call.",
+        "wallet": wallet_norm,
+        "chain": chain,
+        "chainId": cid,
+        "checks": checks,
+        "blocking_reasons": blocking,
+        "vaultState": vault_state,
+        "preview": preview,
+        "vaultCallReadyDraft": preview.get("vaultPayloadDraft") or {},
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/execute-plan", methods=["POST"])
+def api_nexus_execute_plan_safe_mode():
+    """Validate a single preview or a batch/rotation preview for future Vault execution.
+
+    SAFE MODE: returns readiness report only; does not send any transaction.
+    Body examples:
+      {"wallet":"0x...", "preview": {...}}
+      {"wallet":"0x...", "previews": [{...}, {...}]}
+      {"wallet":"0x...", "assets": [...], "budgetUsd": 500, ...}  -> builds rotation-preview first
+    """
+    body = request.get_json(silent=True) or {}
+    wallet = body.get("wallet") or body.get("wallet_address") or request.headers.get("X-Wallet-Address") or ""
+    require_vault_balance = str(body.get("requireVaultBalance", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+    if isinstance(body.get("preview"), dict):
+        report = _nexus_execution_safety_check(body.get("preview") or {}, wallet=wallet, require_vault_balance=require_vault_balance)
+        return jsonify(report)
+
+    previews = body.get("previews")
+    if not isinstance(previews, list):
+        # Build a rotation preview from the same body if assets/symbols were provided.
+        assets = _nexus_assets_from_request_payload(body)
+        if assets:
+            budget_usd = _safe_float(body.get("budget_usd") or body.get("budgetUsd") or body.get("budget") or 0)
+            plan = _nexus_build_rotation_plan(assets, budget_usd)
+            previews = []
+            chain = _normalize_chain_key(body.get("chain") or "POL")
+            for row in plan.get("plan") or []:
+                if row.get("action") in ("INCREASE", "HOLD") and _safe_float(row.get("target_usd")) > 0:
+                    pb = dict(body)
+                    pb.update({
+                        "chain": row.get("chain") or chain,
+                        "symbol": row.get("symbol"),
+                        "token": row.get("token") or body.get("token") or body.get("tokenOut") or "",
+                        "side": "BUY" if row.get("action") == "INCREASE" else "HOLD",
+                        "amountUsd": row.get("target_usd"),
+                    })
+                    prev = _nexus_order_preview(pb)
+                    prev["rotationRank"] = row.get("rank")
+                    prev["rotationAction"] = row.get("action")
+                    previews.append(prev)
+                else:
+                    previews.append({
+                        "status": "skipped",
+                        "ready_for_vault": False,
+                        "symbol": row.get("symbol"),
+                        "rotationRank": row.get("rank"),
+                        "rotationAction": row.get("action"),
+                        "blocking_reasons": ["rotation_action_not_increase_or_no_budget"],
+                        "ts": now_ts(),
+                    })
+        else:
+            return err("missing preview, previews, assets or symbols", 400)
+
+    reports = [_nexus_execution_safety_check(p if isinstance(p, dict) else {}, wallet=wallet, require_vault_balance=require_vault_balance) for p in (previews or [])]
+    ready = [r for r in reports if r.get("can_execute")]
+    blocked = [r for r in reports if not r.get("can_execute")]
+    return jsonify({
+        "status": "ok" if not blocked else "partial" if ready else "blocked",
+        "safe_mode": True,
+        "can_execute_any": bool(ready),
+        "ready_count": len(ready),
+        "blocked_count": len(blocked),
+        "reports": reports,
+        "ts": now_ts(),
+    })
+
+
 @app.route("/api/nexus/routers", methods=["GET"])
 def api_nexus_routers():
     chain = _normalize_chain_key(request.args.get("chain") or request.args.get("network") or "POL")
