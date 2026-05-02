@@ -413,6 +413,48 @@ def _whale_strength(amount_usd: float, threshold_usd: float) -> str:
     return "low"
 
 
+def _dynamic_whale_threshold_usd(volume24h_usd: float | None) -> float:
+    """Realistic whale threshold by 24h volume.
+
+    Goal:
+      - No fake NEWS: Bitquery trade data is still required.
+      - Microcaps can still show real whale events.
+      - Large caps stay strict enough to avoid noise.
+
+    Examples:
+      10k volume   -> ~800 USD
+      50k volume   -> ~3k USD
+      1.5M volume  -> ~15k USD
+      10B volume   -> capped at 250k USD
+    """
+    try:
+        vol = float(volume24h_usd) if volume24h_usd is not None else None
+        if vol is None or not math.isfinite(vol) or vol <= 0:
+            return float(BITQUERY_WHALE_MIN_USD)
+    except Exception:
+        return float(BITQUERY_WHALE_MIN_USD)
+
+    # Microcap: SpongeV2-style whale logic. Below ~3k is usually noise;
+    # 3k-5k can be a real whale if volume supports it.
+    if vol < 20_000:
+        return max(800.0, min(3_000.0, vol * 0.08))
+
+    if vol < 50_000:
+        return max(1_000.0, min(3_500.0, vol * 0.07))
+
+    if vol < 500_000:
+        return max(3_000.0, min(10_000.0, vol * 0.03))
+
+    if vol < 5_000_000:
+        return max(5_000.0, min(50_000.0, vol * 0.01))
+
+    # Large caps: use the configured global min/percent/max.
+    return min(
+        max(float(BITQUERY_WHALE_MIN_USD), vol * float(BITQUERY_WHALE_VOLUME_PCT)),
+        float(BITQUERY_WHALE_MAX_USD)
+    )
+
+
 def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h_usd: float | None = None, force_refresh: bool = False) -> dict:
     """Real whale buy/sell detection from Bitquery DEXTrades."""
     token = str(token_address or "").strip().lower()
@@ -432,15 +474,7 @@ def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h
             "ts": now_ts(),
         }
 
-    dyn_threshold = BITQUERY_WHALE_MIN_USD
-    if volume24h_usd is not None:
-        try:
-            dyn_threshold = min(
-                max(BITQUERY_WHALE_MIN_USD, float(volume24h_usd) * BITQUERY_WHALE_VOLUME_PCT),
-                BITQUERY_WHALE_MAX_USD
-            )
-        except Exception:
-            pass
+    dyn_threshold = _dynamic_whale_threshold_usd(volume24h_usd)
 
     cache_key = f"{ck}|{token}|{round(dyn_threshold, 2)}"
     now_f = time.time()
@@ -467,6 +501,7 @@ def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h
         "chain": ck,
         "token": token,
         "thresholdUsd": round(float(dyn_threshold), 2),
+        "thresholdMode": "dynamic_by_24h_volume",
         "lookbackMinutes": int(BITQUERY_WHALE_LOOKBACK_MIN),
         "cached": False,
         "ts": now_ts(),
