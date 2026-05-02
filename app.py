@@ -432,10 +432,13 @@ def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h
             "ts": now_ts(),
         }
 
-    dyn_threshold = float(BITQUERY_WHALE_MIN_USD)
+    dyn_threshold = BITQUERY_WHALE_MIN_USD
     if volume24h_usd is not None:
         try:
-            dyn_threshold = max(float(BITQUERY_WHALE_MIN_USD), float(volume24h_usd) * 0.005)
+            dyn_threshold = min(
+                max(BITQUERY_WHALE_MIN_USD, float(volume24h_usd) * BITQUERY_WHALE_VOLUME_PCT),
+                BITQUERY_WHALE_MAX_USD
+            )
         except Exception:
             pass
 
