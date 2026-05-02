@@ -221,6 +221,23 @@ COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL") or (
 )
 
 # -------------------------
+# Bitquery Whale Engine
+# -------------------------
+# IMPORTANT: store the token only in backend ENV, never in the frontend.
+BITQUERY_API_KEY = (
+    os.getenv("BITQUERY_API_KEY")
+    or os.getenv("BITQUERY_TOKEN")
+    or os.getenv("BITQUERY_ACCESS_TOKEN")
+    or ""
+).strip()
+BITQUERY_GRAPHQL_URL = os.getenv("BITQUERY_GRAPHQL_URL", "https://graphql.bitquery.io").strip()
+BITQUERY_WHALE_CACHE_TTL_SEC = int(os.getenv("BITQUERY_WHALE_CACHE_TTL_SEC", "90"))
+BITQUERY_WHALE_LOOKBACK_MIN = int(os.getenv("BITQUERY_WHALE_LOOKBACK_MIN", "180"))
+BITQUERY_WHALE_MIN_USD = float(os.getenv("BITQUERY_WHALE_MIN_USD", "10000"))
+BITQUERY_WHALE_TRADE_LIMIT = int(os.getenv("BITQUERY_WHALE_TRADE_LIMIT", "40"))
+_WHALE_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
+
+# -------------------------
 # CoinGecko proxy (avoid browser CORS + basic throttling)
 # -------------------------
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
@@ -279,6 +296,288 @@ def _market_condition_coin_id(raw: str) -> str:
         pass
 
     return s.lower()
+
+
+def _bitquery_network(chain_key: str) -> str:
+    """Map Nexus chain keys to Bitquery EVM network enum values."""
+    ck = _normalize_chain_key(chain_key)
+    return {
+        "ETH": "ethereum",
+        "BNB": "bsc",
+        "POL": "matic",
+    }.get(ck, ck.lower())
+
+
+def _bitquery_headers() -> dict:
+    # Bitquery accounts differ by API generation. Support both common header names.
+    return {
+        "Content-Type": "application/json",
+        "X-API-KEY": BITQUERY_API_KEY,
+        "Authorization": f"Bearer {BITQUERY_API_KEY}",
+    }
+
+
+def _bitquery_post(query: str, variables: dict) -> dict:
+    if not BITQUERY_API_KEY:
+        raise RuntimeError("BITQUERY_API_KEY missing")
+    r = requests.post(
+        BITQUERY_GRAPHQL_URL,
+        headers=_bitquery_headers(),
+        json={"query": query, "variables": variables},
+        timeout=18,
+    )
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"Bitquery HTTP {r.status_code}: {str(data)[:300]}")
+    if isinstance(data, dict) and data.get("errors"):
+        raise RuntimeError(f"Bitquery errors: {str(data.get('errors'))[:300]}")
+    return data if isinstance(data, dict) else {}
+
+
+_BITQUERY_DEX_TRADE_QUERY = """
+query ($network: EthereumNetwork!, $token: String!, $since: ISO8601DateTime!, $limit: Int!) {
+  EVM(network: $network) {
+    DEXTrades(
+      limit: {count: $limit}
+      orderBy: {descending: Block_Time}
+      where: {
+        Block: {Time: {since: $since}}
+        Trade: {
+          Currency: {SmartContract: {is: $token}}
+        }
+      }
+    ) {
+      Block { Time }
+      Transaction { Hash }
+      Trade {
+        AmountInUSD
+        Dex { ProtocolName ProtocolFamily SmartContract }
+        Buy {
+          Amount
+          Buyer
+          Currency { Symbol SmartContract }
+        }
+        Sell {
+          Amount
+          Seller
+          Currency { Symbol SmartContract }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _parse_bitquery_time_to_ts(value: str) -> int:
+    try:
+        from datetime import datetime
+        s = str(value or "").replace("Z", "+00:00")
+        return int(datetime.fromisoformat(s).timestamp())
+    except Exception:
+        return 0
+
+
+def _short_addr(addr: str) -> str:
+    a = str(addr or "").strip()
+    if len(a) >= 12 and a.startswith("0x"):
+        return f"{a[:6]}...{a[-4:]}"
+    return a
+
+
+def _detect_trade_side(trade: dict, token_address: str) -> str:
+    """Return buy/sell from the target token perspective."""
+    token = str(token_address or "").lower()
+    t = trade.get("Trade") or {}
+    buy_token = str(((t.get("Buy") or {}).get("Currency") or {}).get("SmartContract") or "").lower()
+    sell_token = str(((t.get("Sell") or {}).get("Currency") or {}).get("SmartContract") or "").lower()
+    if token and buy_token == token:
+        return "buy"
+    if token and sell_token == token:
+        return "sell"
+    return "neutral"
+
+
+def _whale_strength(amount_usd: float, threshold_usd: float) -> str:
+    amt = _safe_float(amount_usd)
+    thr = max(_safe_float(threshold_usd), 1.0)
+    if amt >= thr * 5:
+        return "high"
+    if amt >= thr * 2:
+        return "medium"
+    return "low"
+
+
+def _get_whale_signal_bitquery(token_address: str, chain: str = "ETH", volume24h_usd: float | None = None, force_refresh: bool = False) -> dict:
+    """Real whale buy/sell detection from Bitquery DEXTrades."""
+    token = str(token_address or "").strip().lower()
+    ck = _normalize_chain_key(chain)
+
+    if not _looks_like_evm_addr(token):
+        return {
+            "status": "ok",
+            "action": "neutral",
+            "strength": "none",
+            "icon": "🔥",
+            "color": "neutral",
+            "summary": "No token contract available for whale detection",
+            "source": "bitquery",
+            "chain": ck,
+            "token": token,
+            "ts": now_ts(),
+        }
+
+    dyn_threshold = float(BITQUERY_WHALE_MIN_USD)
+    if volume24h_usd is not None:
+        try:
+            dyn_threshold = max(float(BITQUERY_WHALE_MIN_USD), float(volume24h_usd) * 0.005)
+        except Exception:
+            pass
+
+    cache_key = f"{ck}|{token}|{round(dyn_threshold, 2)}"
+    now_f = time.time()
+    if not force_refresh:
+        hit = _WHALE_SIGNAL_CACHE.get(cache_key)
+        if hit and (now_f - hit[0]) < BITQUERY_WHALE_CACHE_TTL_SEC:
+            cached = dict(hit[1])
+            cached["cached"] = True
+            return cached
+
+    since_ts = max(0, now_ts() - (int(BITQUERY_WHALE_LOOKBACK_MIN) * 60))
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ts))
+
+    variables = {
+        "network": _bitquery_network(ck),
+        "token": token,
+        "since": since_iso,
+        "limit": max(5, min(100, int(BITQUERY_WHALE_TRADE_LIMIT))),
+    }
+
+    out_base = {
+        "status": "ok",
+        "source": "bitquery",
+        "chain": ck,
+        "token": token,
+        "thresholdUsd": round(float(dyn_threshold), 2),
+        "lookbackMinutes": int(BITQUERY_WHALE_LOOKBACK_MIN),
+        "cached": False,
+        "ts": now_ts(),
+    }
+
+    try:
+        data = _bitquery_post(_BITQUERY_DEX_TRADE_QUERY, variables)
+        trades = (((data.get("data") or {}).get("EVM") or {}).get("DEXTrades") or [])
+        if not isinstance(trades, list):
+            trades = []
+
+        whale_events = []
+        buy_usd = 0.0
+        sell_usd = 0.0
+
+        for item in trades:
+            t = item.get("Trade") or {}
+            usd = _safe_float(t.get("AmountInUSD"))
+            if usd < dyn_threshold:
+                continue
+
+            side = _detect_trade_side(item, token)
+            if side not in ("buy", "sell"):
+                continue
+
+            if side == "buy":
+                buy_usd += usd
+                wallet = ((t.get("Buy") or {}).get("Buyer") or "")
+            else:
+                sell_usd += usd
+                wallet = ((t.get("Sell") or {}).get("Seller") or "")
+
+            dex = t.get("Dex") or {}
+            whale_events.append({
+                "action": side,
+                "amountUsd": round(usd, 2),
+                "wallet": wallet,
+                "walletShort": _short_addr(wallet),
+                "dex": dex.get("ProtocolName") or dex.get("ProtocolFamily") or "DEX",
+                "tx": ((item.get("Transaction") or {}).get("Hash") or ""),
+                "time": ((item.get("Block") or {}).get("Time") or ""),
+                "timeTs": _parse_bitquery_time_to_ts(((item.get("Block") or {}).get("Time") or "")),
+            })
+
+        if not whale_events:
+            out = {
+                **out_base,
+                "action": "neutral",
+                "strength": "none",
+                "icon": "🔥",
+                "color": "neutral",
+                "amountUsd": 0,
+                "buyUsd": round(buy_usd, 2),
+                "sellUsd": round(sell_usd, 2),
+                "events": [],
+                "summary": "No fresh whale buy/sell detected",
+                "label": "No fresh whale buy/sell detected",
+                "score_delta": 0,
+            }
+            _WHALE_SIGNAL_CACHE[cache_key] = (now_f, dict(out))
+            return out
+
+        action = "buy" if buy_usd > sell_usd else "sell" if sell_usd > buy_usd else "neutral"
+        amount = buy_usd if action == "buy" else sell_usd if action == "sell" else max(buy_usd, sell_usd)
+        events_sorted = sorted(whale_events, key=lambda x: int(x.get("timeTs") or 0), reverse=True)
+        latest = events_sorted[0] if events_sorted else {}
+        strength = _whale_strength(amount, dyn_threshold) if action in ("buy", "sell") else "none"
+
+        if action == "buy":
+            summary = f"Whale bought recently · ${amount:,.0f}"
+            icon = "NEWS"
+            color = "green"
+            score_delta = 4 if strength == "high" else 3 if strength == "medium" else 2
+        elif action == "sell":
+            summary = f"Whale sold recently · ${amount:,.0f}"
+            icon = "NEWS"
+            color = "red"
+            score_delta = -4 if strength == "high" else -3 if strength == "medium" else -2
+        else:
+            summary = "Mixed whale activity"
+            icon = "🔥"
+            color = "neutral"
+            score_delta = 0
+
+        out = {
+            **out_base,
+            "action": action,
+            "strength": strength,
+            "icon": icon,
+            "color": color,
+            "amountUsd": round(amount, 2),
+            "buyUsd": round(buy_usd, 2),
+            "sellUsd": round(sell_usd, 2),
+            "latest": latest,
+            "events": events_sorted[:10],
+            "summary": summary,
+            "label": summary,
+            "score_delta": score_delta,
+        }
+        _WHALE_SIGNAL_CACHE[cache_key] = (now_f, dict(out))
+        return out
+
+    except Exception as e:
+        return {
+            **out_base,
+            "status": "error",
+            "action": "neutral",
+            "strength": "none",
+            "icon": "🔥",
+            "color": "neutral",
+            "amountUsd": 0,
+            "summary": "Whale signal unavailable",
+            "label": "Whale signal unavailable",
+            "score_delta": 0,
+            "error": str(e),
+        }
 
 
 def _safe_float(v, default: float = 0.0) -> float:
@@ -467,6 +766,29 @@ def api_market_condition_by_id(coin_id):
             "input": str(coin_id or "").strip(),
             "ts": now_ts(),
         }), 502
+
+
+@app.route("/api/onchain/whale-signal", methods=["GET"])
+def api_onchain_whale_signal():
+    token = (
+        request.args.get("token")
+        or request.args.get("token_address")
+        or request.args.get("contract")
+        or request.args.get("address")
+        or ""
+    )
+    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("network") or "ETH")
+    force_refresh = str(request.args.get("refresh") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    volume24h = request.args.get("volume24h") or request.args.get("volume24h_usd") or request.args.get("volume")
+    volume24h_f = None
+    try:
+        if volume24h is not None and str(volume24h).strip() != "":
+            volume24h_f = float(volume24h)
+    except Exception:
+        volume24h_f = None
+
+    return jsonify(_get_whale_signal_bitquery(token, chain=chain, volume24h_usd=volume24h_f, force_refresh=force_refresh))
 
 
 @app.route("/api/contracts", methods=["GET"])
