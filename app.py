@@ -872,6 +872,7 @@ def api_contracts():
             "executor": (_EXECUTOR_BY_CHAIN.get(cid) or ""),
             "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
             "routerV3": (_ROUTER_V3_BY_CHAIN.get(cid) or ""),
+            "routers": _nexus_allowed_routers_for_chain(cid) if "_nexus_allowed_routers_for_chain" in globals() else [],
             "wnative": (_WNATIVE_BY_CHAIN.get(cid) or ""),
             "native": native_symbol_by_chain_id.get(cid, key),
             "nativeSymbol": native_symbol_by_chain_id.get(cid, key),
@@ -6530,152 +6531,6 @@ def _fmt_usd(x):
     except Exception:
         return str(x)
 
-
-
-def _nexus_rating_from_score(score: float) -> str:
-    """Stable rating bands for Compare / Rotation / future Vault logic."""
-    try:
-        sc = float(score)
-    except Exception:
-        sc = 0.0
-    if sc >= 90:
-        return "AAA"
-    if sc >= 80:
-        return "AA"
-    if sc >= 70:
-        return "A"
-    if sc >= 60:
-        return "B"
-    if sc >= 50:
-        return "C"
-    return "RISK"
-
-
-def _nexus_signal_from_score(score: float, risk: str = "") -> str:
-    """Decision label used by Compare and later by Rotation. No direct trading execution."""
-    try:
-        sc = float(score)
-    except Exception:
-        sc = 0.0
-    rk = str(risk or "").strip().upper()
-    if rk == "HIGH" or sc < 50:
-        return "AVOID"
-    if sc >= 80:
-        return "STRONG"
-    if sc >= 70:
-        return "ENTRY"
-    if sc >= 60:
-        return "WATCH"
-    return "WAIT"
-
-
-def _nexus_risk_from_parts(base_score: float, market_condition: Optional[dict], whale_signal: Optional[dict], row: Optional[dict]) -> str:
-    """Simple risk band that can later feed Vault safety checks."""
-    risk_points = 0
-    try:
-        ch = float((row or {}).get("change24h"))
-        if abs(ch) >= 20:
-            risk_points += 2
-        elif abs(ch) >= 10:
-            risk_points += 1
-    except Exception:
-        pass
-
-    try:
-        vol = float((row or {}).get("volume24h"))
-        if vol < 50_000:
-            risk_points += 2
-        elif vol < 250_000:
-            risk_points += 1
-    except Exception:
-        risk_points += 1
-
-    mc_state = str((market_condition or {}).get("state") or "").upper()
-    if mc_state in ("FAKE_MOVE", "OVEREXTENDED"):
-        risk_points += 2
-    elif mc_state in ("NORMAL", "EARLY_ACCUMULATION"):
-        risk_points += 0
-
-    whale_action = str((whale_signal or {}).get("action") or "").lower()
-    whale_strength = str((whale_signal or {}).get("strength") or "").lower()
-    if whale_action == "sell":
-        risk_points += 2 if whale_strength in ("high", "medium") else 1
-    elif whale_action == "buy":
-        risk_points = max(0, risk_points - 1)
-
-    try:
-        if float(base_score) < 50:
-            risk_points += 2
-    except Exception:
-        pass
-
-    if risk_points >= 5:
-        return "HIGH"
-    if risk_points >= 3:
-        return "MEDIUM"
-    return "LOW"
-
-
-def compute_nexus_score(
-    row: Dict[str, Any],
-    label: str,
-    hist: Optional[Dict[str, Any]] = None,
-    market_condition: Optional[dict] = None,
-    whale_signal: Optional[dict] = None,
-) -> dict:
-    """Unified Score Engine for Compare / Rotation / future Vault.
-
-    It starts from the existing market health score and then applies the two
-    prepared signal engines:
-      - Market Condition score_delta (OE + RVOL)
-      - Whale score_delta (real Bitquery whale activity only)
-
-    This endpoint does NOT execute trades. It only returns decision-ready data.
-    """
-    base = compute_market_health(row or {}, label, hist)
-    base_score = _safe_float(base.get("score"), 0.0)
-
-    market_delta = 0
-    whale_delta = 0
-    components = {
-        "base": round(base_score, 2),
-        "market_condition": 0,
-        "whale": 0,
-    }
-    reasons = list(base.get("reasons") or [])
-
-    if isinstance(market_condition, dict) and market_condition:
-        market_delta = int(_safe_float(market_condition.get("score_delta"), 0))
-        components["market_condition"] = market_delta
-        label_txt = market_condition.get("label") or market_condition.get("state") or "Market condition"
-        reasons.append(f"{label}: market condition {label_txt} ({market_delta:+d})")
-
-    if isinstance(whale_signal, dict) and whale_signal:
-        whale_delta = int(_safe_float(whale_signal.get("score_delta"), 0))
-        components["whale"] = whale_delta
-        summary = whale_signal.get("summary") or whale_signal.get("label") or "Whale signal checked"
-        reasons.append(f"{label}: {summary} ({whale_delta:+d})")
-
-    final_score = round(_clamp(base_score + market_delta + whale_delta, 0, 100))
-    risk = _nexus_risk_from_parts(final_score, market_condition, whale_signal, row)
-    rating = _nexus_rating_from_score(final_score)
-    signal = _nexus_signal_from_score(final_score, risk)
-
-    return {
-        "score": final_score,
-        "base_score": round(base_score, 2),
-        "rating": rating,
-        "signal": signal,
-        "risk": risk,
-        "status": base.get("status"),
-        "confidence": base.get("confidence"),
-        "components": components,
-        "reasons": reasons[:12],
-        "market_condition": market_condition or None,
-        "whale": whale_signal or None,
-        "metrics": base.get("metrics") or {},
-    }
-
 def compute_market_health(row: Dict[str, Any], label: str, hist: Optional[Dict[str, Any]]):
     ch = row.get("change24h")
     vol24 = row.get("volume24h")
@@ -6836,574 +6691,6 @@ def api_health_market():
             return ok(stale_health)
         return err(str(e), 500)
 
-
-
-
-def _nexus_score_for_symbol(symbol: str = "", coin_id: str = "", token: str = "", chain: str = "ETH", fast: bool = True, include_market_condition: bool = True, include_whale: bool = True) -> dict:
-    sym = str(symbol or "").strip().upper()
-    cid = str(coin_id or "").strip()
-    if not cid:
-        if not sym:
-            raise RuntimeError("missing symbol or coin id")
-        cid = _resolve_cg_id(sym) or ""
-        if not cid:
-            raise RuntimeError("could not resolve CoinGecko id")
-
-    snap = _cg_market_snapshot(cid)
-    row = {
-        "price": snap.get("price"),
-        "change24h": snap.get("change24h"),
-        "volume24h": snap.get("volume24h"),
-    }
-
-    hist = None
-    if not fast:
-        try:
-            d30 = _cg_market_chart_usd(cid, 30)
-            d180 = _cg_market_chart_usd(cid, 180)
-            m30 = _compute_history_metrics((d30 or {}).get("prices"))
-            m180 = _compute_history_metrics((d180 or {}).get("prices"))
-            hist = {
-                "trend30d": (m30 or {}).get("retPct"),
-                "vol30d": (m30 or {}).get("vol"),
-                "trend180d": (m180 or {}).get("retPct"),
-                "dd180d": (m180 or {}).get("maxDrawdownPct"),
-            }
-        except Exception:
-            hist = None
-
-    market_condition = None
-    if include_market_condition:
-        try:
-            market_condition = _market_condition_for_coin(cid, days=20)
-        except Exception as e:
-            market_condition = {"status": "error", "score_delta": 0, "error": str(e)}
-
-    whale_signal = None
-    if include_whale and _looks_like_evm_addr(token):
-        try:
-            whale_signal = _get_whale_signal_bitquery(
-                token,
-                chain=_normalize_chain_key(chain or "ETH"),
-                volume24h_usd=row.get("volume24h"),
-                force_refresh=False,
-            )
-        except Exception as e:
-            whale_signal = {"status": "error", "score_delta": 0, "error": str(e), "action": "neutral"}
-
-    label = sym or str(cid).upper()
-    score = compute_nexus_score(row, label, hist=hist, market_condition=market_condition, whale_signal=whale_signal)
-    score.update({
-        "symbol": sym or None,
-        "id": cid,
-        "price": row.get("price"),
-        "change24h": row.get("change24h"),
-        "volume24h": row.get("volume24h"),
-        "fast": bool(fast),
-        "source": "nexus_score_engine",
-    })
-    return score
-
-
-@app.route("/api/nexus/score", methods=["GET"])
-def api_nexus_score():
-    """Unified score endpoint for UI Compare, Rotation and later Vault preview.
-
-    Optional params:
-      symbol=BTC or id=bitcoin
-      token=0x...&chain=POL for real Bitquery whale impact
-      fast=1 for no 30d/180d history fetch
-    """
-    symbol = (request.args.get("symbol") or "").strip().upper()
-    coin_id = (request.args.get("id") or request.args.get("coin_id") or "").strip()
-    token = (request.args.get("token") or request.args.get("token_address") or request.args.get("contract") or "").strip().lower()
-    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("network") or "ETH")
-    fast = str(request.args.get("fast") or "1").strip().lower() in ("1", "true", "yes", "on")
-    include_whale = str(request.args.get("include_whale") or "1").strip().lower() in ("1", "true", "yes", "on")
-    include_market = str(request.args.get("include_market_condition") or "1").strip().lower() in ("1", "true", "yes", "on")
-
-    try:
-        data = _nexus_score_for_symbol(symbol=symbol, coin_id=coin_id, token=token, chain=chain, fast=fast, include_market_condition=include_market, include_whale=include_whale)
-        return jsonify({"status": "ok", "data": data, "ts": now_ts()})
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "symbol": symbol, "id": coin_id, "ts": now_ts()}), 400
-
-
-@app.route("/api/nexus/compare-scores", methods=["GET", "POST"])
-def api_nexus_compare_scores():
-    """Batch score endpoint for Compare and later Rotation ranking.
-
-    GET:  /api/nexus/compare-scores?symbols=BTC,ETH
-    POST: {"symbols":["BTC","ETH"], "tokens":{"TBP":{"token":"0x...","chain":"POL"}}}
-    """
-    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
-    raw_symbols = body.get("symbols") if isinstance(body, dict) else None
-    if not isinstance(raw_symbols, list):
-        symbols_raw = (request.args.get("symbols") or request.args.get("symbol") or "").strip()
-        raw_symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
-
-    symbols = []
-    for s0 in raw_symbols:
-        s1 = str(s0 or "").strip().upper()
-        if s1 and s1 not in symbols:
-            symbols.append(s1)
-    symbols = symbols[:20]
-
-    if not symbols:
-        return err("missing symbols", 400)
-
-    token_map = body.get("tokens") if isinstance(body, dict) else None
-    if not isinstance(token_map, dict):
-        token_map = {}
-        raw_token_map = request.args.get("tokens") or ""
-        if raw_token_map:
-            try:
-                token_map = json.loads(raw_token_map)
-            except Exception:
-                token_map = {}
-
-    fast = str((body.get("fast") if isinstance(body, dict) else request.args.get("fast")) or "1").strip().lower() in ("1", "true", "yes", "on")
-
-    results = []
-    errors = {}
-    for sym in symbols:
-        try:
-            meta = token_map.get(sym) or token_map.get(sym.upper()) or {}
-            token = ""
-            chain = "ETH"
-            if isinstance(meta, dict):
-                token = str(meta.get("token") or meta.get("token_address") or meta.get("contract") or "").strip().lower()
-                chain = _normalize_chain_key(meta.get("chain") or meta.get("network") or "ETH")
-            item = _nexus_score_for_symbol(symbol=sym, token=token, chain=chain, fast=fast, include_market_condition=True, include_whale=True)
-            results.append(item)
-        except Exception as e:
-            errors[sym] = str(e)
-
-    results.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
-    for idx, item in enumerate(results, start=1):
-        item["rank"] = idx
-
-    return jsonify({
-        "status": "partial" if errors else "ok",
-        "symbols": symbols,
-        "results": results,
-        "errors": errors,
-        "ts": now_ts(),
-    }), 200
-
-
-# -------------------------
-# Nexus Rotation Engine (planning only, no execution)
-# -------------------------
-def _rotation_eligible(score_item: dict) -> bool:
-    """Asset eligibility for rotation planning. This never executes a trade."""
-    try:
-        score = float(score_item.get("score") or 0)
-    except Exception:
-        score = 0.0
-    risk = str(score_item.get("risk") or "").strip().upper()
-    signal = str(score_item.get("signal") or "").strip().upper()
-    if risk == "HIGH":
-        return False
-    if signal in ("AVOID", "WAIT"):
-        return False
-    return score >= 60
-
-
-def _rotation_weight(score_item: dict) -> float:
-    """Convert score/risk into a relative allocation weight."""
-    try:
-        score = float(score_item.get("score") or 0)
-    except Exception:
-        score = 0.0
-    risk = str(score_item.get("risk") or "").strip().upper()
-    signal = str(score_item.get("signal") or "").strip().upper()
-
-    # Only the upper part of the score earns allocation weight.
-    w = max(0.0, score - 55.0)
-
-    # Strong assets get priority; risky assets are reduced.
-    if signal == "STRONG":
-        w *= 1.25
-    elif signal == "ENTRY":
-        w *= 1.10
-    elif signal == "WATCH":
-        w *= 0.75
-
-    if risk == "MEDIUM":
-        w *= 0.65
-    elif risk == "HIGH":
-        w = 0.0
-
-    return round(max(0.0, w), 6)
-
-
-def _rotation_reason(item: dict, target_pct: float, current_pct: float) -> list[str]:
-    reasons = []
-    symbol = item.get("symbol") or item.get("id") or "Asset"
-    reasons.append(f"{symbol}: Score {item.get('score')} / Rating {item.get('rating')} / Risk {item.get('risk')}")
-    if target_pct > current_pct + 1:
-        reasons.append("Increase allocation because target weight is above current weight.")
-    elif target_pct < current_pct - 1:
-        reasons.append("Reduce allocation because target weight is below current weight.")
-    else:
-        reasons.append("Keep allocation close to current weight.")
-    for r in (item.get("reasons") or [])[:3]:
-        if isinstance(r, str) and r not in reasons:
-            reasons.append(r)
-    return reasons[:5]
-
-
-def build_nexus_rotation_plan(score_items: list[dict], budget_usd: float = 0.0, current_positions: Optional[dict] = None, max_assets: int = 5, min_target_pct: float = 5.0) -> dict:
-    """Build a decision-ready rotation plan from Compare scores.
-
-    Planning only:
-      - no wallet action
-      - no swap
-      - no contract call
-
-    The later Vault can use this as its dry-run / preview foundation.
-    """
-    current_positions = current_positions if isinstance(current_positions, dict) else {}
-    max_assets_i = max(1, min(10, int(max_assets or 5)))
-    min_target_pct_f = max(0.0, min(25.0, float(min_target_pct or 0)))
-
-    clean = []
-    for raw in score_items or []:
-        if not isinstance(raw, dict):
-            continue
-        item = dict(raw)
-        item["eligible"] = _rotation_eligible(item)
-        item["rotation_weight"] = _rotation_weight(item) if item["eligible"] else 0.0
-        clean.append(item)
-
-    clean.sort(key=lambda x: (float(x.get("rotation_weight") or 0), float(x.get("score") or 0)), reverse=True)
-    selected = [x for x in clean if float(x.get("rotation_weight") or 0) > 0][:max_assets_i]
-    total_weight = sum(float(x.get("rotation_weight") or 0) for x in selected)
-
-    allocations = []
-    if total_weight > 0:
-        for item in selected:
-            symbol = str(item.get("symbol") or item.get("id") or "").upper()
-            weight = float(item.get("rotation_weight") or 0)
-            target_pct = round((weight / total_weight) * 100.0, 2)
-            if target_pct < min_target_pct_f:
-                target_pct = 0.0
-            current_value = _safe_float(current_positions.get(symbol), 0.0)
-            target_value = round((_safe_float(budget_usd) * target_pct / 100.0), 2) if _safe_float(budget_usd) > 0 else 0.0
-            current_pct = round((current_value / _safe_float(budget_usd) * 100.0), 2) if _safe_float(budget_usd) > 0 else 0.0
-            diff_usd = round(target_value - current_value, 2)
-            if target_pct <= 0:
-                action = "SKIP"
-            elif diff_usd > max(10.0, _safe_float(budget_usd) * 0.01):
-                action = "INCREASE"
-            elif diff_usd < -max(10.0, _safe_float(budget_usd) * 0.01):
-                action = "REDUCE"
-            else:
-                action = "HOLD"
-            allocations.append({
-                "symbol": symbol,
-                "rank": len(allocations) + 1,
-                "score": item.get("score"),
-                "rating": item.get("rating"),
-                "signal": item.get("signal"),
-                "risk": item.get("risk"),
-                "target_pct": target_pct,
-                "target_usd": target_value,
-                "current_usd": current_value,
-                "current_pct": current_pct,
-                "delta_usd": diff_usd,
-                "action": action,
-                "reasons": _rotation_reason(item, target_pct, current_pct),
-            })
-
-    excluded = []
-    selected_symbols = {a.get("symbol") for a in allocations}
-    for item in clean:
-        symbol = str(item.get("symbol") or item.get("id") or "").upper()
-        if not symbol or symbol in selected_symbols:
-            continue
-        why = "not eligible"
-        if str(item.get("risk") or "").upper() == "HIGH":
-            why = "high risk"
-        elif float(item.get("score") or 0) < 60:
-            why = "score below rotation threshold"
-        elif str(item.get("signal") or "").upper() in ("AVOID", "WAIT"):
-            why = f"signal {item.get('signal')}"
-        excluded.append({
-            "symbol": symbol,
-            "score": item.get("score"),
-            "rating": item.get("rating"),
-            "signal": item.get("signal"),
-            "risk": item.get("risk"),
-            "reason": why,
-        })
-
-    mode = "READY" if allocations else "WAIT"
-    summary = "Rotation plan ready" if allocations else "No asset currently qualifies for rotation"
-    return {
-        "status": "ok",
-        "mode": mode,
-        "summary": summary,
-        "budget_usd": round(_safe_float(budget_usd), 2),
-        "max_assets": max_assets_i,
-        "min_target_pct": min_target_pct_f,
-        "allocations": allocations,
-        "excluded": excluded[:20],
-        "execution": "disabled_planning_only",
-        "ts": now_ts(),
-    }
-
-
-@app.route("/api/nexus/rotation-plan", methods=["GET", "POST"])
-def api_nexus_rotation_plan():
-    """Create a Nexus Rotation plan from current Compare scores.
-
-    GET:  /api/nexus/rotation-plan?symbols=BTC,ETH&budget_usd=1000
-    POST: {
-      "symbols": ["BTC", "ETH"],
-      "budget_usd": 1000,
-      "positions": {"BTC": 200},
-      "tokens": {"TBP": {"token":"0x...", "chain":"POL"}}
-    }
-    """
-    body = request.get_json(silent=True) or {} if request.method == "POST" else {}
-
-    raw_symbols = body.get("symbols") if isinstance(body, dict) else None
-    if not isinstance(raw_symbols, list):
-        symbols_raw = (request.args.get("symbols") or request.args.get("symbol") or "").strip()
-        raw_symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
-
-    symbols = []
-    for s0 in raw_symbols:
-        s1 = str(s0 or "").strip().upper()
-        if s1 and s1 not in symbols:
-            symbols.append(s1)
-    symbols = symbols[:20]
-    if not symbols:
-        return err("missing symbols", 400)
-
-    budget_usd = _safe_float((body.get("budget_usd") if isinstance(body, dict) else None) or request.args.get("budget_usd") or request.args.get("budget") or 0, 0.0)
-    max_assets = int(_safe_float((body.get("max_assets") if isinstance(body, dict) else None) or request.args.get("max_assets") or 5, 5))
-    min_target_pct = _safe_float((body.get("min_target_pct") if isinstance(body, dict) else None) or request.args.get("min_target_pct") or 5, 5.0)
-    positions = body.get("positions") if isinstance(body, dict) else None
-    if not isinstance(positions, dict):
-        positions = {}
-
-    token_map = body.get("tokens") if isinstance(body, dict) else None
-    if not isinstance(token_map, dict):
-        token_map = {}
-
-    fast = str((body.get("fast") if isinstance(body, dict) else request.args.get("fast")) or "1").strip().lower() in ("1", "true", "yes", "on")
-
-    score_items = []
-    errors = {}
-    for sym in symbols:
-        try:
-            meta = token_map.get(sym) or token_map.get(sym.upper()) or {}
-            token = ""
-            chain = "ETH"
-            if isinstance(meta, dict):
-                token = str(meta.get("token") or meta.get("token_address") or meta.get("contract") or "").strip().lower()
-                chain = _normalize_chain_key(meta.get("chain") or meta.get("network") or "ETH")
-            score_items.append(_nexus_score_for_symbol(symbol=sym, token=token, chain=chain, fast=fast, include_market_condition=True, include_whale=True))
-        except Exception as e:
-            errors[sym] = str(e)
-
-    plan = build_nexus_rotation_plan(score_items, budget_usd=budget_usd, current_positions=positions, max_assets=max_assets, min_target_pct=min_target_pct)
-    plan["symbols"] = symbols
-    plan["errors"] = errors
-    if errors:
-        plan["status"] = "partial"
-    return jsonify(plan), 200
-
-
-
-# -------------------------
-# Nexus Order Preview (dry-run only, no execution)
-# -------------------------
-def _nexus_preview_price(symbol: str = "", coin_id: str = "", price: Any = None) -> tuple[float, str]:
-    """Resolve a USD price for dry-run previews. Never executes an order."""
-    px = _safe_float(price, 0.0)
-    if px > 0:
-        return px, "client"
-
-    cid = str(coin_id or "").strip()
-    sym = str(symbol or "").strip().upper()
-    if not cid and sym:
-        try:
-            cid = _resolve_cg_id(sym) or ""
-        except Exception:
-            cid = ""
-
-    if cid:
-        try:
-            snap = _cg_market_snapshot(cid)
-            px = _safe_float((snap or {}).get("price"), 0.0)
-            if px > 0:
-                return px, "coingecko"
-        except Exception:
-            pass
-
-    return 0.0, "unavailable"
-
-
-def build_nexus_order_preview(payload: dict) -> dict:
-    """Create a conservative order preview for Grid/Rotation/Vault preparation.
-
-    Dry-run only:
-      - no wallet signature
-      - no swap
-      - no contract call
-
-    Supported inputs:
-      {
-        "symbol": "ETH",
-        "coin_id": "ethereum",
-        "side": "BUY" | "SELL",
-        "amount_usd": 250,        # BUY basis
-        "amount_tokens": 0.1,      # SELL basis or optional BUY output hint
-        "price": 2500,             # optional client price
-        "slippage_bps": 300,
-        "score_item": {...},       # optional Nexus score object
-        "route": {...}             # optional planned router/DEX info
-      }
-    """
-    payload = payload if isinstance(payload, dict) else {}
-    symbol = str(payload.get("symbol") or payload.get("asset") or "").strip().upper()
-    coin_id = str(payload.get("coin_id") or payload.get("id") or "").strip()
-    side = str(payload.get("side") or "BUY").strip().upper()
-    if side not in ("BUY", "SELL", "REDUCE", "INCREASE"):
-        side = "BUY"
-    # Rotation actions map to order side for preview purposes.
-    if side == "INCREASE":
-        side = "BUY"
-    elif side == "REDUCE":
-        side = "SELL"
-
-    amount_usd = _safe_float(payload.get("amount_usd") or payload.get("usd") or payload.get("delta_usd"), 0.0)
-    amount_tokens = _safe_float(payload.get("amount_tokens") or payload.get("qty") or payload.get("tokens"), 0.0)
-
-    price, price_source = _nexus_preview_price(symbol=symbol, coin_id=coin_id, price=payload.get("price"))
-
-    try:
-        slippage_bps = int(payload.get("slippage_bps") if payload.get("slippage_bps") is not None else DEFAULT_SLIPPAGE_BPS)
-    except Exception:
-        slippage_bps = int(DEFAULT_SLIPPAGE_BPS)
-    slippage_bps = int(max(0, min(5000, slippage_bps)))
-    slip = slippage_bps / 10000.0
-
-    if side == "BUY":
-        input_usd = max(0.0, amount_usd)
-        estimated_tokens = (input_usd / price) if price > 0 and input_usd > 0 else 0.0
-        min_tokens = estimated_tokens * (1.0 - slip)
-        output_usd = input_usd
-    else:
-        estimated_tokens = max(0.0, amount_tokens)
-        output_usd = estimated_tokens * price if price > 0 else max(0.0, amount_usd)
-        input_usd = output_usd
-        min_tokens = 0.0
-
-    score_item = payload.get("score_item") if isinstance(payload.get("score_item"), dict) else {}
-    risk = str(score_item.get("risk") or payload.get("risk") or "").strip().upper()
-    score = _safe_float(score_item.get("score") or payload.get("score"), 0.0)
-    signal = str(score_item.get("signal") or payload.get("signal") or "").strip().upper()
-
-    warnings = []
-    blocking = []
-    if price <= 0:
-        blocking.append("price unavailable")
-    if input_usd <= 0 and estimated_tokens <= 0:
-        blocking.append("amount missing")
-    if slippage_bps > 1000:
-        warnings.append("high slippage tolerance")
-    if risk == "HIGH":
-        blocking.append("high risk score")
-    elif risk == "MEDIUM":
-        warnings.append("medium risk score")
-    if signal in ("AVOID", "WAIT"):
-        warnings.append(f"weak signal: {signal}")
-
-    route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
-    plan_action = str(payload.get("action") or payload.get("plan_action") or "PREVIEW").strip().upper()
-
-    return {
-        "status": "blocked" if blocking else "ok",
-        "execution": "disabled_preview_only",
-        "symbol": symbol or None,
-        "coin_id": coin_id or None,
-        "side": side,
-        "action": plan_action,
-        "price_usd": round(price, 12) if price > 0 else 0,
-        "price_source": price_source,
-        "input_usd": round(input_usd, 2),
-        "estimated_tokens": round(estimated_tokens, 12),
-        "estimated_output_usd": round(output_usd, 2),
-        "slippage_bps": slippage_bps,
-        "slippage_pct": round(slip * 100.0, 4),
-        "min_tokens_after_slippage": round(min_tokens, 12),
-        "score": score_item.get("score") if score_item else (round(score) if score else None),
-        "rating": score_item.get("rating") if score_item else payload.get("rating"),
-        "signal": signal or None,
-        "risk": risk or None,
-        "route": route or {"mode": "not_selected_yet"},
-        "warnings": warnings,
-        "blocking_reasons": blocking,
-        "ready_for_vault": (len(blocking) == 0),
-        "ts": now_ts(),
-    }
-
-
-@app.route("/api/nexus/order-preview", methods=["POST"])
-def api_nexus_order_preview():
-    """Dry-run endpoint used before real Vault execution exists."""
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict):
-        return err("body must be an object", 400)
-    try:
-        return jsonify(build_nexus_order_preview(body)), 200
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "execution": "disabled_preview_only", "ts": now_ts()}), 500
-
-
-@app.route("/api/nexus/rotation-preview", methods=["POST"])
-def api_nexus_rotation_preview():
-    """Create order previews from a rotation plan/allocation list. No execution."""
-    body = request.get_json(silent=True) or {}
-    if not isinstance(body, dict):
-        return err("body must be an object", 400)
-
-    allocations = body.get("allocations")
-    if not isinstance(allocations, list):
-        plan = body.get("plan") if isinstance(body.get("plan"), dict) else {}
-        allocations = plan.get("allocations") if isinstance(plan.get("allocations"), list) else []
-
-    previews = []
-    for a in allocations[:20]:
-        if not isinstance(a, dict):
-            continue
-        action = str(a.get("action") or "").upper()
-        delta = _safe_float(a.get("delta_usd"), 0.0)
-        if action not in ("INCREASE", "REDUCE") or abs(delta) <= 0:
-            continue
-        previews.append(build_nexus_order_preview({
-            "symbol": a.get("symbol"),
-            "side": "BUY" if action == "INCREASE" else "SELL",
-            "amount_usd": abs(delta),
-            "price": a.get("price") or a.get("price_usd"),
-            "slippage_bps": body.get("slippage_bps", DEFAULT_SLIPPAGE_BPS),
-            "score_item": a,
-            "action": action,
-            "route": body.get("route") if isinstance(body.get("route"), dict) else {},
-        }))
-
-    return jsonify({
-        "status": "ok",
-        "execution": "disabled_preview_only",
-        "count": len(previews),
-        "previews": previews,
-        "ts": now_ts(),
-    }), 200
 
 # -------------------------
 # Market test / Market data
@@ -11923,3 +11210,566 @@ def api_ai_pair_insight():
             "coin_id_b": resolved_b,
             "ts": now_ts(),
         }), 502
+
+# =========================================================
+# Nexus Bridge Layer: Score -> Rotation -> Preview -> Vault-ready checks
+# =========================================================
+# Purpose:
+# - Keep UI clean while exposing backend endpoints needed by Compare, Rotation and later Vault V2.
+# - No trade execution here. These endpoints only score, plan, preview and validate readiness.
+# - Vault V2 remains the execution/security layer and must still validate router/token/minOut/slippage on-chain.
+
+_NEXUS_MAX_SLIPPAGE_BPS = int(os.getenv("NEXUS_MAX_SLIPPAGE_BPS", "500"))  # 5% hard backend preview cap
+_NEXUS_DEFAULT_SLIPPAGE_BPS = int(os.getenv("NEXUS_DEFAULT_SLIPPAGE_BPS", str(DEFAULT_SLIPPAGE_BPS)))
+_NEXUS_MIN_PROFIT_FEE_USD = float(os.getenv("NEXUS_MIN_PROFIT_FEE_USD", "100"))
+_NEXUS_PERFORMANCE_FEE_BPS = int(os.getenv("NEXUS_PERFORMANCE_FEE_BPS", "300"))
+_NEXUS_MAX_PERFORMANCE_FEE_BPS = int(os.getenv("NEXUS_MAX_PERFORMANCE_FEE_BPS", "500"))
+
+# Vault V2 revenue policy:
+# Performance fees must be paid to the fee receiver in a stablecoin, never in random profit tokens.
+# Preferred stable can be overridden globally or per chain:
+#   NEXUS_FEE_STABLE=USDC|USDT
+#   NEXUS_FEE_STABLE_POL=USDC, NEXUS_FEE_STABLE_BNB=USDT, NEXUS_FEE_STABLE_ETH=USDC
+_NEXUS_FEE_STABLE_DEFAULT = str(os.getenv("NEXUS_FEE_STABLE", "USDC")).strip().upper()
+_NEXUS_FEE_RECEIVER = str(os.getenv("NEXUS_FEE_RECEIVER") or os.getenv("FEE_RECEIVER") or os.getenv("TREASURY_ADDRESS") or "").strip()
+
+
+def _nexus_chain_key_from_id(chain_id: int) -> str:
+    try:
+        cid = int(chain_id or 0)
+    except Exception:
+        cid = 0
+    for k, v in (_CHAIN_ID_BY_KEY or {}).items():
+        try:
+            if int(v) == cid:
+                return str(k).upper()
+        except Exception:
+            continue
+    return {1: "ETH", 56: "BNB", 137: "POL"}.get(cid, "")
+
+
+def _nexus_router_env(chain_key: str, router_key: str) -> str:
+    """Read a router address from flexible ENV names, e.g. ROUTER_0X_POL, ZEROX_ROUTER_ADDRESS_137."""
+    ck = _normalize_chain_key(chain_key)
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+    rk = str(router_key or "").strip().upper().replace("-", "_")
+    aliases = {
+        "0X": ["0X", "ZEROX", "ZERO_X"],
+        "ONEINCH": ["ONEINCH", "1INCH", "ONE_INCH"],
+        "UNISWAP": ["UNISWAP", "UNI"],
+        "QUICKSWAP": ["QUICKSWAP", "QUICK"],
+        "PANCAKESWAP": ["PANCAKESWAP", "PANCAKE"],
+        "SUSHISWAP": ["SUSHISWAP", "SUSHI"],
+        "CURVE": ["CURVE"],
+    }.get(rk, [rk])
+    suffixes = [ck]
+    if cid:
+        suffixes.append(str(cid))
+    if ck == "POL":
+        suffixes.append("POLYGON")
+    if ck == "BNB":
+        suffixes.append("BSC")
+    candidates = []
+    for a in aliases:
+        for suf in suffixes:
+            candidates += [
+                f"ROUTER_{a}_{suf}",
+                f"{a}_ROUTER_{suf}",
+                f"{a}_ROUTER_ADDRESS_{suf}",
+                f"ROUTER_ADDRESS_{a}_{suf}",
+            ]
+    for name in candidates:
+        val = str(os.getenv(name) or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def _nexus_allowed_routers_for_chain(chain_id_or_key) -> list[dict]:
+    """Backend router allowlist for Preview + /api/contracts.
+
+    Addresses are ENV-driven to avoid hardcoding wrong chain router contracts.
+    Existing ROUTER_ADDRESS_* and ROUTER_V3_ADDRESS_* are exposed as generic v2/v3 fallbacks.
+    """
+    if isinstance(chain_id_or_key, str) and not str(chain_id_or_key).isdigit():
+        ck = _normalize_chain_key(chain_id_or_key)
+        cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+    else:
+        cid = int(chain_id_or_key or 0)
+        ck = _nexus_chain_key_from_id(cid)
+    native = {1: "ETH", 56: "BNB", 137: "POL"}.get(cid, ck)
+
+    raw = [
+        {"key": "primary_v2", "name": "Primary V2 Router", "type": "v2", "address": (_ROUTER_BY_CHAIN.get(cid) or "")},
+        {"key": "primary_v3", "name": "Primary V3 Router", "type": "v3", "address": (_ROUTER_V3_BY_CHAIN.get(cid) or "")},
+        {"key": "uniswap", "name": "Uniswap", "type": "dex", "address": _nexus_router_env(ck, "UNISWAP")},
+        {"key": "quickswap", "name": "QuickSwap", "type": "dex", "address": _nexus_router_env(ck, "QUICKSWAP")},
+        {"key": "pancakeswap", "name": "PancakeSwap", "type": "dex", "address": _nexus_router_env(ck, "PANCAKESWAP")},
+        {"key": "sushiswap", "name": "SushiSwap", "type": "dex", "address": _nexus_router_env(ck, "SUSHISWAP")},
+        {"key": "oneinch", "name": "1inch", "type": "aggregator", "address": _nexus_router_env(ck, "ONEINCH")},
+        {"key": "0x", "name": "0x Exchange Proxy", "type": "aggregator", "address": _nexus_router_env(ck, "0X")},
+    ]
+    seen = set()
+    out = []
+    for r in raw:
+        addr = str(r.get("address") or "").strip()
+        if not addr:
+            continue
+        low = addr.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        rr = dict(r)
+        rr["address"] = addr
+        rr["chain"] = ck
+        rr["chainId"] = cid
+        rr["native"] = native
+        rr["enabled"] = True
+        out.append(rr)
+    return out
+
+
+def _nexus_router_allowed(chain: str, router_key: str = "", router_address: str = "") -> tuple[bool, dict | None, list[dict]]:
+    ck = _normalize_chain_key(chain or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+    routers = _nexus_allowed_routers_for_chain(cid)
+    rk = str(router_key or "").strip().lower()
+    ra = str(router_address or "").strip().lower()
+    for r in routers:
+        if rk and str(r.get("key") or "").lower() == rk:
+            return True, r, routers
+        if ra and str(r.get("address") or "").strip().lower() == ra:
+            return True, r, routers
+    # If no router specified, use first configured router as default.
+    if not rk and not ra and routers:
+        return True, routers[0], routers
+    return False, None, routers
+
+
+def _nexus_stable_address_for_chain(chain: str, stable: str = "") -> dict:
+    """Return the configured fee stablecoin for a chain. Fees should settle in USDT/USDC only."""
+    ck = _normalize_chain_key(chain or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(ck, 0) or 0)
+    requested = str(stable or os.getenv(f"NEXUS_FEE_STABLE_{ck}") or _NEXUS_FEE_STABLE_DEFAULT or "USDC").strip().upper()
+    if requested not in ("USDC", "USDT"):
+        requested = "USDC"
+
+    usdc = str((_USDC_BY_CHAIN or {}).get(cid) or "").strip()
+    usdt = str((_USDT_BY_CHAIN or {}).get(cid) or "").strip()
+
+    # Prefer requested stable, but fall back to the other configured stable if needed.
+    if requested == "USDT" and usdt:
+        symbol, addr = "USDT", usdt
+    elif requested == "USDC" and usdc:
+        symbol, addr = "USDC", usdc
+    elif usdc:
+        symbol, addr = "USDC", usdc
+    elif usdt:
+        symbol, addr = "USDT", usdt
+    else:
+        symbol, addr = requested, ""
+
+    return {
+        "symbol": symbol,
+        "address": addr,
+        "chain": ck,
+        "chainId": cid,
+        "configured": bool(addr),
+    }
+
+
+def _nexus_fee_preview(profit_usd: float, chain: str, preferred_stable: str = "") -> dict:
+    """Preview performance fee. Fee is charged only on realized profit >= threshold and must settle in USDC/USDT."""
+    profit = _safe_float(profit_usd)
+    fee_bps = min(max(int(_NEXUS_PERFORMANCE_FEE_BPS or 0), 0), int(_NEXUS_MAX_PERFORMANCE_FEE_BPS or 500))
+    threshold = float(_NEXUS_MIN_PROFIT_FEE_USD or 100.0)
+    taxable = profit if profit >= threshold else 0.0
+    fee_usd = taxable * fee_bps / 10_000.0
+    stable = _nexus_stable_address_for_chain(chain, preferred_stable)
+    return {
+        "applies": bool(taxable > 0 and fee_usd > 0),
+        "profitUsd": round(profit, 6),
+        "taxableProfitUsd": round(taxable, 6),
+        "feeUsd": round(fee_usd, 6),
+        "performanceFeeBps": fee_bps,
+        "maxPerformanceFeeBps": int(_NEXUS_MAX_PERFORMANCE_FEE_BPS or 500),
+        "minProfitForFeeUsd": threshold,
+        "settlement": {
+            "mode": "stablecoin_only",
+            "stableSymbol": stable.get("symbol"),
+            "stableAddress": stable.get("address"),
+            "stableConfigured": bool(stable.get("configured")),
+            "allowedStableSymbols": ["USDC", "USDT"],
+            "feeReceiver": _NEXUS_FEE_RECEIVER,
+            "feeReceiverConfigured": _looks_like_evm_addr(_NEXUS_FEE_RECEIVER),
+        },
+        "note": "Performance fee is charged only on realized profit at/above the threshold and must be converted/sent as USDC or USDT.",
+    }
+
+
+def _nexus_symbol_payload(symbol_or_item: str) -> dict:
+    sym = str(symbol_or_item or "").strip().upper()
+    if ":" in sym:
+        sym = sym.split(":", 1)[-1].strip().upper()
+    out = {"symbol": sym, "price": 0.0, "change24h": 0.0, "volume24h": 0.0, "marketCap": 0.0, "coin_id": ""}
+    if not sym:
+        return out
+
+    cid = ""
+    try:
+        cid = _cg_resolve_symbol(sym) or ""
+    except Exception:
+        cid = ""
+    out["coin_id"] = cid
+
+    snap = None
+    if cid:
+        try:
+            snap = _cg_market_snapshot(cid)
+        except Exception:
+            snap = None
+    if isinstance(snap, dict):
+        out["price"] = _safe_float(snap.get("price"))
+        out["change24h"] = _safe_float(snap.get("change24") if "change24" in snap else snap.get("change24h"))
+        out["volume24h"] = _safe_float(snap.get("volume24") if "volume24" in snap else snap.get("volume24h"))
+        out["marketCap"] = _safe_float(snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"))
+    if out["price"] <= 0:
+        try:
+            px = _price_multi(sym)
+            if isinstance(px, dict):
+                out["price"] = _safe_float(px.get("price"))
+                out["coin_id"] = out["coin_id"] or str(px.get("id") or "")
+        except Exception:
+            pass
+    return out
+
+
+def _nexus_rating(score: float) -> str:
+    s = _safe_float(score)
+    if s >= 85:
+        return "AAA"
+    if s >= 75:
+        return "AA"
+    if s >= 65:
+        return "A"
+    if s >= 55:
+        return "B"
+    if s >= 40:
+        return "C"
+    return "RISK"
+
+
+def _nexus_action(score: float, risk: str) -> str:
+    s = _safe_float(score)
+    r = str(risk or "").upper()
+    if r == "HIGH" or s < 40:
+        return "SKIP"
+    if s >= 75:
+        return "INCREASE"
+    if s >= 55:
+        return "HOLD"
+    return "REDUCE"
+
+
+def _nexus_score_for_asset(asset: dict) -> dict:
+    symbol = str(asset.get("symbol") or asset.get("item") or asset.get("id") or "").strip().upper()
+    chain = _normalize_chain_key(asset.get("chain") or "")
+    token = str(asset.get("token") or asset.get("token_address") or asset.get("address") or "").strip()
+    market = _nexus_symbol_payload(symbol)
+    price = _safe_float(asset.get("price"), market.get("price") or 0)
+    change24h = _safe_float(asset.get("change24h"), market.get("change24h") or 0)
+    volume24h = _safe_float(asset.get("volume24h"), market.get("volume24h") or 0)
+    market_cap = _safe_float(asset.get("marketCap") if asset.get("marketCap") is not None else asset.get("market_cap"), market.get("marketCap") or 0)
+
+    base = 50.0
+    parts = {"base": base, "trend": 0, "volume": 0, "market_condition": 0, "whale": 0, "liquidity": 0}
+    reasons = []
+
+    if change24h > 10:
+        parts["trend"] = 10; reasons.append("Strong 24h momentum")
+    elif change24h > 3:
+        parts["trend"] = 5; reasons.append("Positive 24h trend")
+    elif change24h < -10:
+        parts["trend"] = -10; reasons.append("Heavy 24h weakness")
+    elif change24h < -3:
+        parts["trend"] = -5; reasons.append("Weak 24h trend")
+
+    if volume24h >= 5_000_000:
+        parts["volume"] = 10; reasons.append("Strong 24h volume")
+    elif volume24h >= 500_000:
+        parts["volume"] = 6; reasons.append("Healthy 24h volume")
+    elif 0 < volume24h < 25_000:
+        parts["volume"] = -6; reasons.append("Thin 24h volume")
+
+    if market_cap and market_cap < 1_000_000:
+        parts["liquidity"] = -6; reasons.append("Micro-cap risk")
+    elif market_cap and market_cap > 100_000_000:
+        parts["liquidity"] = 4; reasons.append("Higher market-cap stability")
+
+    market_condition = None
+    try:
+        if market.get("coin_id") or symbol:
+            market_condition = _market_condition_for_coin(market.get("coin_id") or symbol, days=20)
+            parts["market_condition"] = int(_safe_float(market_condition.get("score_delta")))
+            if market_condition.get("label"):
+                reasons.append(str(market_condition.get("label")))
+    except Exception as e:
+        market_condition = {"status": "error", "error": str(e)}
+
+    whale = None
+    if token and _looks_like_evm_addr(token) and chain:
+        try:
+            whale = _get_whale_signal_bitquery(token, chain=chain, volume24h_usd=volume24h)
+            parts["whale"] = int(_safe_float(whale.get("score_delta")))
+            if whale.get("summary"):
+                reasons.append(str(whale.get("summary")))
+        except Exception as e:
+            whale = {"status": "error", "error": str(e), "score_delta": 0}
+
+    raw_score = sum(float(v or 0) for v in parts.values())
+    score = max(0, min(100, round(raw_score, 2)))
+    risk = "LOW" if score >= 75 else "MEDIUM" if score >= 50 else "HIGH"
+    rating = _nexus_rating(score)
+    action = _nexus_action(score, risk)
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "chain": chain,
+        "token": token,
+        "score": score,
+        "rating": rating,
+        "risk": risk,
+        "action": action,
+        "components": parts,
+        "reasons": reasons[:8],
+        "market": {"price": price, "change24h": change24h, "volume24h": volume24h, "marketCap": market_cap, "coin_id": market.get("coin_id")},
+        "market_condition": market_condition,
+        "whale": whale,
+        "ts": now_ts(),
+    }
+
+
+def _nexus_assets_from_request_payload(body: dict) -> list[dict]:
+    assets = body.get("assets") if isinstance(body, dict) else None
+    if isinstance(assets, list) and assets:
+        return [x for x in assets if isinstance(x, dict)][:20]
+    symbols_raw = body.get("symbols") if isinstance(body, dict) else ""
+    if isinstance(symbols_raw, list):
+        syms = [str(x).strip().upper() for x in symbols_raw if str(x).strip()]
+    else:
+        syms = [s.strip().upper() for s in str(symbols_raw or "").split(",") if s.strip()]
+    chain = _normalize_chain_key(body.get("chain") or request.args.get("chain") or "")
+    return [{"symbol": s, "chain": chain} for s in syms[:20]]
+
+
+@app.route("/api/nexus/score", methods=["GET", "POST"])
+def api_nexus_score():
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+    else:
+        body = request.args.to_dict(flat=True)
+        body["symbol"] = body.get("symbol") or body.get("asset") or body.get("item") or ""
+        body["token"] = body.get("token") or body.get("token_address") or body.get("address") or ""
+    asset = dict(body)
+    if not str(asset.get("symbol") or asset.get("item") or "").strip():
+        return err("missing symbol", 400)
+    return jsonify(_nexus_score_for_asset(asset))
+
+
+@app.route("/api/nexus/compare-scores", methods=["GET", "POST"])
+def api_nexus_compare_scores():
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args.to_dict(flat=True)
+    assets = _nexus_assets_from_request_payload(body)
+    if not assets:
+        return err("missing assets or symbols", 400)
+    scores = [_nexus_score_for_asset(a) for a in assets]
+    scores = sorted(scores, key=lambda x: float(x.get("score") or 0), reverse=True)
+    for i, row in enumerate(scores, start=1):
+        row["rank"] = i
+    return jsonify({"status": "ok", "items": scores, "scores": scores, "ts": now_ts()})
+
+
+def _nexus_build_rotation_plan(assets: list[dict], budget_usd: float) -> dict:
+    scored = [_nexus_score_for_asset(a) for a in assets]
+    scored = sorted(scored, key=lambda x: float(x.get("score") or 0), reverse=True)
+    eligible = [x for x in scored if x.get("action") != "SKIP" and str(x.get("risk")) != "HIGH" and float(x.get("score") or 0) >= 45]
+    weight_sum = sum(max(0.0, float(x.get("score") or 0) - 40.0) for x in eligible) or 0.0
+    plan = []
+    for i, x in enumerate(scored, start=1):
+        score = float(x.get("score") or 0)
+        eligible_row = x in eligible and weight_sum > 0
+        target_weight = (max(0.0, score - 40.0) / weight_sum * 100.0) if eligible_row else 0.0
+        target_usd = float(budget_usd or 0) * target_weight / 100.0
+        action = _nexus_action(score, x.get("risk"))
+        if not eligible_row:
+            action = "SKIP" if x.get("risk") == "HIGH" or score < 45 else "HOLD"
+        plan.append({
+            "rank": i,
+            "symbol": x.get("symbol"),
+            "chain": x.get("chain"),
+            "token": x.get("token"),
+            "score": x.get("score"),
+            "rating": x.get("rating"),
+            "risk": x.get("risk"),
+            "action": action,
+            "target_weight_pct": round(target_weight, 2),
+            "target_usd": round(target_usd, 2),
+            "reasons": x.get("reasons") or [],
+            "score_ref": x,
+        })
+    return {"status": "ok", "budget_usd": round(float(budget_usd or 0), 2), "plan": plan, "items": plan, "ts": now_ts()}
+
+
+@app.route("/api/nexus/rotation-plan", methods=["GET", "POST"])
+def api_nexus_rotation_plan_bridge():
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args.to_dict(flat=True)
+    assets = _nexus_assets_from_request_payload(body)
+    if not assets:
+        return err("missing assets or symbols", 400)
+    budget_usd = _safe_float(body.get("budget_usd") or body.get("budgetUsd") or body.get("budget") or 0)
+    return jsonify(_nexus_build_rotation_plan(assets, budget_usd))
+
+
+def _nexus_order_preview(body: dict) -> dict:
+    chain = _normalize_chain_key(body.get("chain") or body.get("network") or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(chain, 0) or 0)
+    side = str(body.get("side") or body.get("action") or "BUY").strip().upper()
+    symbol = str(body.get("symbol") or body.get("asset") or body.get("tokenSymbol") or "").strip().upper()
+    token_in = str(body.get("tokenIn") or body.get("token_in") or "").strip()
+    token_out = str(body.get("tokenOut") or body.get("token_out") or body.get("token") or body.get("token_address") or "").strip()
+    router_key = str(body.get("router") or body.get("routerKey") or body.get("router_key") or "").strip()
+    router_address = str(body.get("routerAddress") or body.get("router_address") or "").strip()
+    slippage_bps = int(_safe_float(body.get("slippageBps") or body.get("slippage_bps") or _NEXUS_DEFAULT_SLIPPAGE_BPS, _NEXUS_DEFAULT_SLIPPAGE_BPS))
+    amount_usd = _safe_float(body.get("amountUsd") or body.get("amount_usd") or body.get("target_usd") or body.get("usd") or 0)
+    price_usd = _safe_float(body.get("priceUsd") or body.get("price_usd") or body.get("price") or 0)
+    realized_profit_usd = _safe_float(
+        body.get("realizedProfitUsd")
+        or body.get("realized_profit_usd")
+        or body.get("profitUsd")
+        or body.get("profit_usd")
+        or 0
+    )
+    preferred_fee_stable = str(body.get("feeStable") or body.get("fee_stable") or "").strip().upper()
+    if price_usd <= 0 and symbol:
+        price_usd = _safe_float(_nexus_symbol_payload(symbol).get("price"))
+
+    router_ok, router_obj, routers = _nexus_router_allowed(chain, router_key=router_key, router_address=router_address)
+    checks = {
+        "chain_ok": cid > 0,
+        "amount_ok": amount_usd > 0,
+        "price_ok": price_usd > 0,
+        "slippage_ok": 0 <= slippage_bps <= _NEXUS_MAX_SLIPPAGE_BPS,
+        "router_ok": bool(router_ok),
+        "token_in_present": bool(token_in),
+        "token_out_present": bool(token_out or symbol),
+    }
+    blocking = []
+    for k, okv in checks.items():
+        if not okv:
+            blocking.append(k)
+
+    estimated_out = (amount_usd / price_usd) if price_usd > 0 and amount_usd > 0 else 0.0
+    min_out = estimated_out * max(0.0, (10_000 - slippage_bps) / 10_000.0)
+    fee_preview = _nexus_fee_preview(realized_profit_usd, chain, preferred_fee_stable)
+
+    return {
+        "status": "ok" if not blocking else "blocked",
+        "ready_for_vault": len(blocking) == 0,
+        "chain": chain,
+        "chainId": cid,
+        "side": side,
+        "symbol": symbol,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
+        "router": router_obj,
+        "allowedRouters": routers,
+        "amountUsd": round(amount_usd, 2),
+        "priceUsd": price_usd,
+        "estimatedOut": estimated_out,
+        "minAmountOut": min_out,
+        "slippageBps": slippage_bps,
+        "maxSlippageBps": _NEXUS_MAX_SLIPPAGE_BPS,
+        "checks": checks,
+        "blocking_reasons": blocking,
+        "feePolicy": {
+            **fee_preview,
+            "rule": "Fee must always settle in USDC/USDT, never in the traded/profit token.",
+        },
+        "vaultPayloadDraft": {
+            "chainId": cid,
+            "router": (router_obj or {}).get("address") if router_obj else "",
+            "tokenIn": token_in,
+            "tokenOut": token_out,
+            "amountUsd": round(amount_usd, 2),
+            "minAmountOut": str(min_out),
+            "slippageBps": slippage_bps,
+            "deadlineSec": int(DEFAULT_DEADLINE_MINUTES),
+            "fee": {
+                "profitUsd": fee_preview.get("profitUsd"),
+                "feeUsd": fee_preview.get("feeUsd"),
+                "feeStableSymbol": (fee_preview.get("settlement") or {}).get("stableSymbol"),
+                "feeStableAddress": (fee_preview.get("settlement") or {}).get("stableAddress"),
+                "feeReceiver": (fee_preview.get("settlement") or {}).get("feeReceiver"),
+                "stableOnly": True,
+            },
+        },
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/order-preview", methods=["GET", "POST"])
+def api_nexus_order_preview():
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args.to_dict(flat=True)
+    return jsonify(_nexus_order_preview(body if isinstance(body, dict) else {}))
+
+
+@app.route("/api/nexus/rotation-preview", methods=["GET", "POST"])
+def api_nexus_rotation_preview():
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args.to_dict(flat=True)
+    assets = _nexus_assets_from_request_payload(body)
+    if not assets:
+        return err("missing assets or symbols", 400)
+    budget_usd = _safe_float(body.get("budget_usd") or body.get("budgetUsd") or body.get("budget") or 0)
+    chain = _normalize_chain_key(body.get("chain") or "POL")
+    plan = _nexus_build_rotation_plan(assets, budget_usd)
+    previews = []
+    for row in plan.get("plan") or []:
+        if row.get("action") in ("INCREASE", "HOLD") and _safe_float(row.get("target_usd")) > 0:
+            pb = dict(body)
+            pb.update({
+                "chain": row.get("chain") or chain,
+                "symbol": row.get("symbol"),
+                "token": row.get("token") or body.get("token") or body.get("tokenOut") or "",
+                "side": "BUY" if row.get("action") == "INCREASE" else "HOLD",
+                "amountUsd": row.get("target_usd"),
+            })
+            prev = _nexus_order_preview(pb)
+            prev["rotationRank"] = row.get("rank")
+            prev["rotationAction"] = row.get("action")
+            previews.append(prev)
+        else:
+            previews.append({
+                "status": "skipped",
+                "ready_for_vault": False,
+                "symbol": row.get("symbol"),
+                "rotationRank": row.get("rank"),
+                "rotationAction": row.get("action"),
+                "blocking_reasons": ["rotation_action_not_increase_or_no_budget"],
+                "ts": now_ts(),
+            })
+    return jsonify({"status": "ok", "plan": plan.get("plan") or [], "previews": previews, "ts": now_ts()})
+
+
+@app.route("/api/nexus/routers", methods=["GET"])
+def api_nexus_routers():
+    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("network") or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(chain, 0) or 0)
+    return jsonify({"status": "ok", "chain": chain, "chainId": cid, "routers": _nexus_allowed_routers_for_chain(cid), "ts": now_ts()})
+
+
+@app.route("/api/nexus/fee-policy", methods=["GET"])
+def api_nexus_fee_policy():
+    chain = _normalize_chain_key(request.args.get("chain") or request.args.get("network") or "POL")
+    profit_usd = _safe_float(request.args.get("profitUsd") or request.args.get("profit_usd") or 0)
+    stable = str(request.args.get("feeStable") or request.args.get("fee_stable") or "").strip().upper()
+    return jsonify({"status": "ok", "chain": chain, "feePolicy": _nexus_fee_preview(profit_usd, chain, stable), "ts": now_ts()})
