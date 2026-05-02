@@ -7217,6 +7217,194 @@ def api_nexus_rotation_plan():
         plan["status"] = "partial"
     return jsonify(plan), 200
 
+
+
+# -------------------------
+# Nexus Order Preview (dry-run only, no execution)
+# -------------------------
+def _nexus_preview_price(symbol: str = "", coin_id: str = "", price: Any = None) -> tuple[float, str]:
+    """Resolve a USD price for dry-run previews. Never executes an order."""
+    px = _safe_float(price, 0.0)
+    if px > 0:
+        return px, "client"
+
+    cid = str(coin_id or "").strip()
+    sym = str(symbol or "").strip().upper()
+    if not cid and sym:
+        try:
+            cid = _resolve_cg_id(sym) or ""
+        except Exception:
+            cid = ""
+
+    if cid:
+        try:
+            snap = _cg_market_snapshot(cid)
+            px = _safe_float((snap or {}).get("price"), 0.0)
+            if px > 0:
+                return px, "coingecko"
+        except Exception:
+            pass
+
+    return 0.0, "unavailable"
+
+
+def build_nexus_order_preview(payload: dict) -> dict:
+    """Create a conservative order preview for Grid/Rotation/Vault preparation.
+
+    Dry-run only:
+      - no wallet signature
+      - no swap
+      - no contract call
+
+    Supported inputs:
+      {
+        "symbol": "ETH",
+        "coin_id": "ethereum",
+        "side": "BUY" | "SELL",
+        "amount_usd": 250,        # BUY basis
+        "amount_tokens": 0.1,      # SELL basis or optional BUY output hint
+        "price": 2500,             # optional client price
+        "slippage_bps": 300,
+        "score_item": {...},       # optional Nexus score object
+        "route": {...}             # optional planned router/DEX info
+      }
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    symbol = str(payload.get("symbol") or payload.get("asset") or "").strip().upper()
+    coin_id = str(payload.get("coin_id") or payload.get("id") or "").strip()
+    side = str(payload.get("side") or "BUY").strip().upper()
+    if side not in ("BUY", "SELL", "REDUCE", "INCREASE"):
+        side = "BUY"
+    # Rotation actions map to order side for preview purposes.
+    if side == "INCREASE":
+        side = "BUY"
+    elif side == "REDUCE":
+        side = "SELL"
+
+    amount_usd = _safe_float(payload.get("amount_usd") or payload.get("usd") or payload.get("delta_usd"), 0.0)
+    amount_tokens = _safe_float(payload.get("amount_tokens") or payload.get("qty") or payload.get("tokens"), 0.0)
+
+    price, price_source = _nexus_preview_price(symbol=symbol, coin_id=coin_id, price=payload.get("price"))
+
+    try:
+        slippage_bps = int(payload.get("slippage_bps") if payload.get("slippage_bps") is not None else DEFAULT_SLIPPAGE_BPS)
+    except Exception:
+        slippage_bps = int(DEFAULT_SLIPPAGE_BPS)
+    slippage_bps = int(max(0, min(5000, slippage_bps)))
+    slip = slippage_bps / 10000.0
+
+    if side == "BUY":
+        input_usd = max(0.0, amount_usd)
+        estimated_tokens = (input_usd / price) if price > 0 and input_usd > 0 else 0.0
+        min_tokens = estimated_tokens * (1.0 - slip)
+        output_usd = input_usd
+    else:
+        estimated_tokens = max(0.0, amount_tokens)
+        output_usd = estimated_tokens * price if price > 0 else max(0.0, amount_usd)
+        input_usd = output_usd
+        min_tokens = 0.0
+
+    score_item = payload.get("score_item") if isinstance(payload.get("score_item"), dict) else {}
+    risk = str(score_item.get("risk") or payload.get("risk") or "").strip().upper()
+    score = _safe_float(score_item.get("score") or payload.get("score"), 0.0)
+    signal = str(score_item.get("signal") or payload.get("signal") or "").strip().upper()
+
+    warnings = []
+    blocking = []
+    if price <= 0:
+        blocking.append("price unavailable")
+    if input_usd <= 0 and estimated_tokens <= 0:
+        blocking.append("amount missing")
+    if slippage_bps > 1000:
+        warnings.append("high slippage tolerance")
+    if risk == "HIGH":
+        blocking.append("high risk score")
+    elif risk == "MEDIUM":
+        warnings.append("medium risk score")
+    if signal in ("AVOID", "WAIT"):
+        warnings.append(f"weak signal: {signal}")
+
+    route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+    plan_action = str(payload.get("action") or payload.get("plan_action") or "PREVIEW").strip().upper()
+
+    return {
+        "status": "blocked" if blocking else "ok",
+        "execution": "disabled_preview_only",
+        "symbol": symbol or None,
+        "coin_id": coin_id or None,
+        "side": side,
+        "action": plan_action,
+        "price_usd": round(price, 12) if price > 0 else 0,
+        "price_source": price_source,
+        "input_usd": round(input_usd, 2),
+        "estimated_tokens": round(estimated_tokens, 12),
+        "estimated_output_usd": round(output_usd, 2),
+        "slippage_bps": slippage_bps,
+        "slippage_pct": round(slip * 100.0, 4),
+        "min_tokens_after_slippage": round(min_tokens, 12),
+        "score": score_item.get("score") if score_item else (round(score) if score else None),
+        "rating": score_item.get("rating") if score_item else payload.get("rating"),
+        "signal": signal or None,
+        "risk": risk or None,
+        "route": route or {"mode": "not_selected_yet"},
+        "warnings": warnings,
+        "blocking_reasons": blocking,
+        "ready_for_vault": (len(blocking) == 0),
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/order-preview", methods=["POST"])
+def api_nexus_order_preview():
+    """Dry-run endpoint used before real Vault execution exists."""
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return err("body must be an object", 400)
+    try:
+        return jsonify(build_nexus_order_preview(body)), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "execution": "disabled_preview_only", "ts": now_ts()}), 500
+
+
+@app.route("/api/nexus/rotation-preview", methods=["POST"])
+def api_nexus_rotation_preview():
+    """Create order previews from a rotation plan/allocation list. No execution."""
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return err("body must be an object", 400)
+
+    allocations = body.get("allocations")
+    if not isinstance(allocations, list):
+        plan = body.get("plan") if isinstance(body.get("plan"), dict) else {}
+        allocations = plan.get("allocations") if isinstance(plan.get("allocations"), list) else []
+
+    previews = []
+    for a in allocations[:20]:
+        if not isinstance(a, dict):
+            continue
+        action = str(a.get("action") or "").upper()
+        delta = _safe_float(a.get("delta_usd"), 0.0)
+        if action not in ("INCREASE", "REDUCE") or abs(delta) <= 0:
+            continue
+        previews.append(build_nexus_order_preview({
+            "symbol": a.get("symbol"),
+            "side": "BUY" if action == "INCREASE" else "SELL",
+            "amount_usd": abs(delta),
+            "price": a.get("price") or a.get("price_usd"),
+            "slippage_bps": body.get("slippage_bps", DEFAULT_SLIPPAGE_BPS),
+            "score_item": a,
+            "action": action,
+            "route": body.get("route") if isinstance(body.get("route"), dict) else {},
+        }))
+
+    return jsonify({
+        "status": "ok",
+        "execution": "disabled_preview_only",
+        "count": len(previews),
+        "previews": previews,
+        "ts": now_ts(),
+    }), 200
+
 # -------------------------
 # Market test / Market data
 # -------------------------
