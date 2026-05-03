@@ -1626,6 +1626,7 @@ def init_db():
     """)
 
     # Auto-renew subscription settings (wallet-bound).
+    # Web UI stores a preference only; real recurring charges require the server-side Privy worker.
     # Safe migration: older /data SQLite DBs get these columns automatically.
     _db_ensure_columns(conn, "access_state", {
         "auto_renew_enabled": "auto_renew_enabled INTEGER DEFAULT 0",
@@ -4080,7 +4081,7 @@ def api_access_auto_renew_set():
                 token,
                 chain,
                 int(next_billing) if next_billing else None,
-                "enabled_waiting_for_privy_payment" if enabled else "disabled",
+                "web_preference_saved_server_worker_required" if enabled else "disabled",
                 now_ts(),
             ),
         )
@@ -4415,6 +4416,120 @@ def api_access_auto_renew_consent():
     new_st = _compute_access_status(wa)
     return jsonify({"status": "ok", "wallet_address": wa, "access": new_st, **_auto_renew_payload_from_row(new_st)})
 
+
+@app.route("/api/access/auto-renew/test-enable", methods=["POST"])
+def api_access_auto_renew_test_enable():
+    """Shell/test endpoint: enable Auto Renew without real USDT/USDC.
+
+    This is for Render Shell / staging tests only. It lets you verify:
+      - DB state
+      - UI display
+      - renewal extension logic
+      - /api/access/auto-renew/run behavior
+
+    It does NOT move money and does NOT call Privy.
+    """
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    body = request.get_json(silent=True) or {}
+
+    # If NEXUS_API_KEY exists, protect the test endpoint for shell/admin use.
+    # If no key is configured, wallet param is still required.
+    if server_key and auth != f"Bearer {server_key}":
+        return err("unauthorized", 401)
+
+    wa = _norm_addr(
+        body.get("wallet")
+        or body.get("wallet_address")
+        or request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or ""
+    )
+    if not wa or not _looks_like_evm_addr(wa):
+        return err("missing wallet", 400)
+
+    token = str(body.get("token") or body.get("preferred_token") or "USDT").strip().upper()
+    chain = _normalize_chain_key(body.get("chain") or body.get("preferred_chain") or "POL")
+    if token not in _ALLOWED_AUTO_RENEW_TOKENS:
+        return err("auto-renew token must be USDT or USDC", 400)
+    if chain not in _ENABLED_EVM_CHAINS:
+        return err(f"chain not enabled for auto-renew: {chain}", 400)
+
+    now_i = now_ts()
+    seconds = _subscription_seconds()
+    # Optional shell controls:
+    #   seconds: custom access duration
+    #   due_now: true -> expires immediately so /run can extend it
+    #   days: custom duration in days
+    try:
+        if body.get("days") is not None:
+            seconds = int(float(body.get("days")) * 86400)
+        elif body.get("seconds") is not None:
+            seconds = int(body.get("seconds"))
+    except Exception:
+        seconds = _subscription_seconds()
+    seconds = max(60, min(seconds, 366 * 86400))
+    due_now = str(body.get("due_now") or request.args.get("due_now") or "").strip().lower() in ("1", "true", "yes", "on")
+    expires_ts = now_i - 5 if due_now else now_i + seconds
+
+    conn = _db()
+    cur = conn.cursor()
+    with DB_WRITE_LOCK:
+        _access_state_put(
+            wallet_address=wa,
+            plan="pro",
+            source="auto_renew_test",
+            expires_ts=expires_ts,
+            chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
+            ai_limit=_AI_LIMIT_UNLIMITED,
+            can_open_new_trades=True,
+            conn=conn,
+            cur=cur,
+        )
+        cur.execute(
+            "UPDATE access_state SET auto_renew_enabled=1, preferred_token=?, preferred_chain=?, "
+            "next_billing_ts=?, last_auto_renew_attempt_ts=?, last_auto_renew_status=?, "
+            "last_auto_renew_tx_hash='', auto_renew_payment_mode='test', updated_ts=? WHERE wallet_address=?",
+            (token, chain, int(expires_ts), now_i, "test_enabled_due_now" if due_now else "test_enabled", now_i, wa),
+        )
+        conn.commit()
+    conn.close()
+
+    new_st = _compute_access_status(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet_address": wa,
+        "message": "Auto Renew test mode enabled. No real token transfer was executed.",
+        "access": new_st,
+        **_auto_renew_payload_from_row(new_st),
+    })
+
+@app.route("/api/access/auto-renew/test-disable", methods=["POST"])
+def api_access_auto_renew_test_disable():
+    """Shell/test endpoint: disable Auto Renew for a wallet."""
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    if server_key and auth != f"Bearer {server_key}":
+        return err("unauthorized", 401)
+
+    body = request.get_json(silent=True) or {}
+    wa = _norm_addr(body.get("wallet") or body.get("wallet_address") or request.args.get("wallet") or "")
+    if not wa or not _looks_like_evm_addr(wa):
+        return err("missing wallet", 400)
+
+    conn = _db()
+    cur = conn.cursor()
+    with DB_WRITE_LOCK:
+        cur.execute(
+            "UPDATE access_state SET auto_renew_enabled=0, last_auto_renew_status='test_disabled', "
+            "auto_renew_payment_mode='manual', updated_ts=? WHERE wallet_address=?",
+            (now_ts(), wa),
+        )
+        conn.commit()
+    conn.close()
+    new_st = _compute_access_status(wa)
+    return jsonify({"status": "ok", "wallet_address": wa, "access": new_st, **_auto_renew_payload_from_row(new_st)})
+
 @app.route("/api/access/auto-renew/run", methods=["POST"])
 def api_access_auto_renew_run():
     """Server-only worker endpoint.
@@ -4446,6 +4561,46 @@ def api_access_auto_renew_run():
     for row in rows:
         wa = _norm_addr(row.get("wallet_address") or "")
         try:
+            # TEST MODE: simulate a successful renewal without Privy and without USDT/USDC.
+            # Enable it via /api/access/auto-renew/test-enable. This is the Render Shell
+            # path for checking the whole subscription/renewal lifecycle safely.
+            if str(row.get("auto_renew_payment_mode") or "").strip().lower() == "test":
+                expires_ts = now_ts() + _subscription_seconds()
+                _access_state_put(
+                    wallet_address=wa,
+                    plan="pro",
+                    source="auto_renew_test",
+                    expires_ts=expires_ts,
+                    chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
+                    ai_limit=_AI_LIMIT_UNLIMITED,
+                    can_open_new_trades=True,
+                    conn=conn,
+                    cur=cur,
+                )
+                cur.execute(
+                    "UPDATE access_state SET auto_renew_enabled=1, preferred_token=?, preferred_chain=?, "
+                    "next_billing_ts=?, last_auto_renew_attempt_ts=?, last_auto_renew_status=?, "
+                    "last_auto_renew_tx_hash=?, auto_renew_payment_mode='test', updated_ts=? WHERE wallet_address=?",
+                    (
+                        str(row.get("preferred_token") or "USDT").upper(),
+                        _normalize_chain_key(row.get("preferred_chain") or "POL"),
+                        int(expires_ts),
+                        now_ts(),
+                        "test_success",
+                        "test_no_tx",
+                        now_ts(),
+                        wa,
+                    ),
+                )
+                results.append({
+                    "wallet_address": wa,
+                    "status": "test_success",
+                    "tx_hash": "test_no_tx",
+                    "expires_ts": expires_ts,
+                    "note": "No real token transfer was executed."
+                })
+                continue
+
             charge = _privy_auto_renew_charge(row)
             if charge.get("status") != "ok":
                 _mark_auto_renew_attempt(cur, wa, charge.get("error") or charge.get("status") or "privy_worker_not_ready")
