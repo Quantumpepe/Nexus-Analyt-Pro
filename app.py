@@ -1634,6 +1634,14 @@ def init_db():
         "next_billing_ts": "next_billing_ts INTEGER",
         "last_auto_renew_attempt_ts": "last_auto_renew_attempt_ts INTEGER",
         "last_auto_renew_status": "last_auto_renew_status TEXT DEFAULT ''",
+
+        # Privy Auto-Renew metadata
+        "last_auto_renew_tx_hash": "last_auto_renew_tx_hash TEXT DEFAULT ''",
+        "privy_wallet_id": "privy_wallet_id TEXT DEFAULT ''",
+        "privy_delegation_id": "privy_delegation_id TEXT DEFAULT ''",
+        "privy_policy_id": "privy_policy_id TEXT DEFAULT ''",
+        "privy_consent_ts": "privy_consent_ts INTEGER",
+        "auto_renew_payment_mode": "auto_renew_payment_mode TEXT DEFAULT 'manual'",
     })
 
     cur.execute("""
@@ -3246,6 +3254,9 @@ def _chain_key_from_id(chain_id: int | str) -> str:
             return k
     return ""
 
+def _chain_id_from_key(chain_key: str) -> int:
+    return int(_CHAIN_ID_BY_KEY.get(_normalize_chain_key(chain_key), 0) or 0)
+
 
 # Effective PRO chains exposed/used in this deployment (intersection of plan chains and enabled chains)
 _CHAINS_PRO_EFFECTIVE = [c for c in _CHAINS_PRO if c in _ENABLED_EVM_CHAINS]
@@ -3713,7 +3724,8 @@ def _access_state_get(wallet_address: str) -> dict | None:
     cur = conn.cursor()
     cur.execute(
         "SELECT wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, "
-        "auto_renew_enabled, preferred_token, preferred_chain, next_billing_ts, last_auto_renew_attempt_ts, last_auto_renew_status "
+        "auto_renew_enabled, preferred_token, preferred_chain, next_billing_ts, last_auto_renew_attempt_ts, last_auto_renew_status, "
+        "last_auto_renew_tx_hash, privy_wallet_id, privy_delegation_id, privy_policy_id, privy_consent_ts, auto_renew_payment_mode "
         "FROM access_state WHERE wallet_address=?",
         (wa,),
     )
@@ -3787,6 +3799,12 @@ def _access_defaults() -> dict:
         "next_billing_ts": None,
         "last_auto_renew_attempt_ts": None,
         "last_auto_renew_status": "",
+        "last_auto_renew_tx_hash": "",
+        "privy_wallet_id": "",
+        "privy_delegation_id": "",
+        "privy_policy_id": "",
+        "privy_consent_ts": None,
+        "auto_renew_payment_mode": "manual",
     }
 
 
@@ -3824,6 +3842,12 @@ def _compute_access_status(wallet_address: str | None) -> dict:
         base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
         base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
         base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
+        base["last_auto_renew_tx_hash"] = str(st.get("last_auto_renew_tx_hash") or "")
+        base["privy_wallet_id"] = str(st.get("privy_wallet_id") or "")
+        base["privy_delegation_id"] = str(st.get("privy_delegation_id") or "")
+        base["privy_policy_id"] = str(st.get("privy_policy_id") or "")
+        base["privy_consent_ts"] = int(st.get("privy_consent_ts") or 0) or None
+        base["auto_renew_payment_mode"] = str(st.get("auto_renew_payment_mode") or "manual")
         return base
 
     # stored plan
@@ -3857,6 +3881,12 @@ def _compute_access_status(wallet_address: str | None) -> dict:
             "next_billing_ts": int(st.get("next_billing_ts") or exp or 0) or None,
             "last_auto_renew_attempt_ts": int(st.get("last_auto_renew_attempt_ts") or 0) or None,
             "last_auto_renew_status": str(st.get("last_auto_renew_status") or ""),
+            "last_auto_renew_tx_hash": str(st.get("last_auto_renew_tx_hash") or ""),
+            "privy_wallet_id": str(st.get("privy_wallet_id") or ""),
+            "privy_delegation_id": str(st.get("privy_delegation_id") or ""),
+            "privy_policy_id": str(st.get("privy_policy_id") or ""),
+            "privy_consent_ts": int(st.get("privy_consent_ts") or 0) or None,
+            "auto_renew_payment_mode": str(st.get("auto_renew_payment_mode") or "manual"),
         }
 
 
@@ -3945,7 +3975,12 @@ def _auto_renew_payload_from_row(row_or_status: dict | None) -> dict:
         "period_days": int(int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))) / 86400),
         "supported_tokens": sorted(list(_ALLOWED_AUTO_RENEW_TOKENS)),
         "supported_chains": list(_ENABLED_EVM_CHAINS),
-        "mode": "settings_only_privy_payment_later",
+        "mode": str(d.get("auto_renew_payment_mode") or "manual"),
+        "last_auto_renew_tx_hash": str(d.get("last_auto_renew_tx_hash") or ""),
+        "privy_ready": bool(d.get("privy_wallet_id") and d.get("privy_delegation_id") and d.get("privy_policy_id")),
+        "privy_wallet_id": str(d.get("privy_wallet_id") or ""),
+        "privy_policy_id": str(d.get("privy_policy_id") or ""),
+        "privy_consent_ts": int(d.get("privy_consent_ts") or 0) or None,
     }
 
 @app.route("/api/access/auto-renew/status", methods=["GET"])
@@ -4051,7 +4086,9 @@ def api_access_auto_renew_due():
     conn = _db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT wallet_address, preferred_token, preferred_chain, next_billing_ts, expires_ts, last_auto_renew_attempt_ts, last_auto_renew_status "
+        "SELECT wallet_address, preferred_token, preferred_chain, next_billing_ts, expires_ts, last_auto_renew_attempt_ts, "
+        "last_auto_renew_status, last_auto_renew_tx_hash, privy_wallet_id, privy_delegation_id, privy_policy_id, "
+        "privy_consent_ts, auto_renew_payment_mode "
         "FROM access_state WHERE auto_renew_enabled=1 AND expires_ts IS NOT NULL AND expires_ts <= ?",
         (now_i,),
     )
@@ -4065,6 +4102,274 @@ def api_access_auto_renew_due():
         "due": rows,
         "note": "safe mode: no payment is executed by this endpoint",
     })
+
+
+
+# -------------------------
+# Privy Auto-Renew payment worker integration
+# -------------------------
+def _subscription_seconds() -> int:
+    return int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
+
+def _subscription_price_usd() -> float:
+    return float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15"))
+
+def _auto_renew_amount_units(token_symbol: str, chain_key: str) -> int:
+    token = str(token_symbol or "").upper()
+    chain = _normalize_chain_key(chain_key or "POL")
+    specs = TOKEN_WHITELIST.get(chain) or []
+    spec = next((x for x in specs if str(x.get("symbol") or "").upper() == token), None)
+    if not spec:
+        raise RuntimeError(f"{token} not supported on {chain}")
+    decimals = int(spec.get("decimals") or 6)
+    return int(_subscription_price_usd()) * (10 ** decimals)
+
+def _mark_auto_renew_attempt(cur, wallet_address: str, status: str, tx_hash: str = ""):
+    cur.execute(
+        "UPDATE access_state SET last_auto_renew_attempt_ts=?, last_auto_renew_status=?, "
+        "last_auto_renew_tx_hash=?, updated_ts=? WHERE wallet_address=?",
+        (now_ts(), str(status or ""), str(tx_hash or ""), now_ts(), _norm_addr(wallet_address)),
+    )
+
+def _privy_auto_renew_charge(row: dict) -> dict:
+    """Trigger a scoped Privy payment worker.
+
+    This backend does not hold user keys. It calls a separate Privy worker only when:
+      - user enabled auto-renew
+      - token is USDC/USDT
+      - chain is enabled
+      - Privy wallet/delegation/policy ids are stored
+      - amount is exactly the subscription price
+      - treasury receiver is configured
+
+    Expected worker response:
+      { "status": "ok", "tx_hash": "0x...", "chain_id": 137 }
+    """
+    wallet = _norm_addr(row.get("wallet_address") or "")
+    token = str(row.get("preferred_token") or "USDT").upper()
+    chain = _normalize_chain_key(row.get("preferred_chain") or "POL")
+    chain_id = _chain_id_from_key(chain)
+
+    if token not in _ALLOWED_AUTO_RENEW_TOKENS:
+        raise RuntimeError("auto-renew token must be USDT or USDC")
+    if chain not in _ENABLED_EVM_CHAINS or chain_id <= 0:
+        raise RuntimeError(f"auto-renew chain not enabled: {chain}")
+    if not _looks_like_evm_addr(wallet):
+        raise RuntimeError("invalid wallet")
+    if not _looks_like_evm_addr(TREASURY_ADDRESS):
+        raise RuntimeError("treasury address not configured")
+    if not row.get("privy_wallet_id") or not row.get("privy_delegation_id") or not row.get("privy_policy_id"):
+        raise RuntimeError("Privy auto-renew delegation/policy missing")
+
+    worker_url = (os.getenv("PRIVY_AUTO_RENEW_WORKER_URL") or "").strip()
+    worker_secret = (os.getenv("PRIVY_AUTO_RENEW_WORKER_SECRET") or "").strip()
+    if not worker_url:
+        return {
+            "status": "needs_worker",
+            "error": "PRIVY_AUTO_RENEW_WORKER_URL not configured",
+            "wallet": wallet,
+            "chain": chain,
+            "token": token,
+        }
+
+    payload = {
+        "wallet_address": wallet,
+        "privy_wallet_id": str(row.get("privy_wallet_id") or ""),
+        "privy_delegation_id": str(row.get("privy_delegation_id") or ""),
+        "privy_policy_id": str(row.get("privy_policy_id") or ""),
+        "chain": chain,
+        "chain_id": chain_id,
+        "token": token,
+        "amount_usd": _subscription_price_usd(),
+        "amount_units": str(_auto_renew_amount_units(token, chain)),
+        "treasury_address": TREASURY_ADDRESS,
+        "max_usd": 15,
+        "period_seconds": _subscription_seconds(),
+        "purpose": "nexus_pro_auto_renew",
+    }
+    headers = {"Content-Type": "application/json"}
+    if worker_secret:
+        headers["Authorization"] = f"Bearer {worker_secret}"
+
+    r = requests.post(worker_url, json=payload, headers=headers, timeout=30)
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+    if r.status_code >= 400:
+        raise RuntimeError(f"Privy worker HTTP {r.status_code}: {str(data)[:300]}")
+    if not isinstance(data, dict) or data.get("status") not in ("ok", "success"):
+        raise RuntimeError(str(data.get("error") or data)[:300])
+
+    tx_hash = str(data.get("tx_hash") or data.get("transaction_hash") or "").strip()
+    if not tx_hash:
+        raise RuntimeError("Privy worker did not return tx_hash")
+    return {"status": "ok", "tx_hash": tx_hash, "chain_id": int(data.get("chain_id") or chain_id)}
+
+@app.route("/api/access/auto-renew/consent", methods=["POST"])
+def api_access_auto_renew_consent():
+    """Store explicit user consent metadata for Privy auto-renew.
+
+    The UI/Privy flow must collect user approval first. This endpoint only stores the
+    resulting policy/delegation ids and enables auto-renew for this wallet.
+    """
+    wa = _require_auth()
+    if not wa:
+        wa = _norm_addr((request.get_json(silent=True) or {}).get("wallet") or request.args.get("wallet") or "")
+    if not wa or not _looks_like_evm_addr(wa):
+        return err("unauthorized", 401)
+
+    body = request.get_json(silent=True) or {}
+    token = str(body.get("token") or body.get("preferred_token") or "USDT").upper()
+    chain = _normalize_chain_key(body.get("chain") or body.get("preferred_chain") or "POL")
+    acknowledged = bool(body.get("acknowledged") or body.get("consent") or body.get("accepted"))
+
+    if not acknowledged:
+        return err("explicit user consent acknowledgement required", 400)
+    if token not in _ALLOWED_AUTO_RENEW_TOKENS:
+        return err("auto-renew token must be USDT or USDC", 400)
+    if chain not in _ENABLED_EVM_CHAINS:
+        return err(f"chain not enabled for auto-renew: {chain}", 400)
+
+    privy_wallet_id = str(body.get("privy_wallet_id") or "").strip()
+    privy_delegation_id = str(body.get("privy_delegation_id") or body.get("delegation_id") or "").strip()
+    privy_policy_id = str(body.get("privy_policy_id") or body.get("policy_id") or "").strip()
+    if not privy_wallet_id or not privy_delegation_id or not privy_policy_id:
+        return err("missing Privy wallet/delegation/policy id", 400)
+
+    st = _compute_access_status(wa)
+    next_billing = int(st.get("expires_at") or 0) or None
+
+    conn = _db()
+    cur = conn.cursor()
+    with DB_WRITE_LOCK:
+        cur.execute(
+            "INSERT INTO access_state(wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, "
+            "auto_renew_enabled, preferred_token, preferred_chain, next_billing_ts, last_auto_renew_status, "
+            "privy_wallet_id, privy_delegation_id, privy_policy_id, privy_consent_ts, auto_renew_payment_mode, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(wallet_address) DO UPDATE SET "
+            "auto_renew_enabled=1, preferred_token=excluded.preferred_token, preferred_chain=excluded.preferred_chain, "
+            "next_billing_ts=excluded.next_billing_ts, last_auto_renew_status=excluded.last_auto_renew_status, "
+            "privy_wallet_id=excluded.privy_wallet_id, privy_delegation_id=excluded.privy_delegation_id, "
+            "privy_policy_id=excluded.privy_policy_id, privy_consent_ts=excluded.privy_consent_ts, "
+            "auto_renew_payment_mode=excluded.auto_renew_payment_mode, updated_ts=excluded.updated_ts",
+            (
+                wa,
+                str(st.get("plan") or "free"),
+                str(st.get("source") or "privy_consent"),
+                int(st.get("expires_at")) if st.get("expires_at") else None,
+                json.dumps(st.get("chains_allowed") or [], ensure_ascii=False),
+                int(st.get("ai_limit") if st.get("ai_limit") is not None else _AI_LIMIT_FREE),
+                1 if bool(st.get("can_open_new_trades")) else 0,
+                1,
+                token,
+                chain,
+                int(next_billing) if next_billing else None,
+                "privy_consent_ready",
+                privy_wallet_id,
+                privy_delegation_id,
+                privy_policy_id,
+                now_ts(),
+                "privy_delegated",
+                now_ts(),
+            ),
+        )
+        conn.commit()
+    conn.close()
+
+    new_st = _compute_access_status(wa)
+    return jsonify({"status": "ok", "wallet_address": wa, "access": new_st, **_auto_renew_payload_from_row(new_st)})
+
+@app.route("/api/access/auto-renew/run", methods=["POST"])
+def api_access_auto_renew_run():
+    """Server-only worker endpoint.
+
+    Finds due wallets, asks the configured Privy worker to send USDC/USDT to treasury,
+    verifies the tx using the existing subscription verifier, and extends access by 30 days.
+    """
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    if server_key and auth != f"Bearer {server_key}":
+        return err("unauthorized", 401)
+
+    now_i = now_ts()
+    limit = max(1, min(50, int((request.get_json(silent=True) or {}).get("limit") or 10)))
+
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT wallet_address, preferred_token, preferred_chain, next_billing_ts, expires_ts, last_auto_renew_attempt_ts, "
+        "last_auto_renew_status, last_auto_renew_tx_hash, privy_wallet_id, privy_delegation_id, privy_policy_id, "
+        "privy_consent_ts, auto_renew_payment_mode "
+        "FROM access_state WHERE auto_renew_enabled=1 AND expires_ts IS NOT NULL AND expires_ts <= ? "
+        "ORDER BY expires_ts ASC LIMIT ?",
+        (now_i, limit),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    results = []
+
+    for row in rows:
+        wa = _norm_addr(row.get("wallet_address") or "")
+        try:
+            charge = _privy_auto_renew_charge(row)
+            if charge.get("status") != "ok":
+                _mark_auto_renew_attempt(cur, wa, charge.get("error") or charge.get("status") or "privy_worker_not_ready")
+                results.append({"wallet_address": wa, **charge})
+                continue
+
+            tx_hash = str(charge.get("tx_hash") or "").lower()
+            chain_id = int(charge.get("chain_id") or _chain_id_from_key(row.get("preferred_chain") or "POL"))
+
+            cur.execute("SELECT tx_hash FROM access_payments WHERE tx_hash=?", (tx_hash,))
+            if cur.fetchone():
+                _mark_auto_renew_attempt(cur, wa, "already_verified", tx_hash)
+                results.append({"wallet_address": wa, "status": "already_verified", "tx_hash": tx_hash})
+                continue
+
+            proof = _verify_erc20_payment(chain_id=chain_id, tx_hash=tx_hash, payer=wa, plan="pro")
+            cur.execute(
+                "INSERT INTO access_payments(tx_hash, wallet_address, chain_id, token, amount_units, plan, created_ts) VALUES (?,?,?,?,?,?,?)",
+                (tx_hash, wa, int(chain_id), str(proof.get("token") or ""), int(proof.get("amount_units") or 0), "pro", now_ts()),
+            )
+
+            expires_ts = now_ts() + _subscription_seconds()
+            _access_state_put(
+                wallet_address=wa,
+                plan="pro",
+                source=f"auto_renew_{str(proof.get('token') or 'payment').lower()}",
+                expires_ts=expires_ts,
+                chains_allowed=list(_CHAINS_PRO_EFFECTIVE),
+                ai_limit=_AI_LIMIT_UNLIMITED,
+                can_open_new_trades=True,
+                conn=conn,
+                cur=cur,
+            )
+
+            cur.execute(
+                "UPDATE access_state SET auto_renew_enabled=1, preferred_token=?, preferred_chain=?, "
+                "next_billing_ts=?, last_auto_renew_attempt_ts=?, last_auto_renew_status=?, "
+                "last_auto_renew_tx_hash=?, updated_ts=? WHERE wallet_address=?",
+                (
+                    str(proof.get("token") or row.get("preferred_token") or "USDT").upper(),
+                    _chain_key_from_id(chain_id),
+                    int(expires_ts),
+                    now_ts(),
+                    "success",
+                    tx_hash,
+                    now_ts(),
+                    wa,
+                ),
+            )
+            results.append({"wallet_address": wa, "status": "ok", "tx_hash": tx_hash, "expires_ts": expires_ts})
+
+        except Exception as e:
+            _mark_auto_renew_attempt(cur, wa, f"error: {str(e)[:220]}")
+            results.append({"wallet_address": wa, "status": "error", "error": str(e)})
+
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "ok", "processed": len(results), "results": results, "ts": now_i})
 
 
 
