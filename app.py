@@ -1625,6 +1625,17 @@ def init_db():
         )
     """)
 
+    # Auto-renew subscription settings (wallet-bound).
+    # Safe migration: older /data SQLite DBs get these columns automatically.
+    _db_ensure_columns(conn, "access_state", {
+        "auto_renew_enabled": "auto_renew_enabled INTEGER DEFAULT 0",
+        "preferred_token": "preferred_token TEXT DEFAULT 'USDT'",
+        "preferred_chain": "preferred_chain TEXT DEFAULT 'POL'",
+        "next_billing_ts": "next_billing_ts INTEGER",
+        "last_auto_renew_attempt_ts": "last_auto_renew_attempt_ts INTEGER",
+        "last_auto_renew_status": "last_auto_renew_status TEXT DEFAULT ''",
+    })
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS access_codes (
             code TEXT PRIMARY KEY,
@@ -3225,6 +3236,17 @@ if "POL" not in _ENABLED_EVM_CHAINS:
     _ENABLED_EVM_CHAINS.insert(0, "POL")
 _ENABLED_CHAIN_IDS = {int(_CHAIN_ID_BY_KEY[c]) for c in _ENABLED_EVM_CHAINS if c in _CHAIN_ID_BY_KEY}
 
+def _chain_key_from_id(chain_id: int | str) -> str:
+    try:
+        cid = int(chain_id)
+    except Exception:
+        return ""
+    for k, v in _CHAIN_ID_BY_KEY.items():
+        if int(v) == cid:
+            return k
+    return ""
+
+
 # Effective PRO chains exposed/used in this deployment (intersection of plan chains and enabled chains)
 _CHAINS_PRO_EFFECTIVE = [c for c in _CHAINS_PRO if c in _ENABLED_EVM_CHAINS]
 if not _CHAINS_PRO_EFFECTIVE:
@@ -3690,7 +3712,9 @@ def _access_state_get(wallet_address: str) -> dict | None:
     conn = _db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades FROM access_state WHERE wallet_address=?",
+        "SELECT wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, "
+        "auto_renew_enabled, preferred_token, preferred_chain, next_billing_ts, last_auto_renew_attempt_ts, last_auto_renew_status "
+        "FROM access_state WHERE wallet_address=?",
         (wa,),
     )
     row = cur.fetchone()
@@ -3757,6 +3781,12 @@ def _access_defaults() -> dict:
         "can_open_new_trades": False,
         "can_close_trades": True,
         "active": False,
+        "auto_renew_enabled": False,
+        "preferred_token": "USDT",
+        "preferred_chain": "POL",
+        "next_billing_ts": None,
+        "last_auto_renew_attempt_ts": None,
+        "last_auto_renew_status": "",
     }
 
 
@@ -3788,6 +3818,12 @@ def _compute_access_status(wallet_address: str | None) -> dict:
         base = _access_defaults()
         base["source"] = st.get("source") or "expired"
         base["expires_at"] = int(exp) if exp is not None else None
+        base["auto_renew_enabled"] = bool(st.get("auto_renew_enabled"))
+        base["preferred_token"] = str(st.get("preferred_token") or "USDT").upper()
+        base["preferred_chain"] = _normalize_chain_key(st.get("preferred_chain") or "POL")
+        base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
+        base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
+        base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
         return base
 
     # stored plan
@@ -3815,6 +3851,12 @@ def _compute_access_status(wallet_address: str | None) -> dict:
             "can_open_new_trades": can_open,
             "can_close_trades": True,
             "active": True,
+            "auto_renew_enabled": bool(st.get("auto_renew_enabled")),
+            "preferred_token": str(st.get("preferred_token") or "USDT").upper(),
+            "preferred_chain": _normalize_chain_key(st.get("preferred_chain") or "POL"),
+            "next_billing_ts": int(st.get("next_billing_ts") or exp or 0) or None,
+            "last_auto_renew_attempt_ts": int(st.get("last_auto_renew_attempt_ts") or 0) or None,
+            "last_auto_renew_status": str(st.get("last_auto_renew_status") or ""),
         }
 
 
@@ -3882,6 +3924,147 @@ def api_access_status():
     })
 
 
+
+
+
+# -------------------------
+# Access auto-renew settings
+# -------------------------
+_ALLOWED_AUTO_RENEW_TOKENS = {"USDT", "USDC"}
+
+def _auto_renew_payload_from_row(row_or_status: dict | None) -> dict:
+    d = row_or_status or {}
+    return {
+        "auto_renew_enabled": bool(d.get("auto_renew_enabled")),
+        "preferred_token": str(d.get("preferred_token") or "USDT").upper(),
+        "preferred_chain": _normalize_chain_key(d.get("preferred_chain") or "POL"),
+        "next_billing_ts": int(d.get("next_billing_ts") or d.get("expires_at") or d.get("expires_ts") or 0) or None,
+        "last_auto_renew_attempt_ts": int(d.get("last_auto_renew_attempt_ts") or 0) or None,
+        "last_auto_renew_status": str(d.get("last_auto_renew_status") or ""),
+        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15")),
+        "period_days": int(int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))) / 86400),
+        "supported_tokens": sorted(list(_ALLOWED_AUTO_RENEW_TOKENS)),
+        "supported_chains": list(_ENABLED_EVM_CHAINS),
+        "mode": "settings_only_privy_payment_later",
+    }
+
+@app.route("/api/access/auto-renew/status", methods=["GET"])
+def api_access_auto_renew_status():
+    wa = _require_auth()
+    if not wa:
+        wa = _norm_addr(
+            request.args.get("wallet")
+            or request.args.get("addr")
+            or request.args.get("address")
+            or ""
+        )
+    if not wa or not _looks_like_evm_addr(wa):
+        return err("missing wallet", 400)
+
+    st = _compute_access_status(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet_address": _norm_addr(wa),
+        "access": st,
+        **_auto_renew_payload_from_row(st),
+    })
+
+@app.route("/api/access/auto-renew/set", methods=["POST"])
+def api_access_auto_renew_set():
+    wa = _require_auth()
+    if not wa:
+        wa = _norm_addr(
+            request.args.get("wallet")
+            or request.args.get("addr")
+            or request.args.get("address")
+            or (request.get_json(silent=True) or {}).get("wallet")
+            or ""
+        )
+    if not wa or not _looks_like_evm_addr(wa):
+        return err("unauthorized", 401)
+
+    body = request.get_json(silent=True) or {}
+    enabled = str(body.get("enabled", body.get("auto_renew_enabled", "0"))).strip().lower() in ("1", "true", "yes", "on")
+    token = str(body.get("token") or body.get("preferred_token") or "USDT").strip().upper()
+    chain = _normalize_chain_key(body.get("chain") or body.get("preferred_chain") or "POL")
+
+    if token not in _ALLOWED_AUTO_RENEW_TOKENS:
+        return err("auto-renew token must be USDT or USDC", 400)
+    if chain not in _ENABLED_EVM_CHAINS:
+        return err(f"chain not enabled for auto-renew: {chain}", 400)
+
+    st = _compute_access_status(wa)
+    next_billing = int(st.get("expires_at") or 0) or None
+
+    conn = _db()
+    cur = conn.cursor()
+    with DB_WRITE_LOCK:
+        # Ensure row exists even if user is still free. This stores preference only.
+        cur.execute(
+            "INSERT INTO access_state(wallet_address, plan, source, expires_ts, chains_allowed_json, ai_limit, can_open_new_trades, "
+            "auto_renew_enabled, preferred_token, preferred_chain, next_billing_ts, last_auto_renew_status, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(wallet_address) DO UPDATE SET "
+            "auto_renew_enabled=excluded.auto_renew_enabled, preferred_token=excluded.preferred_token, "
+            "preferred_chain=excluded.preferred_chain, next_billing_ts=excluded.next_billing_ts, "
+            "last_auto_renew_status=excluded.last_auto_renew_status, updated_ts=excluded.updated_ts",
+            (
+                wa,
+                str(st.get("plan") or "free"),
+                str(st.get("source") or "auto_renew_settings"),
+                int(st.get("expires_at")) if st.get("expires_at") else None,
+                json.dumps(st.get("chains_allowed") or [], ensure_ascii=False),
+                int(st.get("ai_limit") if st.get("ai_limit") is not None else _AI_LIMIT_FREE),
+                1 if bool(st.get("can_open_new_trades")) else 0,
+                1 if enabled else 0,
+                token,
+                chain,
+                int(next_billing) if next_billing else None,
+                "enabled_waiting_for_privy_payment" if enabled else "disabled",
+                now_ts(),
+            ),
+        )
+        conn.commit()
+    conn.close()
+
+    new_st = _compute_access_status(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet_address": wa,
+        "access": new_st,
+        **_auto_renew_payload_from_row(new_st),
+    })
+
+@app.route("/api/access/auto-renew/due", methods=["GET"])
+def api_access_auto_renew_due():
+    """Returns wallets that are due for renewal.
+
+    Safe mode: this endpoint does NOT move funds. It only tells the Privy/payment worker
+    which wallet preferences are due so a separate signed/delegated payment flow can run.
+    """
+    server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    if server_key and auth != f"Bearer {server_key}":
+        return err("unauthorized", 401)
+
+    now_i = now_ts()
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT wallet_address, preferred_token, preferred_chain, next_billing_ts, expires_ts, last_auto_renew_attempt_ts, last_auto_renew_status "
+        "FROM access_state WHERE auto_renew_enabled=1 AND expires_ts IS NOT NULL AND expires_ts <= ?",
+        (now_i,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "ts": now_i,
+        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15")),
+        "due": rows,
+        "note": "safe mode: no payment is executed by this endpoint",
+    })
 
 
 
@@ -5431,6 +5614,20 @@ def api_access_subscribe_verify():
         can_open_new_trades=True,
         conn=conn,
         cur=cur,
+    )
+
+    # Keep auto-renew schedule aligned with the paid subscription.
+    # Does NOT enable auto-renew automatically; user must opt in separately.
+    cur.execute(
+        "UPDATE access_state SET next_billing_ts=?, preferred_token=COALESCE(NULLIF(preferred_token,''), ?), "
+        "preferred_chain=COALESCE(NULLIF(preferred_chain,''), ?), last_auto_renew_status=? WHERE wallet_address=?",
+        (
+            int(expires_ts),
+            str(proof.get("token") or "USDT").upper(),
+            _chain_key_from_id(int(chain_id)),
+            "subscription_verified",
+            wa,
+        ),
     )
 
     conn.commit()
