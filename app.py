@@ -4132,18 +4132,22 @@ def _mark_auto_renew_attempt(cur, wallet_address: str, status: str, tx_hash: str
     )
 
 def _privy_auto_renew_charge(row: dict) -> dict:
-    """Trigger a scoped Privy payment worker.
+    """Internal Privy auto-renew payment trigger.
 
-    This backend does not hold user keys. It calls a separate Privy worker only when:
-      - user enabled auto-renew
-      - token is USDC/USDT
-      - chain is enabled
-      - Privy wallet/delegation/policy ids are stored
-      - amount is exactly the subscription price
-      - treasury receiver is configured
+    No external worker URL is required. This backend is the worker.
 
-    Expected worker response:
-      { "status": "ok", "tx_hash": "0x...", "chain_id": 137 }
+    Safety:
+      - user must have enabled auto-renew and stored Privy consent metadata
+      - token must be USDC/USDT
+      - chain must be enabled
+      - treasury must be configured
+      - amount is fixed to the subscription price
+      - this function does NOT hold private keys directly
+
+    IMPORTANT:
+      The actual Privy server-side transaction call is intentionally isolated in
+      _privy_send_erc20_transfer(). Fill that function with your Privy server API
+      credentials once your Privy signer/delegation setup is final.
     """
     wallet = _norm_addr(row.get("wallet_address") or "")
     token = str(row.get("preferred_token") or "USDT").upper()
@@ -4161,50 +4165,134 @@ def _privy_auto_renew_charge(row: dict) -> dict:
     if not row.get("privy_wallet_id") or not row.get("privy_delegation_id") or not row.get("privy_policy_id"):
         raise RuntimeError("Privy auto-renew delegation/policy missing")
 
-    worker_url = (os.getenv("PRIVY_AUTO_RENEW_WORKER_URL") or "").strip()
-    worker_secret = (os.getenv("PRIVY_AUTO_RENEW_WORKER_SECRET") or "").strip()
-    if not worker_url:
+    specs = TOKEN_WHITELIST.get(chain) or []
+    spec = next((x for x in specs if str(x.get("symbol") or "").upper() == token), None)
+    if not spec or not _looks_like_evm_addr(spec.get("address")):
+        raise RuntimeError(f"{token} token address not configured for {chain}")
+
+    amount_units = _auto_renew_amount_units(token, chain)
+
+    tx_hash = _privy_send_erc20_transfer(
+        wallet_address=wallet,
+        privy_wallet_id=str(row.get("privy_wallet_id") or ""),
+        privy_delegation_id=str(row.get("privy_delegation_id") or ""),
+        privy_policy_id=str(row.get("privy_policy_id") or ""),
+        chain=chain,
+        chain_id=chain_id,
+        token_symbol=token,
+        token_address=str(spec.get("address")),
+        amount_units=str(amount_units),
+        to_address=TREASURY_ADDRESS,
+    )
+
+    if not tx_hash:
         return {
-            "status": "needs_worker",
-            "error": "PRIVY_AUTO_RENEW_WORKER_URL not configured",
+            "status": "needs_privy_integration",
+            "error": "Privy server transfer is not configured yet",
             "wallet": wallet,
             "chain": chain,
             "token": token,
         }
 
+    return {"status": "ok", "tx_hash": str(tx_hash), "chain_id": int(chain_id)}
+
+
+def _privy_send_erc20_transfer(
+    wallet_address: str,
+    privy_wallet_id: str,
+    privy_delegation_id: str,
+    privy_policy_id: str,
+    chain: str,
+    chain_id: int,
+    token_symbol: str,
+    token_address: str,
+    amount_units: str,
+    to_address: str,
+) -> str:
+    """Send ERC20 transfer through Privy server-side wallet/delegation.
+
+    This is the ONLY place that needs real Privy server API details.
+
+    Return:
+      tx_hash string when sent successfully.
+      empty string when Privy ENV is not configured yet.
+
+    Required ENV once activated:
+      PRIVY_APP_ID
+      PRIVY_APP_SECRET
+      PRIVY_WALLET_API_URL  (optional override)
+    """
+    privy_app_id = (os.getenv("PRIVY_APP_ID") or "").strip()
+    privy_app_secret = (os.getenv("PRIVY_APP_SECRET") or "").strip()
+    if not privy_app_id or not privy_app_secret:
+        return ""
+
+    # ERC20 transfer(address,uint256)
+    data = _erc20_transfer_data_for_backend(to_address, int(amount_units))
+
+    # NOTE:
+    # Privy server wallet APIs can differ depending on your enabled product
+    # (delegated wallets / server wallets / policies). Keep this isolated so
+    # only this payload needs adjustment to your Privy dashboard setup.
+    url = (os.getenv("PRIVY_WALLET_API_URL") or "").strip()
+    if not url:
+        # Placeholder endpoint. Set PRIVY_WALLET_API_URL to your Privy server wallet
+        # transaction endpoint from your Privy dashboard/docs.
+        return ""
+
     payload = {
-        "wallet_address": wallet,
-        "privy_wallet_id": str(row.get("privy_wallet_id") or ""),
-        "privy_delegation_id": str(row.get("privy_delegation_id") or ""),
-        "privy_policy_id": str(row.get("privy_policy_id") or ""),
-        "chain": chain,
-        "chain_id": chain_id,
-        "token": token,
-        "amount_usd": _subscription_price_usd(),
-        "amount_units": str(_auto_renew_amount_units(token, chain)),
-        "treasury_address": TREASURY_ADDRESS,
-        "max_usd": 15,
-        "period_seconds": _subscription_seconds(),
-        "purpose": "nexus_pro_auto_renew",
+        "wallet_id": privy_wallet_id,
+        "delegation_id": privy_delegation_id,
+        "policy_id": privy_policy_id,
+        "chain_id": int(chain_id),
+        "to": token_address,
+        "value": "0",
+        "data": data,
+        "metadata": {
+            "purpose": "nexus_pro_auto_renew",
+            "user_wallet": wallet_address,
+            "token": token_symbol,
+            "amount_units": str(amount_units),
+            "treasury": to_address,
+        },
     }
-    headers = {"Content-Type": "application/json"}
-    if worker_secret:
-        headers["Authorization"] = f"Bearer {worker_secret}"
 
-    r = requests.post(worker_url, json=payload, headers=headers, timeout=30)
+    r = requests.post(
+        url,
+        auth=(privy_app_id, privy_app_secret),
+        json=payload,
+        timeout=30,
+    )
     try:
-        data = r.json()
+        out = r.json()
     except Exception:
-        data = {"raw": r.text}
+        out = {"raw": r.text}
     if r.status_code >= 400:
-        raise RuntimeError(f"Privy worker HTTP {r.status_code}: {str(data)[:300]}")
-    if not isinstance(data, dict) or data.get("status") not in ("ok", "success"):
-        raise RuntimeError(str(data.get("error") or data)[:300])
+        raise RuntimeError(f"Privy API HTTP {r.status_code}: {str(out)[:300]}")
 
-    tx_hash = str(data.get("tx_hash") or data.get("transaction_hash") or "").strip()
-    if not tx_hash:
-        raise RuntimeError("Privy worker did not return tx_hash")
-    return {"status": "ok", "tx_hash": tx_hash, "chain_id": int(data.get("chain_id") or chain_id)}
+    tx_hash = (
+        out.get("tx_hash")
+        or out.get("transaction_hash")
+        or out.get("hash")
+        or ((out.get("data") or {}).get("tx_hash") if isinstance(out.get("data"), dict) else "")
+        or ""
+    )
+    return str(tx_hash or "").strip()
+
+
+def _erc20_transfer_data_for_backend(to_address: str, amount_units: int) -> str:
+    """Encode ERC20 transfer(address,uint256) without web3 dependency."""
+    to = _norm_addr(to_address)
+    if not _looks_like_evm_addr(to):
+        raise RuntimeError("invalid transfer recipient")
+    amount = int(amount_units)
+    if amount <= 0:
+        raise RuntimeError("invalid transfer amount")
+    selector = "a9059cbb"  # transfer(address,uint256)
+    addr_word = to.lower().replace("0x", "").rjust(64, "0")
+    amount_word = hex(amount)[2:].rjust(64, "0")
+    return "0x" + selector + addr_word + amount_word
+
 
 @app.route("/api/access/auto-renew/consent", methods=["POST"])
 def api_access_auto_renew_consent():
@@ -4285,7 +4373,7 @@ def api_access_auto_renew_consent():
 def api_access_auto_renew_run():
     """Server-only worker endpoint.
 
-    Finds due wallets, asks the configured Privy worker to send USDC/USDT to treasury,
+    Finds due wallets, uses the internal Privy signer integration to send USDC/USDT to treasury,
     verifies the tx using the existing subscription verifier, and extends access by 30 days.
     """
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
