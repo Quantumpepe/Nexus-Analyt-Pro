@@ -3977,7 +3977,7 @@ def _auto_renew_payload_from_row(row_or_status: dict | None) -> dict:
         "supported_chains": list(_ENABLED_EVM_CHAINS),
         "mode": str(d.get("auto_renew_payment_mode") or "manual"),
         "last_auto_renew_tx_hash": str(d.get("last_auto_renew_tx_hash") or ""),
-        "privy_ready": bool(d.get("privy_wallet_id") and d.get("privy_delegation_id") and d.get("privy_policy_id")),
+        "privy_ready": bool(d.get("privy_wallet_id") and d.get("privy_delegation_id")),
         "privy_wallet_id": str(d.get("privy_wallet_id") or ""),
         "privy_policy_id": str(d.get("privy_policy_id") or ""),
         "privy_consent_ts": int(d.get("privy_consent_ts") or 0) or None,
@@ -4162,8 +4162,9 @@ def _privy_auto_renew_charge(row: dict) -> dict:
         raise RuntimeError("invalid wallet")
     if not _looks_like_evm_addr(TREASURY_ADDRESS):
         raise RuntimeError("treasury address not configured")
-    if not row.get("privy_wallet_id") or not row.get("privy_delegation_id") or not row.get("privy_policy_id"):
-        raise RuntimeError("Privy auto-renew delegation/policy missing")
+    if not row.get("privy_wallet_id") or not row.get("privy_delegation_id"):
+        raise RuntimeError("Privy auto-renew wallet/delegation missing")
+    # privy_policy_id is optional. Security is enforced by backend hard checks.
 
     specs = TOKEN_WHITELIST.get(chain) or []
     spec = next((x for x in specs if str(x.get("symbol") or "").upper() == token), None)
@@ -4171,6 +4172,18 @@ def _privy_auto_renew_charge(row: dict) -> dict:
         raise RuntimeError(f"{token} token address not configured for {chain}")
 
     amount_units = _auto_renew_amount_units(token, chain)
+
+    # HARD BACKEND SAFETY CHECKS:
+    # Only the exact subscription payment is allowed.
+    expected_price = int(_subscription_price_usd())
+    if expected_price != 15:
+        raise RuntimeError("auto-renew price must remain fixed at 15 USD")
+    if token not in ("USDT", "USDC"):
+        raise RuntimeError("auto-renew token rejected")
+    if not _looks_like_evm_addr(TREASURY_ADDRESS):
+        raise RuntimeError("treasury address invalid")
+    if int(amount_units) != int(15 * (10 ** int(spec.get("decimals") or 6))):
+        raise RuntimeError("auto-renew amount mismatch")
 
     tx_hash = _privy_send_erc20_transfer(
         wallet_address=wallet,
@@ -4220,7 +4233,14 @@ def _privy_send_erc20_transfer(
     Required ENV once activated:
       PRIVY_APP_ID
       PRIVY_APP_SECRET
-      PRIVY_WALLET_API_URL  (optional override)
+      PRIVY_AUTHORIZATION_PRIVATE_KEY
+      PRIVY_WALLET_API_URL  (optional override, depending on Privy endpoint)
+
+    Policy is optional in this version. Backend hard checks enforce:
+      - token = USDT/USDC only
+      - amount = 15 USD equivalent
+      - recipient = TREASURY_ADDRESS only
+      - chain = enabled chains only
     """
     privy_app_id = (os.getenv("PRIVY_APP_ID") or "").strip()
     privy_app_secret = (os.getenv("PRIVY_APP_SECRET") or "").strip()
@@ -4243,7 +4263,7 @@ def _privy_send_erc20_transfer(
     payload = {
         "wallet_id": privy_wallet_id,
         "delegation_id": privy_delegation_id,
-        "policy_id": privy_policy_id,
+        "policy_id": privy_policy_id or "",
         "chain_id": int(chain_id),
         "to": token_address,
         "value": "0",
@@ -4322,8 +4342,9 @@ def api_access_auto_renew_consent():
     privy_wallet_id = str(body.get("privy_wallet_id") or "").strip()
     privy_delegation_id = str(body.get("privy_delegation_id") or body.get("delegation_id") or "").strip()
     privy_policy_id = str(body.get("privy_policy_id") or body.get("policy_id") or "").strip()
-    if not privy_wallet_id or not privy_delegation_id or not privy_policy_id:
-        return err("missing Privy wallet/delegation/policy id", 400)
+    if not privy_wallet_id or not privy_delegation_id:
+        return err("missing Privy wallet/delegation id", 400)
+    # privy_policy_id may be empty. Backend hard checks enforce token/amount/treasury safety.
 
     st = _compute_access_status(wa)
     next_billing = int(st.get("expires_at") or 0) or None
