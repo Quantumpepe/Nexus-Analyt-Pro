@@ -3862,7 +3862,32 @@ def _compute_access_status(wallet_address: str | None) -> dict:
 
     can_open = bool(st.get("can_open_new_trades"))
 
-    
+    # SECURITY FIX:
+    # A connected/authenticated wallet alone must NOT become ACTIVE.
+    # Only real access sources are active:
+    #   - redeem code: source == "code" (can be permanent, expires_ts=None)
+    #   - paid subscription / auto-renew: expires_ts must exist and still be valid
+    # Old rows like plan=pro/source=auth/expires_ts=NULL must be treated as FREE.
+    valid_plan = plan in ("pro", "gold", "unlimited", "silver")
+    valid_source = (source == "code") or (exp is not None and not _is_expired(exp))
+    if not (valid_plan and can_open and valid_source):
+        base = _access_defaults()
+        base["source"] = source or "default"
+        base["expires_at"] = int(exp) if exp is not None else None
+        base["auto_renew_enabled"] = bool(st.get("auto_renew_enabled"))
+        base["preferred_token"] = str(st.get("preferred_token") or "USDT").upper()
+        base["preferred_chain"] = _normalize_chain_key(st.get("preferred_chain") or "POL")
+        base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
+        base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
+        base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
+        base["last_auto_renew_tx_hash"] = str(st.get("last_auto_renew_tx_hash") or "")
+        base["privy_wallet_id"] = str(st.get("privy_wallet_id") or "")
+        base["privy_delegation_id"] = str(st.get("privy_delegation_id") or "")
+        base["privy_policy_id"] = str(st.get("privy_policy_id") or "")
+        base["privy_consent_ts"] = int(st.get("privy_consent_ts") or 0) or None
+        base["auto_renew_payment_mode"] = str(st.get("auto_renew_payment_mode") or "manual")
+        return base
+
     return {
             "plan": plan,
             "source": source,
