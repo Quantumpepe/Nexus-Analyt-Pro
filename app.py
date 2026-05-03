@@ -3390,15 +3390,15 @@ _RPC_URL_BY_CHAIN = {
 }
 
 _USDC_BY_CHAIN = {
-    1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1"),
-    56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56"),
-    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137"),
+    1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
 }
 
 _USDT_BY_CHAIN = {
-    1: os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1"),
-    56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56"),
-    137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137"),
+    1: os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955",
+    137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xC2132D05D31c914a87C6611C10748AEb04B58e8F",
 }
 
 # -------------------------
@@ -3441,6 +3441,13 @@ _WNATIVE_BY_CHAIN = {
 
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
 _USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", "6"))
+
+def _stable_decimals(chain_id: int, symbol: str) -> int:
+    # ETH + Polygon USDC/USDT use 6 decimals. BNB Chain pegged USDC/USDT use 18 decimals.
+    sym = str(symbol or "").upper()
+    if int(chain_id or 0) == 56:
+        return int(os.getenv(f"{sym}_DECIMALS_BNB", os.getenv(f"{sym}_DECIMALS_56", "18")))
+    return int(os.getenv(f"{sym}_DECIMALS", "6"))
 
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "15")))
 # keccak256("Transfer(address,address,uint256)")
@@ -3672,9 +3679,9 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
 
     candidates = []
     if usdc:
-        candidates.append((usdc, _USDC_DECIMALS, "USDC"))
+        candidates.append((usdc, _stable_decimals(int(chain_id), "USDC"), "USDC"))
     if usdt:
-        candidates.append((usdt, _USDT_DECIMALS, "USDT"))
+        candidates.append((usdt, _stable_decimals(int(chain_id), "USDT"), "USDT"))
     if not candidates:
         raise RuntimeError("token addresses not configured for this chain")
 
@@ -6134,6 +6141,43 @@ def api_nft_activate():
     # NFTs are disabled for the initial release (UI removed). Keeping the endpoint
     # for future re-enable without breaking old deployments.
     return err("nft access is disabled", 403)
+
+@app.route("/api/access/subscribe/config", methods=["GET"])
+def api_access_subscribe_config():
+    """Public subscription payment config. No secrets are returned here.
+    The treasury address is public because users must see/sign the payment recipient.
+    """
+    tokens = {}
+    for cid, chain in ((1, "ETH"), (56, "BNB"), (137, "POL")):
+        tokens[chain] = {
+            "chain_id": cid,
+            "USDC": {
+                "address": (_USDC_BY_CHAIN.get(cid) or "").strip(),
+                "decimals": _stable_decimals(cid, "USDC"),
+            },
+            "USDT": {
+                "address": (_USDT_BY_CHAIN.get(cid) or "").strip(),
+                "decimals": _stable_decimals(cid, "USDT"),
+            },
+        }
+    return jsonify({
+        "status": "ok",
+        "plan": "pro",
+        "price_usd": float(PRICE_PRO_USD),
+        "treasury": TREASURY_ADDRESS,
+        "tokens": tokens,
+        "subscription_seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
+        "ts": now_ts(),
+    })
+
+@app.route("/api/config", methods=["GET"])
+def api_public_config():
+    return jsonify({
+        "status": "ok",
+        "treasury": TREASURY_ADDRESS,
+        "price_usd": float(PRICE_PRO_USD),
+        "ts": now_ts(),
+    })
 
 @app.route("/api/access/subscribe/verify", methods=["POST"])
 def api_access_subscribe_verify():
