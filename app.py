@@ -6135,6 +6135,50 @@ def api_nft_activate():
     # for future re-enable without breaking old deployments.
     return err("nft access is disabled", 403)
 
+
+@app.route("/api/access/subscribe/config", methods=["GET"])
+def api_access_subscribe_config():
+    """Public subscription payment config. No secrets are returned here.
+    The treasury address is public because users must see/sign the payment recipient.
+    """
+    def _stable_decimals_safe(cid, sym):
+        try:
+            return _stable_decimals(cid, sym)
+        except Exception:
+            return 18 if int(cid) == 56 else 6
+
+    tokens = {}
+    for cid, chain in ((1, "ETH"), (56, "BNB"), (137, "POL")):
+        tokens[chain] = {
+            "chain_id": cid,
+            "USDC": {
+                "address": (_USDC_BY_CHAIN.get(cid) or "").strip(),
+                "decimals": _stable_decimals_safe(cid, "USDC"),
+            },
+            "USDT": {
+                "address": (_USDT_BY_CHAIN.get(cid) or "").strip(),
+                "decimals": _stable_decimals_safe(cid, "USDT"),
+            },
+        }
+    return jsonify({
+        "status": "ok",
+        "plan": "pro",
+        "price_usd": float(PRICE_PRO_USD),
+        "treasury": TREASURY_ADDRESS,
+        "tokens": tokens,
+        "subscription_seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
+        "ts": now_ts(),
+    })
+
+@app.route("/api/config", methods=["GET"])
+def api_public_config():
+    return jsonify({
+        "status": "ok",
+        "treasury": TREASURY_ADDRESS,
+        "price_usd": float(PRICE_PRO_USD),
+        "ts": now_ts(),
+    })
+
 @app.route("/api/access/subscribe/verify", methods=["POST"])
 def api_access_subscribe_verify():
     """Verify an onchain USDC/USDT payment to Treasury and activate PRO subscription access.
@@ -6148,9 +6192,9 @@ def api_access_subscribe_verify():
     body = request.get_json(silent=True) or {}
 
     # Normal path: authenticated user.
-    # Payment recovery path: if auth/session is missing after a wallet payment,
-    # use the submitted wallet address ONLY as the payer candidate. The chain
-    # transaction is still verified on-chain before access is activated.
+    # Recovery path: if auth/session is missing after a wallet payment, use the
+    # submitted wallet only as payer candidate. Access is activated only after
+    # on-chain verification of Transfer(payer -> treasury).
     wa = _require_auth()
     if not wa:
         wa_candidate = (
