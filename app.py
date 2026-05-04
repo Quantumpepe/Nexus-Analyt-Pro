@@ -3390,15 +3390,22 @@ _RPC_URL_BY_CHAIN = {
 }
 
 _USDC_BY_CHAIN = {
-    1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1"),
-    56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56"),
-    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137"),
+    1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
+    # Polygon native Circle USDC. Old bridged USDC is accepted as alternate below.
+    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+}
+
+_USDC_ALT_BY_CHAIN = {
+    1: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_ETH") or os.getenv("USDC_ALT_ADDRESSES_1") or "").split(",") if x.strip()],
+    56: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_BNB") or os.getenv("USDC_ALT_ADDRESSES_56") or "").split(",") if x.strip()],
+    137: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").split(",") if x.strip()],
 }
 
 _USDT_BY_CHAIN = {
-    1: os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1"),
-    56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56"),
-    137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137"),
+    1: os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    56: os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955",
+    137: os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
 }
 
 # -------------------------
@@ -3441,6 +3448,16 @@ _WNATIVE_BY_CHAIN = {
 
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
 _USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", "6"))
+
+def _stable_decimals(chain_id: int, symbol: str, token_address: str | None = None) -> int:
+    """Decimals for supported subscription tokens by chain/address."""
+    cid = int(chain_id or 0)
+    sym = str(symbol or "").strip().upper()
+    if cid == 56:
+        return 18
+    if cid in (1, 137):
+        return 6
+    return _USDT_DECIMALS if sym == "USDT" else _USDC_DECIMALS
 
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "15")))
 # keccak256("Transfer(address,address,uint256)")
@@ -3580,43 +3597,59 @@ def _nft_activation_put(wallet_address: str, tier: str, contract: str, chain_id:
     conn.commit()
     conn.close()
 
+def _rpc_urls_for_chain(chain_id: int) -> list[str]:
+    """Configured RPC first, then safe public fallbacks for ETH/BNB/POL."""
+    cid = int(chain_id or 0)
+    urls: list[str] = []
+    configured = (_rpc_url_for_chain(cid) or "").strip()
+    if configured:
+        urls.append(configured)
+
+    fallback = {
+        1: ["https://ethereum.publicnode.com", "https://eth.llamarpc.com", "https://rpc.ankr.com/eth"],
+        56: ["https://bsc-dataseed.binance.org", "https://bsc.publicnode.com", "https://rpc.ankr.com/bsc"],
+        137: ["https://polygon-rpc.com", "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"],
+    }
+    for u in fallback.get(cid, []):
+        if u and u not in urls:
+            urls.append(u)
+    return urls
+
+
 def _rpc_call(chain_id: int, method: str, params: list):
     cid = int(chain_id) or 0
     if _ENABLED_CHAIN_IDS and cid not in _ENABLED_CHAIN_IDS:
         raise RuntimeError(f"chain_id not enabled: {cid}")
 
-    url = _rpc_url_for_chain(cid)
-    if not url:
-        raise RuntimeError(f"rpc url not configured for chain_id={chain_id}")
+    urls = _rpc_urls_for_chain(cid)
+    if not urls:
+        raise RuntimeError(f"rpc url not configured for chain_id={cid}")
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-    except Exception as e:
-        raise RuntimeError(f"rpc request failed for chain_id={cid}: {e}")
-
-    if not r.ok:
-        body = ""
+    last_error = ""
+    for url in urls:
         try:
-            body = (r.text or "")[:240]
+            r = requests.post(url, json=payload, timeout=20)
+        except Exception as e:
+            last_error = f"rpc request failed via {url} for chain_id={cid}: {e}"
+            continue
+        if not r.ok:
+            body = (getattr(r, "text", "") or "")[:240]
+            last_error = f"rpc http {r.status_code} via {url} for chain_id={cid}: {body}"
+            continue
+        try:
+            j = r.json() or {}
         except Exception:
-            body = ""
-        raise RuntimeError(f"rpc http {r.status_code} for chain_id={cid}: {body}")
-
-    try:
-        j = r.json() or {}
-    except Exception:
-        raise RuntimeError(f"rpc returned non-json for chain_id={cid}")
-
-    if j.get("error"):
-        err = j.get("error")
-        if isinstance(err, dict):
-            msg = err.get("message") or json.dumps(err, ensure_ascii=False)
-        else:
-            msg = str(err)
-        raise RuntimeError(f"rpc error for chain_id={cid}: {msg}")
-
-    return j.get("result")
+            body = (getattr(r, "text", "") or "")[:240]
+            last_error = f"rpc returned non-json via {url} for chain_id={cid}: {body}"
+            continue
+        if j.get("error"):
+            err = j.get("error")
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            last_error = f"rpc error via {url} for chain_id={cid}: {msg}"
+            continue
+        return j.get("result")
+    raise RuntimeError(last_error or f"all rpc urls failed for chain_id={cid}")
 
 def _topic_to_addr(topic_hex: str) -> str:
     # topic is 32-byte hex: 0x000.. + 20-byte address
@@ -3666,22 +3699,29 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
 
     logs = rcpt.get("logs") or []
 
-    # accept either USDC or USDT on that chain
-    usdc = (_USDC_BY_CHAIN.get(int(chain_id)) or "").strip().lower()
+    # accept USDC/USDT on that chain, including known alternates (Polygon native + bridged USDC)
+    usdc_main = (_USDC_BY_CHAIN.get(int(chain_id)) or "").strip().lower()
+    usdc_alts = [str(x or "").strip().lower() for x in (_USDC_ALT_BY_CHAIN.get(int(chain_id)) or []) if str(x or "").strip()]
     usdt = (_USDT_BY_CHAIN.get(int(chain_id)) or "").strip().lower()
 
     candidates = []
-    if usdc:
-        candidates.append((usdc, _USDC_DECIMALS, "USDC"))
-    if usdt:
-        candidates.append((usdt, _USDT_DECIMALS, "USDT"))
+    seen = set()
+    for addr in [usdc_main, *usdc_alts]:
+        if addr and addr not in seen:
+            candidates.append((addr, _stable_decimals(chain_id, "USDC", addr), "USDC"))
+            seen.add(addr)
+    if usdt and usdt not in seen:
+        candidates.append((usdt, _stable_decimals(chain_id, "USDT", usdt), "USDT"))
+        seen.add(usdt)
     if not candidates:
         raise RuntimeError("token addresses not configured for this chain")
 
     min_units_by_token = {}
+    token_symbol_by_addr = {}
     for _addr, _dec, _sym in candidates:
         units = int(round(price * (10 ** int(_dec))))
         min_units_by_token[_addr] = units
+        token_symbol_by_addr[_addr] = _sym
 
     # scan logs for Transfer(from=payer, to=treasury) on accepted token
     for lg in logs:
@@ -3705,7 +3745,7 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
             value = _hex_to_int(lg.get("data") or "0x0")
             if value >= int(min_units_by_token[addr]):
                 # ok
-                sym = "USDC" if addr == usdc else "USDT"
+                sym = token_symbol_by_addr.get(addr, "USDT")
                 return {
                     "token": sym,
                     "token_address": addr,
