@@ -5809,7 +5809,7 @@ except Exception as _e:
 # Profit / Fee Engine (Lifetime threshold)
 # -------------------------
 FEE_RATE = float(os.getenv("NEXUS_FEE_RATE", "0.03"))
-FEE_FREE_THRESHOLD_USD = float(os.getenv("NEXUS_FEE_FREE_THRESHOLD_USD", "1000"))
+FEE_FREE_THRESHOLD_USD = float(os.getenv("NEXUS_FEE_FREE_THRESHOLD_USD", os.getenv("NEXUS_MIN_PROFIT_FEE_USD", "100")))
 
 def _profit_state_get(wallet_address: str) -> dict:
     wa = _norm_addr(wallet_address or "")
@@ -5865,7 +5865,7 @@ def _fee_for_profit_delta(prev_lifetime_profit: float, profit_delta: float) -> t
     if delta <= 0:
         return (0.0, 0.0)
 
-    thr = float(FEE_FREE_THRESHOLD_USD or 1000.0)
+    thr = float(FEE_FREE_THRESHOLD_USD or 100.0)
     new_total = prev + delta
 
     taxable = max(0.0, new_total - thr) - max(0.0, prev - thr)
@@ -12849,6 +12849,402 @@ def api_nexus_execute_plan_safe_mode():
         "ts": now_ts(),
     })
 
+
+
+# -------------------------
+# Nexus Vault V2 Privy Execution Package Layer
+# -------------------------
+# This block is intentionally isolated from the existing Grid/Rotation/AI logic.
+# It prepares Vault-compatible execution packages for Privy embedded wallets and
+# keeps live submission disabled unless explicitly enabled by ENV.
+_NEXUS_EIP712_DOMAIN_NAME = os.getenv("NEXUS_EIP712_DOMAIN_NAME", "NexusVault")
+_NEXUS_EIP712_DOMAIN_VERSION = os.getenv("NEXUS_EIP712_DOMAIN_VERSION", "2")
+_NEXUS_VAULT_EXECUTION_LIVE = str(os.getenv("NEXUS_VAULT_EXECUTION_LIVE", "0")).strip().lower() in ("1", "true", "yes", "on")
+_NEXUS_REQUIRE_ROUTER_CALLDATA = str(os.getenv("NEXUS_REQUIRE_ROUTER_CALLDATA", "1")).strip().lower() not in ("0", "false", "no", "off")
+_NEXUS_DEFAULT_EXECUTION_DEADLINE_SEC = int(os.getenv("NEXUS_EXECUTION_DEADLINE_SEC", "1200"))
+_NEXUS_MAX_ROUTER_CALLDATA_BYTES = int(os.getenv("NEXUS_MAX_ROUTER_CALLDATA_BYTES", "4096"))
+
+
+def _nexus_hex_clean(v: Any) -> str:
+    h = str(v or "").strip()
+    if not h:
+        return ""
+    if not h.startswith("0x"):
+        h = "0x" + h
+    return h.lower()
+
+
+def _nexus_is_hex_data(v: Any, allow_empty: bool = False) -> bool:
+    h = str(v or "").strip()
+    if not h:
+        return bool(allow_empty)
+    if not h.startswith("0x"):
+        return False
+    if len(h) == 2:
+        return bool(allow_empty)
+    if (len(h) - 2) % 2 != 0:
+        return False
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]*", h))
+
+
+def _nexus_bytes32(v: Any) -> str:
+    """Normalize an existing bytes32 value. Does not hash names automatically."""
+    h = str(v or "").strip()
+    if not h:
+        return ""
+    if not h.startswith("0x"):
+        h = "0x" + h
+    if re.fullmatch(r"0x[0-9a-fA-F]{64}", h):
+        return h.lower()
+    return ""
+
+
+def _nexus_strategy_kind_value(raw: Any) -> int:
+    s = str(raw or "GRID").strip().upper()
+    if s in ("0", "GRID"):
+        return 0
+    if s in ("1", "ROTATION", "NEXUS_ROTATION"):
+        return 1
+    return -1
+
+
+def _nexus_default_strategy_id(kind_value: int) -> str:
+    if int(kind_value) == 1:
+        return _nexus_bytes32(os.getenv("NEXUS_STRATEGY_ID_ROTATION") or os.getenv("NEXUS_ROTATION_STRATEGY_ID") or "")
+    return _nexus_bytes32(os.getenv("NEXUS_STRATEGY_ID_GRID") or os.getenv("NEXUS_GRID_STRATEGY_ID") or "")
+
+
+def _nexus_token_address_zero_ok(token: Any) -> str:
+    t = str(token or "").strip()
+    if t.lower() in ("native", "eth", "bnb", "pol", "matic", "0x0000000000000000000000000000000000000000"):
+        return "0x0000000000000000000000000000000000000000"
+    return _norm_addr(t)
+
+
+def _nexus_amount_int(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return max(0, int(value))
+    s = str(value).strip()
+    if not s:
+        return 0
+    if s.startswith("0x"):
+        try:
+            return int(s, 16)
+        except Exception:
+            return 0
+    try:
+        # Important: amounts for the Vault package must already be base units.
+        return max(0, int(s))
+    except Exception:
+        return 0
+
+
+def _nexus_vault_actions_table() -> None:
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_vault_actions (
+            action_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            chain TEXT NOT NULL,
+            chain_id INTEGER NOT NULL,
+            action_type TEXT NOT NULL,
+            nonce INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            payload_json TEXT DEFAULT '{}',
+            tx_hash TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_ts INTEGER,
+            updated_ts INTEGER,
+            UNIQUE(wallet_address, chain_id, nonce)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_vault_actions_wallet_chain ON nexus_vault_actions(wallet_address, chain_id, status)")
+    conn.commit()
+    conn.close()
+
+
+def _nexus_create_action_nonce(wallet: str, chain_id: int, action_type: str, payload: dict) -> tuple[str, int]:
+    """Create a high-entropy nonce and persist it for replay/idempotency tracking."""
+    _nexus_vault_actions_table()
+    wallet_n = _norm_addr(wallet)
+    cid = int(chain_id or 0)
+    action_id = str(uuid.uuid4())
+    # Solidity accepts uint256. Use a large random nonce; DB UNIQUE prevents reuse by this backend.
+    for _ in range(5):
+        nonce = int.from_bytes(secrets.token_bytes(24), "big")
+        try:
+            conn = _db()
+            cur = conn.cursor()
+            with DB_WRITE_LOCK:
+                cur.execute(
+                    "INSERT INTO nexus_vault_actions(action_id,wallet_address,chain,chain_id,action_type,nonce,status,payload_json,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (action_id, wallet_n, str(payload.get("chain") or ""), cid, str(action_type), int(nonce), "PACKAGE_CREATED", json.dumps(payload, ensure_ascii=False), now_ts(), now_ts()),
+                )
+                conn.commit()
+            conn.close()
+            return action_id, nonce
+        except sqlite3.IntegrityError:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+    raise RuntimeError("could not allocate unique vault nonce")
+
+
+def _nexus_router_calldata_safety(router_call_data: str, amount_in: int, min_out: int, vault_addr: str) -> dict:
+    """Conservative calldata sanity check. Full router-specific decoding is added per router later."""
+    h = _nexus_hex_clean(router_call_data)
+    byte_len = max(0, (len(h) - 2) // 2) if h.startswith("0x") else 0
+    checks = {
+        "hex_ok": _nexus_is_hex_data(h),
+        "selector_present": len(h) >= 10,
+        "size_ok": byte_len <= _NEXUS_MAX_ROUTER_CALLDATA_BYTES,
+        "amount_in_positive": int(amount_in or 0) > 0,
+        "min_out_positive": int(min_out or 0) > 0,
+    }
+    # Defensive recipient hint: for common ABI-encoded router calls, the vault address should appear in calldata.
+    # This does not replace on-chain validation, but blocks obvious wrong-recipient payloads early.
+    vault_n = _norm_addr(vault_addr).replace("0x", "")
+    if vault_n and _looks_like_evm_addr(vault_addr):
+        checks["vault_recipient_hint"] = vault_n in h.replace("0x", "")
+    else:
+        checks["vault_recipient_hint"] = False
+    blocking = [k for k, v in checks.items() if not bool(v)]
+    return {
+        "status": "ok" if not blocking else "blocked",
+        "checks": checks,
+        "blocking_reasons": blocking,
+        "byteLength": byte_len,
+    }
+
+
+def _nexus_build_execute_swap_typed_data(chain_id: int, vault_addr: str, message: dict) -> dict:
+    """EIP-712 payload matching NexusVaultV2 ExecuteSwap type."""
+    return {
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "ExecuteSwap": [
+                {"name": "user", "type": "address"},
+                {"name": "router", "type": "address"},
+                {"name": "inputToken", "type": "address"},
+                {"name": "outputToken", "type": "address"},
+                {"name": "strategyId", "type": "bytes32"},
+                {"name": "strategyKind", "type": "uint8"},
+                {"name": "amountIn", "type": "uint256"},
+                {"name": "minAmountOut", "type": "uint256"},
+                {"name": "nonce", "type": "uint256"},
+                {"name": "deadline", "type": "uint256"},
+                {"name": "callHash", "type": "bytes32"},
+            ],
+        },
+        "primaryType": "ExecuteSwap",
+        "domain": {
+            "name": _NEXUS_EIP712_DOMAIN_NAME,
+            "version": _NEXUS_EIP712_DOMAIN_VERSION,
+            "chainId": int(chain_id),
+            "verifyingContract": _norm_addr(vault_addr),
+        },
+        "message": message,
+    }
+
+
+def _nexus_call_hash_placeholder(router_call_data: str) -> str:
+    """Return supplied callHash when backend cannot keccak locally. Privy/client should compute if missing."""
+    # The Vault signs bytes32 callHash = keccak256(routerCallData). Without a keccak dependency in this
+    # legacy single-file backend, require caller/client to provide it. This avoids silently using SHA3-256.
+    return ""
+
+
+def _nexus_execution_package_from_body(body: dict, wallet: str) -> dict:
+    chain = _normalize_chain_key(body.get("chain") or body.get("chain_key") or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(chain, 0) or 0)
+    vault_addr = (_VAULT_BY_CHAIN.get(cid) or "").strip()
+    wallet_n = _norm_addr(wallet or body.get("wallet") or body.get("wallet_address") or "")
+
+    # Build or reuse preview without mutating existing preview routes.
+    preview = body.get("preview") if isinstance(body.get("preview"), dict) else _nexus_order_preview(body)
+    report = _nexus_execution_safety_check(preview, wallet=wallet_n, require_vault_balance=str(body.get("requireVaultBalance", "1")).strip().lower() not in ("0", "false", "no", "off"))
+
+    token_in = _nexus_token_address_zero_ok(body.get("inputToken") or body.get("tokenIn") or preview.get("tokenIn"))
+    token_out = _nexus_token_address_zero_ok(body.get("outputToken") or body.get("tokenOut") or preview.get("tokenOut"))
+    router = _norm_addr(body.get("router") or body.get("routerAddress") or (((preview.get("router") or {}) if isinstance(preview.get("router"), dict) else {}).get("address") or ""))
+    amount_in = _nexus_amount_int(body.get("amountIn") or body.get("amount_in") or body.get("amountInWei") or body.get("amount_raw"))
+    min_out = _nexus_amount_int(body.get("minAmountOut") or body.get("min_amount_out") or body.get("minOutWei") or body.get("min_out_raw"))
+    router_call_data = _nexus_hex_clean(body.get("routerCallData") or body.get("router_call_data") or "")
+    call_hash = _nexus_bytes32(body.get("callHash") or body.get("call_hash") or "")
+
+    strategy_kind = _nexus_strategy_kind_value(body.get("strategyKind") or body.get("strategy_kind") or preview.get("strategyKind") or preview.get("strategy_kind") or "GRID")
+    strategy_id = _nexus_bytes32(body.get("strategyId") or body.get("strategy_id") or preview.get("strategyId") or preview.get("strategy_id") or "")
+    if not strategy_id:
+        strategy_id = _nexus_default_strategy_id(strategy_kind)
+
+    deadline = _nexus_amount_int(body.get("deadline") or body.get("deadlineTs") or body.get("deadline_ts"))
+    if deadline <= 0:
+        deadline = now_ts() + int(_NEXUS_DEFAULT_EXECUTION_DEADLINE_SEC)
+
+    # Nonce can be injected only for test; normally backend creates and persists it.
+    supplied_nonce = body.get("nonce")
+    if supplied_nonce is not None and str(supplied_nonce).strip() != "":
+        nonce = _nexus_amount_int(supplied_nonce)
+        action_id = str(body.get("actionId") or body.get("action_id") or uuid.uuid4())
+    else:
+        action_id, nonce = _nexus_create_action_nonce(wallet_n, cid, "EXECUTE_SWAP", {"chain": chain, "preview": preview})
+
+    calldata_report = _nexus_router_calldata_safety(router_call_data, amount_in, min_out, vault_addr) if router_call_data else {
+        "status": "blocked" if _NEXUS_REQUIRE_ROUTER_CALLDATA else "skipped",
+        "checks": {"router_call_data_present": False},
+        "blocking_reasons": ["router_call_data_missing"] if _NEXUS_REQUIRE_ROUTER_CALLDATA else [],
+    }
+
+    extra_checks = {
+        "vault_address_ok": _looks_like_evm_addr(vault_addr),
+        "privy_wallet_user_ok": _looks_like_evm_addr(wallet_n),
+        "router_address_ok": _looks_like_evm_addr(router),
+        "token_in_ok": token_in == "0x0000000000000000000000000000000000000000" or _looks_like_evm_addr(token_in),
+        "token_out_ok": token_out == "0x0000000000000000000000000000000000000000" or _looks_like_evm_addr(token_out),
+        "different_tokens": bool(token_in and token_out and token_in.lower() != token_out.lower()),
+        "strategy_kind_ok": strategy_kind in (0, 1),
+        "strategy_id_ok": bool(strategy_id),
+        "amount_in_base_units_ok": amount_in > 0,
+        "min_out_base_units_ok": min_out > 0,
+        "deadline_future_ok": deadline > now_ts(),
+        "call_hash_present": bool(call_hash),
+    }
+    if not call_hash:
+        # Do not fake callHash. The signing side must supply keccak256(routerCallData).
+        extra_checks["call_hash_present"] = False
+
+    blocking = list(report.get("blocking_reasons") or [])
+    blocking += [k for k, v in extra_checks.items() if not bool(v)]
+    blocking += [f"calldata:{x}" for x in (calldata_report.get("blocking_reasons") or [])]
+
+    message = {
+        "user": wallet_n,
+        "router": router,
+        "inputToken": token_in,
+        "outputToken": token_out,
+        "strategyId": strategy_id,
+        "strategyKind": int(strategy_kind if strategy_kind >= 0 else 0),
+        "amountIn": str(amount_in),
+        "minAmountOut": str(min_out),
+        "nonce": str(nonce),
+        "deadline": str(deadline),
+        "callHash": call_hash,
+    }
+    typed_data = _nexus_build_execute_swap_typed_data(cid, vault_addr, message) if cid > 0 and _looks_like_evm_addr(vault_addr) else {}
+
+    # Args match NexusVaultV2.ExecuteSwapParams struct order. Signature is empty until Privy returns it.
+    vault_args = {
+        "user": wallet_n,
+        "router": router,
+        "inputToken": token_in,
+        "outputToken": token_out,
+        "strategyId": strategy_id,
+        "strategyKind": int(strategy_kind if strategy_kind >= 0 else 0),
+        "amountIn": str(amount_in),
+        "minAmountOut": str(min_out),
+        "nonce": str(nonce),
+        "deadline": str(deadline),
+        "routerCallData": router_call_data,
+        "signature": str(body.get("signature") or ""),
+    }
+
+    return {
+        "status": "ok" if not blocking else "blocked",
+        "canSign": len(blocking) == 0,
+        "canSubmitLive": bool(_NEXUS_VAULT_EXECUTION_LIVE and len(blocking) == 0 and vault_args.get("signature")),
+        "liveExecutionEnabled": bool(_NEXUS_VAULT_EXECUTION_LIVE),
+        "message": "Vault execution package prepared for Privy signing." if not blocking else "Vault execution package blocked by safety checks.",
+        "actionId": action_id,
+        "wallet": wallet_n,
+        "chain": chain,
+        "chainId": cid,
+        "vault": vault_addr,
+        "executor": (_EXECUTOR_BY_CHAIN.get(cid) or "").strip(),
+        "checks": {**(report.get("checks") or {}), **extra_checks, "router_calldata_ok": calldata_report.get("status") == "ok"},
+        "blocking_reasons": blocking,
+        "safetyReport": report,
+        "calldataReport": calldata_report,
+        "eip712": typed_data,
+        "vaultFunction": "executeSwapWithSig((address,address,address,address,bytes32,uint8,uint256,uint256,uint256,uint256,bytes,bytes))",
+        "vaultArgs": vault_args,
+        "privy": {
+            "walletAddress": wallet_n,
+            "mode": "embedded_wallet",
+            "requiresExternalWallet": False,
+            "requiresPrivySignature": True,
+            "signatureField": "vaultArgs.signature",
+        },
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/vault/execute-swap-package", methods=["POST"])
+def api_nexus_vault_execute_swap_package():
+    """Prepare a NexusVaultV2 executeSwapWithSig package for Privy embedded wallets.
+
+    This does not replace Privy. The user wallet address remains the Vault user.
+    The response contains the EIP-712 typed data that Privy/client must sign and
+    the exact struct args needed by the Vault after signature is added.
+    """
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    try:
+        return jsonify(_nexus_execution_package_from_body(body, wa))
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
+
+
+@app.route("/api/nexus/vault/submit-signed-swap", methods=["POST"])
+def api_nexus_vault_submit_signed_swap():
+    """Accept a Privy-signed Vault package and keep live execution gated by ENV.
+
+    By default this endpoint validates and logs the signed package but does not submit
+    a transaction. Set NEXUS_VAULT_EXECUTION_LIVE=1 only after fork/testnet testing
+    and after a Privy server-side signer/tx sender is connected.
+    """
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    sig = str(body.get("signature") or ((body.get("vaultArgs") or {}) if isinstance(body.get("vaultArgs"), dict) else {}).get("signature") or "").strip()
+    if not _nexus_is_hex_data(sig):
+        return err("missing/invalid Privy EIP-712 signature", 400)
+
+    merged = dict(body)
+    if isinstance(body.get("vaultArgs"), dict):
+        for k, v in (body.get("vaultArgs") or {}).items():
+            merged.setdefault(k, v)
+    merged["signature"] = sig
+
+    package = _nexus_execution_package_from_body(merged, wa)
+    if package.get("status") != "ok":
+        return jsonify(package), 400
+
+    if not _NEXUS_VAULT_EXECUTION_LIVE:
+        package["status"] = "ready_not_submitted"
+        package["message"] = "Signed package valid, but live Vault execution is disabled. Enable NEXUS_VAULT_EXECUTION_LIVE only after tests."
+        return jsonify(package)
+
+    # Live tx sending is intentionally not implemented here because Privy server-side signing/delegated
+    # transaction execution requires the project-specific Privy API credentials and policy IDs.
+    return jsonify({
+        "status": "blocked",
+        "error": "live Privy transaction sender not connected in this backend file yet",
+        "package": package,
+        "ts": now_ts(),
+    }), 501
 
 @app.route("/api/nexus/routers", methods=["GET"])
 def api_nexus_routers():
