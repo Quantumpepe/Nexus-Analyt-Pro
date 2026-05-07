@@ -1598,6 +1598,17 @@ def init_db():
         )
     """)
 
+    # Demo AI daily usage: one combined limit across both AI endpoints.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_daily_usage (
+            wallet_address TEXT NOT NULL,
+            day_key TEXT NOT NULL,
+            used_count INTEGER DEFAULT 0,
+            updated_ts INTEGER,
+            PRIMARY KEY(wallet_address, day_key)
+        )
+    """)
+
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
         cur.execute("PRAGMA table_info(ai_memory)")
@@ -3270,7 +3281,7 @@ _ASSETS_SILVER = []
 _ASSETS_GOLD_EXTRA = ["BTC", "SOL"]
 
 # For now we model AI limit as an integer per day (free=1). Unlimited = -1.
-_AI_LIMIT_FREE = 1
+_AI_LIMIT_FREE = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
 _AI_LIMIT_UNLIMITED = -1
 
 # Pre-generated 50 one-time unlimited access codes (redeemable once each)
@@ -3825,14 +3836,32 @@ def _access_state_put(wallet_address: str, plan: str, source: str, expires_ts: i
         conn.close()
 
 def _access_defaults() -> dict:
+    """Default public access state.
+
+    Important product rule:
+    - Every authenticated wallet can use DEMO mode immediately.
+    - DEMO has real market data + simulations, but no live execution.
+    - DEMO AI is limited per day across both AI endpoints.
+    """
+    demo_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
     return {
-        "plan": "free",
-        "source": "default",
+        "plan": "demo",
+        "source": "demo",
+        "mode": "DEMO",
+        "is_demo": True,
+        "is_live": False,
+        "is_permanent": False,
         "expires_at": None,
-        "chains_allowed": [],
-        "ai_limit": _AI_LIMIT_FREE,
+        # Demo can show all configured EVM markets/data in simulation.
+        "chains_allowed": list(_ENABLED_EVM_CHAINS or _KNOWN_NETWORKS),
+        "assets_allowed": [],
+        "ai_limit": demo_limit,
+        "ai_daily_limit": demo_limit,
+        "ai_unlimited": False,
         "can_open_new_trades": False,
         "can_close_trades": True,
+        "can_live_execute": False,
+        "can_demo_simulate": True,
         "active": False,
         "auto_renew_enabled": False,
         "preferred_token": "USDT",
@@ -3848,7 +3877,6 @@ def _access_defaults() -> dict:
         "auto_renew_payment_mode": "manual",
     }
 
-
 def _is_expired(expires_ts: int | None) -> bool:
     if expires_ts is None:
         return False
@@ -3858,102 +3886,168 @@ def _is_expired(expires_ts: int | None) -> bool:
         return True
 
 
+def _copy_access_meta_from_row(base: dict, st: dict | None, exp=None) -> dict:
+    st = st or {}
+    base["expires_at"] = int(exp) if exp is not None else None
+    base["auto_renew_enabled"] = bool(st.get("auto_renew_enabled"))
+    base["preferred_token"] = str(st.get("preferred_token") or "USDT").upper()
+    base["preferred_chain"] = _normalize_chain_key(st.get("preferred_chain") or "POL")
+    base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
+    base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
+    base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
+    base["last_auto_renew_tx_hash"] = str(st.get("last_auto_renew_tx_hash") or "")
+    base["privy_wallet_id"] = str(st.get("privy_wallet_id") or "")
+    base["privy_delegation_id"] = str(st.get("privy_delegation_id") or "")
+    base["privy_policy_id"] = str(st.get("privy_policy_id") or "")
+    base["privy_consent_ts"] = int(st.get("privy_consent_ts") or 0) or None
+    base["auto_renew_payment_mode"] = str(st.get("auto_renew_payment_mode") or "manual")
+    return base
+
+
 def _compute_access_status(wallet_address: str | None) -> dict:
-    # unauthenticated -> free
+    """Central access state.
+
+    Modes:
+    - DEMO: default for every wallet; real data + simulation only; 5 AI/day.
+    - LIVE: paid 30-day access; live execution allowed; AI unlimited.
+    - PERMANENT: redeem-code lifetime access; live execution allowed; AI unlimited.
+    - EXPIRED: previous paid plan expired; falls back to demo capabilities, but mode is EXPIRED.
+    """
     if not wallet_address:
         return _access_defaults()
 
     wa = _norm_addr(wallet_address)
     st = _access_state_get(wa)
     if not st:
-        # authenticated but no plan assigned yet -> free
         base = _access_defaults()
         base["source"] = "auth"
         return base
 
-    # expired -> free
     exp = st.get("expires_ts")
+    plan = str(st.get("plan") or "demo").lower()
+    source = str(st.get("source") or "db").lower()
+    chains = st.get("chains_allowed") if isinstance(st.get("chains_allowed"), list) else []
+    chains_effective = [c for c in chains if (c in _KNOWN_NETWORKS and (not _ENABLED_EVM_CHAINS or c in _ENABLED_EVM_CHAINS))]
+    if not chains_effective:
+        chains_effective = list(_CHAINS_PRO_EFFECTIVE or _ENABLED_EVM_CHAINS or ["ETH", "BNB", "POL"])
+
     if _is_expired(exp):
         base = _access_defaults()
-        base["source"] = st.get("source") or "expired"
-        base["expires_at"] = int(exp) if exp is not None else None
-        base["auto_renew_enabled"] = bool(st.get("auto_renew_enabled"))
-        base["preferred_token"] = str(st.get("preferred_token") or "USDT").upper()
-        base["preferred_chain"] = _normalize_chain_key(st.get("preferred_chain") or "POL")
-        base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
-        base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
-        base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
-        base["last_auto_renew_tx_hash"] = str(st.get("last_auto_renew_tx_hash") or "")
-        base["privy_wallet_id"] = str(st.get("privy_wallet_id") or "")
-        base["privy_delegation_id"] = str(st.get("privy_delegation_id") or "")
-        base["privy_policy_id"] = str(st.get("privy_policy_id") or "")
-        base["privy_consent_ts"] = int(st.get("privy_consent_ts") or 0) or None
-        base["auto_renew_payment_mode"] = str(st.get("auto_renew_payment_mode") or "manual")
-        return base
+        base["mode"] = "EXPIRED"
+        base["source"] = source or "expired"
+        base["is_demo"] = True
+        base["is_live"] = False
+        base["can_demo_simulate"] = True
+        return _copy_access_meta_from_row(base, st, exp)
 
-    # stored plan
-    plan = str(st.get("plan") or "free").lower()
-    source = str(st.get("source") or "db")
-    chains = st.get("chains_allowed") if isinstance(st.get("chains_allowed"), list) else []
-    ai_limit = st.get("ai_limit")
+    ai_limit_raw = st.get("ai_limit")
     try:
-        ai_limit = int(ai_limit) if ai_limit is not None else _AI_LIMIT_FREE
+        ai_limit = int(ai_limit_raw) if ai_limit_raw is not None else _AI_LIMIT_FREE
     except Exception:
         ai_limit = _AI_LIMIT_FREE
 
     can_open = bool(st.get("can_open_new_trades"))
-
-    # SECURITY FIX:
-    # A connected/authenticated wallet alone must NOT become ACTIVE.
-    # Only real access sources are active:
-    #   - redeem code: source == "code" (can be permanent, expires_ts=None)
-    #   - paid subscription / auto-renew: expires_ts must exist and still be valid
-    # Old rows like plan=pro/source=auth/expires_ts=NULL must be treated as FREE.
     valid_plan = plan in ("pro", "gold", "unlimited", "silver")
-    valid_source = (source == "code") or (exp is not None and not _is_expired(exp))
-    if not (valid_plan and can_open and valid_source):
-        base = _access_defaults()
-        base["source"] = source or "default"
-        base["expires_at"] = int(exp) if exp is not None else None
-        base["auto_renew_enabled"] = bool(st.get("auto_renew_enabled"))
-        base["preferred_token"] = str(st.get("preferred_token") or "USDT").upper()
-        base["preferred_chain"] = _normalize_chain_key(st.get("preferred_chain") or "POL")
-        base["next_billing_ts"] = int(st.get("next_billing_ts") or exp or 0) or None
-        base["last_auto_renew_attempt_ts"] = int(st.get("last_auto_renew_attempt_ts") or 0) or None
-        base["last_auto_renew_status"] = str(st.get("last_auto_renew_status") or "")
-        base["last_auto_renew_tx_hash"] = str(st.get("last_auto_renew_tx_hash") or "")
-        base["privy_wallet_id"] = str(st.get("privy_wallet_id") or "")
-        base["privy_delegation_id"] = str(st.get("privy_delegation_id") or "")
-        base["privy_policy_id"] = str(st.get("privy_policy_id") or "")
-        base["privy_consent_ts"] = int(st.get("privy_consent_ts") or 0) or None
-        base["auto_renew_payment_mode"] = str(st.get("auto_renew_payment_mode") or "manual")
-        return base
+    is_permanent = (source == "code")
+    is_paid_live = (exp is not None and not _is_expired(exp) and source in ("payment", "usdc", "usdt", "subscription", "auto_renew", "auto-renew"))
+    is_live = bool(valid_plan and can_open and (is_permanent or is_paid_live))
 
+    if not is_live:
+        base = _access_defaults()
+        base["source"] = source or "auth"
+        return _copy_access_meta_from_row(base, st, exp)
+
+    mode = "PERMANENT" if is_permanent else "LIVE"
     return {
-            "plan": plan,
-            "source": source,
-            "expires_at": int(exp) if exp is not None else None,
-            # Only expose real networks as "chains" to the UI to avoid treating assets like BTC/SOL as chains.
-            "chains_allowed": [c for c in chains if (c in _KNOWN_NETWORKS and (not _ENABLED_EVM_CHAINS or c in _ENABLED_EVM_CHAINS))],
-            # Extra assets/features unlocked by tier (safe to ignore by older frontends).
-            "assets_allowed": (_ASSETS_GOLD_EXTRA if plan in ("gold", "unlimited") else _ASSETS_SILVER),
-            "ai_limit": ai_limit,
-            "can_open_new_trades": can_open,
-            "can_close_trades": True,
-            "active": True,
-            "auto_renew_enabled": bool(st.get("auto_renew_enabled")),
-            "preferred_token": str(st.get("preferred_token") or "USDT").upper(),
-            "preferred_chain": _normalize_chain_key(st.get("preferred_chain") or "POL"),
-            "next_billing_ts": int(st.get("next_billing_ts") or exp or 0) or None,
-            "last_auto_renew_attempt_ts": int(st.get("last_auto_renew_attempt_ts") or 0) or None,
-            "last_auto_renew_status": str(st.get("last_auto_renew_status") or ""),
-            "last_auto_renew_tx_hash": str(st.get("last_auto_renew_tx_hash") or ""),
-            "privy_wallet_id": str(st.get("privy_wallet_id") or ""),
-            "privy_delegation_id": str(st.get("privy_delegation_id") or ""),
-            "privy_policy_id": str(st.get("privy_policy_id") or ""),
-            "privy_consent_ts": int(st.get("privy_consent_ts") or 0) or None,
-            "auto_renew_payment_mode": str(st.get("auto_renew_payment_mode") or "manual"),
-        }
+        "plan": plan,
+        "source": source,
+        "mode": mode,
+        "is_demo": False,
+        "is_live": True,
+        "is_permanent": bool(is_permanent),
+        "expires_at": int(exp) if exp is not None else None,
+        "chains_allowed": chains_effective,
+        "assets_allowed": (_ASSETS_GOLD_EXTRA if plan in ("gold", "unlimited") else _ASSETS_SILVER),
+        "ai_limit": _AI_LIMIT_UNLIMITED,
+        "ai_daily_limit": None,
+        "ai_unlimited": True,
+        "can_open_new_trades": True,
+        "can_close_trades": True,
+        "can_live_execute": True,
+        "can_demo_simulate": True,
+        "active": True,
+        "auto_renew_enabled": bool(st.get("auto_renew_enabled")),
+        "preferred_token": str(st.get("preferred_token") or "USDT").upper(),
+        "preferred_chain": _normalize_chain_key(st.get("preferred_chain") or "POL"),
+        "next_billing_ts": int(st.get("next_billing_ts") or exp or 0) or None,
+        "last_auto_renew_attempt_ts": int(st.get("last_auto_renew_attempt_ts") or 0) or None,
+        "last_auto_renew_status": str(st.get("last_auto_renew_status") or ""),
+        "last_auto_renew_tx_hash": str(st.get("last_auto_renew_tx_hash") or ""),
+        "privy_wallet_id": str(st.get("privy_wallet_id") or ""),
+        "privy_delegation_id": str(st.get("privy_delegation_id") or ""),
+        "privy_policy_id": str(st.get("privy_policy_id") or ""),
+        "privy_consent_ts": int(st.get("privy_consent_ts") or 0) or None,
+        "auto_renew_payment_mode": str(st.get("auto_renew_payment_mode") or "manual"),
+    }
+
+
+def _ai_usage_day_key(ts: int | None = None) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(int(ts or now_ts())))
+
+
+def _ai_usage_get(wallet_address: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    day_key = _ai_usage_day_key()
+    if not wa:
+        return {"used": 0, "limit": int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5")), "remaining": 0, "day": day_key}
+    conn = _db()
+    cur = conn.cursor()
+    cur.execute("SELECT used_count FROM ai_daily_usage WHERE wallet_address=? AND day_key=?", (wa, day_key))
+    row = cur.fetchone()
+    conn.close()
+    used = int(row[0]) if row else 0
+    limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
+    return {"used": used, "limit": limit, "remaining": max(0, limit - used), "day": day_key}
+
+
+def _ai_demo_consume_or_error(wallet_address: str, access_status: dict | None):
+    """Allow paid/redeem AI unlimited; limit DEMO/EXPIRED to 5 total AI requests per UTC day."""
+    st = access_status or {}
+    if bool(st.get("ai_unlimited")) or bool(st.get("is_live")) or bool(st.get("is_permanent")):
+        return None
+
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return err("wallet required for demo AI", 401)
+
+    limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
+    day_key = _ai_usage_day_key()
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute("SELECT used_count FROM ai_daily_usage WHERE wallet_address=? AND day_key=?", (wa, day_key))
+        row = cur.fetchone()
+        used = int(row[0]) if row else 0
+        if used >= limit:
+            conn.close()
+            return jsonify({
+                "status": "error",
+                "error": "daily demo AI limit reached",
+                "mode": st.get("mode") or "DEMO",
+                "ai_used_today": used,
+                "ai_daily_limit": limit,
+                "upgrade_required": True,
+                "ts": now_ts(),
+            }), 429
+        new_used = used + 1
+        cur.execute(
+            "INSERT INTO ai_daily_usage(wallet_address, day_key, used_count, updated_ts) VALUES (?,?,?,?) "
+            "ON CONFLICT(wallet_address, day_key) DO UPDATE SET used_count=excluded.used_count, updated_ts=excluded.updated_ts",
+            (wa, day_key, new_used, now_ts()),
+        )
+        conn.commit()
+        conn.close()
+    return None
 
 
 def _require_access_open() -> tuple[str | None, dict | None, tuple | None]:
@@ -4012,10 +4106,15 @@ def api_access_status():
         )
 
     st = _compute_access_status(wa)
+    ai_usage = _ai_usage_get(wa) if wa and not bool(st.get("ai_unlimited")) else {"used": 0, "limit": None, "remaining": None, "day": _ai_usage_day_key()}
 
     return jsonify({
         "status": "ok",
         "wallet_address": _norm_addr(wa) if wa else None,
+        "ai_used_today": ai_usage.get("used"),
+        "ai_daily_limit": ai_usage.get("limit"),
+        "ai_remaining_today": ai_usage.get("remaining"),
+        "ai_usage_day": ai_usage.get("day"),
         **st
     })
 
@@ -9894,10 +9993,9 @@ def api_ai_insight_profile_get():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     wallet_q = str(request.args.get("wallet") or request.args.get("wallet_address") or wa).strip()
     wallet_q = _norm_addr(wallet_q)
@@ -10872,10 +10970,9 @@ def api_ai_run():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
@@ -10930,10 +11027,9 @@ def api_ai_insight():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
@@ -10992,10 +11088,9 @@ def api_ai_memory_get():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     wa = str(request.args.get("wallet_address") or "").strip()
     mem = _ai_mem_get(wa) if wa else []
@@ -11008,10 +11103,9 @@ def api_ai_memory_clear():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     body = request.get_json(silent=True) or {}
     wa = str(body.get("wallet_address") or "").strip()
@@ -11035,10 +11129,9 @@ def api_ai():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    # Access gate: AI is allowed for any active access source (redeem code, subscription, NFT/unlimited).
-    # Do NOT restrict this to plan == "pro", because redeemed codes may use plan == "unlimited".
-    if not bool(st.get("active")):
-        return err("access required for AI", 403)
+    ai_gate = _ai_demo_consume_or_error(wa, st)
+    if ai_gate:
+        return ai_gate
 
     body = request.get_json(silent=True) or {}
 
