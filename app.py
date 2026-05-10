@@ -10083,30 +10083,196 @@ def _hard_sanitize_ai_insight_text(value: str) -> str:
     return out
 
 
+
+def _ai_intelligence_level(value: float) -> str:
+    try:
+        n = float(value)
+    except Exception:
+        n = 0.0
+    if n >= 75:
+        return "high"
+    if n >= 55:
+        return "medium"
+    if n >= 35:
+        return "low-medium"
+    return "low"
+
+
+def _dynamic_ai_confidence_from_engine(engine_ctx: dict | None = None) -> dict:
+    """Compute a compact confidence profile from the internal intelligence layers.
+
+    This does not create a buy/sell signal. It only tells AI Insight how much
+    weight to put on the current read based on signal alignment, liquidity,
+    confirmation quality, regime stability and risk contradictions.
+    """
+    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
+    mb = ctx.get("market_behavior") if isinstance(ctx.get("market_behavior"), dict) else {}
+    liq = ctx.get("liquidity_context") if isinstance(ctx.get("liquidity_context"), dict) else {}
+    phase = ctx.get("market_phase") if isinstance(ctx.get("market_phase"), dict) else (mb.get("market_phase") if isinstance(mb.get("market_phase"), dict) else {})
+
+    base = _safe_float(ctx.get("confidence"), 6.0) * 10.0
+    continuation = _safe_float(ctx.get("continuation_quality") or mb.get("continuation_quality"), 40.0)
+    volume_conf = _safe_float(ctx.get("volume_confirmation") or mb.get("volume_confirmation"), 35.0)
+    trap = _safe_float(ctx.get("trap_risk") or liq.get("trap_risk"), 0.0)
+    vacuum = _safe_float(ctx.get("liquidity_vacuum_risk") or liq.get("liquidity_vacuum_risk"), 0.0)
+    stop_hunt = _safe_float(ctx.get("stop_hunt_risk") or liq.get("stop_hunt_risk"), 0.0)
+    exhaustion = _safe_float(ctx.get("exhaustion_risk") or mb.get("exhaustion_risk"), 0.0)
+    fake = _safe_float(ctx.get("fake_move_risk") or mb.get("fake_move_risk"), 0.0)
+    depth = _safe_float(ctx.get("participation_depth") or liq.get("participation_depth"), 45.0)
+    phase_conf = _safe_float(phase.get("confidence"), 50.0)
+
+    score = base
+    score += (continuation - 50.0) * 0.12
+    score += (volume_conf - 45.0) * 0.10
+    score += (depth - 45.0) * 0.08
+    score += (phase_conf - 50.0) * 0.08
+    score -= max(trap, vacuum, stop_hunt) * 0.10
+    score -= max(exhaustion, fake) * 0.08
+    score = round(max(20.0, min(95.0, score)), 1)
+
+    label = "HIGH" if score >= 78 else "MEDIUM" if score >= 55 else "LOW"
+    return {
+        "score": score,
+        "label": label,
+        "summary": f"{label} ({score/10.0:.1f}/10)",
+        "drivers": {
+            "continuation_quality": continuation,
+            "volume_confirmation": volume_conf,
+            "liquidity_depth": depth,
+            "trap_pressure": max(trap, vacuum, stop_hunt),
+            "exhaustion_or_fake_move_pressure": max(exhaustion, fake),
+            "phase_confidence": phase_conf,
+        },
+        "display_in_ui": False,
+    }
+
+
+def _tactical_state_from_engine(engine_ctx: dict | None = None) -> dict:
+    """Classify the current pair setup into a tactical behavior window for AI wording."""
+    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
+    mb = ctx.get("market_behavior") if isinstance(ctx.get("market_behavior"), dict) else {}
+    liq = ctx.get("liquidity_context") if isinstance(ctx.get("liquidity_context"), dict) else {}
+    phase = ctx.get("market_phase") if isinstance(ctx.get("market_phase"), dict) else (mb.get("market_phase") if isinstance(mb.get("market_phase"), dict) else {})
+
+    setup = str(ctx.get("setup_bias") or "").lower()
+    phase_regime = str(phase.get("regime") or ctx.get("market_phase_regime") or "").lower()
+    liq_regime = str(liq.get("regime") or ctx.get("liquidity_regime") or "").lower()
+    cont = _safe_float(ctx.get("continuation_quality") or mb.get("continuation_quality"), 0.0)
+    vol_conf = _safe_float(ctx.get("volume_confirmation") or mb.get("volume_confirmation"), 0.0)
+    exhaustion = _safe_float(ctx.get("exhaustion_risk") or mb.get("exhaustion_risk"), 0.0)
+    fake = _safe_float(ctx.get("fake_move_risk") or mb.get("fake_move_risk"), 0.0)
+    trap = _safe_float(ctx.get("trap_risk") or liq.get("trap_risk"), 0.0)
+
+    if "mean" in setup or "grid" in setup or "range" in phase_regime:
+        state = "Mean-Reversion Window"
+        meaning = "structure favors oscillation or rotation rather than a clean directional continuation"
+    elif "accumulation" in phase_regime or _safe_float(mb.get("accumulation_signal"), 0.0) >= 55:
+        state = "Accumulation Behavior"
+        meaning = "participation is building before a fully confirmed expansion"
+    elif exhaustion >= 65 or "euphoria" in phase_regime or "distribution" in phase_regime:
+        state = "Distribution / Exhaustion Risk"
+        meaning = "movement quality may be late-stage, stretched or vulnerable to reversal"
+    elif trap >= 65 or fake >= 65 or "trap" in liq_regime:
+        state = "Trap-Sensitive Expansion"
+        meaning = "price movement can be fast, but confirmation quality remains fragile"
+    elif cont >= 65 and vol_conf >= 50:
+        state = "Continuation Window"
+        meaning = "participation supports follow-through better than usual, while still requiring confirmation"
+    elif "vacuum" in liq_regime:
+        state = "Liquidity Vacuum"
+        meaning = "movement may travel quickly through thin liquidity and invalidate just as fast"
+    else:
+        state = "Mixed Structure"
+        meaning = "no clean tactical regime dominates yet"
+
+    return {"state": state, "meaning": meaning, "display_in_ui": False}
+
+
+def _liquidity_warning_labels_from_engine(engine_ctx: dict | None = None) -> list[str]:
+    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
+    liq = ctx.get("liquidity_context") if isinstance(ctx.get("liquidity_context"), dict) else {}
+    warnings = []
+    trap = _safe_float(ctx.get("trap_risk") or liq.get("trap_risk"), 0.0)
+    vacuum = _safe_float(ctx.get("liquidity_vacuum_risk") or liq.get("liquidity_vacuum_risk"), 0.0)
+    stop_hunt = _safe_float(ctx.get("stop_hunt_risk") or liq.get("stop_hunt_risk"), 0.0)
+    depth = _safe_float(ctx.get("participation_depth") or liq.get("participation_depth"), 0.0)
+    fake = _safe_float(ctx.get("fake_move_risk"), 0.0)
+    vol_conf = _safe_float(ctx.get("volume_confirmation"), 0.0)
+
+    if fake >= 60 and vol_conf < 45:
+        warnings.append("LOW CONVICTION BREAKOUT")
+    if trap >= 65:
+        warnings.append("LIQUIDITY WARNING")
+    if depth and depth < 40:
+        warnings.append("THIN PARTICIPATION")
+    if stop_hunt >= 65:
+        warnings.append("STOP-HUNT SENSITIVITY")
+    if vacuum >= 65:
+        warnings.append("LIQUIDITY VACUUM")
+    return warnings[:4]
+
+
+def _ai_market_intelligence_sections_from_engine(engine_ctx: dict | None = None) -> str:
+    """Deterministic structured AI Insight conclusion from internal engines.
+
+    This is used as the final safety format for AI Insight so the UI receives a
+    clean market-intelligence read, not raw source data. It intentionally avoids
+    ratings, votes, CoinGecko mapping, direct buy/sell language and raw metrics.
+    """
+    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
+    mb = ctx.get("market_behavior") if isinstance(ctx.get("market_behavior"), dict) else {}
+    liq = ctx.get("liquidity_context") if isinstance(ctx.get("liquidity_context"), dict) else {}
+    phase = ctx.get("market_phase") if isinstance(ctx.get("market_phase"), dict) else (mb.get("market_phase") if isinstance(mb.get("market_phase"), dict) else {})
+    dyn_conf = _dynamic_ai_confidence_from_engine(ctx)
+    tactical = _tactical_state_from_engine(ctx)
+    liq_warnings = _liquidity_warning_labels_from_engine(ctx)
+
+    verdict = str(ctx.get("verdict") or "MARKET STRUCTURE").strip()
+    setup = str(ctx.get("setup_bias") or "mixed / no-clean-setup").strip()
+    edge = str(ctx.get("edge") or "structure does not show a clean directional edge yet").strip()
+    invalidation = str(ctx.get("invalidation") or ctx.get("risk") or "weak confirmation can invalidate the current read").strip()
+    risk = str(ctx.get("risk") or "Medium").strip()
+    behavior_label = str(phase.get("label") or ctx.get("market_phase_label") or mb.get("label") or ctx.get("market_behavior_label") or "mixed market behavior").strip()
+    liq_label = str(liq.get("label") or ctx.get("liquidity_label") or "balanced liquidity conditions").strip()
+    rel = ctx.get("relative_strength") if isinstance(ctx.get("relative_strength"), dict) else {}
+    stronger = str(rel.get("stronger") or "").strip().upper()
+    weaker = str(rel.get("weaker") or "").strip().upper()
+
+    market_structure = f"{behavior_label}; current read leans {setup}."
+    liquidity_state = f"{liq_label}."
+    if liq_warnings:
+        liquidity_state += " Warnings: " + ", ".join(liq_warnings) + "."
+    risk_posture = f"Risk posture is {risk}; confidence profile reads {dyn_conf.get('summary')}."
+    if stronger and weaker:
+        pair_relationship = f"Relative strength currently favors {stronger} over {weaker}, but the pair still needs cleaner confirmation."
+    else:
+        pair_relationship = "Pair relationship remains mixed; confirmation quality matters more than isolated movement."
+    tactical_read = f"{tactical.get('state')}: {tactical.get('meaning')}."
+    invalidations = invalidation
+
+    text = (
+        f"Market Structure: {market_structure}\n"
+        f"Liquidity State: {liquidity_state}\n"
+        f"Risk Posture: {risk_posture}\n"
+        f"Pair Relationship: {pair_relationship}\n"
+        f"Tactical Read: {tactical_read}\n"
+        f"Invalidations: {invalidations}\n\n"
+        f"Edge: {edge}\n"
+        f"Risk: {invalidation}\n"
+        f"Setup bias: {setup}"
+    )
+    clean = _hard_sanitize_ai_insight_text(text)
+    clean = re.sub(
+        r"\s+(Liquidity State|Risk Posture|Pair Relationship|Tactical Read|Invalidations|Edge|Risk|Setup bias)\s*:",
+        r"\n\1:",
+        clean,
+    )
+    return clean.strip()
+
+
 def _compact_behavior_answer_from_engine(engine_ctx: dict | None = None) -> str:
     """Deterministic fallback when the LLM still dumps raw UI/source data."""
-    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
-    setup = str(ctx.get("setup_bias") or "behavior-sensitive / no-clean-setup").strip()
-    edge = str(ctx.get("edge") or "structure does not show a clean directional edge yet").strip()
-    risk = str(ctx.get("invalidation") or ctx.get("risk") or "weak confirmation can invalidate the read").strip()
-    behavior = str(ctx.get("behavior") or "mixed behavior").strip()
-    mb = ctx.get("market_behavior") if isinstance(ctx.get("market_behavior"), dict) else {}
-    mb_summary = str(ctx.get("market_behavior_summary") or mb.get("summary") or "Confirmation quality is mixed and should not be overstated.").strip()
-
-    # Keep the summary short and free of raw metrics.
-    mb_summary = _hard_sanitize_ai_insight_text(mb_summary)
-    if not mb_summary:
-        mb_summary = "Confirmation quality is mixed and should not be overstated."
-
-    paragraph = (
-        f"Current structure reads as {setup} rather than a clean directional continuation. "
-        f"The behavior profile is {behavior}, with confirmation quality still mixed. "
-        f"{mb_summary} This favors a cautious market-structure read where movement can appear, "
-        f"but conviction remains dependent on stronger participation and cleaner follow-through."
-    )
-    paragraph = _hard_sanitize_ai_insight_text(paragraph)
-    return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
-
+    return _ai_market_intelligence_sections_from_engine(engine_ctx)
 
 def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> str:
     """Guarantee AI Insight Level 2 output is concise and behavior-driven.
@@ -10121,8 +10287,9 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
 
     forbidden_hit = bool(re.search(r"(?i)\b(Votes?|Rating|CoinGecko|contract mapping|token mapping|Signal context|mapping found)\b", s))
     raw_metric_hit = bool(re.search(r"\b\d+(?:\.\d+)?%\b|\bcorrelation\s+(?:of|at)\s+\d|\bover the last\s+\d+\s*(?:days?|d)\b", s, flags=re.I))
-    too_long = len(re.findall(r"\w+", s)) > 145
-    if forbidden_hit or raw_metric_hit or too_long:
+    too_long = len(re.findall(r"\w+", s)) > 170
+    lacks_market_intel_sections = bool(engine_ctx) and not re.search(r"(?i)\bMarket Structure\s*:", s)
+    if forbidden_hit or raw_metric_hit or too_long or lacks_market_intel_sections:
         return _compact_behavior_answer_from_engine(engine_ctx)
 
     def _extract(label: str) -> str:
@@ -12114,21 +12281,24 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 30) Always merge all signals into ONE combined interpretation.
 31) Prefer one strong paragraph plus optional compact Edge/Risk/Setup bias lines.
 32) Avoid breaking the answer into many titled parts.
-33) Your output MUST follow EXACTLY this structure:
+33) Your output MUST follow this compact market-intelligence structure:
 
-<paragraph>
-(max 80–100 words, no numbers list, no raw metric repetition)
+Market Structure: ...
+Liquidity State: ...
+Risk Posture: ...
+Pair Relationship: ...
+Tactical Read: ...
+Invalidations: ...
 
 Edge: ...
 Risk: ...
 Setup bias: ...
 
 34) Hard rules:
-- You MUST include ALL THREE lines: Edge, Risk, Setup bias
-- Each line MUST be present exactly once
-- Do NOT merge them into the paragraph
-- Do NOT skip any of them
-- If missing, the answer is invalid
+- Use the section labels exactly once where possible.
+- Do NOT turn this into a long report. Keep each section short.
+- Do NOT skip Edge, Risk, or Setup bias.
+- If liquidity context is weak/neutral, keep Liquidity State subtle.
 
 35) Additional rules:
 - Do NOT repeat raw metrics or numbers
