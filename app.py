@@ -10320,6 +10320,222 @@ def _build_movement_chance_score(pair_ctx: dict | None, coins: list, compare_wei
     }
 
 
+
+def _behavior_level(value: float) -> str:
+    v = _safe_float(value, 0.0)
+    if v >= 75:
+        return "high"
+    if v >= 50:
+        return "medium"
+    if v >= 25:
+        return "low"
+    return "quiet"
+
+
+def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str = "standard") -> dict:
+    """Market Behavior Detection Layer for AI Insight.
+
+    This layer classifies what the current movement may represent. It is deliberately
+    informational only: it does not produce buy/sell instructions and does not replace
+    the Movement Chance score. It adds context such as fake-move risk, exhaustion risk,
+    continuation quality, accumulation pressure, and market regime.
+    """
+    p = pair_ctx if isinstance(pair_ctx, dict) else {}
+    mode = _normalize_ai_mode(ai_mode)
+    pair = str(p.get("pair") or "").upper().strip()
+    parts = [x.strip() for x in pair.split("/") if x.strip()]
+
+    coin_map = {}
+    for c in coins if isinstance(coins, list) else []:
+        if isinstance(c, dict):
+            sym = str(c.get("symbol") or "").upper().strip()
+            if sym:
+                coin_map[sym] = c
+
+    ca = coin_map.get(parts[0], {}) if len(parts) >= 1 else {}
+    cb = coin_map.get(parts[1], {}) if len(parts) >= 2 else {}
+
+    corr = _safe_float(p.get("corr"), 0.0)
+    spread = abs(_safe_float(p.get("spread_pct"), 0.0))
+    rsi_gap = abs(_safe_float(p.get("rsi_gap"), 0.0))
+    score_pair = _safe_float(p.get("score"), 0.0)
+    ch_a = _safe_float(ca.get("change_24h_pct"), 0.0)
+    ch_b = _safe_float(cb.get("change_24h_pct"), 0.0)
+    momentum_gap = abs(ch_a - ch_b)
+
+    fake_move_risk = 0.0
+    exhaustion_risk = 0.0
+    continuation_quality = 35.0
+    accumulation_signal = 0.0
+    volatility_expansion = 0.0
+    volume_confirmation = 0.0
+    reasons = []
+    warnings = []
+
+    states = []
+    oe_values = []
+    rvol_values = []
+    for c in (ca, cb):
+        mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
+        state = str(mc.get("state") or "").upper()
+        if state:
+            states.append(state)
+        oe_raw = mc.get("oe_pct")
+        rv_raw = mc.get("rvol")
+        try:
+            oe = float(oe_raw)
+            if math.isfinite(oe):
+                oe_values.append(oe)
+        except Exception:
+            pass
+        try:
+            rv = float(rv_raw)
+            if math.isfinite(rv):
+                rvol_values.append(rv)
+        except Exception:
+            pass
+
+        if state == "FAKE_MOVE":
+            fake_move_risk += 32.0
+            continuation_quality -= 18.0
+            warnings.append(f"{c.get('symbol')}: weak/fake-move structure")
+        elif state == "REAL_BREAKOUT":
+            continuation_quality += 22.0
+            volume_confirmation += 28.0
+            volatility_expansion += 12.0
+            reasons.append(f"{c.get('symbol')}: volume-backed breakout")
+        elif state == "EARLY_ACCUMULATION":
+            accumulation_signal += 32.0
+            continuation_quality += 12.0
+            volume_confirmation += 18.0
+            reasons.append(f"{c.get('symbol')}: early accumulation / volume build")
+        elif state == "OVEREXTENDED":
+            exhaustion_risk += 28.0
+            fake_move_risk += 8.0
+            continuation_quality -= 10.0
+            warnings.append(f"{c.get('symbol')}: overextended")
+
+    max_rvol = max(rvol_values) if rvol_values else 0.0
+    max_oe = max([abs(x) for x in oe_values], default=0.0)
+
+    if max_rvol >= 2.0:
+        volume_confirmation += 18.0
+        volatility_expansion += 10.0
+        reasons.append("relative volume expansion")
+    elif max_rvol > 0 and max_rvol < 1.2 and (spread >= 4.0 or momentum_gap >= 3.0):
+        fake_move_risk += 18.0
+        continuation_quality -= 10.0
+        warnings.append("movement lacks strong relative-volume confirmation")
+
+    if max_oe >= 55:
+        exhaustion_risk += 20.0
+        warnings.append("large overextension increases exhaustion risk")
+    elif 30 <= max_oe < 55 and max_rvol >= 1.5:
+        continuation_quality += 8.0
+        reasons.append("extension is supported by participation")
+
+    if spread >= 8.0:
+        volatility_expansion += 24.0
+        exhaustion_risk += 8.0
+        reasons.append("wide spread expansion")
+    elif spread >= 4.0:
+        volatility_expansion += 14.0
+        reasons.append("spread expansion building")
+
+    if rsi_gap >= 18.0:
+        volatility_expansion += 14.0
+        exhaustion_risk += 10.0
+        reasons.append("large RSI divergence")
+    elif rsi_gap >= 10.0:
+        volatility_expansion += 8.0
+        reasons.append("RSI divergence building")
+
+    if momentum_gap >= 5.0:
+        volatility_expansion += 16.0
+        continuation_quality += 6.0
+        reasons.append("short-term momentum gap")
+    elif momentum_gap >= 2.5:
+        volatility_expansion += 8.0
+
+    if corr >= 0.75 and spread >= 3.0:
+        continuation_quality += 6.0
+        reasons.append("linked pair with relative imbalance")
+    elif corr > 0 and corr < 0.45:
+        fake_move_risk += 10.0
+        warnings.append("weak pair linkage reduces signal reliability")
+
+    if score_pair < 65 and (spread >= 5.0 or rsi_gap >= 14.0):
+        volatility_expansion += 8.0
+        reasons.append("lower-ranked pair shows unusual movement")
+
+    if mode == "extreme":
+        volatility_expansion *= 1.08
+        continuation_quality += 4.0 if (spread >= 4.0 or momentum_gap >= 3.0) else 0.0
+        fake_move_risk += 4.0 if max_rvol < 1.2 and (spread >= 4.0 or momentum_gap >= 3.0) else 0.0
+
+    fake_move_risk = round(max(0.0, min(100.0, fake_move_risk)), 1)
+    exhaustion_risk = round(max(0.0, min(100.0, exhaustion_risk)), 1)
+    continuation_quality = round(max(0.0, min(100.0, continuation_quality)), 1)
+    accumulation_signal = round(max(0.0, min(100.0, accumulation_signal)), 1)
+    volatility_expansion = round(max(0.0, min(100.0, volatility_expansion)), 1)
+    volume_confirmation = round(max(0.0, min(100.0, volume_confirmation)), 1)
+
+    if fake_move_risk >= 60 and exhaustion_risk >= 55:
+        regime = "overheated_fake_move_risk"
+        label = "Overheated / fake-move risk"
+    elif continuation_quality >= 70 and volume_confirmation >= 45:
+        regime = "volume_backed_continuation"
+        label = "Volume-backed continuation"
+    elif accumulation_signal >= 50:
+        regime = "early_accumulation"
+        label = "Early accumulation"
+    elif exhaustion_risk >= 60:
+        regime = "momentum_exhaustion"
+        label = "Momentum exhaustion risk"
+    elif volatility_expansion >= 55:
+        regime = "volatility_expansion"
+        label = "Volatility expansion"
+    elif fake_move_risk >= 50:
+        regime = "fake_move_watch"
+        label = "Fake-move watch"
+    else:
+        regime = "mixed_or_neutral"
+        label = "Mixed / neutral behavior"
+
+    if not reasons:
+        reasons.append("no strong behavior pattern detected")
+
+    return {
+        "pair": pair,
+        "regime": regime,
+        "label": label,
+        "meaning": "Market behavior context only — not a buy/sell instruction and not a profit guarantee.",
+        "fake_move_risk": fake_move_risk,
+        "fake_move_level": _behavior_level(fake_move_risk),
+        "exhaustion_risk": exhaustion_risk,
+        "exhaustion_level": _behavior_level(exhaustion_risk),
+        "continuation_quality": continuation_quality,
+        "continuation_level": _behavior_level(continuation_quality),
+        "accumulation_signal": accumulation_signal,
+        "accumulation_level": _behavior_level(accumulation_signal),
+        "volatility_expansion": volatility_expansion,
+        "volatility_level": _behavior_level(volatility_expansion),
+        "volume_confirmation": volume_confirmation,
+        "volume_confirmation_level": _behavior_level(volume_confirmation),
+        "metrics": {
+            "corr": round(corr, 4),
+            "spread_pct": round(spread, 2),
+            "rsi_gap": round(rsi_gap, 2),
+            "momentum_gap_24h_pct": round(momentum_gap, 2),
+            "max_rvol": round(max_rvol, 2),
+            "max_overextension_pct": round(max_oe, 2),
+            "pair_rank_score": round(score_pair, 2),
+        },
+        "reasons": reasons[:6],
+        "warnings": warnings[:6],
+    }
+
+
 def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None = None, ai_mode: str = "standard") -> list[dict]:
     """Scan all Compare pairs for hidden opportunities, not only the selected/top pair.
     Deterministic and informational only; no buy/sell instructions.
@@ -10678,6 +10894,44 @@ def _ai_engine_v2_from_context(
         drivers.append(f"movement chance score is building ({movement_score}/100)")
         tags.append("movement_watch")
 
+    market_behavior = _market_behavior_from_pair(pair_ctx, coins, ai_mode=ai_mode) if pair_ctx else {
+        "pair": f"{a}/{b}" if a and b else "",
+        "regime": "missing_pair_context",
+        "label": "No pair behavior context",
+        "meaning": "Market behavior context only — not a buy/sell instruction and not a profit guarantee.",
+        "fake_move_risk": 0.0,
+        "fake_move_level": "quiet",
+        "exhaustion_risk": 0.0,
+        "exhaustion_level": "quiet",
+        "continuation_quality": 0.0,
+        "continuation_level": "quiet",
+        "accumulation_signal": 0.0,
+        "accumulation_level": "quiet",
+        "volatility_expansion": 0.0,
+        "volatility_level": "quiet",
+        "volume_confirmation": 0.0,
+        "volume_confirmation_level": "quiet",
+        "metrics": {},
+        "reasons": ["no pair context available"],
+        "warnings": [],
+    }
+    behavior_regime = str(market_behavior.get("regime") or "")
+    if behavior_regime and behavior_regime != "mixed_or_neutral":
+        drivers.append(f"market behavior: {market_behavior.get('label')}")
+        tags.append(f"behavior_{behavior_regime}")
+    if _safe_float(market_behavior.get("fake_move_risk"), 0.0) >= 60:
+        warnings.append("fake-move risk is elevated")
+        contradictions.append("movement may be poorly confirmed by volume/participation")
+        exit_reasons.append("fake-move risk is elevated")
+        tags.append("fake_move_risk")
+    if _safe_float(market_behavior.get("exhaustion_risk"), 0.0) >= 60:
+        warnings.append("momentum exhaustion risk is elevated")
+        exit_reasons.append("momentum exhaustion risk is elevated")
+        tags.append("exhaustion_risk")
+    if _safe_float(market_behavior.get("volume_confirmation"), 0.0) >= 55:
+        drivers.append("volume confirmation supports the movement")
+        tags.append("volume_confirmation")
+
     pair_alerts = _build_ai_pair_alerts(all_pairs, coins, compare_weights=compare_weights, ai_mode=ai_mode)
     if pair_alerts:
         drivers.append(f"pair scanner found {len(pair_alerts)} movement-chance alert(s)")
@@ -10751,6 +11005,12 @@ def _ai_engine_v2_from_context(
         risk_score += 1
     if ai_mode == "extreme" and (rel_strength or accumulation or volume_backed or pair_alerts) and risk_score > 0:
         risk_score -= 1
+    if _safe_float(market_behavior.get("fake_move_risk"), 0.0) >= 70:
+        risk_score += 1
+    if _safe_float(market_behavior.get("exhaustion_risk"), 0.0) >= 70:
+        risk_score += 1
+    if _safe_float(market_behavior.get("volume_confirmation"), 0.0) >= 60 and risk_score > 0:
+        risk_score -= 1
 
     if risk_score >= 6:
         risk = "High"
@@ -10786,7 +11046,7 @@ def _ai_engine_v2_from_context(
     ) if a and b else f"{verdict}: {behavior}. Risk is {risk}; exit risk is {exit_risk}; confidence {confidence}/10."
 
     return {
-        "version": "ai_engine_v2_exit_contradiction_mode_weight_alerts",
+        "version": "ai_engine_v2_behavior_detection_v1",
         "ai_mode": ai_mode,
         "compare_weights": compare_weights,
         "weight_focus": weight_focus,
@@ -10795,6 +11055,13 @@ def _ai_engine_v2_from_context(
         "movement_chance_score": movement_score,
         "movement_chance_level": movement_chance.get("level"),
         "movement_chance_label": movement_chance.get("label"),
+        "market_behavior": market_behavior,
+        "market_behavior_regime": market_behavior.get("regime"),
+        "market_behavior_label": market_behavior.get("label"),
+        "fake_move_risk": market_behavior.get("fake_move_risk"),
+        "exhaustion_risk": market_behavior.get("exhaustion_risk"),
+        "continuation_quality": market_behavior.get("continuation_quality"),
+        "volume_confirmation": market_behavior.get("volume_confirmation"),
         "verdict": verdict,
         "confidence": confidence,
         "risk": risk,
