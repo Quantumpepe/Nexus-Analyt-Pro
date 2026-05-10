@@ -10395,6 +10395,177 @@ def _behavior_level(value: float) -> str:
     return "quiet"
 
 
+def _market_phase_from_behavior_inputs(
+    corr: float,
+    spread: float,
+    rsi_gap: float,
+    momentum_gap: float,
+    score_pair: float,
+    max_rvol: float,
+    max_oe: float,
+    states: list,
+    fake_move_risk: float,
+    exhaustion_risk: float,
+    continuation_quality: float,
+    accumulation_signal: float,
+    volatility_expansion: float,
+    volume_confirmation: float,
+    ai_mode: str = "standard",
+) -> dict:
+    """Regime / Market Phase Engine for AI Insight.
+
+    This is an internal context layer. It classifies the market phase behind the
+    movement so AI Insight can explain *what kind* of environment the pair is in.
+    It is not displayed as a standalone UI badge and is not a buy/sell signal.
+    """
+    mode = _normalize_ai_mode(ai_mode)
+    corr = _safe_float(corr, 0.0)
+    spread = abs(_safe_float(spread, 0.0))
+    rsi_gap = abs(_safe_float(rsi_gap, 0.0))
+    momentum_gap = abs(_safe_float(momentum_gap, 0.0))
+    score_pair = _safe_float(score_pair, 0.0)
+    max_rvol = _safe_float(max_rvol, 0.0)
+    max_oe = abs(_safe_float(max_oe, 0.0))
+    fake_move_risk = _safe_float(fake_move_risk, 0.0)
+    exhaustion_risk = _safe_float(exhaustion_risk, 0.0)
+    continuation_quality = _safe_float(continuation_quality, 0.0)
+    accumulation_signal = _safe_float(accumulation_signal, 0.0)
+    volatility_expansion = _safe_float(volatility_expansion, 0.0)
+    volume_confirmation = _safe_float(volume_confirmation, 0.0)
+    state_set = {str(x or "").upper() for x in (states or []) if str(x or "").strip()}
+
+    trend_strength = 0.0
+    trend_strength += min(28.0, max(0.0, score_pair - 55.0) * 0.45)
+    trend_strength += 18.0 if corr >= 0.72 else 8.0 if corr >= 0.55 else 0.0
+    trend_strength += 18.0 if volume_confirmation >= 55 else 8.0 if volume_confirmation >= 35 else 0.0
+    trend_strength += 18.0 if continuation_quality >= 60 else 8.0 if continuation_quality >= 45 else 0.0
+    trend_strength += 10.0 if max_rvol >= 1.5 else 0.0
+    trend_strength -= 16.0 if fake_move_risk >= 65 else 0.0
+    trend_strength -= 12.0 if exhaustion_risk >= 70 else 0.0
+
+    chop_index = 0.0
+    chop_index += 18.0 if 0.45 <= corr < 0.72 else 8.0 if corr < 0.45 else 0.0
+    chop_index += 16.0 if 2.0 <= spread <= 8.0 else 8.0 if spread > 8.0 else 0.0
+    chop_index += 14.0 if 8.0 <= rsi_gap <= 18.0 else 8.0 if rsi_gap > 18.0 else 0.0
+    chop_index += 16.0 if fake_move_risk >= 45 else 0.0
+    chop_index += 10.0 if volume_confirmation < 35 and volatility_expansion >= 35 else 0.0
+    chop_index += 8.0 if continuation_quality < 45 else 0.0
+
+    range_pressure = 0.0
+    range_pressure += 22.0 if corr >= 0.75 and 2.0 <= spread <= 10.0 else 0.0
+    range_pressure += 18.0 if rsi_gap >= 10.0 else 0.0
+    range_pressure += 14.0 if continuation_quality < 55 else 0.0
+    range_pressure += 12.0 if exhaustion_risk >= 45 else 0.0
+
+    panic_pressure = 0.0
+    panic_pressure += 24.0 if volatility_expansion >= 70 else 12.0 if volatility_expansion >= 50 else 0.0
+    panic_pressure += 18.0 if momentum_gap >= 8.0 else 8.0 if momentum_gap >= 4.0 else 0.0
+    panic_pressure += 18.0 if max_rvol >= 2.5 else 8.0 if max_rvol >= 1.8 else 0.0
+    panic_pressure += 18.0 if spread >= 14.0 else 8.0 if spread >= 8.0 else 0.0
+
+    euphoria_pressure = 0.0
+    euphoria_pressure += 26.0 if max_oe >= 60 else 14.0 if max_oe >= 35 else 0.0
+    euphoria_pressure += 18.0 if max_rvol >= 2.0 else 0.0
+    euphoria_pressure += 16.0 if continuation_quality >= 65 else 0.0
+    euphoria_pressure += 16.0 if exhaustion_risk >= 55 else 0.0
+
+    accumulation_pressure = 0.0
+    accumulation_pressure += 32.0 if accumulation_signal >= 55 else 16.0 if accumulation_signal >= 35 else 0.0
+    accumulation_pressure += 16.0 if "EARLY_ACCUMULATION" in state_set else 0.0
+    accumulation_pressure += 12.0 if max_rvol >= 1.5 and max_oe < 25 else 0.0
+    accumulation_pressure += 8.0 if spread < 8.0 and continuation_quality >= 45 else 0.0
+
+    distribution_pressure = 0.0
+    distribution_pressure += 24.0 if exhaustion_risk >= 65 else 12.0 if exhaustion_risk >= 45 else 0.0
+    distribution_pressure += 18.0 if max_oe >= 45 and volume_confirmation < 45 else 0.0
+    distribution_pressure += 14.0 if fake_move_risk >= 55 else 0.0
+
+    if mode == "extreme":
+        # Extreme mode reacts earlier to regime shifts, but still keeps risk visible.
+        panic_pressure += 4.0 if volatility_expansion >= 45 else 0.0
+        trend_strength += 4.0 if continuation_quality >= 55 and volume_confirmation >= 45 else 0.0
+        chop_index += 4.0 if fake_move_risk >= 45 else 0.0
+
+    scores = {
+        "trend": trend_strength,
+        "range": range_pressure,
+        "chop": chop_index,
+        "volatile": panic_pressure,
+        "euphoria": euphoria_pressure,
+        "accumulation": accumulation_pressure,
+        "distribution": distribution_pressure,
+    }
+    scores = {k: round(max(0.0, min(100.0, v)), 1) for k, v in scores.items()}
+
+    # Priority matters: some phases are more safety-critical than raw score rank.
+    if scores["euphoria"] >= 58 and exhaustion_risk >= 55:
+        regime = "euphoria_exhaustion"
+        label = "Euphoria / exhaustion risk"
+        tone = "risk_off"
+    elif scores["volatile"] >= 62 and (fake_move_risk >= 50 or exhaustion_risk >= 50):
+        regime = "volatile_panic"
+        label = "Volatile / panic-like expansion"
+        tone = "risk_off"
+    elif scores["distribution"] >= 55:
+        regime = "distribution"
+        label = "Distribution / fading participation"
+        tone = "caution"
+    elif scores["accumulation"] >= 55:
+        regime = "accumulation"
+        label = "Accumulation / volume build"
+        tone = "constructive_watch"
+    elif scores["trend"] >= 60 and continuation_quality >= 55:
+        regime = "trend"
+        label = "Trend / continuation regime"
+        tone = "constructive"
+    elif scores["range"] >= 48 and corr >= 0.7:
+        regime = "range"
+        label = "Range / mean-reversion regime"
+        tone = "mean_reversion"
+    elif scores["chop"] >= 50:
+        regime = "chop"
+        label = "Chop / low-confirmation regime"
+        tone = "caution"
+    elif scores["volatile"] >= 50:
+        regime = "volatile"
+        label = "Volatile expansion regime"
+        tone = "caution"
+    else:
+        regime = "mixed"
+        label = "Mixed / neutral regime"
+        tone = "neutral"
+
+    confidence = max(scores.values()) if scores else 0.0
+    # Reduce confidence when top regimes are too close to each other.
+    ranked = sorted(scores.values(), reverse=True)
+    if len(ranked) >= 2 and (ranked[0] - ranked[1]) < 8:
+        confidence = max(0.0, confidence - 8.0)
+    confidence = round(max(0.0, min(100.0, confidence)), 1)
+
+    ai_hint_by_regime = {
+        "trend": "Continuation can be respected more when participation stays firm; invalidation should focus on failed follow-through.",
+        "range": "Mean reversion is favored over chasing direction; stretched moves should be treated as reactive until confirmed.",
+        "chop": "Low-confirmation conditions increase fake-move risk; avoid overstating directional conviction.",
+        "volatile": "Movement potential is high, but signal quality can change quickly; risk language should stay prominent.",
+        "volatile_panic": "Volatility dominates the read; emphasize instability, fake-move risk and fast invalidation.",
+        "euphoria_exhaustion": "Momentum may still move, but exhaustion and blow-off risk should be highlighted.",
+        "accumulation": "Early participation build is constructive, but confirmation still matters before calling a clean trend.",
+        "distribution": "Participation quality is fading; rallies can be unstable and reversal risk should be emphasized.",
+        "mixed": "No dominant regime is clean enough; keep the read balanced and confirmation-dependent.",
+    }
+
+    return {
+        "regime": regime,
+        "label": label,
+        "tone": tone,
+        "confidence": confidence,
+        "scores": scores,
+        "ai_hint": ai_hint_by_regime.get(regime, ai_hint_by_regime["mixed"]),
+        "display_in_ui": False,
+        "meaning": "Internal AI Insight market-phase context only — not a buy/sell signal and not a profit guarantee.",
+    }
+
+
 def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str = "standard") -> dict:
     """Market Behavior Detection Layer for AI Insight.
 
@@ -10543,27 +10714,50 @@ def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str 
     volatility_expansion = round(max(0.0, min(100.0, volatility_expansion)), 1)
     volume_confirmation = round(max(0.0, min(100.0, volume_confirmation)), 1)
 
+    market_phase = _market_phase_from_behavior_inputs(
+        corr=corr,
+        spread=spread,
+        rsi_gap=rsi_gap,
+        momentum_gap=momentum_gap,
+        score_pair=score_pair,
+        max_rvol=max_rvol,
+        max_oe=max_oe,
+        states=states,
+        fake_move_risk=fake_move_risk,
+        exhaustion_risk=exhaustion_risk,
+        continuation_quality=continuation_quality,
+        accumulation_signal=accumulation_signal,
+        volatility_expansion=volatility_expansion,
+        volume_confirmation=volume_confirmation,
+        ai_mode=mode,
+    )
+
+    # Legacy behavior regime remains compatible, while the richer market phase
+    # becomes the primary label for AI Insight interpretation.
     if fake_move_risk >= 60 and exhaustion_risk >= 55:
-        regime = "overheated_fake_move_risk"
-        label = "Overheated / fake-move risk"
+        behavior_regime = "overheated_fake_move_risk"
+        behavior_label = "Overheated / fake-move risk"
     elif continuation_quality >= 70 and volume_confirmation >= 45:
-        regime = "volume_backed_continuation"
-        label = "Volume-backed continuation"
+        behavior_regime = "volume_backed_continuation"
+        behavior_label = "Volume-backed continuation"
     elif accumulation_signal >= 50:
-        regime = "early_accumulation"
-        label = "Early accumulation"
+        behavior_regime = "early_accumulation"
+        behavior_label = "Early accumulation"
     elif exhaustion_risk >= 60:
-        regime = "momentum_exhaustion"
-        label = "Momentum exhaustion risk"
+        behavior_regime = "momentum_exhaustion"
+        behavior_label = "Momentum exhaustion risk"
     elif volatility_expansion >= 55:
-        regime = "volatility_expansion"
-        label = "Volatility expansion"
+        behavior_regime = "volatility_expansion"
+        behavior_label = "Volatility expansion"
     elif fake_move_risk >= 50:
-        regime = "fake_move_watch"
-        label = "Fake-move watch"
+        behavior_regime = "fake_move_watch"
+        behavior_label = "Fake-move watch"
     else:
-        regime = "mixed_or_neutral"
-        label = "Mixed / neutral behavior"
+        behavior_regime = "mixed_or_neutral"
+        behavior_label = "Mixed / neutral behavior"
+
+    regime = str(market_phase.get("regime") or behavior_regime)
+    label = str(market_phase.get("label") or behavior_label)
 
     if not reasons:
         reasons.append("no strong behavior pattern detected")
@@ -10573,6 +10767,13 @@ def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str 
         "regime": regime,
         "label": label,
         "meaning": "Market behavior context only — not a buy/sell instruction and not a profit guarantee.",
+        "market_phase": market_phase,
+        "market_phase_regime": market_phase.get("regime"),
+        "market_phase_label": market_phase.get("label"),
+        "market_phase_confidence": market_phase.get("confidence"),
+        "market_phase_tone": market_phase.get("tone"),
+        "behavior_regime": behavior_regime,
+        "behavior_label": behavior_label,
         "fake_move_risk": fake_move_risk,
         "fake_move_level": _behavior_level(fake_move_risk),
         "exhaustion_risk": exhaustion_risk,
@@ -11111,8 +11312,15 @@ def _ai_engine_v2_from_context(
         cont_q = _safe_float(market_behavior.get("continuation_quality"), 0.0)
         vol_c = _safe_float(market_behavior.get("volume_confirmation"), 0.0)
         acc_s = _safe_float(market_behavior.get("accumulation_signal"), 0.0)
-        if mb_label:
+        market_phase = market_behavior.get("market_phase") if isinstance(market_behavior.get("market_phase"), dict) else {}
+        phase_label = str(market_phase.get("label") or "").strip()
+        phase_hint = str(market_phase.get("ai_hint") or "").strip()
+        if phase_label:
+            behavior_summary_parts.append(phase_label)
+        elif mb_label:
             behavior_summary_parts.append(mb_label)
+        if phase_hint:
+            behavior_summary_parts.append(phase_hint)
         if fake_r >= 65:
             behavior_summary_parts.append("fake-move risk is elevated / participation may be weak")
         if exhaust_r >= 65:
@@ -11148,6 +11356,10 @@ def _ai_engine_v2_from_context(
         "market_behavior": market_behavior,
         "market_behavior_regime": market_behavior.get("regime"),
         "market_behavior_label": market_behavior.get("label"),
+        "market_phase": market_behavior.get("market_phase"),
+        "market_phase_regime": (market_behavior.get("market_phase") or {}).get("regime") if isinstance(market_behavior.get("market_phase"), dict) else None,
+        "market_phase_label": (market_behavior.get("market_phase") or {}).get("label") if isinstance(market_behavior.get("market_phase"), dict) else None,
+        "market_phase_confidence": (market_behavior.get("market_phase") or {}).get("confidence") if isinstance(market_behavior.get("market_phase"), dict) else None,
         "market_behavior_summary": market_behavior_summary,
         "market_behavior_context_for_ai": {
             "summary": market_behavior_summary,
@@ -11661,8 +11873,9 @@ Rules:
 21) AI Insight mode: standard = balanced professional interpretation; extreme = more sensitive to early momentum, rebound, spread, and high-risk/high-reward structures, while still warning clearly about invalidation.
 22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
 23) If ai_engine_v2.pair_alerts exists, use it as movement-chance context across all Compare pairs, not only the selected pair.
-24) If ai_engine_v2.market_behavior exists, use it as INTERNAL interpretation context only. Do not dump all raw behavior fields; translate the strongest behavior signal into the paragraph, Edge, Risk, or Setup bias.
-25) Market behavior priority for AI Insight:
+24) If ai_engine_v2.market_behavior or ai_engine_v2.market_phase exists, use it as INTERNAL interpretation context only. Do not dump raw behavior fields; translate the strongest regime/phase signal into the paragraph, Edge, Risk, or Setup bias.
+25) Market regime priority for AI Insight: trend = continuation can be respected; range = mean-reversion is favored; chop = low-confirmation/fake-move risk; volatile/panic = fast invalidation; euphoria = exhaustion/blow-off risk; accumulation = constructive watch; distribution = fading participation.
+26) Market behavior priority for AI Insight:
    - high fake_move_risk => say the move may be poorly confirmed / unstable / fake-move risk,
    - high exhaustion_risk => say momentum may be stretched or tiring,
    - high volume_confirmation + continuation_quality => say participation supports continuation quality,
