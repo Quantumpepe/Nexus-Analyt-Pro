@@ -10049,10 +10049,25 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
     - does not change access, grid, market data, or AI scoring logic
     - extracts existing labels when the model puts them inline
     - fills safe neutral defaults only when a required line is missing
+    - removes AI Insight data-dump fragments that are already visible in the UI
     """
     s = str(text or "").strip()
     if not s:
         return s
+
+    def _strip_ai_data_dump_fragments(value: str) -> str:
+        out = str(value or "")
+        # Remove common LLM data-dump tails that made AI Insight repeat UI/internal context.
+        out = re.sub(r"(?is)\bSignal context\s*:\s*.*$", "", out).strip()
+        out = re.sub(r"(?is)\bObserved relative bias\s*:\s*.*$", "", out).strip()
+        out = re.sub(r"(?is)\bNo CoinGecko contract mapping found yet\.?", "", out).strip()
+        out = re.sub(r"(?is)\bVotes?\s+\d+\b", "", out).strip()
+        out = re.sub(r"(?is)\bRating\s+[A-Z]{1,3}\b", "", out).strip()
+        out = re.sub(r"(?is)\bCoinGecko\b[^.]*\.", "", out).strip()
+        out = re.sub(r"\s{2,}", " ", out).strip(" ;,.-\n\t")
+        return out
+
+    s = _strip_ai_data_dump_fragments(s)
 
     def _extract(label: str) -> str:
         # Capture content after "Label:" until the next required label or end of text.
@@ -10079,6 +10094,7 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
 
     # Remove accidental trailing label fragments from the paragraph.
     paragraph = re.sub(r"(?is)\b(edge|risk|setup bias)\s*:.*$", "", paragraph).strip()
+    paragraph = _strip_ai_data_dump_fragments(paragraph)
 
     engine_ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
     if not edge:
@@ -10091,25 +10107,12 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
     # Prevent duplicated labels inside extracted values.
     def _clean_value(v: str) -> str:
         v = re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(v or "")).strip()
+        v = _strip_ai_data_dump_fragments(v)
         return v or "not clearly defined"
 
     edge = _clean_value(edge)
     risk = _clean_value(risk)
     setup = _clean_value(setup)
-
-    def _clean_ai_narrative_paragraph(v: str) -> str:
-        """Remove raw data-dump fragments from short AI Insight answers.
-
-        The model still receives the full context, but final AI Insight should read
-        like market-behavior interpretation, not like a metadata export. This only
-        affects generated prose; API context and scoring remain unchanged.
-        """
-        txt = re.sub(r"(?is)\bSignal context\s*:\s*.*$", "", str(v or "")).strip()
-        txt = re.sub(r"(?is)\b(CoinGecko|contract mapping|Votes?\s*\d+|Rating\s+[A-Z]{1,3})\b[^.]*\.", "", txt).strip()
-        txt = re.sub(r"\s+", " ", txt).strip()
-        return txt
-
-    paragraph = _clean_ai_narrative_paragraph(paragraph) or "Market behavior remains mixed, with conviction dependent on confirmation quality rather than raw movement alone."
 
     return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
 
@@ -11501,7 +11504,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 15) Prefer decision-support language over report style.
 16) Do NOT dump raw stats, long metric lists, repeated timeframe blocks, or full summaries.
 17) Focus on relationships between metrics, not isolated numbers.
-18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, rating, community rating, on-chain signal, Market Condition, and wallet-fit implies for likely behavior. Do not restate the raw inputs.
+18) Explain what the COMBINATION of correlation, spread, momentum, volatility, drawdown, rating, community rating, on-chain signal, Market Condition, and wallet-fit implies for likely behavior.
 19) REQUIRED Level 2 output:
     - structure read: what the pair structure currently looks like,
     - behavior read: range-bound, mean-reversion style, trend-bias, unstable/choppy, rotation, or low-conviction,
@@ -11510,9 +11513,10 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 20) REQUIRED when ai_signal_context is present:
     - Use ai_engine_v2 as the primary Level 2 interpretation layer when present.
     - Do not contradict ai_engine_v2.verdict, ai_engine_v2.risk, ai_engine_v2.edge, ai_engine_v2.invalidation, or ai_engine_v2.setup_bias.
-    - Use ratings, votes, on-chain, spread, correlation, RSI, and Market Condition only as hidden evidence for the interpretation.
-    - Do NOT mechanically mention ratings, vote counts, CoinGecko mapping, exact correlation, exact spread, or raw RSI values unless one number is essential to explain the behavior.
-    - The output should read like market-behavior interpretation, not like a data dump.
+    - Do NOT mention raw ratings, votes, contract mapping, CoinGecko status, or long metric lists.
+    - Do NOT repeat UI-visible numbers unless one number is essential to the behavior read.
+    - Use on-chain, rating, community, and market-condition data only as hidden supporting context.
+    - Translate the strongest signals into market behavior, confirmation quality, strategy fit, and risk reason.
 21) Market Condition interpretation rules:
     - High OE + low RVOL = weak participation / fake-move risk / unstable continuation.
     - High OE + high RVOL = stronger momentum quality / volume-backed continuation risk.
@@ -11526,15 +11530,14 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     - "Edge:" what the structure favors, without direct advice.
     - "Risk:" what can invalidate or weaken the read.
     - "Setup bias:" e.g. mean-reversion, rotation, continuation-risk, grid-friendly, volatility-sensitive.
-26) Prefer phrases like:
-    - "relative strength favors one side"
-    - "rotation is likely underway"
-    - "low RVOL weakens conviction"
-    - "market condition does not strongly confirm the move"
-    - "on-chain is neutral, so the setup is mostly price-structure driven"
-    - "community input is still thin, so the user-rating layer has limited weight"
+26) Prefer concise behavior phrases like:
+    - "confirmation quality remains weak"
+    - "movement looks reactive rather than trend-supported"
+    - "structure favors mean-reversion over clean continuation"
+    - "participation supports continuation quality"
+    - "momentum appears stretched or tiring"
     - "behavior looks range-bound / mean-reversion style / unstable"
-    - "strategy fit is grid-friendly / weak for grid / volatility-sensitive"
+    - "strategy fit is grid-friendly / volatility-sensitive / no-clean-setup"
 27) Avoid generic filler like "monitor across multiple windows" unless it adds clear meaning.
 28) Do NOT list timeframe outputs like "7D neutral, 30D neutral, 90D neutral".
 29) Do NOT repeat structures already visible in the UI.
@@ -11544,7 +11547,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
 33) Your output MUST follow EXACTLY this structure:
 
 <paragraph>
-(max 65–90 words, behavior first, no numbers list, no raw metric repetition)
+(max 80–100 words, no numbers list, no raw metric repetition)
 
 Edge: ...
 Risk: ...
@@ -11560,8 +11563,8 @@ Setup bias: ...
 35) Additional rules:
 - Do NOT repeat raw metrics or numbers
 - Do NOT restate all data points
-- Do NOT mention CoinGecko mapping, vote counts, or raw rating metadata in the final text
-- If community or on-chain data is weak/missing, compress it into a short phrase such as "confirmation remains thin" only when it affects conviction
+- Do NOT mention Votes, Ratings, CoinGecko, contract mapping, or missing token mapping
+- Do NOT write "Signal context" or dump source context into the answer
 - Focus on interpretation, not description
 - Keep it tight, clear, and trading-relevant
 """
@@ -11592,8 +11595,8 @@ Rules:
 11) Never mix AI Analyst chat memory with AI Insight order memory. If order_memory / insight_profile are present, treat them as wallet setup context only, not as a chat transcript.
 12) Do not write as if the user asked for direct instructions. Describe, interpret, compare, and explain only.
 13) When several metrics point in different directions, explain the conflict briefly instead of listing everything.
-14) Prefer interpretation of structure over enumeration of values. Raw visible UI metrics should normally be omitted from the final prose.
-15) If ai_signal_context is present, merge rating, user/community rating, on-chain signals, watchlist momentum, and pair context into one combined explanation, but do not list the raw metadata.
+14) Prefer interpretation of structure over enumeration of values.
+15) If ai_signal_context is present, use rating, community, on-chain, watchlist momentum, and pair context only as hidden support. Do not name or list those raw fields unless essential.
 16) Treat on-chain signals as supporting evidence only, not as a standalone reason. Never overstate weak or missing signals.
 17) If on-chain data is neutral/missing for a symbol, say it is neutral only when relevant; do not present it as a failure.
 18) Market Condition is based on Overextension (distance from MA20) plus Relative Volume (RVOL). Use it as movement-quality context:
@@ -11615,6 +11618,8 @@ Rules:
    - accumulation_signal => say behavior looks like early accumulation / volume build,
    - mixed_or_neutral => do not overstate behavior.
 26) Use market_behavior_summary when present as the compact source of truth for behavior interpretation.
+27) Forbidden in the final AI Insight answer: "Votes", "Rating", "CoinGecko", "contract mapping", "Signal context".
+28) Preferred final answer style: one compact behavior paragraph, then Edge/Risk/Setup bias. No data dump.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
