@@ -1609,6 +1609,48 @@ def init_db():
         )
     """)
 
+    # Adaptive Market Memory: structured snapshots for later outcome learning.
+    # This stores behavior/state, not full AI text. Outcomes are intentionally nullable
+    # in phase 1 and can be filled by a later background/outcome worker.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS market_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_address TEXT DEFAULT '',
+            pair TEXT NOT NULL,
+            symbol_a TEXT DEFAULT '',
+            symbol_b TEXT DEFAULT '',
+            source TEXT DEFAULT 'ai_insight',
+            timestamp INTEGER NOT NULL,
+
+            regime TEXT DEFAULT '',
+            liquidity_state TEXT DEFAULT '',
+            tactical_state TEXT DEFAULT '',
+            movement_quality TEXT DEFAULT '',
+
+            movement_score REAL,
+            confidence REAL,
+            risk TEXT DEFAULT '',
+
+            spread REAL,
+            rvol REAL,
+            overextension REAL,
+            trap_risk REAL,
+
+            price_a REAL,
+            price_b REAL,
+            meta_json TEXT DEFAULT '{}',
+
+            outcome_1h REAL,
+            outcome_4h REAL,
+            outcome_24h REAL,
+            outcome_json TEXT DEFAULT '{}',
+            created_ts INTEGER NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_market_memory_pair_ts ON market_memory(pair, timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_market_memory_wallet_ts ON market_memory(wallet_address, timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_market_memory_source_ts ON market_memory(source, timestamp)")
+
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
         cur.execute("PRAGMA table_info(ai_memory)")
@@ -12484,6 +12526,332 @@ def api_ai_run():
     return jsonify(resp)
 
 
+
+# -------------------------
+# Adaptive Market Memory (phase 1: snapshot collection)
+# -------------------------
+def _market_memory_as_float(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        x = float(value)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return default
+
+
+def _market_memory_pick_text(*values) -> str:
+    for v in values:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if v is not None and not isinstance(v, (dict, list, tuple)):
+            sv = str(v).strip()
+            if sv:
+                return sv
+    return ""
+
+
+def _market_memory_deep_get(obj, *paths, default=None):
+    for path in paths:
+        cur = obj
+        ok = True
+        for key in path:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur.get(key)
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            return cur
+    return default
+
+
+def _market_memory_pair_from_symbols(symbols) -> tuple[str, str, str]:
+    if not isinstance(symbols, list):
+        symbols = []
+    clean = [str(x or "").strip().upper() for x in symbols if str(x or "").strip()]
+    if len(clean) >= 2:
+        return f"{clean[0]}/{clean[1]}", clean[0], clean[1]
+    if len(clean) == 1:
+        return clean[0], clean[0], ""
+    return "UNKNOWN", "", ""
+
+
+def _market_memory_extract_snapshot(source: str, pair: str, symbol_a: str = "", symbol_b: str = "", wallet_address: str = "", payload: dict | None = None, extra_context: dict | None = None) -> dict:
+    """Build a compact market-memory snapshot from existing AI/pair payloads.
+
+    The function is deliberately defensive: the app already has several AI engines,
+    so fields may live under ai_engine_v2, liquidity/trap context, market_condition,
+    insight, risk, spread, or frontend-provided ai_signal_context.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    extra_context = extra_context if isinstance(extra_context, dict) else {}
+    engine = payload.get("ai_engine_v2") if isinstance(payload.get("ai_engine_v2"), dict) else {}
+    liq = payload.get("liquidity_behavior") if isinstance(payload.get("liquidity_behavior"), dict) else {}
+    regime_obj = payload.get("market_regime") if isinstance(payload.get("market_regime"), dict) else {}
+    insight = payload.get("insight") if isinstance(payload.get("insight"), dict) else {}
+    risk_obj = payload.get("risk") if isinstance(payload.get("risk"), dict) else {}
+    spread_obj = payload.get("spread") if isinstance(payload.get("spread"), dict) else {}
+
+    # frontend/context may contain the freshest movement/opportunity data
+    ctx_engine = extra_context.get("ai_engine_v2") if isinstance(extra_context.get("ai_engine_v2"), dict) else {}
+    ctx_market = extra_context.get("market_condition") if isinstance(extra_context.get("market_condition"), dict) else {}
+    ctx_liq = extra_context.get("liquidity_behavior") if isinstance(extra_context.get("liquidity_behavior"), dict) else {}
+
+    regime = _market_memory_pick_text(
+        _market_memory_deep_get(engine, ("market_regime", "phase")),
+        _market_memory_deep_get(engine, ("regime", "phase")),
+        regime_obj.get("phase"),
+        regime_obj.get("regime"),
+        ctx_engine.get("regime"),
+        ctx_engine.get("market_regime"),
+        extra_context.get("regime"),
+    )
+    liquidity_state = _market_memory_pick_text(
+        _market_memory_deep_get(engine, ("liquidity", "state")),
+        _market_memory_deep_get(engine, ("liquidity_behavior", "liquidity_quality")),
+        liq.get("liquidity_quality"),
+        liq.get("liquidity_state"),
+        ctx_liq.get("liquidity_quality"),
+        ctx_liq.get("liquidity_state"),
+        risk_obj.get("liquidity_state"),
+        _market_memory_deep_get(payload, ("risk", "liquidity_state")),
+        extra_context.get("liquidity_state"),
+    )
+    tactical_state = _market_memory_pick_text(
+        engine.get("tactical_state"),
+        engine.get("setup_bias"),
+        insight.get("setupBias"),
+        insight.get("setup_bias"),
+        extra_context.get("tactical_state"),
+        extra_context.get("setup_bias"),
+    )
+    movement_quality = _market_memory_pick_text(
+        engine.get("movement_quality"),
+        engine.get("verdict"),
+        payload.get("verdict"),
+        payload.get("ai_verdict"),
+        insight.get("verdictText"),
+    )
+
+    confidence = _market_memory_as_float(
+        _market_memory_deep_get(engine, ("confidence", "score")),
+        None,
+    )
+    if confidence is None:
+        confidence = _market_memory_as_float(engine.get("confidence"), None)
+    if confidence is None:
+        confidence = _market_memory_as_float(payload.get("confidence"), None)
+    if confidence is None:
+        confidence = _market_memory_as_float(extra_context.get("confidence"), None)
+
+    movement_score = _market_memory_as_float(
+        engine.get("movement_score"),
+        None,
+    )
+    if movement_score is None:
+        movement_score = _market_memory_as_float(extra_context.get("movement_score"), None)
+    if movement_score is None:
+        movement_score = _market_memory_as_float(extra_context.get("opportunity_score"), None)
+
+    risk = _market_memory_pick_text(
+        engine.get("risk"),
+        payload.get("risk"),
+        extra_context.get("risk"),
+        risk_obj.get("level"),
+        risk_obj.get("state"),
+    )
+
+    spread = _market_memory_as_float(
+        spread_obj.get("latest") if isinstance(spread_obj, dict) else None,
+        None,
+    )
+    if spread is None:
+        spread = _market_memory_as_float(extra_context.get("spread"), None)
+    if spread is None:
+        spread = _market_memory_as_float(extra_context.get("spread_pct"), None)
+    if spread is None:
+        spread = _market_memory_as_float(engine.get("spread"), None)
+
+    rvol = _market_memory_as_float(
+        _market_memory_deep_get(engine, ("market_condition", "rvol")),
+        None,
+    )
+    if rvol is None:
+        rvol = _market_memory_as_float(ctx_market.get("rvol"), None)
+    if rvol is None:
+        rvol = _market_memory_as_float(ctx_market.get("relative_volume"), None)
+    if rvol is None:
+        rvol = _market_memory_as_float(extra_context.get("rvol"), None)
+
+    overextension = _market_memory_as_float(
+        _market_memory_deep_get(engine, ("market_condition", "overextension")),
+        None,
+    )
+    if overextension is None:
+        overextension = _market_memory_as_float(ctx_market.get("oe_pct"), None)
+    if overextension is None:
+        overextension = _market_memory_as_float(ctx_market.get("overextension_pct"), None)
+    if overextension is None:
+        overextension = _market_memory_as_float(extra_context.get("overextension"), None)
+
+    trap_risk = _market_memory_as_float(
+        _market_memory_deep_get(engine, ("liquidity_behavior", "trap_risk")),
+        None,
+    )
+    if trap_risk is None:
+        trap_risk = _market_memory_as_float(liq.get("trap_risk"), None)
+    if trap_risk is None:
+        trap_risk = _market_memory_as_float(ctx_liq.get("trap_risk"), None)
+    if trap_risk is None:
+        trap_risk = _market_memory_as_float(extra_context.get("trap_risk"), None)
+
+    price_a = _market_memory_as_float(_market_memory_deep_get(payload, ("market", symbol_a, "price")), None)
+    price_b = _market_memory_as_float(_market_memory_deep_get(payload, ("market", symbol_b, "price")), None)
+
+    meta = {
+        "source": source,
+        "engine_keys": sorted(list(engine.keys()))[:40] if isinstance(engine, dict) else [],
+        "liquidity_warnings": engine.get("liquidity_warnings") or engine.get("warnings") or extra_context.get("warnings"),
+        "pair_relationship": engine.get("pair_relationship") or extra_context.get("pair_relationship"),
+        "raw_pair": pair,
+    }
+
+    return {
+        "wallet_address": _norm_addr(wallet_address or ""),
+        "pair": str(pair or "UNKNOWN").strip().upper(),
+        "symbol_a": str(symbol_a or "").strip().upper(),
+        "symbol_b": str(symbol_b or "").strip().upper(),
+        "source": str(source or "ai_insight").strip().lower(),
+        "timestamp": now_ts(),
+        "regime": regime,
+        "liquidity_state": liquidity_state,
+        "tactical_state": tactical_state,
+        "movement_quality": movement_quality,
+        "movement_score": movement_score,
+        "confidence": confidence,
+        "risk": risk,
+        "spread": spread,
+        "rvol": rvol,
+        "overextension": overextension,
+        "trap_risk": trap_risk,
+        "price_a": price_a,
+        "price_b": price_b,
+        "meta_json": json.dumps(meta, ensure_ascii=False, separators=(",", ":")),
+    }
+
+
+def _market_memory_save_snapshot(snapshot: dict) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    pair = str(snapshot.get("pair") or "").strip().upper()
+    if not pair or pair == "UNKNOWN":
+        return None
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO market_memory(
+                    wallet_address, pair, symbol_a, symbol_b, source, timestamp,
+                    regime, liquidity_state, tactical_state, movement_quality,
+                    movement_score, confidence, risk, spread, rvol, overextension,
+                    trap_risk, price_a, price_b, meta_json, created_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    _norm_addr(snapshot.get("wallet_address") or ""),
+                    pair,
+                    str(snapshot.get("symbol_a") or "").strip().upper(),
+                    str(snapshot.get("symbol_b") or "").strip().upper(),
+                    str(snapshot.get("source") or "ai_insight").strip().lower(),
+                    int(snapshot.get("timestamp") or now_ts()),
+                    str(snapshot.get("regime") or ""),
+                    str(snapshot.get("liquidity_state") or ""),
+                    str(snapshot.get("tactical_state") or ""),
+                    str(snapshot.get("movement_quality") or ""),
+                    snapshot.get("movement_score"),
+                    snapshot.get("confidence"),
+                    str(snapshot.get("risk") or ""),
+                    snapshot.get("spread"),
+                    snapshot.get("rvol"),
+                    snapshot.get("overextension"),
+                    snapshot.get("trap_risk"),
+                    snapshot.get("price_a"),
+                    snapshot.get("price_b"),
+                    str(snapshot.get("meta_json") or "{}"),
+                    now_ts(),
+                ),
+            )
+            snapshot_id = int(cur.lastrowid or 0)
+            conn.commit()
+            return snapshot_id
+    except Exception as e:
+        try:
+            print("[WARN] market_memory snapshot failed:", e)
+        except Exception:
+            pass
+        return None
+    finally:
+        conn.close()
+
+
+def _market_memory_recent(wallet_address: str = "", pair: str = "", limit: int = 25) -> list[dict]:
+    lim = max(1, min(100, int(limit or 25)))
+    where = []
+    params = []
+    wa = _norm_addr(wallet_address or "")
+    if wa:
+        where.append("wallet_address=?")
+        params.append(wa)
+    if pair:
+        where.append("pair=?")
+        params.append(str(pair).strip().upper())
+    sql = "SELECT * FROM market_memory"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+    params.append(lim)
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                d["meta"] = json.loads(d.get("meta_json") or "{}")
+            except Exception:
+                d["meta"] = {}
+            d.pop("meta_json", None)
+            rows.append(d)
+        return rows
+    finally:
+        conn.close()
+
+
+@app.route("/api/market-memory/recent", methods=["GET"])
+def api_market_memory_recent():
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    pair = str(request.args.get("pair") or "").strip().upper()
+    try:
+        limit = int(request.args.get("limit") or 25)
+    except Exception:
+        limit = 25
+    return jsonify({
+        "status": "ok",
+        "wallet_address": wa,
+        "pair": pair,
+        "items": _market_memory_recent(wallet_address=wa, pair=pair, limit=limit),
+        "ts": now_ts(),
+    })
+
+
 @app.route("/api/ai/insight", methods=["POST"])
 def api_ai_insight():
     """AI Insight endpoint. Uses wallet-specific order_memory / insight_profile, never ai_memory chat history."""
@@ -12553,6 +12921,28 @@ def api_ai_insight():
             )
         except Exception:
             pass
+    # Phase 1 Adaptive Market Memory: store a structured behavior snapshot.
+    # This is best-effort and must never block the AI response.
+    try:
+        pair, symbol_a, symbol_b = _market_memory_pair_from_symbols(sym_norm)
+        snap = _market_memory_extract_snapshot(
+            source="ai_insight",
+            pair=pair,
+            symbol_a=symbol_a,
+            symbol_b=symbol_b,
+            wallet_address=wa,
+            payload=resp if isinstance(resp, dict) else {},
+            extra_context=ai_signal_context if isinstance(ai_signal_context, dict) else {},
+        )
+        sid = _market_memory_save_snapshot(snap)
+        if sid:
+            resp["market_memory_snapshot_id"] = sid
+    except Exception as e:
+        try:
+            print("[WARN] market_memory ai_insight hook failed:", e)
+        except Exception:
+            pass
+
     return jsonify(resp)
 
 
@@ -13658,6 +14048,27 @@ def api_ai_pair_insight():
             "insight": setup,
             "ts": now_ts(),
         }
+        # Phase 1 Adaptive Market Memory: pair insight snapshots are global/anonymous
+        # because this endpoint can be called without wallet auth.
+        try:
+            snap = _market_memory_extract_snapshot(
+                source="pair_insight",
+                pair=out.get("pair") or f"{symbol_a}/{symbol_b}",
+                symbol_a=symbol_a,
+                symbol_b=symbol_b,
+                wallet_address="",
+                payload=out,
+                extra_context={},
+            )
+            sid = _market_memory_save_snapshot(snap)
+            if sid:
+                out["market_memory_snapshot_id"] = sid
+        except Exception as e:
+            try:
+                print("[WARN] market_memory pair_insight hook failed:", e)
+            except Exception:
+                pass
+
         _gen_cache_set(cache_key, out)
         return jsonify(out)
     except Exception as e:
