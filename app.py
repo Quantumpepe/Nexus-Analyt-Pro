@@ -11039,6 +11039,33 @@ def _ai_engine_v2_from_context(
     elif corr < 0.45 and pair_ctx:
         invalidation = "weak correlation can break the pair relationship"
 
+    behavior_summary_parts = []
+    try:
+        mb_label = str(market_behavior.get("label") or "").strip()
+        mb_regime = str(market_behavior.get("regime") or "").strip()
+        fake_r = _safe_float(market_behavior.get("fake_move_risk"), 0.0)
+        exhaust_r = _safe_float(market_behavior.get("exhaustion_risk"), 0.0)
+        cont_q = _safe_float(market_behavior.get("continuation_quality"), 0.0)
+        vol_c = _safe_float(market_behavior.get("volume_confirmation"), 0.0)
+        acc_s = _safe_float(market_behavior.get("accumulation_signal"), 0.0)
+        if mb_label:
+            behavior_summary_parts.append(mb_label)
+        if fake_r >= 65:
+            behavior_summary_parts.append("fake-move risk is elevated / participation may be weak")
+        if exhaust_r >= 65:
+            behavior_summary_parts.append("momentum exhaustion risk is elevated")
+        if vol_c >= 60 and cont_q >= 55:
+            behavior_summary_parts.append("volume participation supports continuation quality")
+        elif vol_c < 35 and (movement_score >= 60 or abs(spread) >= 4):
+            behavior_summary_parts.append("movement is not strongly volume-confirmed")
+        if acc_s >= 55:
+            behavior_summary_parts.append("early accumulation / volume-build behavior is present")
+        if mb_regime and mb_regime not in ("mixed_or_neutral", "missing_pair_context"):
+            behavior_summary_parts.append(f"regime={mb_regime}")
+    except Exception:
+        behavior_summary_parts = []
+    market_behavior_summary = "; ".join([x for x in behavior_summary_parts if x]) or "Market behavior context is neutral or mixed."
+
     summary = (
         f"{verdict}: {behavior}. "
         f"Ratings: {a} {rating_a} ({int(score_a) if score_a else 'n/a'}), {b} {rating_b} ({int(score_b) if score_b else 'n/a'}). "
@@ -11058,6 +11085,13 @@ def _ai_engine_v2_from_context(
         "market_behavior": market_behavior,
         "market_behavior_regime": market_behavior.get("regime"),
         "market_behavior_label": market_behavior.get("label"),
+        "market_behavior_summary": market_behavior_summary,
+        "market_behavior_context_for_ai": {
+            "summary": market_behavior_summary,
+            "use_in_ai_insight_only": True,
+            "display_in_ui": False,
+            "meaning": "Internal AI Insight behavior context only — not a buy/sell signal and not a profit guarantee.",
+        },
         "fake_move_risk": market_behavior.get("fake_move_risk"),
         "exhaustion_risk": market_behavior.get("exhaustion_risk"),
         "continuation_quality": market_behavior.get("continuation_quality"),
@@ -11559,6 +11593,14 @@ Rules:
 21) AI Insight mode: standard = balanced professional interpretation; extreme = more sensitive to early momentum, rebound, spread, and high-risk/high-reward structures, while still warning clearly about invalidation.
 22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
 23) If ai_engine_v2.pair_alerts exists, use it as movement-chance context across all Compare pairs, not only the selected pair.
+24) If ai_engine_v2.market_behavior exists, use it as INTERNAL interpretation context only. Do not dump all raw behavior fields; translate the strongest behavior signal into the paragraph, Edge, Risk, or Setup bias.
+25) Market behavior priority for AI Insight:
+   - high fake_move_risk => say the move may be poorly confirmed / unstable / fake-move risk,
+   - high exhaustion_risk => say momentum may be stretched or tiring,
+   - high volume_confirmation + continuation_quality => say participation supports continuation quality,
+   - accumulation_signal => say behavior looks like early accumulation / volume build,
+   - mixed_or_neutral => do not overstate behavior.
+26) Use market_behavior_summary when present as the compact source of truth for behavior interpretation.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
