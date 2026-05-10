@@ -10041,48 +10041,98 @@ def api_ai_insight_profile_refresh():
 # -------------------------
 
 
-def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> str:
-    """Guarantee AI Insight Level 2 output has separate Edge / Risk / Setup bias lines.
+def _hard_sanitize_ai_insight_text(value: str) -> str:
+    """Remove data-dump fragments from AI Insight text.
 
-    This is intentionally light-touch:
-    - only used for short_insight_mode responses
-    - does not change access, grid, market data, or AI scoring logic
-    - extracts existing labels when the model puts them inline
-    - fills safe neutral defaults only when a required line is missing
-    - removes AI Insight data-dump fragments that are already visible in the UI
+    This is intentionally strict for /api/ai/insight only. The raw metrics are already
+    visible in the UI; AI Insight should explain behavior, not repeat source data.
     """
-    s = str(text or "").strip()
-    if not s:
-        return s
-
-    def _strip_ai_data_dump_fragments(value: str) -> str:
-        out = str(value or "")
-        # Remove common LLM data-dump tails that made AI Insight repeat UI/internal context.
-        out = re.sub(r"(?is)\bSignal context\s*:\s*.*$", "", out).strip()
-        out = re.sub(r"(?is)\bObserved relative bias\s*:\s*.*$", "", out).strip()
-        out = re.sub(r"(?is)\bNo CoinGecko contract mapping found yet\.?", "", out).strip()
-        out = re.sub(r"(?is)\bVotes?\s+\d+\b", "", out).strip()
-        out = re.sub(r"(?is)\bRating\s+[A-Z]{1,3}\b", "", out).strip()
-        out = re.sub(r"(?is)\bCoinGecko\b[^.]*\.", "", out).strip()
-        out = re.sub(r"\s{2,}", " ", out).strip(" ;,.-\n\t")
+    out = str(value or "").strip()
+    if not out:
         return out
 
-    s = _strip_ai_data_dump_fragments(s)
+    # Remove hard data-dump tails first.
+    out = re.sub(r"(?is)\bSignal context\s*:\s*.*$", "", out).strip()
+    out = re.sub(r"(?is)\bObserved relative bias\s*:\s*.*$", "", out).strip()
+
+    # Remove sentences/fragments containing forbidden source-dump terms.
+    forbidden = r"(?:Votes?|Rating|CoinGecko|contract mapping|token mapping|No CoinGecko|mapping found)"
+    parts = re.split(r"(?<=[.!?])\s+", out)
+    kept = []
+    for part in parts:
+        if re.search(forbidden, part, flags=re.I):
+            continue
+        kept.append(part)
+    out = " ".join(kept).strip()
+
+    # Replace raw-metric phrasing with behavior phrasing.
+    out = re.sub(r"(?i)strong correlation of\s*[-+]?\d+(?:\.\d+)?", "strong linkage", out)
+    out = re.sub(r"(?i)correlation of\s*[-+]?\d+(?:\.\d+)?", "correlation", out)
+    out = re.sub(r"(?i)spread of approximately\s*[-+]?\d+(?:\.\d+)?%", "stretched spread", out)
+    out = re.sub(r"(?i)spread of\s*[-+]?\d+(?:\.\d+)?%", "stretched spread", out)
+    out = re.sub(r"(?i)decline of\s*[-+]?\d+(?:\.\d+)?%[^.]*", "recent weakness", out)
+
+    # Remove remaining raw percentages and score-like dumps. Keep prose clean.
+    out = re.sub(r"\b[-+]?\d+(?:\.\d+)?%\b", "", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.])", r"\1", out)
+    out = out.strip(" ;,.-\n\t")
+    return out
+
+
+def _compact_behavior_answer_from_engine(engine_ctx: dict | None = None) -> str:
+    """Deterministic fallback when the LLM still dumps raw UI/source data."""
+    ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
+    setup = str(ctx.get("setup_bias") or "behavior-sensitive / no-clean-setup").strip()
+    edge = str(ctx.get("edge") or "structure does not show a clean directional edge yet").strip()
+    risk = str(ctx.get("invalidation") or ctx.get("risk") or "weak confirmation can invalidate the read").strip()
+    behavior = str(ctx.get("behavior") or "mixed behavior").strip()
+    mb = ctx.get("market_behavior") if isinstance(ctx.get("market_behavior"), dict) else {}
+    mb_summary = str(ctx.get("market_behavior_summary") or mb.get("summary") or "Confirmation quality is mixed and should not be overstated.").strip()
+
+    # Keep the summary short and free of raw metrics.
+    mb_summary = _hard_sanitize_ai_insight_text(mb_summary)
+    if not mb_summary:
+        mb_summary = "Confirmation quality is mixed and should not be overstated."
+
+    paragraph = (
+        f"Current structure reads as {setup} rather than a clean directional continuation. "
+        f"The behavior profile is {behavior}, with confirmation quality still mixed. "
+        f"{mb_summary} This favors a cautious market-structure read where movement can appear, "
+        f"but conviction remains dependent on stronger participation and cleaner follow-through."
+    )
+    paragraph = _hard_sanitize_ai_insight_text(paragraph)
+    return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
+
+
+def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> str:
+    """Guarantee AI Insight Level 2 output is concise and behavior-driven.
+
+    For AI Insight, raw UI/source values must not leak into the final answer. If the
+    model still outputs data-dump text, this function switches to a deterministic
+    concise behavior summary from ai_engine_v2.
+    """
+    s = _hard_sanitize_ai_insight_text(str(text or "").strip())
+    if not s:
+        return _compact_behavior_answer_from_engine(engine_ctx)
+
+    forbidden_hit = bool(re.search(r"(?i)\b(Votes?|Rating|CoinGecko|contract mapping|token mapping|Signal context|mapping found)\b", s))
+    raw_metric_hit = bool(re.search(r"\b\d+(?:\.\d+)?%\b|\bcorrelation\s+of\s+\d", s, flags=re.I))
+    too_long = len(re.findall(r"\w+", s)) > 145
+    if forbidden_hit or raw_metric_hit or too_long:
+        return _compact_behavior_answer_from_engine(engine_ctx)
 
     def _extract(label: str) -> str:
-        # Capture content after "Label:" until the next required label or end of text.
         pattern = rf"(?is)\b{re.escape(label)}\s*:\s*(.*?)(?=\bEdge\s*:|\bRisk\s*:|\bSetup bias\s*:|$)"
         m = re.search(pattern, s)
         if not m:
             return ""
-        val = re.sub(r"\s+", " ", str(m.group(1) or "")).strip(" -:\n\t")
-        return val
+        return _hard_sanitize_ai_insight_text(re.sub(r"\s+", " ", str(m.group(1) or "")).strip(" -:\n\t"))
 
     edge = _extract("Edge")
     risk = _extract("Risk")
     setup = _extract("Setup bias")
 
-    # Keep the explanatory paragraph separate from the forced label lines.
     label_positions = [
         pos for pos in [
             s.lower().find("edge:"),
@@ -10091,10 +10141,8 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
         ] if pos >= 0
     ]
     paragraph = s[:min(label_positions)].strip() if label_positions else s.strip()
-
-    # Remove accidental trailing label fragments from the paragraph.
     paragraph = re.sub(r"(?is)\b(edge|risk|setup bias)\s*:.*$", "", paragraph).strip()
-    paragraph = _strip_ai_data_dump_fragments(paragraph)
+    paragraph = _hard_sanitize_ai_insight_text(paragraph)
 
     engine_ctx = engine_ctx if isinstance(engine_ctx, dict) else {}
     if not edge:
@@ -10104,17 +10152,15 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
     if not setup:
         setup = str(engine_ctx.get("setup_bias") or "no-clean-setup")
 
-    # Prevent duplicated labels inside extracted values.
-    def _clean_value(v: str) -> str:
-        v = re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(v or "")).strip()
-        v = _strip_ai_data_dump_fragments(v)
-        return v or "not clearly defined"
+    edge = _hard_sanitize_ai_insight_text(re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(edge or ""))).strip() or "not clearly defined"
+    risk = _hard_sanitize_ai_insight_text(re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(risk or ""))).strip() or "not clearly defined"
+    setup = _hard_sanitize_ai_insight_text(re.sub(r"(?is)\b(Edge|Risk|Setup bias)\s*:\s*", "", str(setup or ""))).strip() or "not clearly defined"
 
-    edge = _clean_value(edge)
-    risk = _clean_value(risk)
-    setup = _clean_value(setup)
-
-    return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
+    # Final safety pass: if paragraph is still empty or dumpy, use deterministic answer.
+    final = f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
+    if (not paragraph) or re.search(r"(?i)\b(Votes?|Rating|CoinGecko|contract mapping|Signal context|mapping found)\b", final):
+        return _compact_behavior_answer_from_engine(engine_ctx)
+    return final
 
 
 # -------------------------
@@ -11194,6 +11240,11 @@ def _ai_call_openai(
 
         if short_insight_mode:
             try:
+                ans = _enforce_ai_insight_structure(ans, user_payload.get("ai_engine_v2"))
+            except Exception:
+                ans = _compact_behavior_answer_from_engine(user_payload.get("ai_engine_v2"))
+            try:
+                ans = _hard_sanitize_ai_insight_text(ans)
                 ans = _enforce_ai_insight_structure(ans, user_payload.get("ai_engine_v2"))
             except Exception:
                 pass
