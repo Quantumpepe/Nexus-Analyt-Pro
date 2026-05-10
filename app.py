@@ -10569,6 +10569,209 @@ def _market_phase_from_behavior_inputs(
     }
 
 
+def _liquidity_trap_context_from_behavior_inputs(
+    *,
+    corr: float = 0.0,
+    spread: float = 0.0,
+    rsi_gap: float = 0.0,
+    momentum_gap: float = 0.0,
+    score_pair: float = 0.0,
+    max_rvol: float = 0.0,
+    max_oe: float = 0.0,
+    fake_move_risk: float = 0.0,
+    exhaustion_risk: float = 0.0,
+    continuation_quality: float = 0.0,
+    volatility_expansion: float = 0.0,
+    volume_confirmation: float = 0.0,
+    states: list | None = None,
+    ai_mode: str = "standard",
+) -> dict:
+    """Liquidity / Trap Detection Layer for AI Insight only.
+
+    This does not try to read an order book. It infers liquidity fragility from the
+    data Nexus already has: spread expansion, RSI divergence, momentum gap, RVOL,
+    overextension, market-condition state and behavior flags. The result is internal
+    context for AI wording, not a buy/sell signal and not a profit guarantee.
+    """
+    mode = _normalize_ai_mode(ai_mode)
+    states_u = [str(x or "").upper() for x in (states or []) if str(x or "").strip()]
+
+    corr = _safe_float(corr, 0.0)
+    spread = abs(_safe_float(spread, 0.0))
+    rsi_gap = abs(_safe_float(rsi_gap, 0.0))
+    momentum_gap = abs(_safe_float(momentum_gap, 0.0))
+    score_pair = _safe_float(score_pair, 0.0)
+    max_rvol = _safe_float(max_rvol, 0.0)
+    max_oe = abs(_safe_float(max_oe, 0.0))
+    fake_move_risk = _safe_float(fake_move_risk, 0.0)
+    exhaustion_risk = _safe_float(exhaustion_risk, 0.0)
+    continuation_quality = _safe_float(continuation_quality, 0.0)
+    volatility_expansion = _safe_float(volatility_expansion, 0.0)
+    volume_confirmation = _safe_float(volume_confirmation, 0.0)
+
+    trap_risk = 0.0
+    stop_hunt_risk = 0.0
+    liquidity_vacuum_risk = 0.0
+    participation_depth = 45.0
+    liquidity_quality_score = 55.0
+    reasons = []
+    warnings = []
+
+    # Wide movement with weak participation often behaves like fragile liquidity.
+    if spread >= 8.0:
+        liquidity_vacuum_risk += 26.0
+        trap_risk += 10.0
+        liquidity_quality_score -= 12.0
+        reasons.append("wide spread expansion suggests thin liquidity around the move")
+    elif spread >= 4.0:
+        liquidity_vacuum_risk += 14.0
+        liquidity_quality_score -= 6.0
+        reasons.append("spread expansion is building")
+
+    if momentum_gap >= 5.0:
+        liquidity_vacuum_risk += 16.0
+        stop_hunt_risk += 8.0
+        reasons.append("fast relative momentum gap")
+    elif momentum_gap >= 2.5:
+        liquidity_vacuum_risk += 8.0
+
+    if rsi_gap >= 18.0:
+        trap_risk += 14.0
+        stop_hunt_risk += 12.0
+        liquidity_quality_score -= 6.0
+        warnings.append("large RSI imbalance can invite reversal or stop-hunt behavior")
+    elif rsi_gap >= 10.0:
+        trap_risk += 6.0
+
+    if max_rvol <= 0:
+        participation_depth -= 8.0
+    elif max_rvol < 1.15 and (spread >= 4.0 or momentum_gap >= 3.0):
+        trap_risk += 26.0
+        liquidity_vacuum_risk += 12.0
+        participation_depth -= 24.0
+        liquidity_quality_score -= 18.0
+        warnings.append("movement is not strongly participation-backed")
+    elif max_rvol >= 2.0:
+        participation_depth += 24.0
+        liquidity_quality_score += 14.0
+        trap_risk -= 8.0
+        reasons.append("relative volume improves participation depth")
+    elif max_rvol >= 1.4:
+        participation_depth += 12.0
+        liquidity_quality_score += 6.0
+
+    if max_oe >= 55.0:
+        stop_hunt_risk += 18.0
+        trap_risk += 10.0
+        liquidity_quality_score -= 10.0
+        warnings.append("overextension raises rejection sensitivity")
+    elif max_oe >= 30.0:
+        stop_hunt_risk += 8.0
+
+    if "FAKE_MOVE" in states_u:
+        trap_risk += 30.0
+        participation_depth -= 16.0
+        liquidity_quality_score -= 16.0
+        warnings.append("market condition already flags weak/fake-move behavior")
+    if "OVEREXTENDED" in states_u:
+        stop_hunt_risk += 14.0
+        trap_risk += 8.0
+    if "REAL_BREAKOUT" in states_u:
+        trap_risk -= 12.0
+        participation_depth += 14.0
+        liquidity_quality_score += 10.0
+        reasons.append("breakout has better volume support")
+    if "EARLY_ACCUMULATION" in states_u:
+        trap_risk -= 6.0
+        participation_depth += 10.0
+        reasons.append("early accumulation improves structure stability")
+
+    if corr < 0.45 and corr > 0:
+        trap_risk += 10.0
+        warnings.append("weak pair linkage makes trap signals less reliable")
+    elif corr >= 0.75 and spread >= 3.0:
+        # Strong linkage plus spread can be tradable, but also mean-reversion sensitive.
+        stop_hunt_risk += 5.0
+
+    trap_risk += max(0.0, fake_move_risk - 50.0) * 0.45
+    stop_hunt_risk += max(0.0, exhaustion_risk - 50.0) * 0.35
+    liquidity_vacuum_risk += max(0.0, volatility_expansion - 50.0) * 0.35
+
+    if continuation_quality >= 70 and volume_confirmation >= 55:
+        trap_risk -= 12.0
+        liquidity_quality_score += 10.0
+    elif continuation_quality < 45 and volatility_expansion >= 45:
+        trap_risk += 10.0
+        warnings.append("movement quality is unstable versus expansion")
+
+    if score_pair < 65 and (spread >= 5.0 or momentum_gap >= 3.0):
+        trap_risk += 8.0
+        warnings.append("lower-ranked pair movement may be less structurally reliable")
+
+    if mode == "extreme":
+        trap_risk += 4.0 if (spread >= 4.0 or momentum_gap >= 3.0) else 0.0
+        liquidity_vacuum_risk += 4.0 if volatility_expansion >= 45.0 else 0.0
+
+    trap_risk = round(max(0.0, min(100.0, trap_risk)), 1)
+    stop_hunt_risk = round(max(0.0, min(100.0, stop_hunt_risk)), 1)
+    liquidity_vacuum_risk = round(max(0.0, min(100.0, liquidity_vacuum_risk)), 1)
+    participation_depth = round(max(0.0, min(100.0, participation_depth)), 1)
+    liquidity_quality_score = round(max(0.0, min(100.0, liquidity_quality_score)), 1)
+
+    if trap_risk >= 70 or liquidity_vacuum_risk >= 70:
+        regime = "liquidity_trap_watch"
+        label = "Liquidity trap watch"
+        tone = "defensive"
+    elif stop_hunt_risk >= 65:
+        regime = "stop_hunt_sensitive"
+        label = "Stop-hunt sensitive"
+        tone = "caution"
+    elif liquidity_vacuum_risk >= 55:
+        regime = "liquidity_vacuum"
+        label = "Liquidity vacuum risk"
+        tone = "caution"
+    elif participation_depth >= 65 and liquidity_quality_score >= 60:
+        regime = "participation_supported"
+        label = "Participation-supported movement"
+        tone = "constructive"
+    else:
+        regime = "balanced_liquidity"
+        label = "Balanced liquidity context"
+        tone = "neutral"
+
+    if not reasons:
+        reasons.append("no dominant liquidity trap pattern detected")
+
+    ai_hint_by_regime = {
+        "liquidity_trap_watch": "Describe the move as fragile or trap-sensitive; emphasize confirmation quality rather than direction.",
+        "stop_hunt_sensitive": "Mention rejection sensitivity or stop-hunt behavior if the setup is stretched or volatile.",
+        "liquidity_vacuum": "Frame expansion as fast but potentially thin; avoid implying clean continuation without participation.",
+        "participation_supported": "Acknowledge that participation quality reduces trap risk, while keeping the wording probabilistic.",
+        "balanced_liquidity": "Keep liquidity wording subtle; do not overstate trap risk.",
+    }
+
+    return {
+        "regime": regime,
+        "label": label,
+        "tone": tone,
+        "trap_risk": trap_risk,
+        "trap_level": _behavior_level(trap_risk),
+        "stop_hunt_risk": stop_hunt_risk,
+        "stop_hunt_level": _behavior_level(stop_hunt_risk),
+        "liquidity_vacuum_risk": liquidity_vacuum_risk,
+        "liquidity_vacuum_level": _behavior_level(liquidity_vacuum_risk),
+        "participation_depth": participation_depth,
+        "participation_depth_level": _behavior_level(participation_depth),
+        "liquidity_quality_score": liquidity_quality_score,
+        "liquidity_quality_level": _behavior_level(liquidity_quality_score),
+        "reasons": reasons[:6],
+        "warnings": warnings[:6],
+        "ai_hint": ai_hint_by_regime.get(regime, ai_hint_by_regime["balanced_liquidity"]),
+        "display_in_ui": False,
+        "meaning": "Internal AI Insight liquidity/trap context only — not a buy/sell signal and not a profit guarantee.",
+    }
+
+
 def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str = "standard") -> dict:
     """Market Behavior Detection Layer for AI Insight.
 
@@ -10735,6 +10938,23 @@ def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str 
         ai_mode=mode,
     )
 
+    liquidity_context = _liquidity_trap_context_from_behavior_inputs(
+        corr=corr,
+        spread=spread,
+        rsi_gap=rsi_gap,
+        momentum_gap=momentum_gap,
+        score_pair=score_pair,
+        max_rvol=max_rvol,
+        max_oe=max_oe,
+        states=states,
+        fake_move_risk=fake_move_risk,
+        exhaustion_risk=exhaustion_risk,
+        continuation_quality=continuation_quality,
+        volatility_expansion=volatility_expansion,
+        volume_confirmation=volume_confirmation,
+        ai_mode=mode,
+    )
+
     # Legacy behavior regime remains compatible, while the richer market phase
     # becomes the primary label for AI Insight interpretation.
     if fake_move_risk >= 60 and exhaustion_risk >= 55:
@@ -10771,6 +10991,14 @@ def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str 
         "label": label,
         "meaning": "Market behavior context only — not a buy/sell instruction and not a profit guarantee.",
         "market_phase": market_phase,
+        "liquidity_context": liquidity_context,
+        "liquidity_regime": liquidity_context.get("regime"),
+        "liquidity_label": liquidity_context.get("label"),
+        "trap_risk": liquidity_context.get("trap_risk"),
+        "stop_hunt_risk": liquidity_context.get("stop_hunt_risk"),
+        "liquidity_vacuum_risk": liquidity_context.get("liquidity_vacuum_risk"),
+        "participation_depth": liquidity_context.get("participation_depth"),
+        "liquidity_quality_score": liquidity_context.get("liquidity_quality_score"),
         "market_phase_regime": market_phase.get("regime"),
         "market_phase_label": market_phase.get("label"),
         "market_phase_confidence": market_phase.get("confidence"),
@@ -11178,6 +11406,21 @@ def _ai_engine_v2_from_context(
         "volatility_level": "quiet",
         "volume_confirmation": 0.0,
         "volume_confirmation_level": "quiet",
+        "liquidity_context": {
+            "regime": "missing_pair_context",
+            "label": "No liquidity context",
+            "trap_risk": 0.0,
+            "stop_hunt_risk": 0.0,
+            "liquidity_vacuum_risk": 0.0,
+            "participation_depth": 0.0,
+            "liquidity_quality_score": 0.0,
+            "display_in_ui": False,
+        },
+        "trap_risk": 0.0,
+        "stop_hunt_risk": 0.0,
+        "liquidity_vacuum_risk": 0.0,
+        "participation_depth": 0.0,
+        "liquidity_quality_score": 0.0,
         "metrics": {},
         "reasons": ["no pair context available"],
         "warnings": [],
@@ -11198,6 +11441,32 @@ def _ai_engine_v2_from_context(
     if _safe_float(market_behavior.get("volume_confirmation"), 0.0) >= 55:
         drivers.append("volume confirmation supports the movement")
         tags.append("volume_confirmation")
+
+    liquidity_context = market_behavior.get("liquidity_context") if isinstance(market_behavior.get("liquidity_context"), dict) else {}
+    liquidity_regime = str(liquidity_context.get("regime") or "").strip()
+    trap_risk = _safe_float(liquidity_context.get("trap_risk"), 0.0)
+    stop_hunt_risk = _safe_float(liquidity_context.get("stop_hunt_risk"), 0.0)
+    vacuum_risk = _safe_float(liquidity_context.get("liquidity_vacuum_risk"), 0.0)
+    participation_depth = _safe_float(liquidity_context.get("participation_depth"), 0.0)
+    if liquidity_regime and liquidity_regime not in ("balanced_liquidity", "missing_pair_context"):
+        warnings.append(f"liquidity context: {liquidity_context.get('label')}")
+        tags.append(f"liquidity_{liquidity_regime}")
+    if trap_risk >= 65:
+        warnings.append("liquidity trap risk is elevated")
+        contradictions.append("movement may be liquidity-driven rather than participation-driven")
+        exit_reasons.append("liquidity trap risk is elevated")
+        tags.append("liquidity_trap_risk")
+    if stop_hunt_risk >= 65:
+        warnings.append("stop-hunt sensitivity is elevated")
+        exit_reasons.append("stop-hunt sensitivity is elevated")
+        tags.append("stop_hunt_sensitive")
+    if vacuum_risk >= 65:
+        warnings.append("liquidity vacuum risk is elevated")
+        exit_reasons.append("liquidity vacuum risk is elevated")
+        tags.append("liquidity_vacuum")
+    if participation_depth >= 65:
+        drivers.append("participation depth improves liquidity quality")
+        tags.append("participation_depth")
 
     pair_alerts = _build_ai_pair_alerts(all_pairs, coins, compare_weights=compare_weights, ai_mode=ai_mode)
     if pair_alerts:
@@ -11278,6 +11547,15 @@ def _ai_engine_v2_from_context(
         risk_score += 1
     if _safe_float(market_behavior.get("volume_confirmation"), 0.0) >= 60 and risk_score > 0:
         risk_score -= 1
+    try:
+        if _safe_float((market_behavior.get("liquidity_context") or {}).get("trap_risk"), 0.0) >= 70:
+            risk_score += 1
+        if _safe_float((market_behavior.get("liquidity_context") or {}).get("liquidity_vacuum_risk"), 0.0) >= 70:
+            risk_score += 1
+        if _safe_float((market_behavior.get("liquidity_context") or {}).get("participation_depth"), 0.0) >= 70 and risk_score > 0:
+            risk_score -= 1
+    except Exception:
+        pass
 
     if risk_score >= 6:
         risk = "High"
@@ -11334,6 +11612,25 @@ def _ai_engine_v2_from_context(
             behavior_summary_parts.append("movement is not strongly volume-confirmed")
         if acc_s >= 55:
             behavior_summary_parts.append("early accumulation / volume-build behavior is present")
+        liquidity_context = market_behavior.get("liquidity_context") if isinstance(market_behavior.get("liquidity_context"), dict) else {}
+        liq_label = str(liquidity_context.get("label") or "").strip()
+        liq_hint = str(liquidity_context.get("ai_hint") or "").strip()
+        trap_r = _safe_float(liquidity_context.get("trap_risk"), 0.0)
+        vacuum_r = _safe_float(liquidity_context.get("liquidity_vacuum_risk"), 0.0)
+        stop_r = _safe_float(liquidity_context.get("stop_hunt_risk"), 0.0)
+        depth = _safe_float(liquidity_context.get("participation_depth"), 0.0)
+        if liq_label and str(liquidity_context.get("regime") or "") not in ("balanced_liquidity", "missing_pair_context"):
+            behavior_summary_parts.append(liq_label)
+        if liq_hint and (trap_r >= 60 or vacuum_r >= 60 or stop_r >= 60):
+            behavior_summary_parts.append(liq_hint)
+        if trap_r >= 65:
+            behavior_summary_parts.append("liquidity trap risk is elevated")
+        if vacuum_r >= 65:
+            behavior_summary_parts.append("movement may be thin / liquidity-vacuum sensitive")
+        if stop_r >= 65:
+            behavior_summary_parts.append("stop-hunt sensitivity is elevated")
+        if depth >= 65:
+            behavior_summary_parts.append("participation depth improves signal quality")
         if mb_regime and mb_regime not in ("mixed_or_neutral", "missing_pair_context"):
             behavior_summary_parts.append(f"regime={mb_regime}")
     except Exception:
@@ -11357,6 +11654,13 @@ def _ai_engine_v2_from_context(
         "movement_chance_level": movement_chance.get("level"),
         "movement_chance_label": movement_chance.get("label"),
         "market_behavior": market_behavior,
+        "liquidity_context": market_behavior.get("liquidity_context"),
+        "liquidity_regime": (market_behavior.get("liquidity_context") or {}).get("regime") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
+        "liquidity_label": (market_behavior.get("liquidity_context") or {}).get("label") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
+        "trap_risk": (market_behavior.get("liquidity_context") or {}).get("trap_risk") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
+        "liquidity_vacuum_risk": (market_behavior.get("liquidity_context") or {}).get("liquidity_vacuum_risk") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
+        "stop_hunt_risk": (market_behavior.get("liquidity_context") or {}).get("stop_hunt_risk") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
+        "participation_depth": (market_behavior.get("liquidity_context") or {}).get("participation_depth") if isinstance(market_behavior.get("liquidity_context"), dict) else None,
         "market_behavior_regime": market_behavior.get("regime"),
         "market_behavior_label": market_behavior.get("label"),
         "market_phase": market_behavior.get("market_phase"),
@@ -11877,6 +12181,7 @@ Rules:
 22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
 23) If ai_engine_v2.pair_alerts exists, use it as movement-chance context across all Compare pairs, not only the selected pair.
 24) If ai_engine_v2.market_behavior or ai_engine_v2.market_phase exists, use it as INTERNAL interpretation context only. Do not dump raw behavior fields; translate the strongest regime/phase signal into the paragraph, Edge, Risk, or Setup bias.
+24b) If ai_engine_v2.liquidity_context exists, use it only as INTERNAL language guidance. Mention liquidity-trap, stop-hunt sensitivity, liquidity vacuum, thin participation, or participation-supported movement only when it is clearly relevant. Never print raw trap scores or liquidity metrics.
 25) Market regime priority for AI Insight: trend = continuation can be respected; range = mean-reversion is favored; chop = low-confirmation/fake-move risk; volatile/panic = fast invalidation; euphoria = exhaustion/blow-off risk; accumulation = constructive watch; distribution = fading participation.
 26) Market behavior priority for AI Insight:
    - high fake_move_risk => say the move may be poorly confirmed / unstable / fake-move risk,
