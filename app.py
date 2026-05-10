@@ -10056,7 +10056,7 @@ def _hard_sanitize_ai_insight_text(value: str) -> str:
     out = re.sub(r"(?is)\bObserved relative bias\s*:\s*.*$", "", out).strip()
 
     # Remove sentences/fragments containing forbidden source-dump terms.
-    forbidden = r"(?:Votes?|Rating|CoinGecko|contract mapping|token mapping|No CoinGecko|mapping found)"
+    forbidden = r"(?:Votes?|Rating|CoinGecko|contract mapping|token mapping|No CoinGecko|mapping found|Signal context)"
     parts = re.split(r"(?<=[.!?])\s+", out)
     kept = []
     for part in parts:
@@ -10066,11 +10066,14 @@ def _hard_sanitize_ai_insight_text(value: str) -> str:
     out = " ".join(kept).strip()
 
     # Replace raw-metric phrasing with behavior phrasing.
-    out = re.sub(r"(?i)strong correlation of\s*[-+]?\d+(?:\.\d+)?", "strong linkage", out)
-    out = re.sub(r"(?i)correlation of\s*[-+]?\d+(?:\.\d+)?", "correlation", out)
+    out = re.sub(r"(?i)strong correlation\s+(?:of|at)\s*[-+]?\d+(?:\.\d+)?", "strong linkage", out)
+    out = re.sub(r"(?i)correlation\s+(?:of|at)\s*[-+]?\d+(?:\.\d+)?", "linkage", out)
     out = re.sub(r"(?i)spread of approximately\s*[-+]?\d+(?:\.\d+)?%", "stretched spread", out)
     out = re.sub(r"(?i)spread of\s*[-+]?\d+(?:\.\d+)?%", "stretched spread", out)
     out = re.sub(r"(?i)decline of\s*[-+]?\d+(?:\.\d+)?%[^.]*", "recent weakness", out)
+    out = re.sub(r"(?i)over the last\s+\d+\s*(?:days?|d)\b", "recently", out)
+    out = re.sub(r"(?i)approximately\s+[-+]?\d+(?:\.\d+)?%", "noticeably", out)
+    out = re.sub(r"(?i)significant decline\s+of\s*[-+]?\d+(?:\.\d+)?%", "significant recent weakness", out)
 
     # Remove remaining raw percentages and score-like dumps. Keep prose clean.
     out = re.sub(r"\b[-+]?\d+(?:\.\d+)?%\b", "", out)
@@ -10117,7 +10120,7 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
         return _compact_behavior_answer_from_engine(engine_ctx)
 
     forbidden_hit = bool(re.search(r"(?i)\b(Votes?|Rating|CoinGecko|contract mapping|token mapping|Signal context|mapping found)\b", s))
-    raw_metric_hit = bool(re.search(r"\b\d+(?:\.\d+)?%\b|\bcorrelation\s+of\s+\d", s, flags=re.I))
+    raw_metric_hit = bool(re.search(r"\b\d+(?:\.\d+)?%\b|\bcorrelation\s+(?:of|at)\s+\d|\bover the last\s+\d+\s*(?:days?|d)\b", s, flags=re.I))
     too_long = len(re.findall(r"\w+", s)) > 145
     if forbidden_hit or raw_metric_hit or too_long:
         return _compact_behavior_answer_from_engine(engine_ctx)
@@ -12060,6 +12063,21 @@ def api_ai_insight():
     if err_pair:
         msg, code = err_pair
         return err(msg, code)
+
+    # Final safety gate for AI Insight: the UI must never receive source dumps
+    # like Signal context, Votes, Ratings or CoinGecko mapping in the answer.
+    try:
+        resp["answer"] = _enforce_ai_insight_structure(
+            str(resp.get("answer") or ""),
+            resp.get("ai_engine_v2") if isinstance(resp.get("ai_engine_v2"), dict) else {},
+        )
+    except Exception:
+        try:
+            resp["answer"] = _compact_behavior_answer_from_engine(
+                resp.get("ai_engine_v2") if isinstance(resp.get("ai_engine_v2"), dict) else {}
+            )
+        except Exception:
+            pass
     return jsonify(resp)
 
 
