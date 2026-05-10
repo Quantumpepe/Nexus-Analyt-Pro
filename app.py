@@ -10100,6 +10100,129 @@ def _enforce_ai_insight_structure(text: str, engine_ctx: dict | None = None) -> 
     return f"{paragraph}\n\nEdge: {edge}\nRisk: {risk}\nSetup bias: {setup}".strip()
 
 
+# -------------------------
+# AI Insight add-ons: Mode, Custom Weighting, Pair Alerts
+# -------------------------
+def _normalize_ai_mode(raw: Any) -> str:
+    """AI Insight supports one optional extra mode: extreme.
+    Standard stays the default to preserve existing behavior.
+    """
+    mode = str(raw or "standard").strip().lower()
+    if mode in ("extreme", "x", "high_risk", "high-risk"):
+        return "extreme"
+    return "standard"
+
+
+def _normalize_compare_weights_for_ai(raw: Any) -> dict:
+    """Normalize frontend Compare weights into AI-readable 0..100 percentages."""
+    defaults = {"corr": 35, "momentum": 25, "opportunity": 25, "stability": 15}
+    data = raw if isinstance(raw, dict) else {}
+    out = {}
+    for k, default in defaults.items():
+        try:
+            v = float(data.get(k, default))
+            if not math.isfinite(v):
+                v = float(default)
+        except Exception:
+            v = float(default)
+        out[k] = max(0.0, min(100.0, v))
+    total = sum(out.values())
+    if total <= 0:
+        return defaults
+    # Keep user percentages when total <= 100; normalize only if corrupted/over 100.
+    if total > 100.0:
+        out = {k: round((v / total) * 100.0, 2) for k, v in out.items()}
+    return out
+
+
+def _weight_focus(compare_weights: dict) -> str:
+    w = _normalize_compare_weights_for_ai(compare_weights)
+    top = sorted(w.items(), key=lambda kv: (-kv[1], kv[0]))[:2]
+    return ", ".join([f"{k}={int(round(v))}%" for k, v in top])
+
+
+def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None = None, ai_mode: str = "standard") -> list[dict]:
+    """Scan all Compare pairs for hidden opportunities, not only the selected/top pair.
+    Deterministic and informational only; no buy/sell instructions.
+    """
+    if not isinstance(pairs, list):
+        return []
+    mode = _normalize_ai_mode(ai_mode)
+    w = _normalize_compare_weights_for_ai(compare_weights or {})
+    sens = 0.82 if mode == "extreme" else 1.0
+
+    coin_map = {}
+    for c in coins if isinstance(coins, list) else []:
+        if isinstance(c, dict):
+            sym = str(c.get("symbol") or "").upper()
+            if sym:
+                coin_map[sym] = c
+
+    alerts = []
+    for p in pairs[:30]:
+        if not isinstance(p, dict):
+            continue
+        pair = str(p.get("pair") or "").upper()
+        parts = [x.strip() for x in pair.split("/") if x.strip()]
+        if len(parts) != 2:
+            continue
+        a, b = parts
+        corr = _safe_float(p.get("corr"), 0.0)
+        spread = abs(_safe_float(p.get("spread_pct"), 0.0))
+        rsi_gap = abs(_safe_float(p.get("rsi_gap"), 0.0))
+        score = _safe_float(p.get("score"), 0.0)
+        ca, cb = coin_map.get(a, {}), coin_map.get(b, {})
+        ch_gap = abs(_safe_float(ca.get("change_24h_pct"), 0.0) - _safe_float(cb.get("change_24h_pct"), 0.0))
+
+        reasons = []
+        kind = ""
+        base = score
+        if corr >= 0.72 * sens and spread >= 5.0 * sens:
+            kind = "hidden_opportunity"
+            reasons.append("strong spread movement inside a linked pair")
+            base += w.get("opportunity", 25) * 0.28
+        if rsi_gap >= 14.0 * sens:
+            kind = kind or "rsi_divergence"
+            reasons.append("large RSI difference")
+            base += w.get("momentum", 25) * 0.24
+        if ch_gap >= 4.0 * sens:
+            kind = kind or "momentum_shift"
+            reasons.append("short-term momentum shift")
+            base += w.get("momentum", 25) * 0.18
+        if corr >= 0.82 * sens and 2.0 * sens <= spread <= 7.5 / sens:
+            kind = kind or "rebound_watch"
+            reasons.append("rebound / mean-reversion structure")
+            base += w.get("corr", 35) * 0.14
+        if score < 70 and (spread >= 6.0 * sens or rsi_gap >= 16.0 * sens):
+            kind = kind or "low_rank_unusual_activity"
+            reasons.append("unusual activity in a lower-ranked pair")
+            base += 8
+
+        if not reasons:
+            continue
+        strength_score = round(max(0.0, min(100.0, base)), 1)
+        if strength_score >= 82:
+            strength = "high"
+        elif strength_score >= 65:
+            strength = "medium"
+        else:
+            strength = "low"
+        alerts.append({
+            "pair": pair,
+            "type": kind or "pair_alert",
+            "strength": strength,
+            "score": strength_score,
+            "corr": round(corr, 4),
+            "spread_pct": round(spread, 2),
+            "rsi_gap": round(rsi_gap, 2),
+            "reasons": reasons[:4],
+        })
+
+    alerts.sort(key=lambda x: (x.get("score") or 0), reverse=True)
+    return alerts[:8]
+
+
+
 
 
 def _ai_engine_v2_from_context(
@@ -10119,6 +10242,9 @@ def _ai_engine_v2_from_context(
     extra_context = extra_context if isinstance(extra_context, dict) else {}
     coins = extra_context.get("coins") if isinstance(extra_context.get("coins"), list) else []
     pairs = extra_context.get("relevant_pairs") if isinstance(extra_context.get("relevant_pairs"), list) else []
+    all_pairs = extra_context.get("all_compare_pairs") if isinstance(extra_context.get("all_compare_pairs"), list) else pairs
+    ai_mode = _normalize_ai_mode(extra_context.get("ai_mode") or extra_context.get("mode"))
+    compare_weights = _normalize_compare_weights_for_ai(extra_context.get("compare_weights") or extra_context.get("weights") or {})
 
     def _sf(v, default=0.0):
         try:
@@ -10214,6 +10340,17 @@ def _ai_engine_v2_from_context(
 
     price_moving = abs(ch_a) >= 2 or abs(ch_b) >= 2
     divergent_24h = bool(a and b and abs(ch_a - ch_b) >= 3)
+    weight_focus = _weight_focus(compare_weights)
+
+    if compare_weights.get("momentum", 0) >= 35 and (rel_strength or divergent_24h):
+        drivers.append("custom weighting emphasizes momentum")
+        tags.append("weight_momentum_focus")
+    if compare_weights.get("opportunity", 0) >= 35 and abs(spread) >= 3:
+        drivers.append("custom weighting emphasizes opportunity spread")
+        tags.append("weight_opportunity_focus")
+    if compare_weights.get("stability", 0) >= 30 and corr < 0.65 and pair_ctx:
+        warnings.append("custom weighting emphasizes stability, but pair linkage is not strong")
+        tags.append("weight_stability_conflict")
 
     if corr >= 0.8:
         drivers.append("high pair linkage")
@@ -10329,6 +10466,23 @@ def _ai_engine_v2_from_context(
         setup_bias = "no-clean-setup / wait-for-confirmation"
         verdict = "LOW CONVICTION"
 
+    pair_alerts = _build_ai_pair_alerts(all_pairs, coins, compare_weights=compare_weights, ai_mode=ai_mode)
+    if pair_alerts:
+        drivers.append(f"pair scanner found {len(pair_alerts)} hidden-opportunity alert(s)")
+        tags.append("pair_alerts")
+        top_alert = pair_alerts[0]
+        if top_alert.get("pair") and top_alert.get("pair") != f"{a}/{b}":
+            warnings.append(f"strongest hidden pair alert is {top_alert.get('pair')}")
+
+    if ai_mode == "extreme":
+        tags.append("extreme_mode")
+        drivers.append("Extreme mode increases sensitivity to early momentum, rebound, and spread signals")
+        # Extreme mode is more willing to read early setups, but it does not hide structural danger.
+        if accumulation or volume_backed or rel_strength or pair_alerts:
+            exit_score = max(0, exit_score - 1)
+        if not weak_participation and not overextended:
+            warnings = [w for w in warnings if "pre-exit warning" not in str(w).lower()]
+
     # Confidence
     confidence = 5.0
     if corr >= 0.8:
@@ -10351,6 +10505,14 @@ def _ai_engine_v2_from_context(
         confidence -= 0.3
     if contradictions:
         confidence -= min(1.2, 0.3 * len(contradictions))
+    if compare_weights.get("momentum", 0) >= 35 and rel_strength:
+        confidence += 0.3
+    if compare_weights.get("opportunity", 0) >= 35 and abs(spread) >= 3:
+        confidence += 0.3
+    if compare_weights.get("stability", 0) >= 30 and corr < 0.65 and pair_ctx:
+        confidence -= 0.4
+    if ai_mode == "extreme" and (rel_strength or accumulation or volume_backed or pair_alerts):
+        confidence += 0.6
     confidence = round(max(1.0, min(10.0, confidence)), 1)
 
     # Risk
@@ -10372,6 +10534,10 @@ def _ai_engine_v2_from_context(
     if pre_exit_warning:
         risk_score += 1
     if confidence >= 8 and risk_score > 0:
+        risk_score -= 1
+    if compare_weights.get("stability", 0) >= 30 and corr < 0.65 and pair_ctx:
+        risk_score += 1
+    if ai_mode == "extreme" and (rel_strength or accumulation or volume_backed or pair_alerts) and risk_score > 0:
         risk_score -= 1
 
     if risk_score >= 6:
@@ -10408,7 +10574,11 @@ def _ai_engine_v2_from_context(
     ) if a and b else f"{verdict}: {behavior}. Risk is {risk}; exit risk is {exit_risk}; confidence {confidence}/10."
 
     return {
-        "version": "ai_engine_v2_exit_contradiction",
+        "version": "ai_engine_v2_exit_contradiction_mode_weight_alerts",
+        "ai_mode": ai_mode,
+        "compare_weights": compare_weights,
+        "weight_focus": weight_focus,
+        "pair_alerts": pair_alerts,
         "verdict": verdict,
         "confidence": confidence,
         "risk": risk,
@@ -10755,6 +10925,9 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     except Exception:
         order_memory, insight_profile = {}, {}
 
+    ai_mode = _normalize_ai_mode((extra_context or {}).get("ai_mode") if isinstance(extra_context, dict) else "standard")
+    compare_weights_for_ai = _normalize_compare_weights_for_ai((extra_context or {}).get("compare_weights") if isinstance(extra_context, dict) else {})
+
     ai_engine_v2 = {}
     try:
         if short_insight_mode:
@@ -10900,6 +11073,9 @@ Rules:
    - NORMAL = no strong OE/RVOL anomaly.
 19) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
 20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
+21) AI Insight mode: standard = balanced professional interpretation; extreme = more sensitive to early momentum, rebound, spread, and high-risk/high-reward structures, while still warning clearly about invalidation.
+22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
+23) If ai_engine_v2.pair_alerts exists, use it as hidden-opportunity context across all Compare pairs, not only the selected pair.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -10917,6 +11093,8 @@ Task:
         "timeframe_context": timeframe_context,
         "market_context": market_context,
         "short_insight_mode": bool(short_insight_mode),
+        "ai_mode": ai_mode,
+        "compare_weights": compare_weights_for_ai,
     }
     if ai_engine_v2:
         user_payload["ai_engine_v2"] = ai_engine_v2
