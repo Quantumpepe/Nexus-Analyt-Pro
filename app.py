@@ -10141,6 +10141,185 @@ def _weight_focus(compare_weights: dict) -> str:
     return ", ".join([f"{k}={int(round(v))}%" for k, v in top])
 
 
+def _movement_level_from_score(score: float) -> str:
+    s = _safe_float(score, 0.0)
+    if s >= 82:
+        return "very_high"
+    if s >= 68:
+        return "high"
+    if s >= 50:
+        return "medium"
+    if s >= 32:
+        return "low"
+    return "quiet"
+
+
+def _movement_alert_label(level: str) -> str:
+    lvl = str(level or "").lower()
+    if lvl in ("very_high", "high"):
+        return "Volatile Chance"
+    if lvl == "medium":
+        return "Movement Chance"
+    return "Movement Watch"
+
+
+def _build_movement_chance_score(pair_ctx: dict | None, coins: list, compare_weights: dict | None = None, ai_mode: str = "standard") -> dict:
+    """Backend Movement Chance Score.
+
+    This is NOT a buy/sell score and NOT a success probability.
+    It measures unusual short-term movement potential from pair structure:
+    spread expansion, RSI divergence, momentum gap, correlation context,
+    market-condition quality, on-chain/whale confirmation, custom weights,
+    and optional Extreme mode sensitivity.
+    """
+    p = pair_ctx if isinstance(pair_ctx, dict) else {}
+    w = _normalize_compare_weights_for_ai(compare_weights or {})
+    mode = _normalize_ai_mode(ai_mode)
+
+    pair = str(p.get("pair") or "").upper().strip()
+    parts = [x.strip() for x in pair.split("/") if x.strip()]
+
+    coin_map = {}
+    for c in coins if isinstance(coins, list) else []:
+        if isinstance(c, dict):
+            sym = str(c.get("symbol") or "").upper().strip()
+            if sym:
+                coin_map[sym] = c
+
+    ca = coin_map.get(parts[0], {}) if len(parts) >= 1 else {}
+    cb = coin_map.get(parts[1], {}) if len(parts) >= 2 else {}
+
+    corr = _safe_float(p.get("corr"), 0.0)
+    spread = abs(_safe_float(p.get("spread_pct"), 0.0))
+    rsi_gap = abs(_safe_float(p.get("rsi_gap"), 0.0))
+    pair_rank_score = _safe_float(p.get("score"), 0.0)
+    ch_a = _safe_float(ca.get("change_24h_pct"), 0.0)
+    ch_b = _safe_float(cb.get("change_24h_pct"), 0.0)
+    momentum_gap = abs(ch_a - ch_b)
+
+    # Component scores, each intentionally capped so one noisy metric cannot dominate.
+    spread_score = min(22.0, spread * 2.75)
+    rsi_score = min(22.0, rsi_gap * 1.25)
+    momentum_score = min(18.0, momentum_gap * 3.0)
+
+    if corr >= 0.82:
+        corr_score = 12.0
+    elif corr >= 0.70:
+        corr_score = 9.0
+    elif corr >= 0.55:
+        corr_score = 5.0
+    elif corr > 0:
+        corr_score = 1.5
+    else:
+        corr_score = 0.0
+
+    market_score = 0.0
+    market_notes = []
+    for c in (ca, cb):
+        mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
+        state = str(mc.get("state") or "").upper()
+        if state == "REAL_BREAKOUT":
+            market_score += 7.0
+            market_notes.append(f"{c.get('symbol')}: volume-backed breakout")
+        elif state == "EARLY_ACCUMULATION":
+            market_score += 6.0
+            market_notes.append(f"{c.get('symbol')}: early accumulation")
+        elif state == "OVEREXTENDED":
+            market_score -= 3.0
+            market_notes.append(f"{c.get('symbol')}: overextended")
+        elif state == "FAKE_MOVE":
+            market_score -= 5.0
+            market_notes.append(f"{c.get('symbol')}: weak/fake-move risk")
+    market_score = max(-8.0, min(14.0, market_score))
+
+    onchain_score = 0.0
+    onchain_notes = []
+    for c in (ca, cb):
+        oc = c.get("onchain") if isinstance(c.get("onchain"), dict) else {}
+        delta = _safe_float(c.get("onchain_delta"), _safe_float(oc.get("score_delta"), 0.0))
+        if delta >= 3:
+            onchain_score += 4.0
+            onchain_notes.append(f"{c.get('symbol')}: positive on-chain/whale pressure")
+        elif delta <= -3:
+            onchain_score -= 4.0
+            onchain_notes.append(f"{c.get('symbol')}: negative on-chain/whale pressure")
+    onchain_score = max(-6.0, min(8.0, onchain_score))
+
+    # Custom weighting influences the interpretation without replacing raw data.
+    weight_boost = 0.0
+    weight_boost += max(0.0, w.get("opportunity", 25) - 25.0) * 0.18 if spread >= 3.0 else 0.0
+    weight_boost += max(0.0, w.get("momentum", 25) - 25.0) * 0.18 if (rsi_gap >= 8.0 or momentum_gap >= 2.5) else 0.0
+    weight_boost += max(0.0, w.get("corr", 35) - 35.0) * 0.10 if corr >= 0.70 else 0.0
+    if w.get("stability", 15) >= 30 and corr < 0.60 and corr > 0:
+        weight_boost -= 4.0
+
+    # Low-ranked pairs with strong movement receive a small scanner bonus.
+    low_rank_bonus = 0.0
+    if pair_rank_score and pair_rank_score < 70 and (spread >= 5.0 or rsi_gap >= 14.0 or momentum_gap >= 4.0):
+        low_rank_bonus = 7.0
+
+    raw_score = (
+        spread_score + rsi_score + momentum_score + corr_score +
+        market_score + onchain_score + weight_boost + low_rank_bonus
+    )
+
+    if mode == "extreme":
+        raw_score *= 1.10
+        if spread >= 4.0 or rsi_gap >= 12.0 or momentum_gap >= 3.5:
+            raw_score += 4.0
+
+    score = round(max(0.0, min(100.0, raw_score)), 1)
+    level = _movement_level_from_score(score)
+
+    reasons = []
+    if spread >= 5.0:
+        reasons.append("wide spread movement")
+    elif spread >= 2.5:
+        reasons.append("visible spread movement")
+    if rsi_gap >= 14.0:
+        reasons.append("large RSI divergence")
+    elif rsi_gap >= 8.0:
+        reasons.append("RSI gap building")
+    if momentum_gap >= 4.0:
+        reasons.append("short-term momentum gap")
+    if corr >= 0.75 and spread >= 2.0:
+        reasons.append("linked pair with relative imbalance")
+    if low_rank_bonus > 0:
+        reasons.append("lower-ranked pair showing unusual activity")
+    if market_notes:
+        reasons.extend(market_notes[:2])
+    if onchain_notes:
+        reasons.extend(onchain_notes[:2])
+    if not reasons:
+        reasons.append("no unusual movement structure detected")
+
+    return {
+        "pair": pair,
+        "score": score,
+        "level": level,
+        "label": _movement_alert_label(level),
+        "meaning": "Movement potential only — not a buy signal, not a quality rating, and not a success probability.",
+        "components": {
+            "spread": round(spread_score, 2),
+            "rsi": round(rsi_score, 2),
+            "momentum": round(momentum_score, 2),
+            "correlation": round(corr_score, 2),
+            "market_condition": round(market_score, 2),
+            "onchain_whale": round(onchain_score, 2),
+            "custom_weighting": round(weight_boost, 2),
+            "low_rank_bonus": round(low_rank_bonus, 2),
+        },
+        "metrics": {
+            "corr": round(corr, 4),
+            "spread_pct": round(spread, 2),
+            "rsi_gap": round(rsi_gap, 2),
+            "momentum_gap_24h_pct": round(momentum_gap, 2),
+            "pair_rank_score": round(pair_rank_score, 2),
+        },
+        "reasons": reasons[:6],
+    }
+
+
 def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None = None, ai_mode: str = "standard") -> list[dict]:
     """Scan all Compare pairs for hidden opportunities, not only the selected/top pair.
     Deterministic and informational only; no buy/sell instructions.
@@ -10178,8 +10357,8 @@ def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None
         kind = ""
         base = score
         if corr >= 0.72 * sens and spread >= 5.0 * sens:
-            kind = "hidden_opportunity"
-            reasons.append("strong spread movement inside a linked pair")
+            kind = "movement_chance"
+            reasons.append("wide spread movement inside a linked pair")
             base += w.get("opportunity", 25) * 0.28
         if rsi_gap >= 14.0 * sens:
             kind = kind or "rsi_divergence"
@@ -10194,31 +10373,46 @@ def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None
             reasons.append("rebound / mean-reversion structure")
             base += w.get("corr", 35) * 0.14
         if score < 70 and (spread >= 6.0 * sens or rsi_gap >= 16.0 * sens):
-            kind = kind or "low_rank_unusual_activity"
-            reasons.append("unusual activity in a lower-ranked pair")
+            kind = kind or "low_rank_movement"
+            reasons.append("lower-ranked pair showing unusual movement")
             base += 8
 
-        if not reasons:
+        movement = _build_movement_chance_score(p, coins, compare_weights=w, ai_mode=mode)
+        movement_score = _safe_float(movement.get("score"), 0.0)
+
+        # Keep the existing alert filter, but require at least a real movement-watch score.
+        if not reasons and movement_score < 32:
             continue
-        strength_score = round(max(0.0, min(100.0, base)), 1)
-        if strength_score >= 82:
+        if not reasons:
+            reasons = list(movement.get("reasons") or [])[:4]
+            kind = kind or "movement_watch"
+
+        strength_score = round(max(0.0, min(100.0, max(base, movement_score))), 1)
+        level = str(movement.get("level") or _movement_level_from_score(strength_score))
+        if level in ("very_high", "high"):
             strength = "high"
-        elif strength_score >= 65:
+        elif level == "medium":
             strength = "medium"
         else:
             strength = "low"
         alerts.append({
             "pair": pair,
-            "type": kind or "pair_alert",
+            "type": kind or "movement_alert",
+            "label": movement.get("label") or _movement_alert_label(level),
             "strength": strength,
+            "level": level,
             "score": strength_score,
+            "movement_chance_score": movement_score,
+            "movement_chance_level": level,
+            "movement_chance": movement,
+            "meaning": movement.get("meaning"),
             "corr": round(corr, 4),
             "spread_pct": round(spread, 2),
             "rsi_gap": round(rsi_gap, 2),
-            "reasons": reasons[:4],
+            "reasons": list(dict.fromkeys((reasons or []) + list(movement.get("reasons") or [])))[:6],
         })
 
-    alerts.sort(key=lambda x: (x.get("score") or 0), reverse=True)
+    alerts.sort(key=lambda x: (x.get("movement_chance_score") or x.get("score") or 0), reverse=True)
     return alerts[:8]
 
 
@@ -10466,13 +10660,31 @@ def _ai_engine_v2_from_context(
         setup_bias = "no-clean-setup / wait-for-confirmation"
         verdict = "LOW CONVICTION"
 
+    movement_chance = _build_movement_chance_score(pair_ctx, coins, compare_weights=compare_weights, ai_mode=ai_mode) if pair_ctx else {
+        "pair": f"{a}/{b}" if a and b else "",
+        "score": 0.0,
+        "level": "quiet",
+        "label": "Movement Watch",
+        "meaning": "Movement potential only — not a buy signal, not a quality rating, and not a success probability.",
+        "components": {},
+        "metrics": {},
+        "reasons": ["no pair context available"],
+    }
+    movement_score = _safe_float(movement_chance.get("score"), 0.0)
+    if movement_score >= 68:
+        drivers.append(f"movement chance score is elevated ({movement_score}/100)")
+        tags.append("movement_chance")
+    elif movement_score >= 50:
+        drivers.append(f"movement chance score is building ({movement_score}/100)")
+        tags.append("movement_watch")
+
     pair_alerts = _build_ai_pair_alerts(all_pairs, coins, compare_weights=compare_weights, ai_mode=ai_mode)
     if pair_alerts:
-        drivers.append(f"pair scanner found {len(pair_alerts)} hidden-opportunity alert(s)")
+        drivers.append(f"pair scanner found {len(pair_alerts)} movement-chance alert(s)")
         tags.append("pair_alerts")
         top_alert = pair_alerts[0]
         if top_alert.get("pair") and top_alert.get("pair") != f"{a}/{b}":
-            warnings.append(f"strongest hidden pair alert is {top_alert.get('pair')}")
+            warnings.append(f"strongest movement-chance alert is {top_alert.get('pair')}")
 
     if ai_mode == "extreme":
         tags.append("extreme_mode")
@@ -10579,6 +10791,10 @@ def _ai_engine_v2_from_context(
         "compare_weights": compare_weights,
         "weight_focus": weight_focus,
         "pair_alerts": pair_alerts,
+        "movement_chance": movement_chance,
+        "movement_chance_score": movement_score,
+        "movement_chance_level": movement_chance.get("level"),
+        "movement_chance_label": movement_chance.get("label"),
         "verdict": verdict,
         "confidence": confidence,
         "risk": risk,
@@ -11075,7 +11291,7 @@ Rules:
 20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
 21) AI Insight mode: standard = balanced professional interpretation; extreme = more sensitive to early momentum, rebound, spread, and high-risk/high-reward structures, while still warning clearly about invalidation.
 22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
-23) If ai_engine_v2.pair_alerts exists, use it as hidden-opportunity context across all Compare pairs, not only the selected pair.
+23) If ai_engine_v2.pair_alerts exists, use it as movement-chance context across all Compare pairs, not only the selected pair.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
