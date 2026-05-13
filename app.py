@@ -12389,6 +12389,18 @@ Setup bias: ...
 - Keep it tight, clear, and trading-relevant
 """
 
+    analyst_concise_rules = "" if short_insight_mode else """
+AI ANALYST OUTPUT FORMAT — KEEP IT SHORT:
+- Do not write long reports or essay-style paragraphs.
+- Maximum length: usually 6-10 compact bullet lines.
+- Use short section labels only when useful.
+- Prefer this structure when applicable: Setup / Entry Logic / Risk / Failure / Next Check.
+- Each bullet should be one clear sentence.
+- Do not add long disclaimers. Use at most one short safety note at the end.
+- Do not explain basic trading terms unless the user asks.
+- If Pine Script/code is requested, provide code plus a very short explanation.
+"""
+
     sys = f"""You are Nexus Analyt AI Analyst, a crypto research, strategy, backtest, TradingView/Pine, reporting, and diagnostics workspace.
 
 {PRO_STYLE_RULES}
@@ -12399,6 +12411,7 @@ AI ANALYST ROLE SEPARATION:
 - Do not simply repeat AI Insight sections such as Market Structure, Liquidity State, Risk Posture, and Tactical Read unless the selected mode explicitly needs a short reference.
 - Prefer tool-like, practical outputs: frameworks, checks, diagnostics, report sections, strategy rules, Pine logic, and questions to validate.
 
+{analyst_concise_rules}
 {insight_length_rules}
 
 Rules:
@@ -12563,6 +12576,14 @@ Rules:
 - Provide educational analysis, structure, diagnostics, and templates only.
 - No financial advice, no direct buy/sell instruction, no exact prescriptive entry/exit levels.
 - Keep the answer practical and focused on the selected AI Analyst mode.
+- Do not write long reports or essay-style paragraphs.
+- Maximum length: usually 6-10 compact bullet lines.
+- Use short section labels only when useful.
+- Prefer this structure when applicable: Setup / Entry Logic / Risk / Failure / Next Check.
+- Each bullet should be one clear sentence.
+- Do not add long disclaimers. Use at most one short safety note at the end.
+- Do not explain basic trading terms unless the user asks.
+- If Pine Script/code is requested, provide code plus a very short explanation.
 
 Mode instructions:
 {_ai_kind_instructions(kind)}
