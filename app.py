@@ -12203,15 +12203,53 @@ def _build_ai_timeframe_context(symbols: list[str], timeframe: str, series_stats
 
 def _ai_kind_instructions(kind: str) -> str:
     k = (kind or "").strip().lower()
-    if k in ("quick_overview", "overview"):
-        return "Give a concise market overview for the selected coins."
-    if k in ("risk_check", "risk"):
-        return "Focus on risks, liquidity/volume, volatility, and what could invalidate a grid setup."
+
+    if k in ("research", "market_research", "quick_overview", "overview"):
+        return (
+            "AI Analyst mode: Research. Identify rotation, relative strength, watchlist changes, market themes, "
+            "unusual volume/momentum conditions, and discovery candidates. Do NOT repeat AI Insight sections. "
+            "Focus on what deserves research attention and why."
+        )
+
+    if k in ("strategy_builder", "strategy", "builder", "grid_plan", "grid", "plan"):
+        return (
+            "AI Analyst mode: Strategy Builder. Turn the user's idea and selected context into an educational strategy framework: "
+            "setup thesis, filters, entry/exit rules as logic only, risk controls, invalidation logic, alert conditions, and failure regimes. "
+            "Do NOT give direct financial advice and do NOT output exact buy/sell price levels."
+        )
+
+    if k in ("backtest_review", "backtest", "review"):
+        return (
+            "AI Analyst mode: Backtest Review. Evaluate robustness, drawdown behavior, expectancy quality, regime dependency, "
+            "parameter sensitivity, overfitting risk, and where the strategy is likely to fail. If no backtest table is provided, "
+            "explain what must be checked and use available context only."
+        )
+
+    if k in ("pine_tradingview", "pine", "tradingview", "pine_script"):
+        return (
+            "AI Analyst mode: TradingView / Pine. Help create, explain, debug, or improve Pine Script indicators, strategies, "
+            "and alert logic. Keep outputs educational and code-focused when requested. Never claim code was backtested unless results are provided."
+        )
+
+    if k in ("daily_report", "report", "daily"):
+        return (
+            "AI Analyst mode: Daily Report. Produce a practical report: strongest/weakest selected assets, market themes, "
+            "risk conditions, movement candidates, watchlist notes, and what deserves attention next. Do not duplicate AI Insight wording."
+        )
+
+    if k in ("diagnostics", "diagnosis", "trading_diagnostics", "risk_check", "risk", "explain"):
+        return (
+            "AI Analyst mode: Diagnostics. Diagnose behavioral risk, execution fit, volatility tolerance, weak setups, contradictions, "
+            "and common mistakes. Use coaching-style explanation, not commands. Do not repeat AI Insight sections unless needed as context."
+        )
+
     if k in ("compare", "comparison"):
-        return "Compare the selected coins and rank which are most suitable for grid trading under the chosen profile."
-    if k in ("grid_plan", "grid", "plan"):
-        return "Provide an educational manual grid plan template (range, spacing, number of orders, risk notes). Do NOT output specific buy/sell price levels."
-    return "Answer the user's question based on the provided context."
+        return (
+            "AI Analyst mode: Research comparison. Compare the selected coins by relative strength, risk quality, liquidity/volume, "
+            "market-condition context, and suitability for the user's selected profile."
+        )
+
+    return "Answer the user's question as AI Analyst: research, diagnose, build, review, or explain using only the provided context."
 
 
 
@@ -12351,9 +12389,16 @@ Setup bias: ...
 - Keep it tight, clear, and trading-relevant
 """
 
-    sys = f"""You are Nexus Analyt AI, a crypto market analyst.
+    sys = f"""You are Nexus Analyt AI Analyst, a crypto research, strategy, backtest, TradingView/Pine, reporting, and diagnostics workspace.
 
 {PRO_STYLE_RULES}
+
+AI ANALYST ROLE SEPARATION:
+- AI Insight is the compact market interpretation layer.
+- AI Analyst is an active workspace: research, strategy building, backtest review, TradingView/Pine help, daily reports, and diagnostics.
+- Do not simply repeat AI Insight sections such as Market Structure, Liquidity State, Risk Posture, and Tactical Read unless the selected mode explicitly needs a short reference.
+- Prefer tool-like, practical outputs: frameworks, checks, diagnostics, report sections, strategy rules, Pine logic, and questions to validate.
+
 {insight_length_rules}
 
 Rules:
