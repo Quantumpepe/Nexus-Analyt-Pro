@@ -12546,10 +12546,57 @@ def api_ai_run():
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
-    if len(sym_norm) > 6:
-        return err("max 6 symbols allowed", 400)
+
+    # New AI Analyst workspace mode:
+    # The analyst is now task-based and must also run without visible coin chips / Compare symbols.
+    # Research and Daily Report may still receive symbols as hidden context from the frontend,
+    # but Strategy Builder, Pine Builder, Backtest Review, and Trade Review often have no symbols at all.
     if not sym_norm:
-        return err("no symbols provided", 400)
+        workspace_sys = f"""You are Nexus Analyt AI Analyst, an active research, strategy, Pine Script, backtest, daily report, and trade-review workspace.
+
+Rules:
+- Always answer in the same language as the user's task.
+- The request is task-based; do not require coin symbols.
+- Do not say that no symbols were provided unless the user specifically asked for coin-specific market analysis.
+- Do not invent live prices, volumes, market data, whale activity, or current market facts.
+- If the task requires live/current market data that is not provided, clearly say that the answer is based only on the supplied task/context.
+- Provide educational analysis, structure, diagnostics, and templates only.
+- No financial advice, no direct buy/sell instruction, no exact prescriptive entry/exit levels.
+- Keep the answer practical and focused on the selected AI Analyst mode.
+
+Mode instructions:
+{_ai_kind_instructions(kind)}
+"""
+        user_payload = {
+            "kind": kind,
+            "question": question,
+            "profile": profile,
+            "requested_timeframe": timeframe,
+            "selected_timeframe": body.get("selected_timeframe"),
+            "index_mode": bool(index_mode),
+            "symbols": [],
+            "task_based_workspace": True,
+            "ai_signal_context": ai_signal_context if isinstance(ai_signal_context, dict) else {},
+        }
+        mem_msgs = _ai_mem_get(wa)
+        resp, err_pair = _ai_call_openai(
+            workspace_sys,
+            user_payload,
+            wallet_address=wa,
+            mem_msgs=mem_msgs,
+            short_insight_mode=False,
+        )
+        if err_pair:
+            msg, code = err_pair
+            return err(msg, code)
+        if isinstance(resp, dict):
+            resp["context_used"] = {
+                "symbols": [],
+                "profile": profile,
+                "task_based_workspace": True,
+                "kind": kind,
+            }
+        return jsonify(resp)
 
     resp, err_pair = _build_ai_response(
         kind=kind,
