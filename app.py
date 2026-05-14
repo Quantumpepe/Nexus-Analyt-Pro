@@ -5718,8 +5718,19 @@ def _grid_db_orders_payload(conn, wallet_address: str, item_id: str, chain: str 
             o["item_id"] = o.get("item_id") or item_eff
             o["chain"] = o.get("chain") or chain_eff
 
-    vault_total = _grid_best_vault_total(conn, wallet_address, item_eff, chain=chain_eff)
-    reserved = _grid_db_reserved_any_variant(conn, wallet_address, item_eff, chain=chain_eff)
+    # Fast visible-order endpoint: do NOT call on-chain vault/RPC here.
+    # /api/grid/orders is used after every Add/Stop/Delete to reconcile visible orders;
+    # if this endpoint performs vault reads, the Execution Preview can lag 15-30s.
+    # Use only SQLite-derived values here. The frontend's dedicated vaultState reader
+    # remains responsible for on-chain vault balances in the background.
+    try:
+        vault_total = float(_grid_db_vault_total(conn, wallet_address, item_eff, chain=chain_eff) or 0.0)
+    except Exception:
+        vault_total = 0.0
+    try:
+        reserved = float(_grid_db_reserved_any_variant(conn, wallet_address, item_eff, chain=chain_eff) or 0.0)
+    except Exception:
+        reserved = 0.0
     free = max(0.0, float(vault_total) - float(reserved))
     return {
         "item": item_eff,
