@@ -5675,6 +5675,87 @@ def _grid_item_variants(item_id: str) -> list:
     return vars
 
 
+def _grid_canonical_item_chain(item_id: str, chain: str = "") -> tuple[str, str]:
+    """Return canonical (item_id, chain) for grid DB operations.
+
+    New visible orders are stored as:
+      chain   = POL / BNB / ETH / ...
+      item_id = CHAIN:SYMBOL
+
+    Legacy variants (e.g. item_id='POL') are still read by fallback helpers,
+    but writes should always use this canonical form.
+    """
+    raw_item = str(item_id or "").strip()
+    raw_chain = str(chain or "").strip()
+
+    chain_eff = _grid_chain_key(raw_item, raw_chain) or _normalize_chain_key(raw_chain) or "POL"
+    if not chain_eff:
+        chain_eff = "POL"
+
+    if raw_item and ":" in raw_item:
+        sym = raw_item.split(":", 1)[1].strip().upper()
+    else:
+        sym = raw_item.strip().upper()
+
+    if not sym:
+        sym = chain_eff
+
+    return f"{chain_eff}:{sym}", chain_eff
+
+
+def _grid_db_orders_payload(conn, wallet_address: str, item_id: str, chain: str = "") -> dict:
+    """Authoritative visible grid payload.
+
+    This is the single response shape for UI-visible orders.
+    It intentionally reads orders only from SQLite grid_orders.
+    Runtime sessions may still exist, but they do not decide visible order state.
+    """
+    item_eff, chain_eff = _grid_canonical_item_chain(item_id, chain)
+    orders = _grid_db_list_orders_any_variant(conn, wallet_address, item_eff, chain=chain_eff)
+    for o in orders or []:
+        if isinstance(o, dict):
+            o["item"] = o.get("item") or item_eff
+            o["item_id"] = o.get("item_id") or item_eff
+            o["chain"] = o.get("chain") or chain_eff
+
+    vault_total = _grid_best_vault_total(conn, wallet_address, item_eff, chain=chain_eff)
+    reserved = _grid_db_reserved_any_variant(conn, wallet_address, item_eff, chain=chain_eff)
+    free = max(0.0, float(vault_total) - float(reserved))
+    return {
+        "item": item_eff,
+        "active_item": item_eff,
+        "active_chain": chain_eff,
+        "orders": orders,
+        "vault_total": vault_total,
+        "reserved": reserved,
+        "free": free,
+    }
+
+
+def _grid_refresh_session_orders_from_db(item_id: str, wallet_address: str, chain: str = "") -> Optional[dict]:
+    """Refresh runtime session orders from SQLite before executor/tick usage.
+
+    This keeps SQLite as the authoritative order source while still allowing
+    GRID_SESSIONS to run executor/simulation state.
+    """
+    item_eff, chain_eff = _grid_canonical_item_chain(item_id, chain)
+    sess = _get_owned_session(item_eff, wallet_address)
+    if not isinstance(sess, dict):
+        return None
+    conn = _db()
+    try:
+        db_orders = _grid_db_list_orders_any_variant(conn, wallet_address, item_eff, chain=chain_eff)
+        sess["orders"] = db_orders if isinstance(db_orders, list) else []
+        sess["item"] = item_eff
+        sess["item_id"] = item_eff
+        sess["wallet_address"] = _norm_addr(wallet_address)
+        sess["orders_source"] = "sqlite"
+        _grid_sessions_set(item_eff, _trim_grid_session(sess))
+        return sess
+    finally:
+        conn.close()
+
+
 def _grid_sessions_set(item_id: str, sess: dict) -> None:
     for it in _grid_item_variants(item_id):
         GRID_SESSIONS[it] = sess
@@ -5729,23 +5810,30 @@ def _grid_mark_order_in_sessions(item_id: str, oid: str, status: str, cancelled:
             _grid_sessions_set(it, sess)
 
 def _grid_add_order_to_sessions(item_id: str, order: dict) -> None:
-    """Add a manual order to every compatible in-memory session exactly once."""
+    """Deprecated visible mirror.
+
+    SQLite grid_orders is now the single source of truth for visible orders.
+    Runtime sessions are refreshed from SQLite before execution/tick.
+    Set NEXUS_GRID_LEGACY_SESSION_ORDER_MIRROR=1 only for emergency rollback.
+    """
+    if str(os.getenv("NEXUS_GRID_LEGACY_SESSION_ORDER_MIRROR", "0")).strip().lower() not in ("1", "true", "yes", "on"):
+        for _it, sess in _grid_session_variants(item_id):
+            if isinstance(sess, dict):
+                sess["orders_source"] = "sqlite"
+                sess["orders_db_dirty"] = True
+                _grid_sessions_set(_it, sess)
+        return
+
     oid = str((order or {}).get("id") or (order or {}).get("order_id") or (order or {}).get("orderId") or "")
     if not oid:
         return
     for it, sess in _grid_session_variants(item_id):
         orders = sess.get("orders") if isinstance(sess.get("orders"), list) else []
-        exists = False
-        for o in orders:
-            if not isinstance(o, dict):
-                continue
-            ooid = str(o.get("id") or o.get("order_id") or o.get("orderId") or "")
-            if ooid == oid:
-                exists = True
-                break
+        exists = any(isinstance(o, dict) and str(o.get("id") or o.get("order_id") or o.get("orderId") or "") == oid for o in orders)
         if not exists:
             orders.insert(0, dict(order))
             sess["orders"] = orders
+            sess["orders_source"] = "legacy_session_mirror"
             _trim_grid_session(sess)
             _grid_sessions_set(it, sess)
 
@@ -5810,6 +5898,35 @@ def _grid_db_reserved_any_variant(conn, wallet_address: str, item_id: str, chain
         except Exception:
             continue
     return float(total)
+
+def _grid_db_cancel_open_orders_any_variant(conn, wallet_address: str, item_id: str, chain: str = "") -> int:
+    """Cancel all OPEN visible SQLite orders for an item across compatible variants.
+
+    Used by /api/grid/stop so stopping a grid cannot leave DB-visible orders
+    active while the runtime session is stopped.
+    """
+    wa = _norm_addr(wallet_address)
+    item_eff, chain_eff = _grid_canonical_item_chain(item_id, chain)
+    nowi = int(time.time())
+    total = 0
+    cur = conn.cursor()
+    seen_items = set()
+    for it in _grid_item_variants(item_eff):
+        cand = str(it or "").strip()
+        if cand and ":" not in cand:
+            ck = _grid_chain_key(cand, chain_eff) or chain_eff or "POL"
+            cand = f"{ck}:{cand.upper()}"
+        if not cand or cand in seen_items:
+            continue
+        seen_items.add(cand)
+        cur.execute(
+            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE wallet_address=? AND item_id=? AND (?='' OR chain=?) AND status='OPEN'",
+            (nowi, nowi, wa, cand, chain_eff, chain_eff),
+        )
+        total += max(0, int(cur.rowcount or 0))
+    return total
+
 
 def _hydrate_grid_session_from_db(item_id: str, wa: str) -> Optional[dict]:
     """Rebuild a minimal grid session from DB orders/UI state when RAM session is missing or empty."""
@@ -8850,6 +8967,16 @@ def api_grid_start():
         except Exception:
             pass
 
+        visible_orders = []
+        try:
+            conn_vis = _db()
+            try:
+                visible_orders = (_grid_db_orders_payload(conn_vis, wa, item_id, chain_key_req or _grid_chain_key(item_id) or "POL").get("orders") or [])
+            finally:
+                conn_vis.close()
+        except Exception:
+            visible_orders = []
+
         return jsonify({
             "status": "ok",
             "item": item_id,
@@ -8866,7 +8993,8 @@ def api_grid_start():
                 "unrealized": float(session.get("unrealized_pnl") or 0.0),
                 "total": float(session.get("total_pnl") or 0.0),
             },
-            "orders": session.get("orders", []),
+            "orders": visible_orders,
+            "orders_source": "sqlite",
             "filled_now": int(session.get("filled_now") or 0),
             "fills": session.get("fills", []),
         })
@@ -8900,13 +9028,18 @@ def api_grid_tick():
 
     with _GRID_EXEC_LOCK:
         item_id = str(item_id).strip()
+        item_id, chain_eff = _grid_canonical_item_chain(item_id, (body.get("chain") if request.method != "GET" else request.args.get("chain")) or "")
         wa = _require_auth() or _pick_wallet_from_request()
         if not wa:
             return err("unauthorized", 401)
 
         session = _get_owned_session(item_id, wa)
+        if isinstance(session, dict):
+            session = _grid_refresh_session_orders_from_db(item_id, wa, chain_eff) or session
         if not isinstance(session, dict) or not isinstance(session.get("orders"), list) or len(session.get("orders") or []) == 0:
             session = _hydrate_grid_session_from_db(item_id, wa)
+            if isinstance(session, dict):
+                session = _grid_refresh_session_orders_from_db(item_id, wa, chain_eff) or session
         if not session:
             return err("grid not started (press Start first)", 404)
     
@@ -9052,9 +9185,22 @@ def api_grid_tick():
     except Exception:
         pass
 
+    # Return visible orders from SQLite only, even after execution/tick changed runtime state.
+    visible_orders = []
+    try:
+        _conn_vis = _db()
+        try:
+            visible_orders = (_grid_db_orders_payload(_conn_vis, wa, item_id, chain_eff).get("orders") or [])
+        finally:
+            _conn_vis.close()
+    except Exception:
+        visible_orders = []
+
     return jsonify({
         "status": "ok",
         "item": item_id,
+        "active_item": item_id,
+        "active_chain": chain_eff,
         "tick": int(updated.get("ticks") or 0) if isinstance(updated, dict) else 0,
         "price": float(updated.get("price") or 0) if isinstance(updated, dict) else 0,
         "price_source": price_source_label,
@@ -9068,7 +9214,8 @@ def api_grid_tick():
             "unrealized": float(session.get("unrealized_pnl") or 0),
             "total": float(session.get("total_pnl") or 0),
         },
-        "orders": (updated.get("orders") if isinstance(updated, dict) else []),
+        "orders": visible_orders,
+        "orders_source": "sqlite",
         "filled_now": int(updated.get("filled_now") or 0) if isinstance(updated, dict) else 0,
         "fills": (fills if isinstance(fills, list) else []),
         "note": ("No live price available; tick did not move price." if new_price is None else None),
@@ -9100,8 +9247,18 @@ def api_grid_summary():
     return jsonify({"items": out})
 @app.route("/api/grid/stop", methods=["POST"])
 def api_grid_stop():
-    """Stop a single grid session without deleting its history."""
+    """Stop a grid session, or stop a single order when an order id is provided.
+
+    Backward compatibility: older frontend code may call /api/grid/stop with
+    order_id/id for a single order. In that case delegate to the SQLite-backed
+    single-order stop route instead of stopping the whole session.
+    """
     body = request.get_json(silent=True) or {}
+    if body.get("order_id") or body.get("orderId") or body.get("id") or body.get("oid"):
+        fn = globals().get("api_grid_order_stop")
+        if callable(fn):
+            return fn()
+
     wa = _require_auth()
     if not wa:
         return err("unauthorized", 401)
@@ -9109,12 +9266,12 @@ def api_grid_stop():
     if not item_id:
         return err("missing 'item' in body", 400)
 
-    item_id = str(item_id).strip()
+    item_id, chain_eff = _grid_canonical_item_chain(str(item_id).strip(), body.get("chain") or "")
     try:
         conn_ui = _db()
         try:
             with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id) or "POL"), active_item=item_id)
+                _grid_ui_state_put(conn_ui, wa, active_chain=(chain_eff or _grid_chain_key(item_id) or "POL"), active_item=item_id)
                 conn_ui.commit()
         finally:
             conn_ui.close()
@@ -9144,11 +9301,25 @@ def api_grid_stop():
     session["running"] = False
     _grid_sessions_set(item_id, _trim_grid_session(session))
     try:
-        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, session.get("orders") or [], chain=_grid_chain_key(item_id))
+        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, session.get("orders") or [], chain=chain_eff or _grid_chain_key(item_id))
     except Exception:
         pass
+
+    visible = {"orders": []}
+    try:
+        conn_vis = _db()
+        try:
+            with DB_WRITE_LOCK:
+                _grid_db_cancel_open_orders_any_variant(conn_vis, wa, item_id, chain=chain_eff)
+                conn_vis.commit()
+            visible = _grid_db_orders_payload(conn_vis, wa, item_id, chain_eff)
+        finally:
+            conn_vis.close()
+    except Exception:
+        visible = {"orders": []}
+
     _persist_grid_state()
-    return jsonify({"status": "ok", "item": item_id, "stopped": True, "orders": session.get("orders", []), "ts": now})
+    return jsonify({"status": "ok", "item": item_id, "active_item": item_id, "active_chain": chain_eff, "stopped": True, **visible, "orders_source": "sqlite", "ts": now})
 
 
 
@@ -9335,101 +9506,51 @@ def api_grid_init():
 
 @app.route("/api/grid/orders", methods=["GET"])
 def api_grid_orders():
-    """Return grid orders (SQLite-backed).
+    """Return visible grid orders from SQLite only.
 
-    - If ?item=... is provided: return orders for that item for this wallet.
-    - If no item is provided: return ALL orders across items for this wallet.
-
-    When item is provided we also return: vault_total, reserved, free.
+    SQLite grid_orders is the single source of truth for the UI.
+    GRID_SESSIONS can still hold runtime/tick data, but never decides visible order state.
     """
     wa = _require_auth() or _pick_wallet_from_request()
 
     if not wa:
         item_id = request.args.get("item") or request.args.get("item_id")
         if item_id:
-            item_id = str(item_id).strip()
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "unauthenticated": True, "ts": now_ts()})
+            item_id, chain_eff = _grid_canonical_item_chain(str(item_id).strip(), request.args.get("chain") or "")
+            return jsonify({"status": "ok", "item": item_id, "active_item": item_id, "active_chain": chain_eff, "orders": [], "unauthenticated": True, "ts": now_ts()})
         return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
 
-    item_id = request.args.get("item") or request.args.get("item_id")
-    chain = _normalize_chain_key(request.args.get("chain") or "")
+    item_raw = request.args.get("item") or request.args.get("item_id")
+    chain_raw = request.args.get("chain") or ""
 
     conn = _db()
     try:
-        if item_id:
-            item_id = str(item_id).strip()
-            chain_eff = _grid_chain_key(item_id, chain) or "POL"
-            if item_id and ":" not in item_id:
-                item_id = f"{chain_eff}:{str(item_id).strip().upper()}"
-            if item_id:
-                try:
-                    with DB_WRITE_LOCK:
-                        _grid_ui_state_put(conn, wa, active_chain=chain_eff, active_item=item_id)
-                        conn.commit()
-                except Exception:
-                    pass
-            orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain_eff)
-            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain_eff)
-            reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain_eff)
-            free = max(0.0, float(vault_total) - float(reserved))
-            for o in orders:
-                o["item"] = o.get("item") or item_id
+        if item_raw:
+            item_id, chain_eff = _grid_canonical_item_chain(str(item_raw).strip(), chain_raw)
+            try:
+                with DB_WRITE_LOCK:
+                    _grid_ui_state_put(conn, wa, active_chain=chain_eff, active_item=item_id)
+                    conn.commit()
+            except Exception:
+                pass
+
+            payload = _grid_db_orders_payload(conn, wa, item_id, chain_eff)
             sess = _get_owned_session(item_id, wa)
             return jsonify({
                 "status": "ok",
-                "item": item_id,
-                "active_chain": chain_eff,
-                "active_item": item_id,
-                "orders": orders,
-                "vault_total": vault_total,
-                "reserved": reserved,
-                "free": free,
+                **payload,
                 "tick": int(sess.get("ticks") or 0) if isinstance(sess, dict) else 0,
                 "price": float(sess.get("price") or 0.0) if isinstance(sess, dict) and sess.get("price") is not None else None,
                 "running": bool(sess.get("running")) and not bool(sess.get("stopped")) if isinstance(sess, dict) else False,
+                "orders_source": "sqlite",
                 "ts": now_ts(),
             })
 
+        chain = _normalize_chain_key(chain_raw)
         orders = _grid_db_list_orders(conn, wa, item_id=None, chain=chain)
-        return jsonify({"status": "ok", "orders": orders, "ts": now_ts()})
+        return jsonify({"status": "ok", "orders": orders, "orders_source": "sqlite", "ts": now_ts()})
     finally:
         conn.close()
-
-        return jsonify({"status": "ok", "orders": [], "unauthenticated": True, "ts": now_ts()})
-
-    item_id = request.args.get("item") or request.args.get("item_id")
-
-    if item_id:
-        item_id = str(item_id).strip()
-        session = _get_owned_session(item_id, wa)
-        if not session:
-            return jsonify({"status": "ok", "item": item_id, "orders": [], "ts": now_ts()})
-        orders = session.get("orders") if isinstance(session, dict) else []
-        # ensure item field
-        out=[]
-        for o in (orders or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or item_id
-                out.append(oo)
-        return jsonify({"status":"ok","item": item_id, "orders": out, "ts": now_ts()})
-
-    # all items
-    all_orders=[]
-    for it, sess in (GRID_SESSIONS or {}).items():
-        owner = _norm_addr(sess.get("wallet_address") or "") if isinstance(sess, dict) else ""
-        if owner and owner != _norm_addr(wa):
-            continue
-        if not isinstance(sess, dict):
-            continue
-        for o in (sess.get("orders") or []):
-            if isinstance(o, dict):
-                oo=dict(o)
-                oo["item"]=oo.get("item") or it
-                all_orders.append(oo)
-    return jsonify({"status":"ok","orders": all_orders, "ts": now_ts()})
-
-
 
 @app.route("/api/grid/budgets", methods=["GET"])
 def api_grid_budgets():
@@ -9602,12 +9723,12 @@ def api_grid_order_stop():
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
         return jsonify({"error": "missing item"}), 400
+    item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     side = payload.get("side")
     price = payload.get("price")
     level = payload.get("level")
-    chain = str(payload.get("chain") or "").strip()
     try:
         conn_ui = _db()
         try:
@@ -9633,10 +9754,7 @@ def api_grid_order_stop():
             rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
-        free = max(0.0, float(vault_total) - float(reserved))
+        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
@@ -9644,7 +9762,7 @@ def api_grid_order_stop():
             _refresh_user_insight_profile(wa)
         except Exception:
             pass
-        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
     finally:
         conn.close()
 
@@ -9664,12 +9782,11 @@ def api_grid_order_delete():
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
         return jsonify({"error": "missing item"}), 400
+    item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
-
-    chain = str(payload.get("chain") or "").strip()
     try:
         conn_ui = _db()
         try:
@@ -9690,10 +9807,7 @@ def api_grid_order_delete():
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
-        free = max(0.0, float(vault_total) - float(reserved))
+        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
@@ -9701,7 +9815,7 @@ def api_grid_order_delete():
             _refresh_user_insight_profile(wa)
         except Exception:
             pass
-        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
     finally:
         conn.close()
 
@@ -9726,12 +9840,11 @@ def api_grid_order_resume():
     item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
     if not item_id:
         return jsonify({"error": "missing item"}), 400
+    item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
-
-    chain = str(payload.get("chain") or "").strip()
     try:
         conn_ui = _db()
         try:
@@ -9752,10 +9865,7 @@ def api_grid_order_resume():
             rc = _grid_db_resume_order(conn, wa, item_id, str(oid), chain=chain)
             conn.commit()
 
-        orders = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-        vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-        reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
-        free = max(0.0, float(vault_total) - float(reserved))
+        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
 
         if rc <= 0:
             return jsonify({"error": "order not found"}), 404
@@ -9763,7 +9873,7 @@ def api_grid_order_resume():
             _refresh_user_insight_profile(wa)
         except Exception:
             pass
-        return jsonify({"status": "ok", "item": item_id, "orders": orders, "vault_total": vault_total, "reserved": reserved, "free": free, "ts": now_ts()})
+        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
     finally:
         conn.close()
 
@@ -9876,11 +9986,9 @@ def api_grid_manual_add():
     try:
         payload = request.get_json(silent=True) or {}
         item_id = str(payload.get("item") or payload.get("item_id") or "").strip()
-        chain = _grid_chain_key(item_id, payload.get("chain")) or "POL"
-        if item_id and ":" not in item_id:
-            item_id = f"{chain}:{str(item_id).strip().upper()}"
         if not item_id:
             return jsonify({"error": "missing item"}), 400
+        item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
         side = str(payload.get("side") or "").upper().strip()
         if side not in ("BUY", "SELL"):
@@ -9928,9 +10036,18 @@ def api_grid_manual_add():
         except Exception:
             deadline_i = int(DEFAULT_DEADLINE_MINUTES)
 
-        # Create order
+        # Create order. client_order_id makes retries/double-clicks idempotent when the frontend sends it.
+        client_order_id = str(
+            payload.get("client_order_id")
+            or payload.get("clientOrderId")
+            or payload.get("request_id")
+            or ""
+        ).strip()
+        order_id = client_order_id if client_order_id else str(uuid.uuid4())
+
         order = {
-            "id": str(uuid.uuid4()),
+            "id": order_id,
+            "client_order_id": client_order_id or order_id,
             "side": side,
             "price": round(price_f, 12),
             "qty": round(qty_f, 12),
@@ -9943,8 +10060,6 @@ def api_grid_manual_add():
         }
 
         # Persist to DB (authoritative)
-        chain = _grid_chain_key(item_id, payload.get("chain")) or "POL"
-
         db_saved = True
         db_error = None
         conn = _db()
@@ -9962,7 +10077,8 @@ def api_grid_manual_add():
         finally:
             conn.close()
 
-        # Optional: mirror into compatible in-memory sessions if they exist (executor may use it)
+        # Do not mirror the order as a second visible truth. Mark runtime sessions dirty only;
+        # the executor refreshes orders from SQLite before ticking.
         _grid_add_order_to_sessions(item_id, order)
         _persist_grid_state()
 
@@ -9975,12 +10091,11 @@ def api_grid_manual_add():
                     conn.commit()
             except Exception:
                 pass
-            orders_db = _grid_db_list_orders_any_variant(conn, wa, item_id=item_id, chain=chain)
-            vault_total = _grid_best_vault_total(conn, wa, item_id, chain=chain)
-            reserved = _grid_db_reserved_any_variant(conn, wa, item_id, chain=chain)
-            if not reserved:
-                reserved = _grid_db_reserved(conn, wa, item_id, chain="")
-            free = max(0.0, float(vault_total) - float(reserved))
+            visible = _grid_db_orders_payload(conn, wa, item_id, chain)
+            orders_db = visible.get("orders") or []
+            vault_total = visible.get("vault_total", 0.0)
+            reserved = visible.get("reserved", 0.0)
+            free = visible.get("free", 0.0)
             try:
                 conn.commit()
             except Exception:
@@ -10003,6 +10118,7 @@ def api_grid_manual_add():
             "db_error": db_error,
             "saved_item_id": item_id,
             "saved_chain": chain,
+            "orders_source": "sqlite",
             "orders_count": len(orders_db or []),
             "ts": now_ts(),
         })
