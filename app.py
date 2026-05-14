@@ -9709,11 +9709,11 @@ def api_grid_budgets_by_chain():
 
 @app.route("/api/grid/order/stop", methods=["POST"])
 def api_grid_order_stop():
-    """Stop (cancel) a single order (SQLite-backed).
+    """Fast-path stop/cancel for a single visible SQLite order.
 
-    Works even if the grid session is not running.
-    Accepts:
-      {item, id} OR {item, orderId/order_id} OR {item, side, price, level}
+    Important: this endpoint intentionally does NOT rebuild vault/order summaries,
+    refresh insight profiles, persist GRID_SESSIONS, or walk runtime session state.
+    The UI reloads /api/grid/orders after the action.
     """
     wa = _require_auth()
     if not wa:
@@ -9726,54 +9726,36 @@ def api_grid_order_stop():
     item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
-    side = payload.get("side")
-    price = payload.get("price")
-    level = payload.get("level")
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
-
-    # Update RAM session if present (fast UI feedback) across all compatible item variants
-    if oid is not None and str(oid).strip() != "":
-        _grid_mark_order_in_sessions(item_id, str(oid), "CANCELLED", cancelled=True)
-
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
-    # Authoritative DB update
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
+            try:
+                _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+            except Exception:
+                pass
             conn.commit()
-
-        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
-
         if rc <= 0:
-            return jsonify({"error": "order not found"}), 404
-        try:
-            _refresh_user_insight_profile(wa)
-        except Exception:
-            pass
-        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
+            return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
+        return jsonify({
+            "status": "ok",
+            "action": "stopped",
+            "order_id": str(oid),
+            "item": item_id,
+            "chain": chain,
+            "orders_source": "sqlite",
+            "fast_path": True,
+            "ts": now_ts(),
+        })
     finally:
         conn.close()
 
 @app.route("/api/grid/order/delete", methods=["POST", "DELETE"])
 def api_grid_order_delete():
-    """Permanently delete a single order (SQLite-backed).
-
-    Works even if the grid session is not running.
-    Accepts:
-      {item, id} OR {item, orderId/order_id}
-    """
+    """Fast-path hard delete for a single visible SQLite order."""
     wa = _require_auth()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
@@ -9787,51 +9769,36 @@ def api_grid_order_delete():
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
-
-    # Remove from RAM sessions if present across all compatible item variants
-    _grid_remove_order_from_sessions(item_id, str(oid))
 
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
+            try:
+                _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+            except Exception:
+                pass
             conn.commit()
-
-        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
-
         if rc <= 0:
-            return jsonify({"error": "order not found"}), 404
-        try:
-            _refresh_user_insight_profile(wa)
-        except Exception:
-            pass
-        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
+            return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
+        return jsonify({
+            "status": "ok",
+            "action": "deleted",
+            "order_id": str(oid),
+            "item": item_id,
+            "chain": chain,
+            "orders_source": "sqlite",
+            "fast_path": True,
+            "ts": now_ts(),
+        })
     finally:
         conn.close()
-
-
-
 
 @app.route("/api/grid/order/resume", methods=["POST"])
 @app.route("/api/grid/order/start", methods=["POST"])
 @app.route("/api/grid/order/restart", methods=["POST"])
 def api_grid_order_resume():
-    """Resume a previously stopped/cancelled order (SQLite-backed).
-
-    Works even if the grid session is not running.
-    Accepts:
-      {item, id} OR {item, orderId/order_id}
-    """
+    """Fast-path resume for a single visible SQLite order."""
     wa = _require_auth()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
@@ -9845,38 +9812,30 @@ def api_grid_order_resume():
     oid = payload.get("id") or payload.get("orderId") or payload.get("order_id") or payload.get("oid")
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
-    try:
-        conn_ui = _db()
-        try:
-            with DB_WRITE_LOCK:
-                _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
-                conn_ui.commit()
-        finally:
-            conn_ui.close()
-    except Exception:
-        pass
-
-    # Update RAM session if present (fast UI feedback) across all compatible item variants
-    _grid_mark_order_in_sessions(item_id, str(oid), "OPEN", cancelled=False)
 
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             rc = _grid_db_resume_order(conn, wa, item_id, str(oid), chain=chain)
+            try:
+                _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+            except Exception:
+                pass
             conn.commit()
-
-        visible = _grid_db_orders_payload(conn, wa, item_id, chain)
-
         if rc <= 0:
-            return jsonify({"error": "order not found"}), 404
-        try:
-            _refresh_user_insight_profile(wa)
-        except Exception:
-            pass
-        return jsonify({"status": "ok", **visible, "orders_source": "sqlite", "ts": now_ts()})
+            return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
+        return jsonify({
+            "status": "ok",
+            "action": "resumed",
+            "order_id": str(oid),
+            "item": item_id,
+            "chain": chain,
+            "orders_source": "sqlite",
+            "fast_path": True,
+            "ts": now_ts(),
+        })
     finally:
         conn.close()
-
 
 @app.route("/api/grid/order/cancel", methods=["POST"])
 def api_grid_order_cancel_alias():
@@ -10077,49 +10036,32 @@ def api_grid_manual_add():
         finally:
             conn.close()
 
-        # Do not mirror the order as a second visible truth. Mark runtime sessions dirty only;
-        # the executor refreshes orders from SQLite before ticking.
-        _grid_add_order_to_sessions(item_id, order)
-        _persist_grid_state()
-
-        # Return DB view
-        conn = _db()
+        # Fast path: do not mirror into GRID_SESSIONS, do not persist runtime state,
+        # do not rebuild vault/order summaries, and do not refresh insight profiles here.
+        # The UI reloads /api/grid/orders after the action; executor/tick refreshes
+        # runtime orders from SQLite when needed.
         try:
+            conn_ui = _db()
             try:
                 with DB_WRITE_LOCK:
-                    _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or "POL"), active_item=item_id)
-                    conn.commit()
-            except Exception:
-                pass
-            visible = _grid_db_orders_payload(conn, wa, item_id, chain)
-            orders_db = visible.get("orders") or []
-            vault_total = visible.get("vault_total", 0.0)
-            reserved = visible.get("reserved", 0.0)
-            free = visible.get("free", 0.0)
-            try:
-                conn.commit()
-            except Exception:
-                pass
-        finally:
-            conn.close()
-
-        try:
-            _refresh_user_insight_profile(wa)
+                    _grid_ui_state_put(conn_ui, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
+                    conn_ui.commit()
+            finally:
+                conn_ui.close()
         except Exception:
             pass
+
         return jsonify({
             "status": "ok",
+            "action": "added",
             "order": order,
-            "orders": orders_db,
-            "vault_total": vault_total,
-            "reserved": reserved,
-            "free": free,
+            "order_id": order_id,
             "db_saved": db_saved,
             "db_error": db_error,
             "saved_item_id": item_id,
             "saved_chain": chain,
             "orders_source": "sqlite",
-            "orders_count": len(orders_db or []),
+            "fast_path": True,
             "ts": now_ts(),
         })
 
