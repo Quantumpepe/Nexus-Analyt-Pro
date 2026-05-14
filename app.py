@@ -10015,6 +10015,10 @@ def api_grid_manual_add():
         ).strip()
         order_id = client_order_id if client_order_id else str(uuid.uuid4())
 
+        source = str(payload.get("source") or payload.get("origin") or "MANUAL").upper().strip()
+        if source not in ("MANUAL", "GRID", "ROTATION", "TRADING", "STRATEGIST"):
+            source = "MANUAL"
+
         order = {
             "id": order_id,
             "client_order_id": client_order_id or order_id,
@@ -10024,7 +10028,10 @@ def api_grid_manual_add():
             "slippage": slip_f,
             "deadline": deadline_i,
             "status": "OPEN",
-            "source": "MANUAL",
+            "source": source,
+            "origin_module": str(payload.get("origin_module") or source.lower()).strip(),
+            "session_id": str(payload.get("session_id") or "").strip(),
+            "strategy_id": str(payload.get("strategy_id") or "").strip(),
             "ts": int(time.time()),
             "level": payload.get("level", None),  # optional
         }
