@@ -9929,6 +9929,149 @@ def api_grid_autorun():
     return jsonify({"status": "ok", "item": item_id, "autorun": True, "interval": interval})
 
 
+
+
+def _nexus_funding_resolver_report(body: dict, wallet: str) -> dict:
+    """Resolve whether an order has enough direct funding and suggest swap sources.
+
+    Safe mode only: this does not execute swaps. It reports when the target/direct
+    asset balance is insufficient and lists alternative assets that could fund a
+    later Vault swap after explicit user approval.
+    """
+    body = body if isinstance(body, dict) else {}
+    wa = _norm_addr(wallet or body.get("wallet") or body.get("wallet_address") or "")
+    chain = _normalize_chain_key(body.get("chain") or body.get("network") or "POL")
+    cid = int((_CHAIN_ID_BY_KEY or {}).get(chain, 0) or 0)
+    item_id, chain = _grid_canonical_item_chain(body.get("item") or body.get("item_id") or chain, chain)
+    symbol = str(item_id.split(":", 1)[1] if ":" in item_id else item_id).upper().strip()
+    side = str(body.get("side") or "BUY").upper().strip()
+
+    price = _safe_float(body.get("price") or body.get("priceUsd") or body.get("price_usd") or 0)
+    qty = _safe_float(body.get("qty") or body.get("amount") or 0)
+    amount_usd = _safe_float(body.get("amountUsd") or body.get("amount_usd") or body.get("budgetUsd") or body.get("budget_usd") or 0)
+    if amount_usd <= 0 and price > 0 and qty > 0:
+        amount_usd = price * qty
+
+    native_px = _safe_float(body.get("nativePriceUsd") or body.get("native_price_usd") or body.get("chainNativeUsd") or 0)
+    native_required = qty if symbol == chain and qty > 0 else (amount_usd / native_px if amount_usd > 0 and native_px > 0 else 0.0)
+
+    out = {
+        "status": "ok",
+        "funding_required": False,
+        "requires_user_approval": False,
+        "chain": chain,
+        "chainId": cid,
+        "symbol": symbol,
+        "side": side,
+        "amountUsd": round(float(amount_usd or 0), 6),
+        "requiredNative": round(float(native_required or 0), 12),
+        "directAsset": chain,
+        "directAvailable": 0.0,
+        "directAvailableUsd": 0.0,
+        "shortageNative": 0.0,
+        "shortageUsd": 0.0,
+        "suggestions": [],
+        "message": "Direct funding looks sufficient.",
+        "ts": now_ts(),
+    }
+
+    if not _looks_like_evm_addr(wa) or cid <= 0 or amount_usd <= 0:
+        out.update({"status": "unknown", "message": "Funding check unavailable."})
+        return out
+
+    # Direct funding source today is the wallet-bound Vault native balance for the selected chain.
+    direct_native = 0.0
+    try:
+        vstate = _vault_state_read(wa, chain)
+        direct_native = _safe_float(vstate.get("vault_balance") or 0)
+    except Exception:
+        # Avoid blocking UX if RPC/vault read is unavailable.
+        direct_native = 0.0
+
+    direct_usd = direct_native * native_px if native_px > 0 else 0.0
+    out["directAvailable"] = round(float(direct_native), 12)
+    out["directAvailableUsd"] = round(float(direct_usd), 6)
+
+    enough = False
+    if native_required > 0:
+        enough = direct_native + 1e-12 >= native_required
+    elif amount_usd > 0 and native_px > 0:
+        enough = direct_usd + 1e-9 >= amount_usd
+
+    if enough:
+        return out
+
+    shortage_native = max(0.0, native_required - direct_native) if native_required > 0 else 0.0
+    shortage_usd = max(0.0, amount_usd - direct_usd) if amount_usd > 0 else 0.0
+    if shortage_usd <= 0 and shortage_native > 0 and native_px > 0:
+        shortage_usd = shortage_native * native_px
+    out["funding_required"] = True
+    out["requires_user_approval"] = True
+    out["shortageNative"] = round(float(shortage_native), 12)
+    out["shortageUsd"] = round(float(shortage_usd), 6)
+
+    suggestions = []
+    # Same-chain wallet native as a possible top-up source.
+    try:
+        raw = _rpc_call(cid, "eth_getBalance", [wa, "latest"])
+        wallet_native = _hex_to_int(raw or "0x0") / 1e18
+        wallet_native_usd = wallet_native * native_px if native_px > 0 else 0.0
+        if wallet_native > 0 and (shortage_native <= 0 or wallet_native + 1e-12 >= shortage_native):
+            suggestions.append({
+                "asset": chain,
+                "type": "native_wallet",
+                "balance": round(float(wallet_native), 12),
+                "balanceUsd": round(float(wallet_native_usd), 6),
+                "action": "deposit_or_swap_to_vault",
+                "label": f"Use wallet {chain}",
+            })
+    except Exception:
+        pass
+
+    # Same-chain stables as swap funding sources.
+    for stable_sym, addr_map in (("USDC", _USDC_BY_CHAIN), ("USDT", _USDT_BY_CHAIN)):
+        try:
+            token_addr = str((addr_map or {}).get(cid) or "").strip()
+            if not _looks_like_evm_addr(token_addr):
+                continue
+            bal = _erc20_balance_of_rpc(chain, token_addr, wa)
+            raw_i = int(str(bal.get("balance_raw") or "0"))
+            dec = int(_stable_decimals(cid, stable_sym, token_addr))
+            bal_units = raw_i / (10 ** dec)
+            if bal_units > 0 and (shortage_usd <= 0 or bal_units + 1e-9 >= shortage_usd):
+                suggestions.append({
+                    "asset": stable_sym,
+                    "type": "stable_wallet",
+                    "address": token_addr,
+                    "balance": round(float(bal_units), 6),
+                    "balanceUsd": round(float(bal_units), 6),
+                    "action": "swap_to_target_asset",
+                    "label": f"Swap {stable_sym}",
+                })
+        except Exception:
+            continue
+
+    out["suggestions"] = suggestions[:4]
+    if suggestions:
+        out["status"] = "funding_required"
+        out["message"] = f"Not enough {chain} available. User approval required to fund via another asset."
+    else:
+        out["status"] = "blocked"
+        out["message"] = f"Not enough {chain} available and no suitable same-chain funding asset was found."
+    return out
+
+
+@app.route("/api/nexus/funding/resolve", methods=["POST"])
+def api_nexus_funding_resolve():
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("unauthorized", 401)
+    try:
+        return jsonify(_nexus_funding_resolver_report(body, wa))
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
+
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
     """Add a manual order (OPEN) into an existing grid session.
@@ -10006,6 +10149,17 @@ def api_grid_manual_add():
         except Exception:
             deadline_i = int(DEFAULT_DEADLINE_MINUTES)
 
+        funding_report = _nexus_funding_resolver_report({**payload, "item": item_id, "chain": chain, "price": price_f, "qty": qty_f}, wa)
+        funding_approved = str(payload.get("funding_approved") or payload.get("fundingApproved") or "").strip().lower() in ("1", "true", "yes", "on")
+        if funding_report.get("funding_required") and not funding_approved:
+            return jsonify({
+                "status": "funding_required",
+                "error": "insufficient_direct_funding",
+                "funding": funding_report,
+                "message": funding_report.get("message") or "Funding approval required.",
+                "ts": now_ts(),
+            }), 409
+
         # Create order. client_order_id makes retries/double-clicks idempotent when the frontend sends it.
         client_order_id = str(
             payload.get("client_order_id")
@@ -10032,6 +10186,10 @@ def api_grid_manual_add():
             "origin_module": str(payload.get("origin_module") or source.lower()).strip(),
             "session_id": str(payload.get("session_id") or "").strip(),
             "strategy_id": str(payload.get("strategy_id") or "").strip(),
+            "funding_approved": bool(funding_approved),
+            "funding_source_asset": str(payload.get("funding_source_asset") or payload.get("fundingSourceAsset") or "").upper().strip(),
+            "funding_required": bool(funding_report.get("funding_required")),
+            "funding_shortage_usd": funding_report.get("shortageUsd"),
             "ts": int(time.time()),
             "level": payload.get("level", None),  # optional
         }
