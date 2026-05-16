@@ -13277,6 +13277,8 @@ Answer logic:
 - Focus on controlled allocation, budget slots, reserve logic, READY/WAIT/BLOCKED queue state, risk state, and whether runtime should be active or defensive.
 - If a budget is mentioned, propose a slot split such as 100 / 50 / 50 / 50 only as preparation, not execution.
 - For multiple candidates, assign slots across candidates, not only one symbol: BEST gets first slot, SECONDARY gets waiting slots, AVOID is blocked.
+- Nexus Trading is autonomous after budget approval. Do not ask the user to manually add orders, rebuild queues, or start individual slots.
+- The user's live controls after approval are Pause and Stop only.
 - Never imply the AI can execute outside user-approved limits.
 - No direct buy/sell commands.
 """
