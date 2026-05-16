@@ -15993,7 +15993,7 @@ def api_nexus_fee_policy():
     profit_usd = _safe_float(request.args.get("profitUsd") or request.args.get("profit_usd") or 0)
     stable = str(request.args.get("feeStable") or request.args.get("fee_stable") or "").strip().upper()
     return jsonify({"status": "ok", "chain": chain, "feePolicy": _nexus_fee_preview(profit_usd, chain, stable), "ts": now_ts()})# backend/app.py
-from __future__ import annotations
+
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 
