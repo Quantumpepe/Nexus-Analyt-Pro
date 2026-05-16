@@ -13815,6 +13815,17 @@ NARRATIVE INTELLIGENCE RULES:
   b) pair-relative spread,
   c) general momentum difference.
 - Buttons/actions should only be implied when a setup is actually prepared and useful; otherwise answer without action language.
+- When the user asks whether something is suitable for Nexus Trading, Rotation, or Grid, classify suitability explicitly as HIGH / MEDIUM / LOW.
+- If Nexus Trading is relevant, include compact machine-readable lines when useful so the frontend can prepare a safe setup:
+  Nexus Trading Suitability: HIGH|MEDIUM|LOW
+  Recommended Risk Mode: DEFENSIVE|BALANCED|DYNAMIC
+  Tactical Style: MOMENTUM|ACCUMULATION|RANGE|ROTATION|TACTICAL
+  Runtime Suggestion: 6-24h
+  Max Trades Suggestion: 2-8
+  Max Slippage Suggestion: 0.7-1.5%
+  Tactical Reason: short reason
+  Invalidation: what would weaken the setup
+- These machine-readable lines are preparation hints only, not financial advice and not a direct buy/sell instruction.
 
 INTERNAL DIGEST:
 {json.dumps(strategist_digest, ensure_ascii=False)}
@@ -13852,7 +13863,11 @@ Rules:
 2) Use ONLY the numbers provided in the JSON (do not invent prices, volumes, metrics, scores, or levels).
 3) Provide informational analysis only. No financial advice. No buy/sell instructions.
 4) Do NOT output exact trade entries/exits or prescriptive price levels. If asked, provide an educational template instead.
-5) The app is MANUAL-only: never suggest automatic order placement; focus on manual decision support.
+5) Mode behavior must match Nexus Analyt architecture:
+   - Nexus Grid = manual precision control only.
+   - Nexus Rotation = semi-autonomous opportunity rotation with user influence.
+   - Nexus Trading = autonomous execution preparation after the user approves budget, slots and limits.
+   - Do not suggest extra confirmation layers. Do not present Nexus Trading as manual-only.
 6) Timeframe integrity is mandatory:
    - requested_timeframe = what the user selected.
    - actual_timeframe_used = what data is truly available.
@@ -14025,6 +14040,10 @@ def api_ai_run():
             ai_signal_context["user_intent"] = body.get("user_intent")
         if body.get("raw_user_question"):
             ai_signal_context["raw_user_question"] = body.get("raw_user_question")
+        if body.get("strategist_intelligence_focus"):
+            ai_signal_context["strategist_intelligence_focus"] = body.get("strategist_intelligence_focus")
+        if body.get("strategist_phase"):
+            ai_signal_context["strategist_phase"] = body.get("strategist_phase")
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
