@@ -12485,13 +12485,33 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
                 price_txt = ""
                 if cheap_px is not None and high_px is not None:
                     price_txt = f" ({cheap_px:g} USD → {high_px:g} USD)"
-                lines.append(f"- {item['symbol']}: günstiger kaufen bei {cheap}, teurer verkaufen/prüfen bei {high}{price_txt}" + (f", Differenz ca. {prem}." if prem else "."))
+
+                net_edge = _estimate_net_edge(ex.get("exchange_premium_pct"))
+                conf = _edge_confidence_label(
+                    ex.get("exchange_premium_pct"),
+                    ex.get("top_exchange_volume_share_pct"),
+                    item.get("liquidity_score")
+                )
+
+                quality = "saubere Rotation"
+                if net_edge < 0.5:
+                    quality = "zu kleiner Netto-Spread"
+                elif net_edge < 1.2:
+                    quality = "schwache Edge"
+                elif net_edge > 8:
+                    quality = "möglicher Spike/Fake-Move"
+
+                lines.append(
+                    f"- {item['symbol']}: günstiger kaufen bei {cheap}, teurer verkaufen/prüfen bei {high}{price_txt}"
+                    + (f", Differenz ca. {prem}." if prem else ".")
+                    + f" Netto-Edge ~{net_edge}% | Confidence: {conf} | Bewertung: {quality}."
+                )
                 any_buy_sell = True
             elif cheap:
                 lines.append(f"- {item['symbol']}: Kaufseite sichtbar bei {cheap}; die Verkaufsseite ist im aktuellen Kontext nicht sauber bestätigt.")
                 any_buy_sell = True
         if not any_buy_sell:
-            lines.append("- Kein sauberer Kaufen-/Verkaufen-Vergleich pro Exchange vorhanden. Die Pair-Rotation unten ist nur relative Stärke, keine bestätigte Arbitrage.")
+            lines.append("- Kein sauberer Kaufen-/Verkaufen-Vergleich pro Exchange vorhanden. Die Pair-Rotation unten ist nur relative Stärke, keine bestätigte Arbitrage oder sichere Edge.")
         lines.append("")
         lines.append("ROTATION / RELATIVER WERT")
         added = 0
@@ -12557,7 +12577,27 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
             price_txt = ""
             if cheap_px is not None and high_px is not None:
                 price_txt = f" ({cheap_px:g} USD → {high_px:g} USD)"
-            lines.append(f"- {item['symbol']}: cheaper buy side at {cheap}, higher sell/check side at {high}{price_txt}" + (f", difference about {prem}." if prem else "."))
+
+            net_edge = _estimate_net_edge(ex.get("exchange_premium_pct"))
+            conf = _edge_confidence_label(
+                ex.get("exchange_premium_pct"),
+                ex.get("top_exchange_volume_share_pct"),
+                item.get("liquidity_score")
+            )
+
+            quality = "clean rotation"
+            if net_edge < 0.5:
+                quality = "net edge too small"
+            elif net_edge < 1.2:
+                quality = "weak edge"
+            elif net_edge > 8:
+                quality = "possible spike/fake move"
+
+            lines.append(
+                f"- {item['symbol']}: cheaper buy side at {cheap}, higher sell/check side at {high}{price_txt}"
+                + (f", difference about {prem}." if prem else ".")
+                + f" Net edge ~{net_edge}% | Confidence: {conf} | Assessment: {quality}."
+            )
             any_buy_sell = True
         elif cheap:
             lines.append(f"- {item['symbol']}: buy side is visible at {cheap}; the sell side is not cleanly confirmed in the current context.")
@@ -13308,6 +13348,52 @@ def _strategist_market_narrative(digest: dict, lang: str = "en") -> str:
     if lang == "de":
         return f"{sym} zeigt aktuell {phrase}. Der Strategist sollte die Qualität der Teilnahme höher gewichten als reine Preisbewegung."
     return f"{sym} currently shows {phrase}. The Strategist should weight participation quality higher than raw price movement."
+
+
+
+def _edge_confidence_label(spread_pct, volume_share=None, liquidity_score=None):
+    try:
+        s = float(spread_pct or 0)
+    except Exception:
+        s = 0.0
+
+    score = 0
+    if s >= 2:
+        score += 1
+    if s >= 5:
+        score += 1
+    if s >= 10:
+        score += 1
+
+    try:
+        v = float(volume_share or 0)
+        if v >= 15:
+            score += 1
+    except Exception:
+        pass
+
+    try:
+        lq = float(liquidity_score or 0)
+        if lq >= 60:
+            score += 1
+    except Exception:
+        pass
+
+    if score >= 4:
+        return "HIGH"
+    if score >= 2:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _estimate_net_edge(spread_pct, fee_pct=0.45, slippage_pct=0.35):
+    try:
+        gross = float(spread_pct or 0)
+    except Exception:
+        gross = 0.0
+
+    net = gross - fee_pct - slippage_pct
+    return round(net, 2)
 
 
 def _extract_exchange_name(value) -> str:
