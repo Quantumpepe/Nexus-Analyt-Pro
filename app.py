@@ -7301,6 +7301,126 @@ _CG_COMMON_IDS = {
 }
 _CG_SYMBOL_CACHE_TTL_SEC = 24 * 3600
 
+
+# --- CoinGecko Exchange Intelligence (Strategist context) ---
+_CG_EXCHANGE_INTEL_CACHE = {}
+_CG_EXCHANGE_INTEL_TTL_SEC = int(os.getenv("NEXUS_CG_EXCHANGE_INTEL_TTL_SEC", "900"))
+_CG_EXCHANGE_INTEL_MAX_SYMBOLS = int(os.getenv("NEXUS_CG_EXCHANGE_INTEL_MAX_SYMBOLS", "6"))
+_CG_EXCHANGE_INTEL_MAX_TICKERS = int(os.getenv("NEXUS_CG_EXCHANGE_INTEL_MAX_TICKERS", "60"))
+
+
+def _cg_exchange_intelligence_for_coin(coin_id: str, symbol: str = "") -> dict:
+    """Compact /coins/{id}/tickers intelligence for Strategist.
+
+    Detects exchange price premium/discount, volume concentration, spread quality,
+    stale/anomaly flags and trusted ticker quality from CoinGecko.
+    """
+    cid = str(coin_id or "").strip()
+    sym = str(symbol or "").strip().upper()
+    if not cid:
+        return {"status": "missing_coin_id", "symbol": sym, "coin_id": cid}
+    now_f = time.time()
+    hit = _CG_EXCHANGE_INTEL_CACHE.get(cid)
+    if hit and isinstance(hit, tuple) and (now_f - float(hit[0] or 0)) < _CG_EXCHANGE_INTEL_TTL_SEC:
+        cached = dict(hit[1] or {})
+        cached["cached"] = True
+        return cached
+    url = f"{COINGECKO_BASE}/coins/{requests.utils.quote(cid)}/tickers"
+    try:
+        r = requests.get(url, params={"include_exchange_logo":"false","depth":"false","order":"volume_desc","page":"1"}, headers=_cg_headers(), timeout=8)
+        if r.status_code == 429:
+            if hit:
+                cached = dict(hit[1] or {})
+                cached["cached"] = True
+                cached["stale_fallback"] = True
+                return cached
+            return {"status":"rate_limited","symbol":sym,"coin_id":cid,"source":"coingecko_tickers"}
+        r.raise_for_status()
+        data = r.json() or {}
+        raw = data.get("tickers") or []
+        if not isinstance(raw, list): raw = []
+        valid=[]; stale_count=0; anomaly_count=0
+        for t in raw[:max(1,min(_CG_EXCHANGE_INTEL_MAX_TICKERS,100))]:
+            if not isinstance(t, dict): continue
+            market = t.get("market") if isinstance(t.get("market"), dict) else {}
+            cl = t.get("converted_last") if isinstance(t.get("converted_last"), dict) else {}
+            cv = t.get("converted_volume") if isinstance(t.get("converted_volume"), dict) else {}
+            px = _safe_float(cl.get("usd"), 0.0)
+            vol = _safe_float(cv.get("usd"), 0.0)
+            spread_raw = t.get("bid_ask_spread_percentage")
+            spread = None
+            if spread_raw is not None:
+                try:
+                    spread = float(spread_raw)
+                    if not math.isfinite(spread):
+                        spread = None
+                except Exception:
+                    spread = None
+            is_stale = bool(t.get("is_stale")); is_anomaly = bool(t.get("is_anomaly"))
+            stale_count += 1 if is_stale else 0; anomaly_count += 1 if is_anomaly else 0
+            if px <= 0 or vol <= 0 or is_stale or is_anomaly: continue
+            valid.append({
+                "exchange": str(market.get("name") or "Unknown")[:48],
+                "identifier": str(market.get("identifier") or "")[:48],
+                "pair": (str(t.get("base") or "")[:20] + "/" + str(t.get("target") or "")[:20]).strip("/"),
+                "price_usd": round(px, 10),
+                "volume_usd": round(vol, 2),
+                "spread_pct": round(spread, 4) if isinstance(spread,(int,float)) and math.isfinite(spread) else None,
+                "trust_score": str(t.get("trust_score") or ""),
+            })
+        valid.sort(key=lambda x: _safe_float(x.get("volume_usd"),0.0), reverse=True)
+        top=valid[:10]
+        total_vol=sum(_safe_float(x.get("volume_usd"),0.0) for x in valid)
+        cheapest=highest=None; premium=None
+        if valid:
+            cheapest=min(valid, key=lambda x:_safe_float(x.get("price_usd"),0.0))
+            highest=max(valid, key=lambda x:_safe_float(x.get("price_usd"),0.0))
+            min_px=_safe_float(cheapest.get("price_usd"),0.0); max_px=_safe_float(highest.get("price_usd"),0.0)
+            if min_px>0: premium=((max_px-min_px)/min_px)*100.0
+        primary=top[0] if top else None
+        spreads=[]
+        for x in top:
+            if x.get("spread_pct") is None:
+                continue
+            try:
+                sp=float(x.get("spread_pct"))
+                if math.isfinite(sp):
+                    spreads.append(sp)
+            except Exception:
+                pass
+        avg_spread=sum(spreads)/len(spreads) if spreads else None
+        top_share=(_safe_float(primary.get("volume_usd"),0.0)/total_vol*100.0) if primary and total_vol>0 else None
+        if premium is None:
+            interp="No reliable multi-exchange price context available."
+        elif premium>=2.0:
+            interp="Visible exchange price dispersion; liquidity and spread confirmation required."
+        elif premium>=0.7:
+            interp="Small exchange premium/discount exists; useful only if volume and spread confirm it."
+        else:
+            interp="Exchange prices are broadly aligned; no major cross-exchange premium."
+        out={"status":"ok","source":"coingecko_tickers","symbol":sym,"coin_id":cid,
+             "valid_ticker_count":len(valid),"stale_ticker_count":stale_count,"anomaly_ticker_count":anomaly_count,
+             "total_volume_usd_sample":round(total_vol,2),"top_exchange":primary,"cheapest_exchange":cheapest,
+             "highest_exchange":highest,"exchange_premium_pct":round(float(premium),3) if premium is not None and math.isfinite(premium) else None,
+             "avg_top_spread_pct":round(float(avg_spread),4) if avg_spread is not None and math.isfinite(avg_spread) else None,
+             "top_exchange_volume_share_pct":round(float(top_share),2) if top_share is not None and math.isfinite(top_share) else None,
+             "top_tickers":top[:5],"interpretation":interp,"cached":False,"ts":now_ts()}
+        _CG_EXCHANGE_INTEL_CACHE[cid]=(now_f,dict(out))
+        return out
+    except Exception as e:
+        if hit:
+            cached=dict(hit[1] or {}); cached["cached"]=True; cached["stale_fallback"]=True; return cached
+        return {"status":"error","symbol":sym,"coin_id":cid,"error":str(e),"source":"coingecko_tickers","ts":now_ts()}
+
+
+def _build_exchange_intelligence_context(id_map: dict, symbols: list[str]) -> dict:
+    out={}
+    clean=[str(s or "").strip().upper() for s in (symbols or []) if str(s or "").strip()]
+    for sym in clean[:max(1,min(_CG_EXCHANGE_INTEL_MAX_SYMBOLS,10))]:
+        cid=id_map.get(sym) if isinstance(id_map,dict) else None
+        if cid: out[sym]=_cg_exchange_intelligence_for_coin(cid,sym)
+    return out
+
 def _cg_resolve_symbol(symbol: str):
     """Resolve ticker symbol to CoinGecko coin id.
 
@@ -12274,6 +12394,7 @@ def _build_ai_market_context(symbols: list[str], profile: str = "conservative", 
     id_map = _resolve_ids_from_symbols(symbols)
     ids = [id_map.get(sym) for sym in symbols if id_map.get(sym)]
     snaps_by_id = _cg_market_snapshots_batch(ids)
+    exchange_intel_by_symbol = _build_exchange_intelligence_context(id_map, symbols)
 
     coins = []
     for sym in symbols:
@@ -12288,6 +12409,14 @@ def _build_ai_market_context(symbols: list[str], profile: str = "conservative", 
             "volume24h": snap.get("volume24h"),
             "source": snap.get("source"),
         }
+
+        # Exchange intelligence (CoinGecko tickers): price dispersion, volume concentration, spread quality.
+        try:
+            exi = exchange_intel_by_symbol.get(sym) if isinstance(exchange_intel_by_symbol, dict) else None
+            if isinstance(exi, dict) and exi:
+                item["exchange_intelligence"] = exi
+        except Exception:
+            pass
 
         # Trading suitability (always safe/informational)
         try:
@@ -12305,7 +12434,7 @@ def _build_ai_market_context(symbols: list[str], profile: str = "conservative", 
                 pass
 
         # Market Condition (Overextension + RVOL)
-        # This feeds AI Insight / Nexus Strategist as behavior context:
+        # This feeds AI Insight / AI Analyst as behavior context:
         #   OE high + RVOL weak  -> weak/fake move risk
         #   OE high + RVOL strong -> volume-backed breakout
         #   OE low + RVOL strong  -> early accumulation / volume build
@@ -12440,51 +12569,50 @@ def _ai_kind_instructions(kind: str) -> str:
 
     if k in ("research", "market_research", "quick_overview", "overview"):
         return (
-            "Nexus Strategist mode: Research. Understand natural user language and translate simple phrases like "
-            "cheap/expensive, günstig/teuer, where to rotate, better exchange, stronger coin, weak coin, or where is more activity "
-            "into relative-value, rotation, exchange-spread, liquidity, volume, momentum, and market-behavior analysis. "
-            "Focus on what deserves research attention and why, using only provided context."
+            "AI Analyst mode: Research. Identify rotation, relative strength, watchlist changes, market themes, "
+            "unusual volume/momentum conditions, and discovery candidates. Do NOT repeat AI Insight sections. "
+            "Focus on what deserves research attention and why."
         )
 
     if k in ("strategy_builder", "strategy", "builder", "grid_plan", "grid", "plan"):
         return (
-            "Nexus Strategist mode: Strategy Builder. Turn the user's idea and selected context into an educational strategy framework: "
+            "AI Analyst mode: Strategy Builder. Turn the user's idea and selected context into an educational strategy framework: "
             "setup thesis, filters, entry/exit rules as logic only, risk controls, invalidation logic, alert conditions, and failure regimes. "
             "Do NOT give direct financial advice and do NOT output exact buy/sell price levels."
         )
 
     if k in ("backtest_review", "backtest", "review"):
         return (
-            "Nexus Strategist mode: Backtest Review. Evaluate robustness, drawdown behavior, expectancy quality, regime dependency, "
+            "AI Analyst mode: Backtest Review. Evaluate robustness, drawdown behavior, expectancy quality, regime dependency, "
             "parameter sensitivity, overfitting risk, and where the strategy is likely to fail. If no backtest table is provided, "
             "explain what must be checked and use available context only."
         )
 
     if k in ("pine_tradingview", "pine", "tradingview", "pine_script"):
         return (
-            "Nexus Strategist mode: TradingView / Pine. Help create, explain, debug, or improve Pine Script indicators, strategies, "
+            "AI Analyst mode: TradingView / Pine. Help create, explain, debug, or improve Pine Script indicators, strategies, "
             "and alert logic. Keep outputs educational and code-focused when requested. Never claim code was backtested unless results are provided."
         )
 
     if k in ("daily_report", "report", "daily"):
         return (
-            "Nexus Strategist mode: Daily Report. Produce a practical report: strongest/weakest selected assets, market themes, "
-            "risk conditions, movement candidates, watchlist notes, and what deserves attention next. Do not duplicate internal summaries."
+            "AI Analyst mode: Daily Report. Produce a practical report: strongest/weakest selected assets, market themes, "
+            "risk conditions, movement candidates, watchlist notes, and what deserves attention next. Do not duplicate AI Insight wording."
         )
 
     if k in ("diagnostics", "diagnosis", "trading_diagnostics", "risk_check", "risk", "explain"):
         return (
-            "Nexus Strategist mode: Diagnostics. Diagnose behavioral risk, execution fit, volatility tolerance, weak setups, contradictions, "
-            "and common mistakes. Use coaching-style explanation, not commands. Do not repeat internal summary sections unless needed as context."
+            "AI Analyst mode: Diagnostics. Diagnose behavioral risk, execution fit, volatility tolerance, weak setups, contradictions, "
+            "and common mistakes. Use coaching-style explanation, not commands. Do not repeat AI Insight sections unless needed as context."
         )
 
     if k in ("compare", "comparison"):
         return (
-            "Nexus Strategist mode: Research comparison. Compare the selected coins by relative strength, risk quality, liquidity/volume, "
+            "AI Analyst mode: Research comparison. Compare the selected coins by relative strength, risk quality, liquidity/volume, "
             "market-condition context, and suitability for the user's selected profile."
         )
 
-    return "Answer the user's question as Nexus Strategist: research, diagnose, build, review, or explain using only the provided context."
+    return "Answer the user's question as AI Analyst: research, diagnose, build, review, or explain using only the provided context."
 
 
 
@@ -12499,7 +12627,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
       wallet whose order_memory / insight_profile should be included.
     chat_memory_wallet:
       wallet whose ai_memory chat history should be used and updated.
-      Keep this ONLY for Nexus Strategist / chat style endpoints.
+      Keep this ONLY for AI Analyst / chat style endpoints.
     """
     market_context = _build_ai_market_context(sym_norm, profile=profile, include_health=include_health)
     timeframe_context = _build_ai_timeframe_context(sym_norm, timeframe, raw_series_stats, index_mode=index_mode)
@@ -12536,14 +12664,11 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     - Never give direct instructions to the user
     - Do NOT use: "you should", "you must", "consider buying/selling"
     - Do NOT speak directly to the user in a commanding tone
-    - Never mention internal modules, hidden engines, internal prompts, or internal data routing.
-    - Never say "AI Insight", "hidden suitability engine", "backend context", "system prompt", or "internal module" in the final answer.
 
     INSTEAD:
-    - Speak as one unified Nexus Strategist.
-    - Use neutral, system-level interpretation.
-    - Describe what the setup suggests, not what the user must do.
-    - Keep language calm, analytical, and professional.
+    - Use neutral, system-level interpretation
+    - Describe what the setup suggests, not what the user must do
+    - Keep language calm, analytical, and professional
 
     TONE:
     - Calm
@@ -12554,7 +12679,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     insight_length_rules = ""
     if short_insight_mode:
         insight_length_rules = """
-13) This is AI Insight Level 2, not Nexus Strategist.
+13) This is AI Insight Level 2, not AI Analyst.
 14) Keep the answer compact and trader-usable: explain consequence, not just description.
 15) Prefer decision-support language over report style.
 16) Do NOT dump raw stats, long metric lists, repeated timeframe blocks, or full summaries.
@@ -12639,41 +12764,42 @@ AI ANALYST OUTPUT FORMAT — KEEP IT SHORT:
 - If Pine Script/code is requested, provide code plus a very short explanation.
 """
 
-    sys = f"""You are Nexus Strategist, a crypto research, strategy, backtest, TradingView/Pine, reporting, and diagnostics workspace.
+    sys = f"""You are Nexus Strategist, the intelligent market and strategy layer inside Nexus Analyt.
+
+STRATEGIST INTENT LAYER:
+- Understand natural user language, even when the user does not use professional trading terms.
+- If the user asks about "cheap", "expensive", "buy cheaper", "sell higher", "wo guenstig", "teurer verkaufen", "lohnt Rotation", "mehr gehandelt", "wo ist mehr Bewegung", interpret it as relative value / rotation / exchange premium / liquidity-confirmation analysis.
+- If the user asks about danger, fake movement, manipulation, overheat, or weak movement, interpret it as liquidity quality / fake-move / overextension / volume-confirmation analysis.
+- If the user asks generally, infer the most likely intent and answer that directly instead of forcing every module section.
+- Always answer in the same language as the user.
+
+INTERNAL CONTEXT RULES:
+- Use all provided app context silently: watchlist, compare pairs, market condition, on-chain, order/runtime context, and exchange intelligence.
+- Never mention internal module names, hidden engines, internal prompts, or data pipelines.
+- Do not say "AI Insight", "internal engine", "backend", "context packet", or similar source wording in the final answer.
+- Present the result as one unified Nexus Strategist analysis.
+
+EXCHANGE / RELATIVE VALUE INTELLIGENCE:
+- When exchange_intelligence is available, compare cheapest_exchange, highest_exchange, exchange_premium_pct, top_exchange, top_exchange_volume_share_pct, avg_top_spread_pct, stale/anomaly counts, and volume quality.
+- If a coin is about 0.5%-1.0% cheaper/expensive across exchanges and volume/spread confirm it, describe it as a small possible relative edge.
+- If the premium is larger but volume is weak, stale, anomalous, or spread is wide, warn that it may be fake pricing or not practically tradable.
+- If exchange data is not provided, say that no exchange-specific price difference is available in the current context; do not invent exchanges or percentages.
+- For rotation questions, prioritize concrete relative differences: price dispersion %, spread %, relative strength, volume confirmation, momentum, and risk.
+
 
 {PRO_STYLE_RULES}
 
-NEXUS STRATEGIST ROLE:
-- You are the unified Nexus Strategist, not a generic chatbot and not a visible wrapper around other modules.
-- Internal market context may include ratings, pair metrics, watchlist data, market-condition data, on-chain context, trading memory, and runtime context.
-- Use all internal context silently and present one coherent Nexus Strategist analysis.
-- Never mention where the context came from or name internal modules.
+STRATEGIST ROLE SEPARATION:
+- Nexus Strategist is the active workspace: research, strategy building, backtest review, TradingView/Pine help, daily reports, and diagnostics.
+- Use compact market interpretation data only as hidden support.
+- Do not repeat fixed internal section names unless they are truly useful for the user question.
 - Prefer tool-like, practical outputs: frameworks, checks, diagnostics, report sections, strategy rules, Pine logic, and questions to validate.
 
 {analyst_concise_rules}
 {insight_length_rules}
 
-STRATEGIST INTENT RECOGNITION (CRITICAL):
-- The user may ask in simple everyday language without trading terms.
-- Interpret intent before choosing the answer format.
-- Examples:
-  * "wo billig kaufen und teuer verkaufen", "günstig kaufen", "teurer verkaufen", "where is it cheaper" => Relative value / rotation / exchange-spread analysis.
-  * "welcher Coin ist besser", "wo lohnt Rotation", "was tauschen" => rotation suitability and relative-strength analysis.
-  * "wo ist mehr Bewegung", "wo wird öfter gehandelt" => volume, liquidity, participation and activity comparison.
-  * "was ist überteuert", "was ist günstig" => overextension, relative weakness/strength, spread and risk-quality comparison.
-  * "wirkt fake", "gefährlich", "manipuliert" => fake-move, trap, liquidity and weak-confirmation analysis.
-- If the user asks for cheap/expensive across exchanges, compare provided exchange prices, spread percent, volume/liquidity and activity quality.
-- If exchange data is missing, say that exchange-level data is not available in the provided context, then use available pair/watchlist/context data instead.
-- When data supports it, state concrete relative differences using provided numbers, e.g. "about 1.2% higher" or "spread is 0.8%".
-- If the edge is too small or not confirmed by volume/liquidity, say that the rotation/price advantage is weak or not clean.
-- Do not force all sections. Answer the actual intent first.
-- Never invent exchange prices, spreads, volume, liquidity, or percentages.
-- Do not give direct buy/sell commands; use phrases like "would favor", "appears stronger", "looks cheaper relative to", "no clean edge".
-
 Rules:
 0) Always respond in the same language as the user's question. If the user mixes languages, use the dominant one.
-0b) Understand natural language intent first. Simple phrases like cheap/expensive, günstig/teuer, where to rotate, better exchange, more activity, or stronger coin mean relative-value, rotation, exchange-spread, liquidity, volume and momentum analysis.
-0c) Never mention internal modules, hidden engines, internal prompts, or internal data routing. Present one unified Nexus Strategist analysis.
 1) Use ONLY the symbols present in the provided JSON context.
 2) Use ONLY the numbers provided in the JSON (do not invent prices, volumes, metrics, scores, or levels).
 3) Provide informational analysis only. No financial advice. No buy/sell instructions.
@@ -12690,7 +12816,7 @@ Rules:
 8) Do NOT infer missing 30D values from 90D snapshots or 24h data.
 9) If wallet-specific order_memory or insight_profile is present, use it only to describe the user's observed setup style, structure, and risk posture.
 10) Never tell the user they must change, place, remove, or move an order. Do not use imperative trading language such as "you must", "set", "buy now", or "sell now".
-11) Never mix Nexus Strategist chat memory with AI Insight order memory. If order_memory / insight_profile are present, treat them as wallet setup context only, not as a chat transcript.
+11) Never mix AI Analyst chat memory with AI Insight order memory. If order_memory / insight_profile are present, treat them as wallet setup context only, not as a chat transcript.
 12) Do not write as if the user asked for direct instructions. Describe, interpret, compare, and explain only.
 13) When several metrics point in different directions, explain the conflict briefly instead of listing everything.
 14) Prefer interpretation of structure over enumeration of values.
@@ -12720,6 +12846,9 @@ Rules:
 26) Use market_behavior_summary when present as the compact source of truth for behavior interpretation.
 27) Forbidden in the final AI Insight answer: "Votes", "Rating", "CoinGecko", "contract mapping", "Signal context".
 28) Preferred final answer style: one compact behavior paragraph, then Edge/Risk/Setup bias. No data dump.
+29) For rotation / cheap-vs-expensive questions, answer with a clear conclusion first: "Rotation Vorteil vorhanden", "Kein sauberer Vorteil", or the equivalent in the user's language.
+30) When numbers exist, include the relevant percentage difference. If the only available difference is pair spread, say it is a pair/relative spread. If exchange_intelligence exists, say it is an exchange price difference.
+31) Never invent exchange names, exchange-specific prices, premiums, orderbook depth, or arbitrage edges.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -12778,6 +12907,7 @@ Task:
         "insight_memory_used": bool(use_order_memory),
         "has_ai_signal_context": bool(isinstance(extra_context, dict) and extra_context),
         "has_market_condition_context": any(bool((c or {}).get("market_condition")) for c in (market_context.get("coins") or [])),
+        "has_exchange_intelligence": any(bool((c or {}).get("exchange_intelligence")) for c in (market_context.get("coins") or [])),
         "has_ai_engine_v2": bool(ai_engine_v2),
     }
     if ai_engine_v2:
@@ -12785,9 +12915,26 @@ Task:
     return resp, None
 
 
+
+def _symbols_from_ai_context(ctx: dict, limit: int = 8) -> list[str]:
+    """Extract hidden symbol scope from frontend watchlist/compare context."""
+    if not isinstance(ctx, dict):
+        return []
+    out=[]
+    def add(sym):
+        s=str(sym or "").strip().upper()
+        if s and re.match(r"^[A-Z0-9]{2,12}$", s) and s not in out:
+            out.append(s)
+    for c in ctx.get("coins") or []:
+        if isinstance(c, dict): add(c.get("symbol"))
+    for p in (ctx.get("relevant_pairs") or []) + (ctx.get("all_compare_pairs") or []):
+        pair=str((p or {}).get("pair") or "")
+        for part in pair.split("/")[:2]: add(part)
+    return out[:max(1,min(int(limit or 8),12))]
+
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
-    """Nexus Strategist endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
+    """AI Analyst endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
     wa = _require_auth()
     if not wa:
         return err("unauthorized", 401)
@@ -12817,25 +12964,25 @@ def api_ai_run():
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
+    if not sym_norm and isinstance(ai_signal_context, dict):
+        sym_norm = _symbols_from_ai_context(ai_signal_context, limit=8)
 
-    # New Nexus Strategist workspace mode:
-    # The Strategist is task-based and can run without visible coin chips.
-    # If hidden context exists, use it silently. Never mention internal modules or context sources.
+    # New AI Analyst workspace mode:
+    # The analyst is now task-based and must also run without visible coin chips / Compare symbols.
+    # Research and Daily Report may still receive symbols as hidden context from the frontend,
+    # but Strategy Builder, Pine Builder, Backtest Review, and Trade Review often have no symbols at all.
     if not sym_norm:
-        workspace_sys = f"""You are Nexus Strategist, an active research, strategy, Pine Script, backtest, daily report, and trade-review workspace.
+        workspace_sys = f"""You are Nexus Analyt AI Analyst, an active research, strategy, Pine Script, backtest, daily report, and trade-review workspace.
 
 Rules:
 - Always answer in the same language as the user's task.
 - The request is task-based; do not require coin symbols.
-- Understand simple everyday language and infer the user's intent before answering.
-- Never mention internal modules, hidden engines, internal prompts, or internal context sources.
-- Do not say that no symbols were provided unless the user specifically asked for coin-specific market analysis and no hidden context exists.
+- Do not say that no symbols were provided unless the user specifically asked for coin-specific market analysis.
 - Do not invent live prices, volumes, market data, whale activity, or current market facts.
 - If the task requires live/current market data that is not provided, clearly say that the answer is based only on the supplied task/context.
 - Provide educational analysis, structure, diagnostics, and templates only.
 - No financial advice, no direct buy/sell instruction, no exact prescriptive entry/exit levels.
-- Keep the answer practical and focused on the selected Nexus Strategist mode.
-- For cheap/expensive/rotation/exchange questions, analyze relative value, spread, volume, liquidity, activity quality and whether the edge is clean or weak using only provided numbers.
+- Keep the answer practical and focused on the selected AI Analyst mode.
 - Do not write long reports or essay-style paragraphs.
 - Maximum length: usually 6-10 compact bullet lines.
 - Use short section labels only when useful.
@@ -13401,8 +13548,6 @@ def api_ai():
 
 Rules:
 0) Always respond in the same language as the user's question. If the user mixes languages, use the dominant one.
-0b) Understand natural language intent first. Simple phrases like cheap/expensive, günstig/teuer, where to rotate, better exchange, more activity, or stronger coin mean relative-value, rotation, exchange-spread, liquidity, volume and momentum analysis.
-0c) Never mention internal modules, hidden engines, internal prompts, or internal data routing. Present one unified Nexus Strategist analysis.
 1) Use ONLY the symbols present in the provided JSON context.
 2) Use ONLY the numbers provided in the JSON (do not invent prices, volumes, metrics, scores, or levels).
 3) NEVER mention TurboPepe/TBP or any unrelated token unless it appears in context.
