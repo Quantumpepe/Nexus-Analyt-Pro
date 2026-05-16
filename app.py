@@ -13060,6 +13060,40 @@ def _ai_kind_instructions(kind: str) -> str:
 
 
 
+
+def _strategist_is_followup_question(question: str) -> bool:
+    q = str(question or "").strip().lower()
+    if not q:
+        return False
+    return bool(re.search(
+        r"^(und|aber|warum|wieso|wie meinst|was heißt|was heisst|erklär|erklaer|nochmal|weiter|ok|ja|nein|and|but|why|what does|explain|continue|go on|again)\b|"
+        r"\b(das|dieser|diese|diesen|there|that|this|it|same|gleich)\b",
+        q,
+        re.I,
+    ))
+
+
+def _strategist_followup_rule(question: str, intent: str, lang: str) -> str:
+    if not _strategist_is_followup_question(question):
+        return ""
+    if str(lang or "").lower() == "de":
+        return """
+FOLLOW-UP REGEL:
+- Diese Nutzerfrage wirkt wie eine Rückfrage.
+- Behalte den vorherigen Kontext und den zuletzt erkannten Intent bei.
+- Antworte nicht mit einem neuen Vollreport.
+- Erkläre nur den Punkt, nach dem gefragt wurde.
+- Wenn der Nutzer "weiter" sagt, vertiefe die letzte Analyse um eine Ebene: Ursache, Risiko oder nächste Prüfung.
+"""
+    return """
+FOLLOW-UP RULE:
+- This user message looks like a follow-up.
+- Keep the previous context and the last detected intent.
+- Do not create a new full report.
+- Answer only the specific point being asked about.
+- If the user says "continue", deepen the last analysis by one layer: cause, risk, or next check.
+"""
+
 def _strategist_intent_from_payload(question: str, extra_context: dict | None = None) -> str:
     """Strict query router for Nexus Strategist Phase 1.
 
@@ -13448,6 +13482,7 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     response_language = _detect_user_language_from_text(str((extra_context or {}).get("raw_user_question") or question), (extra_context or {}).get("user_language") if isinstance(extra_context, dict) else None)
     language_hard_rule = _language_hard_rule(response_language)
     strategist_intent = _strategist_intent_from_payload(question, extra_context if isinstance(extra_context, dict) else {})
+    strategist_followup_rule = _strategist_followup_rule(str((extra_context or {}).get("raw_user_question") or question), strategist_intent, response_language)
     strategist_profile = _strategist_response_profile(strategist_intent, response_language)
     strategist_digest = _strategist_context_digest(extra_context if isinstance(extra_context, dict) else {})
     strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
@@ -13590,6 +13625,8 @@ STRATEGIST INTENT LAYER:
 
 {strategist_profile}
 
+{strategist_followup_rule}
+
 NARRATIVE INTELLIGENCE RULES:
 - Explain the meaning of the strongest signals before listing numbers.
 - Convert metrics into market behavior: participation quality, relative strength, weak confirmation, overextension, rotation pressure, or liquidity risk.
@@ -13705,6 +13742,7 @@ Task:
         "compare_weights": compare_weights_for_ai,
         "user_intent": strategist_intent,
         "response_profile": strategist_profile,
+        "strategist_followup": bool(strategist_followup_rule),
         "strategist_digest": strategist_digest,
     }
     if ai_engine_v2:
@@ -13750,6 +13788,7 @@ Task:
         "user_intent": strategist_intent,
         "response_language": response_language,
         "has_strategist_digest": bool(strategist_digest),
+        "strategist_followup": bool(strategist_followup_rule),
     }
     if ai_engine_v2:
         resp["ai_engine_v2"] = ai_engine_v2
