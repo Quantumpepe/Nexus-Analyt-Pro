@@ -13111,9 +13111,9 @@ def _strategist_intent_from_payload(question: str, extra_context: dict | None = 
 
     q = str(ctx.get("raw_user_question") or question or "").lower()
 
-    if re.search(r"(arbitrage|spread|exchange|börse|boerse|preisunterschied|price difference|premium|discount|günstig|guenstig|billig|cheaper|teurer|higher|wo.*kaufen|where.*buy|wo.*verkaufen|where.*sell|sell higher|buy cheaper)", q, re.I):
+    if re.search(r"(arbitrage|spread|exchange|börse|boerse|preisunterschied|price difference|premium|discount|günstig|guenstig|billig|cheaper|teurer|higher|wo.*kaufen|where.*buy|wo.*verkaufen|where.*sell|sell higher|buy cheaper|wo.*besser|where.*better|wo.*mehr wert|more expensive there|anderer preis|different price|lohnt|worth it)", q, re.I):
         return "rotation_spread"
-    if re.search(r"(rotation|rotieren|relative\s+stärke|relative strength|weakness|strength|kapitalfluss|capital flow|outperform|underperform)", q, re.I):
+    if re.search(r"(rotation|rotieren|relative\s+stärke|relative strength|weakness|strength|kapitalfluss|capital flow|outperform|underperform|welcher.*stärker|welcher.*staerker|which.*stronger|besserer coin|better coin|stärker als|staerker als|stronger than)", q, re.I):
         return "rotation"
     if re.search(r"(grid|range|seitwärts|seitwaerts|sideways|levels|raster)", q, re.I):
         return "grid"
@@ -13193,7 +13193,7 @@ Answer logic:
 STRICT RESPONSE PROFILE: GENERAL_MARKET_ANALYSIS
 Allowed sections only if useful: Direct assessment, Market read, Risk context, Next check.
 Answer logic:
-- Answer the exact user question first.
+- Answer the exact user question first in one direct sentence.
 - Do not output every Nexus module.
 - Prioritize the 2-3 most important facts and explain their meaning.
 - Use narrative interpretation over raw metric lists.
@@ -13615,6 +13615,13 @@ AI ANALYST OUTPUT FORMAT — KEEP IT SHORT:
 
 STRATEGIST INTENT LAYER:
 - Understand natural user language, even when the user does not use professional trading terms.
+- Translate casual user wording into market intent internally:
+  "wo ist besser" / "where is better" => compare value, liquidity and spread.
+  "lohnt sich das" / "is it worth it" => edge quality and risk/reward quality.
+  "ist das echt" / "is it real" => confirmation quality, fake-move risk and volume participation.
+  "wo mehr gehandelt" / "where traded more" => volume/liquidity bias.
+  "welcher ist stärker" / "which is stronger" => relative strength and rotation.
+  "kann man das nehmen" / "can this be used" => setup quality, not a buy/sell command.
 - If the user asks about "cheap", "expensive", "buy cheaper", "sell higher", "wo guenstig", "teurer verkaufen", "lohnt Rotation", "mehr gehandelt", "wo ist mehr Bewegung", interpret it as relative value / rotation / exchange premium / liquidity-confirmation analysis.
 - If the user asks about danger, fake movement, manipulation, overheat, or weak movement, interpret it as liquidity quality / fake-move / overextension / volume-confirmation analysis.
 - If the user asks generally, infer the most likely intent and answer that directly instead of forcing every module section.
