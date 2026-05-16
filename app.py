@@ -12470,6 +12470,29 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
         else:
             lines.append(f"{top['symbol']} wirkt im aktuellen Kontext am interessantesten, aber es liegt kein sauberer Exchange-Prozentvorteil vor.")
         lines.append("")
+        lines.append("KAUFEN / VERKAUFEN")
+        any_buy_sell = False
+        for item in cands[:3]:
+            ex = item.get("exchange") or {}
+            prem = _fmt_pct_value(ex.get("exchange_premium_pct"))
+            cheap_obj = ex.get("cheapest_exchange") or ex.get("lowest_exchange") or ex.get("cheapest") or ex.get("min_exchange")
+            high_obj = ex.get("highest_exchange") or ex.get("top_exchange") or ex.get("highest") or ex.get("max_exchange")
+            cheap = _extract_exchange_name(cheap_obj)
+            high = _extract_exchange_name(high_obj)
+            cheap_px = _extract_exchange_price(cheap_obj)
+            high_px = _extract_exchange_price(high_obj)
+            if cheap and high:
+                price_txt = ""
+                if cheap_px is not None and high_px is not None:
+                    price_txt = f" ({cheap_px:g} USD → {high_px:g} USD)"
+                lines.append(f"- {item['symbol']}: günstiger kaufen bei {cheap}, teurer verkaufen/prüfen bei {high}{price_txt}" + (f", Differenz ca. {prem}." if prem else "."))
+                any_buy_sell = True
+            elif cheap:
+                lines.append(f"- {item['symbol']}: Kaufseite sichtbar bei {cheap}; die Verkaufsseite ist im aktuellen Kontext nicht sauber bestätigt.")
+                any_buy_sell = True
+        if not any_buy_sell:
+            lines.append("- Kein sauberer Kaufen-/Verkaufen-Vergleich pro Exchange vorhanden. Die Pair-Rotation unten ist nur relative Stärke, keine bestätigte Arbitrage.")
+        lines.append("")
         lines.append("ROTATION / RELATIVER WERT")
         added = 0
         for item in cands[:3]:
@@ -12519,6 +12542,28 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
         lines.append(f"{top['symbol']} stands out in the relative-value context with a relevant pair spread around {pair_spread}.")
     else:
         lines.append(f"{top['symbol']} is the most relevant candidate, but no clean exchange percentage edge is available.")
+    lines += ["", "BUY / SELL"]
+    any_buy_sell = False
+    for item in cands[:3]:
+        ex = item.get("exchange") or {}
+        prem = _fmt_pct_value(ex.get("exchange_premium_pct"))
+        cheap_obj = ex.get("cheapest_exchange") or ex.get("lowest_exchange") or ex.get("cheapest") or ex.get("min_exchange")
+        high_obj = ex.get("highest_exchange") or ex.get("top_exchange") or ex.get("highest") or ex.get("max_exchange")
+        cheap = _extract_exchange_name(cheap_obj)
+        high = _extract_exchange_name(high_obj)
+        cheap_px = _extract_exchange_price(cheap_obj)
+        high_px = _extract_exchange_price(high_obj)
+        if cheap and high:
+            price_txt = ""
+            if cheap_px is not None and high_px is not None:
+                price_txt = f" ({cheap_px:g} USD → {high_px:g} USD)"
+            lines.append(f"- {item['symbol']}: cheaper buy side at {cheap}, higher sell/check side at {high}{price_txt}" + (f", difference about {prem}." if prem else "."))
+            any_buy_sell = True
+        elif cheap:
+            lines.append(f"- {item['symbol']}: buy side is visible at {cheap}; the sell side is not cleanly confirmed in the current context.")
+            any_buy_sell = True
+    if not any_buy_sell:
+        lines.append("- No clean buy/sell exchange comparison is available. The pair rotation below is relative strength only, not confirmed arbitrage.")
     lines += ["", "ROTATION / RELATIVE VALUE"]
     for item in cands[:3]:
         bp = item.get("best_pair") or {}
@@ -13136,17 +13181,21 @@ def _strategist_response_profile(intent: str, lang: str) -> str:
         return """
 STRICT RESPONSE PROFILE: ROTATION_SPREAD_ANALYSIS
 Allowed sections only:
-- German: DIREKTE EINSCHÄTZUNG, ROTATION / RELATIVER WERT, EXCHANGE / SPREAD, RISIKOKONTEXT, NÄCHSTE PRÜFUNG.
-- English: DIRECT VIEW, ROTATION / RELATIVE VALUE, EXCHANGE / SPREAD, RISK CONTEXT, NEXT CHECK.
+- German: DIREKTE EINSCHÄTZUNG, KAUFEN / VERKAUFEN, EXCHANGE / SPREAD, ROTATION / RELATIVER WERT, RISIKOKONTEXT, NÄCHSTE PRÜFUNG.
+- English: DIRECT VIEW, BUY / SELL, EXCHANGE / SPREAD, ROTATION / RELATIVE VALUE, RISK CONTEXT, NEXT CHECK.
 Forbidden unless explicitly requested: Nexus Trading, Nexus Grid, Trading Suitability, Runtime Suggestion, Market Evaluation, full multi-report.
 Answer logic:
 1) First sentence must classify the edge: clean edge / weak edge / watch only.
-2) Explain whether the difference is a real rotation/spread opportunity or only a relative pair spread.
-3) Separate exchange-specific facts from pair/relative spread facts.
-4) Weight the answer by volume quality, liquidity quality, stale/anomaly risk, and spread size.
-5) If exchange prices are missing, say that exchange-specific buy-cheap/sell-high data is not available in the current context.
-6) Do not invent exchange names, prices, depth, orderbook data, or arbitrage execution.
-7) Use at most 5 compact sections and avoid raw metric dumps.
+2) For buy-cheap/sell-higher questions, prioritize COIN -> BUY EXCHANGE -> SELL EXCHANGE -> DIFFERENCE.
+3) Do NOT answer mainly with pairs when the user asks where to buy/sell a coin.
+4) Pair/relative spread is only supporting context after the coin/exchange answer.
+5) Separate exchange-specific facts from pair/relative spread facts.
+6) If cheapest_exchange and highest_exchange exist, name both clearly.
+7) If only cheapest_exchange exists but no sell/highest exchange exists, say that the buy side is visible but the sell side is not confirmed.
+8) Weight the answer by volume quality, liquidity quality, stale/anomaly risk, and spread size.
+9) If exchange prices are missing, say that exchange-specific buy-cheap/sell-high data is not available in the current context.
+10) Do not invent exchange names, prices, depth, orderbook data, or arbitrage execution.
+11) Use at most 5 compact sections and avoid raw metric dumps.
 """
     if intent == "rotation":
         return """
@@ -13260,6 +13309,26 @@ def _strategist_market_narrative(digest: dict, lang: str = "en") -> str:
         return f"{sym} zeigt aktuell {phrase}. Der Strategist sollte die Qualität der Teilnahme höher gewichten als reine Preisbewegung."
     return f"{sym} currently shows {phrase}. The Strategist should weight participation quality higher than raw price movement."
 
+
+def _extract_exchange_name(value) -> str:
+    if isinstance(value, dict):
+        return str(value.get("exchange") or value.get("market") or value.get("name") or value.get("identifier") or "").strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _extract_exchange_price(value):
+    if isinstance(value, dict):
+        for k in ("price", "last", "converted_last_usd", "usd", "value"):
+            try:
+                x = float(value.get(k))
+                if math.isfinite(x):
+                    return x
+            except Exception:
+                pass
+    return None
+
 def _strategist_context_digest(extra_context: dict | None) -> dict:
     """Create compact data digest for the Strategist so it can reason without dumping raw fields."""
     ctx = extra_context if isinstance(extra_context, dict) else {}
@@ -13291,8 +13360,10 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
             "market_condition_state": mc.get("state") or mc.get("label") or "",
             "overextension_pct": nf(mc.get("oe_pct")),
             "rvol": nf(mc.get("rvol")),
-            "exchange_cheapest": ex.get("cheapest_exchange") or ex.get("lowest_exchange") or "",
-            "exchange_highest": ex.get("highest_exchange") or ex.get("top_exchange") or "",
+            "exchange_cheapest": _extract_exchange_name(ex.get("cheapest_exchange") or ex.get("lowest_exchange") or ex.get("cheapest") or ex.get("min_exchange")),
+            "exchange_highest": _extract_exchange_name(ex.get("highest_exchange") or ex.get("top_exchange") or ex.get("highest") or ex.get("max_exchange")),
+            "exchange_cheapest_price": _extract_exchange_price(ex.get("cheapest_exchange") or ex.get("lowest_exchange") or ex.get("cheapest") or ex.get("min_exchange")),
+            "exchange_highest_price": _extract_exchange_price(ex.get("highest_exchange") or ex.get("top_exchange") or ex.get("highest") or ex.get("max_exchange")),
             "exchange_premium_pct": nf(ex.get("exchange_premium_pct") or ex.get("premium_pct") or ex.get("spread_pct")),
             "top_exchange_volume_share_pct": nf(ex.get("top_exchange_volume_share_pct") or ex.get("volume_share_pct")),
             "exchange_warning": ex.get("warning") or ex.get("quality") or "",
