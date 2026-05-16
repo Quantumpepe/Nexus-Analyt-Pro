@@ -12908,6 +12908,239 @@ def _ai_kind_instructions(kind: str) -> str:
 
 
 
+
+def _strategist_intent_from_payload(question: str, extra_context: dict | None = None) -> str:
+    """Strict query router for Nexus Strategist Phase 1.
+
+    The UI can send user_intent, but the backend re-checks the raw user question
+    so long English prompt/context blocks can never override the latest user intent.
+    """
+    ctx = extra_context if isinstance(extra_context, dict) else {}
+    explicit = str(ctx.get("user_intent") or "").strip().lower()
+    allowed = {
+        "rotation_spread", "rotation", "grid", "trading", "risk",
+        "market", "daily_report", "pine", "backtest", "diagnostics", "general"
+    }
+    if explicit in allowed:
+        return explicit
+
+    q = str(ctx.get("raw_user_question") or question or "").lower()
+
+    if re.search(r"(arbitrage|spread|exchange|börse|boerse|preisunterschied|price difference|premium|discount|günstig|guenstig|billig|cheaper|teurer|higher|wo.*kaufen|where.*buy|wo.*verkaufen|where.*sell|sell higher|buy cheaper)", q, re.I):
+        return "rotation_spread"
+    if re.search(r"(rotation|rotieren|relative\s+stärke|relative strength|weakness|strength|kapitalfluss|capital flow|outperform|underperform)", q, re.I):
+        return "rotation"
+    if re.search(r"(grid|range|seitwärts|seitwaerts|sideways|levels|raster)", q, re.I):
+        return "grid"
+    if re.search(r"(trading|autonom|runtime|slot|allocation|budget|position|vault|execute|execution)", q, re.I):
+        return "trading"
+    if re.search(r"(risiko|risk|fake|manipul|gefährlich|gefaehrlich|danger|overheat|überhitzt|ueberhitzt|trap|liquidität|liquidity)", q, re.I):
+        return "risk"
+    if re.search(r"(report|daily|täglich|taeglich|markt|market|overview|überblick|ueberblick)", q, re.I):
+        return "market"
+    return "general"
+
+
+def _strategist_response_profile(intent: str, lang: str) -> str:
+    """Return strict output profile so the model cannot fall back to generic reports."""
+    intent = str(intent or "general").strip().lower()
+    lang = str(lang or "en").strip().lower()
+
+    de = lang == "de"
+    if intent == "rotation_spread":
+        return """
+STRICT RESPONSE PROFILE: ROTATION_SPREAD_ANALYSIS
+Allowed sections only:
+- German: DIREKTE EINSCHÄTZUNG, ROTATION / RELATIVER WERT, EXCHANGE / SPREAD, RISIKOKONTEXT, NÄCHSTE PRÜFUNG.
+- English: DIRECT VIEW, ROTATION / RELATIVE VALUE, EXCHANGE / SPREAD, RISK CONTEXT, NEXT CHECK.
+Forbidden unless explicitly requested: Nexus Trading, Nexus Grid, Trading Suitability, Runtime Suggestion, Market Evaluation, full multi-report.
+Answer logic:
+1) First sentence must classify the edge: clean edge / weak edge / watch only.
+2) Explain whether the difference is a real rotation/spread opportunity or only a relative pair spread.
+3) Separate exchange-specific facts from pair/relative spread facts.
+4) Weight the answer by volume quality, liquidity quality, stale/anomaly risk, and spread size.
+5) If exchange prices are missing, say that exchange-specific buy-cheap/sell-high data is not available in the current context.
+6) Do not invent exchange names, prices, depth, orderbook data, or arbitrage execution.
+7) Use at most 5 compact sections and avoid raw metric dumps.
+"""
+    if intent == "rotation":
+        return """
+STRICT RESPONSE PROFILE: ROTATION_ANALYSIS
+Allowed sections: Direct assessment, Relative strength / rotation, Risk context, Next check.
+Forbidden unless explicitly requested: Grid suitability, Trading execution, Runtime automation.
+Answer logic:
+- Rank the strongest visible rotation candidates by relative strength, momentum quality, and confirmation.
+- Explain why the strongest candidate matters in market-language, not just numbers.
+- Mention conflicts: strong momentum but weak volume, spread without confirmation, overextension risk, or neutral on-chain.
+- No direct buy/sell commands.
+"""
+    if intent == "grid":
+        return """
+STRICT RESPONSE PROFILE: GRID_ANALYSIS
+Allowed sections: Grid fit, Range quality, Risk context, Next check.
+Forbidden unless explicitly requested: Rotation candidates, Nexus Trading automation, exchange arbitrage.
+Answer logic:
+- Judge whether the market looks range-friendly, too directional, too volatile, or too thin.
+- Explain range risk, expansion risk, and invalidation behavior.
+- No automatic order instructions.
+"""
+    if intent == "trading":
+        return """
+STRICT RESPONSE PROFILE: TRADING_ALLOCATION_ANALYSIS
+Allowed sections: Direct assessment, Allocation logic, Risk limits, Next check.
+Forbidden unless explicitly requested: Grid report, exchange arbitrage report.
+Answer logic:
+- Focus on controlled allocation, slots, reserve logic, risk state, and whether runtime should be active or defensive.
+- Never imply the AI can execute outside user-approved limits.
+- No direct buy/sell commands.
+"""
+    if intent == "risk":
+        return """
+STRICT RESPONSE PROFILE: RISK_ANALYSIS
+Allowed sections: Direct assessment, Risk drivers, Confirmation quality, Next check.
+Forbidden unless explicitly requested: Trading preparation, Grid setup, exchange arbitrage.
+Answer logic:
+- Focus on liquidity quality, fake-move risk, overextension, volume confirmation, trap/exhaustion, and invalidation.
+- Explain the most important risk first.
+- No direct buy/sell commands.
+"""
+    return """
+STRICT RESPONSE PROFILE: GENERAL_MARKET_ANALYSIS
+Allowed sections only if useful: Direct assessment, Market read, Risk context, Next check.
+Answer logic:
+- Answer the exact user question first.
+- Do not output every Nexus module.
+- Prioritize the 2-3 most important facts and explain their meaning.
+- Use narrative interpretation over raw metric lists.
+"""
+
+
+def _strategist_context_digest(extra_context: dict | None) -> dict:
+    """Create compact data digest for the Strategist so it can reason without dumping raw fields."""
+    ctx = extra_context if isinstance(extra_context, dict) else {}
+    coins = ctx.get("coins") if isinstance(ctx.get("coins"), list) else []
+    pairs = ctx.get("relevant_pairs") if isinstance(ctx.get("relevant_pairs"), list) else []
+    all_pairs = ctx.get("all_compare_pairs") if isinstance(ctx.get("all_compare_pairs"), list) else []
+
+    def nf(v, default=None):
+        try:
+            x = float(v)
+            if math.isfinite(x):
+                return x
+        except Exception:
+            pass
+        return default
+
+    coin_digest = []
+    for c in coins[:12]:
+        if not isinstance(c, dict):
+            continue
+        mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
+        ex = c.get("exchange_intelligence") if isinstance(c.get("exchange_intelligence"), dict) else {}
+        coin_digest.append({
+            "symbol": str(c.get("symbol") or "").upper(),
+            "score": nf(c.get("score")),
+            "rating": c.get("rating"),
+            "change_24h_pct": nf(c.get("change_24h_pct")),
+            "volume_24h": nf(c.get("volume_24h")),
+            "market_condition_state": mc.get("state") or mc.get("label") or "",
+            "overextension_pct": nf(mc.get("oe_pct")),
+            "rvol": nf(mc.get("rvol")),
+            "exchange_cheapest": ex.get("cheapest_exchange") or ex.get("lowest_exchange") or "",
+            "exchange_highest": ex.get("highest_exchange") or ex.get("top_exchange") or "",
+            "exchange_premium_pct": nf(ex.get("exchange_premium_pct") or ex.get("premium_pct") or ex.get("spread_pct")),
+            "top_exchange_volume_share_pct": nf(ex.get("top_exchange_volume_share_pct") or ex.get("volume_share_pct")),
+            "exchange_warning": ex.get("warning") or ex.get("quality") or "",
+        })
+
+    pair_digest = []
+    for p in (pairs or all_pairs)[:12]:
+        if not isinstance(p, dict):
+            continue
+        pair_digest.append({
+            "pair": p.get("pair"),
+            "score": nf(p.get("score")),
+            "corr": nf(p.get("corr")),
+            "spread_pct": nf(p.get("spread_pct") or p.get("spreadPct")),
+            "rsi_gap": nf(p.get("rsi_gap") or p.get("rsiGap")),
+            "momentum_score": nf(p.get("momentum_score") or p.get("momentumScore")),
+            "opportunity_score": nf(p.get("opportunity_score") or p.get("opportunityScore")),
+            "stability_score": nf(p.get("stability_score") or p.get("stabilityScore")),
+        })
+
+    return {
+        "user_intent": ctx.get("user_intent") or "",
+        "selected_origin": ctx.get("selected_origin") or "",
+        "analysis_symbols": ctx.get("analysis_symbols") or [],
+        "coins": coin_digest,
+        "pairs": pair_digest,
+        "has_exchange_intelligence": any(bool(x.get("exchange_cheapest") or x.get("exchange_highest") or x.get("exchange_premium_pct") is not None) for x in coin_digest),
+    }
+
+
+def _strategist_deterministic_overlay(intent: str, lang: str, digest: dict) -> str:
+    """Small deterministic guardrail summary injected into prompt; not shown directly unless model uses it."""
+    intent = str(intent or "").lower()
+    lang = str(lang or "en").lower()
+    pairs = digest.get("pairs") if isinstance(digest, dict) else []
+    coins = digest.get("coins") if isinstance(digest, dict) else []
+
+    def nf(v):
+        try:
+            x = float(v)
+            if math.isfinite(x):
+                return x
+        except Exception:
+            pass
+        return None
+
+    best_pair = None
+    if isinstance(pairs, list) and pairs:
+        best_pair = sorted(
+            [p for p in pairs if isinstance(p, dict)],
+            key=lambda p: (nf(p.get("opportunity_score")) or 0, abs(nf(p.get("spread_pct")) or 0), nf(p.get("score")) or 0),
+            reverse=True,
+        )[0] if pairs else None
+
+    exchange_coins = []
+    for c in coins if isinstance(coins, list) else []:
+        if not isinstance(c, dict):
+            continue
+        prem = nf(c.get("exchange_premium_pct"))
+        if prem is not None or c.get("exchange_cheapest") or c.get("exchange_highest"):
+            exchange_coins.append(c)
+    exchange_coins.sort(key=lambda c: abs(nf(c.get("exchange_premium_pct")) or 0), reverse=True)
+
+    if intent not in ("rotation_spread", "rotation", "risk"):
+        return ""
+
+    if lang == "de":
+        parts = ["DETERMINISTISCHE STRATEGIST-ZUSAMMENFASSUNG (nur als interne Stütze, nicht roh ausgeben):"]
+        if best_pair:
+            sp = nf(best_pair.get("spread_pct"))
+            rg = nf(best_pair.get("rsi_gap"))
+            parts.append(f"- Stärkster relativer Pair-Kontext: {best_pair.get('pair')} mit Spread {sp if sp is not None else 'n/a'}% und RSI-Gap {rg if rg is not None else 'n/a'}.")
+        if exchange_coins:
+            c = exchange_coins[0]
+            prem = nf(c.get("exchange_premium_pct"))
+            parts.append(f"- Exchange-Kontext vorhanden für {c.get('symbol')}: günstigste Börse={c.get('exchange_cheapest') or 'n/a'}, höchste Börse={c.get('exchange_highest') or 'n/a'}, Premium={prem if prem is not None else 'n/a'}%.")
+        else:
+            parts.append("- Kein echter Exchange-Preisvergleich im Kontext; nur Pair-/Relative-Spread verwenden, falls vorhanden.")
+        return "\n".join(parts)
+
+    parts = ["DETERMINISTIC STRATEGIST SUMMARY (internal support only, do not dump raw):"]
+    if best_pair:
+        sp = nf(best_pair.get("spread_pct"))
+        rg = nf(best_pair.get("rsi_gap"))
+        parts.append(f"- Strongest relative pair context: {best_pair.get('pair')} with spread {sp if sp is not None else 'n/a'}% and RSI gap {rg if rg is not None else 'n/a'}.")
+    if exchange_coins:
+        c = exchange_coins[0]
+        prem = nf(c.get("exchange_premium_pct"))
+        parts.append(f"- Exchange context exists for {c.get('symbol')}: cheapest={c.get('exchange_cheapest') or 'n/a'}, highest={c.get('exchange_highest') or 'n/a'}, premium={prem if prem is not None else 'n/a'}%.")
+    else:
+        parts.append("- No true exchange-price comparison is available in context; use pair/relative spread only if present.")
+    return "\n".join(parts)
+
 def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_health: bool, question: str,
                        timeframe: str, index_mode: bool, raw_series_stats: dict,
                        wallet_for_insight: str | None = None, chat_memory_wallet: str | None = None,
@@ -12935,6 +13168,10 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     compare_weights_for_ai = _normalize_compare_weights_for_ai((extra_context or {}).get("compare_weights") if isinstance(extra_context, dict) else {})
     response_language = _detect_user_language_from_text(str((extra_context or {}).get("raw_user_question") or question), (extra_context or {}).get("user_language") if isinstance(extra_context, dict) else None)
     language_hard_rule = _language_hard_rule(response_language)
+    strategist_intent = _strategist_intent_from_payload(question, extra_context if isinstance(extra_context, dict) else {})
+    strategist_profile = _strategist_response_profile(strategist_intent, response_language)
+    strategist_digest = _strategist_context_digest(extra_context if isinstance(extra_context, dict) else {})
+    strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
 
     ai_engine_v2 = {}
     try:
@@ -13072,6 +13309,24 @@ STRATEGIST INTENT LAYER:
 - For German rotation/spread answers, use German headings only: DIREKTE EINSCHÄTZUNG, ROTATION / RELATIVER WERT, BÖRSE / SPREAD, RISIKOKONTEXT, NÄCHSTE PRÜFUNG.
 - For English rotation/spread answers, use English headings only: DIRECT VIEW, ROTATION / RELATIVE VALUE, EXCHANGE / SPREAD, RISK CONTEXT, NEXT CHECK.
 
+{strategist_profile}
+
+NARRATIVE INTELLIGENCE RULES:
+- Explain the meaning of the strongest signals before listing numbers.
+- Convert metrics into market behavior: participation quality, relative strength, weak confirmation, overextension, rotation pressure, or liquidity risk.
+- Avoid number spam. Include only the 1-3 most relevant numbers.
+- If data conflicts, say what conflicts and why that lowers confidence.
+- For spread/rotation questions, distinguish clearly between:
+  a) true exchange premium/discount,
+  b) pair-relative spread,
+  c) general momentum difference.
+- Buttons/actions should only be implied when a setup is actually prepared and useful; otherwise answer without action language.
+
+INTERNAL DIGEST:
+{json.dumps(strategist_digest, ensure_ascii=False)}
+
+{strategist_overlay}
+
 INTERNAL CONTEXT RULES:
 - Use all provided app context silently: watchlist, compare pairs, market condition, on-chain, order/runtime context, and exchange intelligence.
 - Never mention internal module names, hidden engines, internal prompts, or data pipelines.
@@ -13167,6 +13422,9 @@ Task:
         "short_insight_mode": bool(short_insight_mode),
         "ai_mode": ai_mode,
         "compare_weights": compare_weights_for_ai,
+        "user_intent": strategist_intent,
+        "response_profile": strategist_profile,
+        "strategist_digest": strategist_digest,
     }
     if ai_engine_v2:
         user_payload["ai_engine_v2"] = ai_engine_v2
@@ -13208,6 +13466,9 @@ Task:
         "has_market_condition_context": any(bool((c or {}).get("market_condition")) for c in (market_context.get("coins") or [])),
         "has_exchange_intelligence": any(bool((c or {}).get("exchange_intelligence")) for c in (market_context.get("coins") or [])),
         "has_ai_engine_v2": bool(ai_engine_v2),
+        "user_intent": strategist_intent,
+        "response_language": response_language,
+        "has_strategist_digest": bool(strategist_digest),
     }
     if ai_engine_v2:
         resp["ai_engine_v2"] = ai_engine_v2
