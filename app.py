@@ -12498,6 +12498,10 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
         lines.append("")
         lines.append("RISIKOKONTEXT")
         lines.append("- Ein Spread ist nur verwertbar, wenn Volumen, Liquidität und Spread-Qualität bestätigen. Kleine Differenzen unter ca. 0,5% sind oft nur Rauschen oder Gebührenrisiko.")
+        if top.get("coin"):
+            hint = top.get("coin", {}).get("tradeability_hint")
+            if hint:
+                lines.append(f"- {hint}")
         return "\n".join(lines)
 
     # English/default. For other languages, the model should normally translate; this fallback is English only.
@@ -12533,6 +12537,10 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
             any_ex = True
     if not any_ex:
         lines.append("- No clean exchange price deviation with exchange names is available in the current context.")
+    if top.get("coin"):
+        hint = top.get("coin", {}).get("tradeability_hint")
+        if hint:
+            lines.append(f"- {hint}")
     return "\n".join(lines)
 
 
@@ -13254,6 +13262,16 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
             "exchange_premium_pct": nf(ex.get("exchange_premium_pct") or ex.get("premium_pct") or ex.get("spread_pct")),
             "top_exchange_volume_share_pct": nf(ex.get("top_exchange_volume_share_pct") or ex.get("volume_share_pct")),
             "exchange_warning": ex.get("warning") or ex.get("quality") or "",
+            "confidence_band": _strategist_confidence_band(
+                c.get("score"),
+                mc.get("rvol"),
+                mc.get("oe_pct"),
+            ),
+            "tradeability_hint": _strategist_tradeability_hint(
+                ex.get("exchange_premium_pct") or ex.get("premium_pct") or ex.get("spread_pct"),
+                ex.get("top_exchange_volume_share_pct") or ex.get("volume_share_pct"),
+                "de" if str(ctx.get("user_language") or "").lower() == "de" else "en",
+            ),
         })
 
     pair_digest = []
@@ -13280,6 +13298,56 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
         "has_exchange_intelligence": any(bool(x.get("exchange_cheapest") or x.get("exchange_highest") or x.get("exchange_premium_pct") is not None) for x in coin_digest),
     }
 
+
+
+def _strategist_confidence_band(score: float | None, rvol: float | None, overextension: float | None) -> str:
+    s = _safe_float(score, 0.0)
+    rv = _safe_float(rvol, 0.0)
+    oe = abs(_safe_float(overextension, 0.0))
+
+    confidence = 0
+    if s >= 70:
+        confidence += 2
+    elif s >= 50:
+        confidence += 1
+
+    if rv >= 2.0:
+        confidence += 2
+    elif rv >= 1.2:
+        confidence += 1
+
+    if oe >= 12:
+        confidence -= 2
+    elif oe >= 8:
+        confidence -= 1
+
+    if confidence >= 3:
+        return "high"
+    if confidence >= 1:
+        return "medium"
+    return "low"
+
+
+def _strategist_tradeability_hint(exchange_premium_pct: float | None, volume_share_pct: float | None, lang: str = "en") -> str:
+    prem = abs(_safe_float(exchange_premium_pct, 0.0))
+    vol = _safe_float(volume_share_pct, 0.0)
+
+    if lang == "de":
+        if prem < 0.5:
+            return "Der sichtbare Preisunterschied wirkt eher klein und könnte durch Gebühren oder Slippage neutralisiert werden."
+        if vol < 8:
+            return "Der Vorteil existiert zwar, aber die Liquiditäts-/Volumentiefe wirkt noch schwach."
+        if prem >= 1.5 and vol >= 15:
+            return "Der Preisunterschied wirkt aktuell handelbarer als normale Marktgeräusche."
+        return "Der Vorteil sollte zusätzlich über Liquidität und Ausführungsqualität bestätigt werden."
+
+    if prem < 0.5:
+        return "The visible price difference looks small and could be neutralized by fees or slippage."
+    if vol < 8:
+        return "The edge exists, but liquidity/volume depth still looks weak."
+    if prem >= 1.5 and vol >= 15:
+        return "The price difference currently looks more tradable than normal market noise."
+    return "The edge should still be confirmed through liquidity and execution quality."
 
 def _strategist_deterministic_overlay(intent: str, lang: str, digest: dict) -> str:
     """Small deterministic guardrail summary injected into prompt; not shown directly unless model uses it."""
@@ -13526,6 +13594,8 @@ NARRATIVE INTELLIGENCE RULES:
 - Explain the meaning of the strongest signals before listing numbers.
 - Convert metrics into market behavior: participation quality, relative strength, weak confirmation, overextension, rotation pressure, or liquidity risk.
 - Avoid number spam. Include only the 1-3 most relevant numbers.
+- Explicitly classify confidence as high / medium / low when useful.
+- Mention whether a visible edge appears realistically tradable or only theoretically visible.
 - If data conflicts, say what conflicts and why that lowers confidence.
 - For spread/rotation questions, distinguish clearly between:
   a) true exchange premium/discount,
