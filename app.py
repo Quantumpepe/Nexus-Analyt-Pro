@@ -13271,11 +13271,12 @@ Answer logic:
         return """
 STRICT RESPONSE PROFILE: TRADING_ALLOCATION_ANALYSIS
 Trader Phase 1 must include budget split, slot queue, confidence, risk and safety logic when Nexus Trading is requested.
-Allowed sections: Direct assessment, Budget slots, Trader queue, Allocation logic, Risk limits, Safety blocks, Next check.
+Allowed sections: Direct assessment, Budget slots, Trader queue, Candidate priority, Allocation logic, Risk limits, Safety blocks, Next check.
 Forbidden unless explicitly requested: Grid report, exchange arbitrage report.
 Answer logic:
 - Focus on controlled allocation, budget slots, reserve logic, READY/WAIT/BLOCKED queue state, risk state, and whether runtime should be active or defensive.
 - If a budget is mentioned, propose a slot split such as 100 / 50 / 50 / 50 only as preparation, not execution.
+- For multiple candidates, assign slots across candidates, not only one symbol: BEST gets first slot, SECONDARY gets waiting slots, AVOID is blocked.
 - Never imply the AI can execute outside user-approved limits.
 - No direct buy/sell commands.
 """
