@@ -12263,14 +12263,135 @@ def _ai_engine_v2_from_context(
     }
 
 
+
+def _strip_forbidden_strategist_sections(ans: str, intent: str, lang: str) -> str:
+    """Remove whole generic report sections that do not match the routed intent."""
+    text = str(ans or "").strip()
+    if not text:
+        return text
+
+    intent = str(intent or "").lower()
+    if intent not in ("rotation_spread", "rotation", "risk", "grid", "trading"):
+        return text
+
+    forbidden = {
+        "rotation_spread": [
+            "NEXUS TRADING", "NEXUS TRADING PREPARATION", "NEXUS TRADING SUITABILITY",
+            "TRADING SUITABILITY", "TRADING PREPARATION", "RUNTIME SUGGESTION",
+            "NEXUS GRID", "NEXUS GRID SUITABILITY", "GRID SUITABILITY",
+            "MARKET EVALUATION", "SUGGESTED BEHAVIOR"
+        ],
+        "rotation": [
+            "NEXUS TRADING PREPARATION", "TRADING SUITABILITY", "RUNTIME SUGGESTION",
+            "NEXUS GRID SUITABILITY", "GRID SUITABILITY"
+        ],
+        "risk": [
+            "NEXUS TRADING PREPARATION", "TRADING SUITABILITY", "RUNTIME SUGGESTION",
+            "NEXUS GRID SUITABILITY", "GRID SUITABILITY"
+        ],
+        "grid": [
+            "NEXUS TRADING PREPARATION", "TRADING SUITABILITY", "RUNTIME SUGGESTION",
+            "EXCHANGE / SPREAD"
+        ],
+        "trading": [
+            "NEXUS GRID SUITABILITY", "GRID SUITABILITY"
+        ],
+    }.get(intent, [])
+
+    if not forbidden:
+        return text
+
+    # Split by heading-like lines and keep allowed blocks.
+    lines = text.splitlines()
+    blocks = []
+    cur = []
+    for line in lines:
+        clean = re.sub(r"^\s{0,4}(?:#{1,4}\s*)?(?:[-*]\s*)?", "", line).strip()
+        normalized = re.sub(r"[:：]+\s*$", "", clean).upper()
+        is_heading = bool(normalized and len(normalized) <= 70 and (normalized == clean.upper() or normalized in forbidden))
+        if is_heading and cur:
+            blocks.append(cur)
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        blocks.append(cur)
+
+    kept = []
+    for block in blocks:
+        first = re.sub(r"^\s{0,4}(?:#{1,4}\s*)?(?:[-*]\s*)?", "", (block[0] if block else "")).strip().upper()
+        if any(bad.upper() in first for bad in forbidden):
+            continue
+        kept.extend(block)
+        kept.append("")
+
+    out = "\n".join(kept).strip()
+    return out or text
+
+
+def _limit_strategist_number_spam(ans: str, max_numeric_lines: int = 6) -> str:
+    """Keep answers readable: too many raw numeric lines makes Strategist look like a data dump."""
+    lines = str(ans or "").splitlines()
+    kept = []
+    numeric_count = 0
+    for line in lines:
+        # Keep headings even if they include numbers.
+        clean = line.strip()
+        is_heading = clean and len(clean) <= 60 and clean.upper() == clean
+        has_metric_dump = bool(re.search(r"[-+]?\d+(?:\.\d+)?\s*%|corr(?:elation)?\s*[=:]|\brsi\b|\bscore\b", clean, re.I))
+        if has_metric_dump and not is_heading:
+            numeric_count += 1
+            if numeric_count > max_numeric_lines:
+                continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def _normalize_strategist_language_leaks(ans: str, lang: str) -> str:
+    """Small deterministic heading cleanup after the model answer."""
+    out = str(ans or "").strip()
+    l = str(lang or "en").lower()
+    if l == "de":
+        repl = {
+            "DIRECT VIEW": "DIREKTE EINSCHÄTZUNG",
+            "DIRECT ASSESSMENT": "DIREKTE EINSCHÄTZUNG",
+            "ANSWER": "ANTWORT",
+            "MARKET READ": "MARKTLAGE",
+            "RISK CONTEXT": "RISIKOKONTEXT",
+            "NEXT CHECK": "NÄCHSTE PRÜFUNG",
+            "ROTATION / RELATIVE VALUE": "ROTATION / RELATIVER WERT",
+        }
+        for a, b in repl.items():
+            out = re.sub(rf"(?im)^(\s*(?:#{1,4}\s*)?){re.escape(a)}(\s*:?\s*)$", rf"\1{b}\2", out)
+    elif l == "en":
+        repl = {
+            "DIREKTE EINSCHÄTZUNG": "DIRECT VIEW",
+            "DIREKTE EINSCHAETZUNG": "DIRECT VIEW",
+            "ANTWORT": "ANSWER",
+            "MARKTLAGE": "MARKET READ",
+            "RISIKOKONTEXT": "RISK CONTEXT",
+            "NÄCHSTE PRÜFUNG": "NEXT CHECK",
+            "NAECHSTE PRUEFUNG": "NEXT CHECK",
+            "ROTATION / RELATIVER WERT": "ROTATION / RELATIVE VALUE",
+            "BÖRSE / SPREAD": "EXCHANGE / SPREAD",
+            "BOERSE / SPREAD": "EXCHANGE / SPREAD",
+        }
+        for a, b in repl.items():
+            out = re.sub(rf"(?im)^(\s*(?:#{1,4}\s*)?){re.escape(a)}(\s*:?\s*)$", rf"\1{b}\2", out)
+    return out.strip()
+
 def _extract_user_intent_from_payload(user_payload: dict) -> str:
+    if not isinstance(user_payload, dict):
+        return ""
+    for key in ("user_intent",):
+        v = str(user_payload.get(key) or "").strip().lower()
+        if v:
+            return v
     ctx = user_payload.get("ai_signal_context") if isinstance(user_payload, dict) else None
     if isinstance(ctx, dict) and ctx.get("user_intent"):
         return str(ctx.get("user_intent") or "").strip().lower()
     q = str((user_payload or {}).get("question") or "")
-    if re.search(r"(günstig|guenstig|billig|teurer|verkaufen|arbitrage|spread|exchange|börse|boerse|cheaper|higher|sell higher|buy cheaper)", q, re.I):
-        return "rotation_spread"
-    return ""
+    return _strategist_intent_from_payload(q, ctx if isinstance(ctx, dict) else {})
 
 
 def _collect_rotation_spread_candidates(user_payload: dict) -> list[dict]:
@@ -12343,7 +12464,7 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
         prem = _fmt_pct_value(ex.get("exchange_premium_pct"))
         pair_spread = _fmt_pct_value(bp.get("spread_pct"))
         if prem:
-            lines.append(f"{top['symbol']} zeigt aktuell die auffälligste Exchange-Differenz im Kontext: ungefähr {prem} zwischen günstigster und teuerster Börse.")
+            lines.append(f"{top['symbol']} zeigt aktuell die auffälligste Exchange-Differenz im Kontext: ungefähr {prem} zwischen günstigster und teuerster Börse. Gleichzeitig sollte geprüft werden, ob genügend Volumen vorhanden ist, damit der Vorteil handelbar bleibt.")
         elif pair_spread:
             lines.append(f"{top['symbol']} ist über den Pair-/Relative-Value-Kontext auffällig. Der relevante relative Spread liegt bei etwa {pair_spread}.")
         else:
@@ -12389,7 +12510,7 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
     pair_spread = _fmt_pct_value(bp.get("spread_pct"))
     lines = ["DIRECT VIEW"]
     if prem:
-        lines.append(f"{top['symbol']} shows the clearest exchange difference in the current context: about {prem} between the cheapest and highest exchange.")
+        lines.append(f"{top['symbol']} shows the clearest exchange difference in the current context: about {prem} between the cheapest and highest exchange. Volume quality should still confirm whether the edge is realistically tradable.")
     elif pair_spread:
         lines.append(f"{top['symbol']} stands out in the relative-value context with a relevant pair spread around {pair_spread}.")
     else:
@@ -12419,29 +12540,51 @@ def _answer_looks_wrong_for_intent(ans: str, lang: str, intent: str) -> bool:
     a = str(ans or "")
     if not a.strip():
         return True
-    if intent == "rotation_spread":
-        bad = ["NEXUS TRADING PREPARATION", "Trading Suitability", "Runtime Suggestion", "NEXUS GRID SUITABILITY", "NEXUS TRADING SUITABILITY", "MARKET EVALUATION"]
-        if any(x.lower() in a.lower() for x in bad):
-            return True
-        if not re.search(r"(spread|börse|boerse|exchange|rotation|relativer wert|relative value|günstig|guenstig|cheapest)", a, re.I):
-            return True
+    il = str(intent or "").lower()
+    al = a.lower()
+
+    forbidden_by_intent = {
+        "rotation_spread": ["nexus trading preparation", "trading suitability", "runtime suggestion", "nexus grid suitability", "grid suitability", "market evaluation"],
+        "rotation": ["nexus trading preparation", "runtime suggestion", "nexus grid suitability", "grid suitability"],
+        "risk": ["nexus trading preparation", "runtime suggestion", "nexus grid suitability", "grid suitability"],
+        "grid": ["nexus trading preparation", "runtime suggestion", "exchange / spread"],
+    }
+    if any(x in al for x in forbidden_by_intent.get(il, [])):
+        return True
+
+    if il == "rotation_spread" and not re.search(r"(spread|börse|boerse|exchange|rotation|relativer wert|relative value|günstig|guenstig|cheapest|premium|price difference)", a, re.I):
+        return True
+    if il == "rotation" and not re.search(r"(rotation|relative|stärke|staerke|strength|weakness|momentum)", a, re.I):
+        return True
+    if il == "risk" and not re.search(r"(risk|risiko|fake|liquid|volume|rvol|overextension|überhitzt|ueberhitzt|trap|confirmation)", a, re.I):
+        return True
+
     if str(lang).lower() == "de":
         english_bad = ["ANSWER", "DIRECT VIEW", "MARKET READ", "NEXT CHECK", "Risk Factors", "Suggested Behavior", "Failure", "Trading Suitability"]
-        hits = sum(1 for x in english_bad if x.lower() in a.lower())
-        if hits >= 1:
+        if any(re.search(rf"(?im)^\s*(?:#{{1,4}}\s*)?{re.escape(x)}\s*:?", a) for x in english_bad):
+            return True
+    if str(lang).lower() == "en":
+        german_bad = ["DIREKTE EINSCHÄTZUNG", "RISIKOKONTEXT", "NÄCHSTE PRÜFUNG", "MARKTLAGE", "BÖRSE / SPREAD"]
+        if any(re.search(rf"(?im)^\s*(?:#{{1,4}}\s*)?{re.escape(x)}\s*:?", a) for x in german_bad):
             return True
     return False
 
 
 def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
     ctx = user_payload.get("ai_signal_context") if isinstance(user_payload, dict) else {}
-    lang = _detect_user_language_from_text(str(user_payload.get("question") or ""), (ctx or {}).get("user_language") if isinstance(ctx, dict) else None)
+    lang = _detect_user_language_from_text(str((ctx or {}).get("raw_user_question") or user_payload.get("question") or ""), (ctx or {}).get("user_language") if isinstance(ctx, dict) else None)
     intent = _extract_user_intent_from_payload(user_payload)
-    if _answer_looks_wrong_for_intent(ans, lang, intent):
+
+    cleaned = _normalize_strategist_language_leaks(str(ans or ""), lang)
+    cleaned = _strip_forbidden_strategist_sections(cleaned, intent, lang)
+    cleaned = _limit_strategist_number_spam(cleaned, max_numeric_lines=6)
+
+    if _answer_looks_wrong_for_intent(cleaned, lang, intent):
         if intent == "rotation_spread":
             # Deterministic fallback prevents generic Trading/Grid reports for rotation/spread questions.
             return _deterministic_rotation_spread_answer(user_payload, lang if lang in ("de", "en") else "en")
-    return str(ans or "").strip()
+        return cleaned.strip() or str(ans or "").strip()
+    return cleaned.strip()
 
 
 def _ai_call_openai(
@@ -13015,6 +13158,66 @@ Answer logic:
 """
 
 
+
+def _narrative_phrase_from_market_state(state: str, rvol: float | None = None, oe: float | None = None, lang: str = "en") -> str:
+    s = str(state or "").lower()
+    rv = _safe_float(rvol, 0.0)
+    oe = _safe_float(oe, 0.0)
+
+    if lang == "de":
+        if rv >= 2.0 and oe > 8:
+            return "starke Teilnahme mit bereits überdehnter Bewegung"
+        if rv >= 2.0:
+            return "sichtbar aggressive Marktteilnahme"
+        if oe > 10:
+            return "überdehnte Struktur mit erhöhtem Rücksetzungsrisiko"
+        if "neutral" in s:
+            return "eher neutrale Marktstruktur"
+        if "risk" in s or "danger" in s:
+            return "fragile Struktur mit erhöhtem Fehlbewegungsrisiko"
+        return "stabile, aber noch nicht vollständig bestätigte Struktur"
+
+    if rv >= 2.0 and oe > 8:
+        return "strong participation with already extended price behavior"
+    if rv >= 2.0:
+        return "aggressive market participation"
+    if oe > 10:
+        return "extended structure with elevated pullback risk"
+    if "neutral" in s:
+        return "rather neutral market structure"
+    if "risk" in s or "danger" in s:
+        return "fragile structure with elevated fake-move risk"
+    return "stable but not fully confirmed structure"
+
+
+def _strategist_market_narrative(digest: dict, lang: str = "en") -> str:
+    coins = digest.get("coins") if isinstance(digest, dict) else []
+    if not isinstance(coins, list) or not coins:
+        return ""
+
+    ranked = sorted(
+        [c for c in coins if isinstance(c, dict)],
+        key=lambda c: (
+            _safe_float(c.get("score"), 0.0),
+            _safe_float(c.get("rvol"), 0.0),
+            abs(_safe_float(c.get("change_24h_pct"), 0.0))
+        ),
+        reverse=True,
+    )
+
+    top = ranked[0]
+    sym = top.get("symbol") or "UNKNOWN"
+    phrase = _narrative_phrase_from_market_state(
+        top.get("market_condition_state"),
+        top.get("rvol"),
+        top.get("overextension_pct"),
+        lang,
+    )
+
+    if lang == "de":
+        return f"{sym} zeigt aktuell {phrase}. Der Strategist sollte die Qualität der Teilnahme höher gewichten als reine Preisbewegung."
+    return f"{sym} currently shows {phrase}. The Strategist should weight participation quality higher than raw price movement."
+
 def _strategist_context_digest(extra_context: dict | None) -> dict:
     """Create compact data digest for the Strategist so it can reason without dumping raw fields."""
     ctx = extra_context if isinstance(extra_context, dict) else {}
@@ -13114,12 +13317,16 @@ def _strategist_deterministic_overlay(intent: str, lang: str, digest: dict) -> s
     if intent not in ("rotation_spread", "rotation", "risk"):
         return ""
 
+    narrative = _strategist_market_narrative(digest, lang)
+
     if lang == "de":
         parts = ["DETERMINISTISCHE STRATEGIST-ZUSAMMENFASSUNG (nur als interne Stütze, nicht roh ausgeben):"]
         if best_pair:
             sp = nf(best_pair.get("spread_pct"))
             rg = nf(best_pair.get("rsi_gap"))
             parts.append(f"- Stärkster relativer Pair-Kontext: {best_pair.get('pair')} mit Spread {sp if sp is not None else 'n/a'}% und RSI-Gap {rg if rg is not None else 'n/a'}.")
+        if narrative:
+            parts.append(f"- Markt-Narrativ: {narrative}")
         if exchange_coins:
             c = exchange_coins[0]
             prem = nf(c.get("exchange_premium_pct"))
@@ -13129,7 +13336,11 @@ def _strategist_deterministic_overlay(intent: str, lang: str, digest: dict) -> s
         return "\n".join(parts)
 
     parts = ["DETERMINISTIC STRATEGIST SUMMARY (internal support only, do not dump raw):"]
+    if narrative:
+        parts.append(f"- Market narrative: {narrative}")
     if best_pair:
+        sp = nf(best_pair.get("spread_pct"))
+
         sp = nf(best_pair.get("spread_pct"))
         rg = nf(best_pair.get("rsi_gap"))
         parts.append(f"- Strongest relative pair context: {best_pair.get('pair')} with spread {sp if sp is not None else 'n/a'}% and RSI gap {rg if rg is not None else 'n/a'}.")
