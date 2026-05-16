@@ -13276,6 +13276,7 @@ Forbidden unless explicitly requested: Grid report, exchange arbitrage report.
 Answer logic:
 - Focus on controlled allocation, budget slots, reserve logic, READY/WAIT/BLOCKED queue state, risk state, and whether runtime should be active or defensive.
 - If a budget is mentioned, propose a slot split such as 100 / 50 / 50 / 50 only as preparation, not execution.
+- Nexus Trading is autonomous after budget approval. Do not ask for manual queue rebuild, manual order add, or manual start. User controls Pause and Stop only.
 - Never imply the AI can execute outside user-approved limits.
 - No direct buy/sell commands.
 """
