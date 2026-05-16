@@ -12494,17 +12494,21 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
                 )
 
                 quality = "saubere Rotation"
+                rank_label = "BEST CHOICE"
                 if net_edge < 0.5:
                     quality = "zu kleiner Netto-Spread"
+                    rank_label = "AVOID / WEAK EDGE"
                 elif net_edge < 1.2:
                     quality = "schwache Edge"
+                    rank_label = "SECONDARY CHOICE"
                 elif net_edge > 8:
                     quality = "möglicher Spike/Fake-Move"
+                    rank_label = "AVOID / WEAK EDGE"
 
                 lines.append(
                     f"- {item['symbol']}: günstiger kaufen bei {cheap}, teurer verkaufen/prüfen bei {high}{price_txt}"
                     + (f", Differenz ca. {prem}." if prem else ".")
-                    + f" Netto-Edge ~{net_edge}% | Confidence: {conf} | Bewertung: {quality}."
+                    + f" Netto-Edge ~{net_edge}% | Confidence: {conf} | Ranking: {rank_label} | Bewertung: {quality}."
                 )
                 any_buy_sell = True
             elif cheap:
@@ -12586,17 +12590,21 @@ def _deterministic_rotation_spread_answer(user_payload: dict, lang: str) -> str:
             )
 
             quality = "clean rotation"
+            rank_label = "BEST CHOICE"
             if net_edge < 0.5:
                 quality = "net edge too small"
+                rank_label = "AVOID / WEAK EDGE"
             elif net_edge < 1.2:
                 quality = "weak edge"
+                rank_label = "SECONDARY CHOICE"
             elif net_edge > 8:
                 quality = "possible spike/fake move"
+                rank_label = "AVOID / WEAK EDGE"
 
             lines.append(
                 f"- {item['symbol']}: cheaper buy side at {cheap}, higher sell/check side at {high}{price_txt}"
                 + (f", difference about {prem}." if prem else ".")
-                + f" Net edge ~{net_edge}% | Confidence: {conf} | Assessment: {quality}."
+                + f" Net edge ~{net_edge}% | Confidence: {conf} | Ranking: {rank_label} | Assessment: {quality}."
             )
             any_buy_sell = True
         elif cheap:
@@ -13236,6 +13244,7 @@ Answer logic:
 9) If exchange prices are missing, say that exchange-specific buy-cheap/sell-high data is not available in the current context.
 10) Do not invent exchange names, prices, depth, orderbook data, or arbitrage execution.
 11) Use at most 5 compact sections and avoid raw metric dumps.
+12) When multiple candidates exist, label them clearly as BEST CHOICE, SECONDARY CHOICE, or AVOID / WEAK EDGE.
 """
     if intent == "rotation":
         return """
