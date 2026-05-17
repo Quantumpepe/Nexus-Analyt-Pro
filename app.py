@@ -1609,6 +1609,38 @@ def init_db():
         )
     """)
 
+    # Strategist access (separate add-on from Core).
+    # Core subscription unlocks the platform + AI Insight.
+    # Strategist is priced separately because it can run 24/7 in the background.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_strategist_access (
+            wallet_address TEXT PRIMARY KEY,
+            plan TEXT DEFAULT '',
+            source TEXT DEFAULT '',
+            expires_ts INTEGER,
+            last_payment_tx_hash TEXT DEFAULT '',
+            updated_ts INTEGER
+        )
+    """)
+
+    # Support tickets captured in-app. This is intentionally simple now,
+    # so it can later be connected to email, Discord, CRM, or a ticket system.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            ticket_id TEXT PRIMARY KEY,
+            wallet_address TEXT DEFAULT '',
+            email TEXT DEFAULT '',
+            category TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            message TEXT DEFAULT '',
+            meta_json TEXT DEFAULT '{}',
+            status TEXT DEFAULT 'open',
+            created_ts INTEGER,
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_wallet_ts ON support_tickets(wallet_address, created_ts)")
+
     # Adaptive Market Memory: structured snapshots for later outcome learning.
     # This stores behavior/state, not full AI text. Outcomes are intentionally nullable
     # in phase 1 and can be filled by a later background/outcome worker.
@@ -3342,7 +3374,7 @@ _ASSETS_SILVER = []
 _ASSETS_GOLD_EXTRA = ["BTC", "SOL"]
 
 # For now we model AI limit as an integer per day (free=1). Unlimited = -1.
-_AI_LIMIT_FREE = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
+_AI_LIMIT_FREE = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))
 _AI_LIMIT_UNLIMITED = -1
 
 # Pre-generated 50 one-time unlimited access codes (redeemable once each)
@@ -3531,7 +3563,7 @@ def _stable_decimals(chain_id: int, symbol: str, token_address: str | None = Non
         return 6
     return _USDT_DECIMALS if sym == "USDT" else _USDC_DECIMALS
 
-PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "15")))
+PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "25")))
 # keccak256("Transfer(address,address,uint256)")
 ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
@@ -3904,7 +3936,7 @@ def _access_defaults() -> dict:
     - DEMO has real market data + simulations, but no live execution.
     - DEMO AI is limited per day across both AI endpoints.
     """
-    demo_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
+    demo_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))
     return {
         "plan": "demo",
         "source": "demo",
@@ -3919,10 +3951,15 @@ def _access_defaults() -> dict:
         "ai_limit": demo_limit,
         "ai_daily_limit": demo_limit,
         "ai_unlimited": False,
+        "ai_month_days_limit": int(os.getenv("NEXUS_DEMO_AI_MONTH_DAYS_LIMIT", "5")),
         "can_open_new_trades": False,
         "can_close_trades": True,
         "can_live_execute": False,
         "can_demo_simulate": True,
+        "execution_mode": "simulation",
+        "strategist_active": False,
+        "can_use_strategist": True,
+        "strategist_demo_limited": True,
         "active": False,
         "auto_renew_enabled": False,
         "preferred_token": "USDT",
@@ -3965,6 +4002,68 @@ def _copy_access_meta_from_row(base: dict, st: dict | None, exp=None) -> dict:
     return base
 
 
+
+def _strategist_access_get(wallet_address: str) -> dict:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {
+            "active": False,
+            "plan": "none",
+            "source": "none",
+            "expires_at": None,
+            "days_left": None,
+        }
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM nexus_strategist_access WHERE wallet_address=?", (wa,))
+        row = cur.fetchone()
+        conn.close()
+    except Exception:
+        row = None
+    if not row:
+        return {
+            "active": False,
+            "plan": "none",
+            "source": "none",
+            "expires_at": None,
+            "days_left": None,
+        }
+    d = dict(row)
+    exp = d.get("expires_ts")
+    active = bool(exp and not _is_expired(exp))
+    days_left = None
+    try:
+        if exp:
+            days_left = max(0, int(math.ceil((int(exp) - now_ts()) / 86400)))
+    except Exception:
+        days_left = None
+    return {
+        "active": active,
+        "plan": str(d.get("plan") or "strategist").lower(),
+        "source": str(d.get("source") or "db"),
+        "expires_at": int(exp) if exp else None,
+        "days_left": days_left,
+        "last_payment_tx_hash": str(d.get("last_payment_tx_hash") or ""),
+    }
+
+
+def _access_apply_strategist_meta(base: dict, wallet_address: str | None) -> dict:
+    strat = _strategist_access_get(wallet_address or "") if wallet_address else _strategist_access_get("")
+    base["strategist_access"] = strat
+    base["strategist_active"] = bool(strat.get("active"))
+    # Demo can try AI under demo limits; Core/Live requires the separate Strategist add-on for Strategist mode.
+    base["can_use_strategist"] = bool(base.get("is_demo")) or bool(strat.get("active")) or bool(base.get("is_permanent"))
+    base["strategist_demo_limited"] = bool(base.get("is_demo")) and not bool(strat.get("active"))
+    base["strategist_prices"] = {
+        "weekly_usd": float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20")),
+        "monthly_usd": float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50")),
+        "weekly_days": 7,
+        "monthly_days": 30,
+        "tokens": ["USDC", "USDT"],
+    }
+    return base
+
 def _compute_access_status(wallet_address: str | None) -> dict:
     """Central access state.
 
@@ -3975,14 +4074,14 @@ def _compute_access_status(wallet_address: str | None) -> dict:
     - EXPIRED: previous paid plan expired; falls back to demo capabilities, but mode is EXPIRED.
     """
     if not wallet_address:
-        return _access_defaults()
+        return _access_apply_strategist_meta(_access_defaults(), None)
 
     wa = _norm_addr(wallet_address)
     st = _access_state_get(wa)
     if not st:
         base = _access_defaults()
         base["source"] = "auth"
-        return base
+        return _access_apply_strategist_meta(base, wa)
 
     exp = st.get("expires_ts")
     plan = str(st.get("plan") or "demo").lower()
@@ -3999,7 +4098,7 @@ def _compute_access_status(wallet_address: str | None) -> dict:
         base["is_demo"] = True
         base["is_live"] = False
         base["can_demo_simulate"] = True
-        return _copy_access_meta_from_row(base, st, exp)
+        return _access_apply_strategist_meta(_copy_access_meta_from_row(base, st, exp), wa)
 
     ai_limit_raw = st.get("ai_limit")
     try:
@@ -4016,10 +4115,10 @@ def _compute_access_status(wallet_address: str | None) -> dict:
     if not is_live:
         base = _access_defaults()
         base["source"] = source or "auth"
-        return _copy_access_meta_from_row(base, st, exp)
+        return _access_apply_strategist_meta(_copy_access_meta_from_row(base, st, exp), wa)
 
     mode = "PERMANENT" if is_permanent else "LIVE"
-    return {
+    base = {
         "plan": plan,
         "source": source,
         "mode": mode,
@@ -4049,30 +4148,62 @@ def _compute_access_status(wallet_address: str | None) -> dict:
         "privy_policy_id": str(st.get("privy_policy_id") or ""),
         "privy_consent_ts": int(st.get("privy_consent_ts") or 0) or None,
         "auto_renew_payment_mode": str(st.get("auto_renew_payment_mode") or "manual"),
+        "execution_mode": "live",
     }
+    return _access_apply_strategist_meta(base, wa)
 
 
 def _ai_usage_day_key(ts: int | None = None) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(int(ts or now_ts())))
 
 
+
+def _ai_usage_month_key(ts: int | None = None) -> str:
+    return time.strftime("%Y-%m", time.gmtime(int(ts or now_ts())))
+
+
 def _ai_usage_get(wallet_address: str) -> dict:
     wa = _norm_addr(wallet_address or "")
     day_key = _ai_usage_day_key()
+    month_key = _ai_usage_month_key()
+    daily_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))
+    month_days_limit = int(os.getenv("NEXUS_DEMO_AI_MONTH_DAYS_LIMIT", "5"))
     if not wa:
-        return {"used": 0, "limit": int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5")), "remaining": 0, "day": day_key}
+        return {
+            "used": 0,
+            "limit": daily_limit,
+            "remaining": 0,
+            "day": day_key,
+            "month": month_key,
+            "month_days_used": 0,
+            "month_days_limit": month_days_limit,
+            "month_days_remaining": 0,
+        }
     conn = _db()
     cur = conn.cursor()
     cur.execute("SELECT used_count FROM ai_daily_usage WHERE wallet_address=? AND day_key=?", (wa, day_key))
     row = cur.fetchone()
-    conn.close()
     used = int(row[0]) if row else 0
-    limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
-    return {"used": used, "limit": limit, "remaining": max(0, limit - used), "day": day_key}
+    cur.execute(
+        "SELECT COUNT(*) FROM ai_daily_usage WHERE wallet_address=? AND substr(day_key,1,7)=? AND used_count>0",
+        (wa, month_key),
+    )
+    month_days_used = int((cur.fetchone() or [0])[0] or 0)
+    conn.close()
+    return {
+        "used": used,
+        "limit": daily_limit,
+        "remaining": max(0, daily_limit - used),
+        "day": day_key,
+        "month": month_key,
+        "month_days_used": month_days_used,
+        "month_days_limit": month_days_limit,
+        "month_days_remaining": max(0, month_days_limit - month_days_used),
+    }
 
 
 def _ai_demo_consume_or_error(wallet_address: str, access_status: dict | None):
-    """Allow paid/redeem AI unlimited; limit DEMO/EXPIRED to 5 total AI requests per UTC day."""
+    """Allow paid/redeem AI unlimited; limit DEMO/EXPIRED to 3 AI requests/day on max 5 days/month."""
     st = access_status or {}
     if bool(st.get("ai_unlimited")) or bool(st.get("is_live")) or bool(st.get("is_permanent")):
         return None
@@ -4081,25 +4212,51 @@ def _ai_demo_consume_or_error(wallet_address: str, access_status: dict | None):
     if not wa:
         return err("wallet required for demo AI", 401)
 
-    limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "5"))
+    daily_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))
+    month_days_limit = int(os.getenv("NEXUS_DEMO_AI_MONTH_DAYS_LIMIT", "5"))
     day_key = _ai_usage_day_key()
+    month_key = _ai_usage_month_key()
     with DB_WRITE_LOCK:
         conn = _db()
         cur = conn.cursor()
         cur.execute("SELECT used_count FROM ai_daily_usage WHERE wallet_address=? AND day_key=?", (wa, day_key))
         row = cur.fetchone()
         used = int(row[0]) if row else 0
-        if used >= limit:
+        cur.execute(
+            "SELECT COUNT(*) FROM ai_daily_usage WHERE wallet_address=? AND substr(day_key,1,7)=? AND used_count>0",
+            (wa, month_key),
+        )
+        month_days_used = int((cur.fetchone() or [0])[0] or 0)
+        today_already_counted = bool(row and used > 0)
+
+        if used >= daily_limit:
             conn.close()
             return jsonify({
                 "status": "error",
                 "error": "daily demo AI limit reached",
                 "mode": st.get("mode") or "DEMO",
                 "ai_used_today": used,
-                "ai_daily_limit": limit,
+                "ai_daily_limit": daily_limit,
+                "ai_month_days_used": month_days_used,
+                "ai_month_days_limit": month_days_limit,
                 "upgrade_required": True,
                 "ts": now_ts(),
             }), 429
+
+        if (not today_already_counted) and month_days_used >= month_days_limit:
+            conn.close()
+            return jsonify({
+                "status": "error",
+                "error": "monthly demo AI days limit reached",
+                "mode": st.get("mode") or "DEMO",
+                "ai_used_today": used,
+                "ai_daily_limit": daily_limit,
+                "ai_month_days_used": month_days_used,
+                "ai_month_days_limit": month_days_limit,
+                "upgrade_required": True,
+                "ts": now_ts(),
+            }), 429
+
         new_used = used + 1
         cur.execute(
             "INSERT INTO ai_daily_usage(wallet_address, day_key, used_count, updated_ts) VALUES (?,?,?,?) "
@@ -4176,6 +4333,10 @@ def api_access_status():
         "ai_daily_limit": ai_usage.get("limit"),
         "ai_remaining_today": ai_usage.get("remaining"),
         "ai_usage_day": ai_usage.get("day"),
+        "ai_usage_month": ai_usage.get("month"),
+        "ai_month_days_used": ai_usage.get("month_days_used"),
+        "ai_month_days_limit": ai_usage.get("month_days_limit"),
+        "ai_month_days_remaining": ai_usage.get("month_days_remaining"),
         **st
     })
 
@@ -4197,7 +4358,7 @@ def _auto_renew_payload_from_row(row_or_status: dict | None) -> dict:
         "next_billing_ts": int(d.get("next_billing_ts") or d.get("expires_at") or d.get("expires_ts") or 0) or None,
         "last_auto_renew_attempt_ts": int(d.get("last_auto_renew_attempt_ts") or 0) or None,
         "last_auto_renew_status": str(d.get("last_auto_renew_status") or ""),
-        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15")),
+        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "25")),
         "period_days": int(int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))) / 86400),
         "supported_tokens": sorted(list(_ALLOWED_AUTO_RENEW_TOKENS)),
         "supported_chains": list(_ENABLED_EVM_CHAINS),
@@ -4324,7 +4485,7 @@ def api_access_auto_renew_due():
     return jsonify({
         "status": "ok",
         "ts": now_i,
-        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15")),
+        "amount_usd": float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "25")),
         "due": rows,
         "note": "safe mode: no payment is executed by this endpoint",
     })
@@ -4338,7 +4499,7 @@ def _subscription_seconds() -> int:
     return int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
 
 def _subscription_price_usd() -> float:
-    return float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "15"))
+    return float(os.getenv("NEXUS_SUBSCRIPTION_PRICE_USD", "25"))
 
 def _auto_renew_amount_units(token_symbol: str, chain_key: str) -> int:
     token = str(token_symbol or "").upper()
@@ -6540,7 +6701,7 @@ def api_access_subscribe_verify():
 
     chain_id = body.get("chain_id")
     tx_hash = str(body.get("tx_hash") or "").strip()
-    plan = "pro"  # single plan (15$/mo); client may still send plan but we ignore it
+    plan = "pro"  # single core plan (25$/30d); client may still send plan but we ignore it
 
     try:
         chain_id = int(chain_id)
@@ -9268,6 +9429,99 @@ def api_nexus_trading_hold_state():
             conn.commit()
 
     return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "ts": now_ts()})
+
+
+
+@app.route("/api/nexus/trading/state", methods=["GET"])
+def api_nexus_trading_state():
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet)
+    if wallet and not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+    access = _compute_access_status(wa) if wa else _access_apply_strategist_meta(_access_defaults(), None)
+    hold_state = _nexus_trading_hold_row_to_dict(None)
+    if wa:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        conn.close()
+    vault_ready = bool(any((_VAULT_BY_CHAIN.get(int(cid)) or "").strip() for cid in _ENABLED_CHAIN_IDS)) if "_ENABLED_CHAIN_IDS" in globals() else False
+    execution_mode = "live" if access.get("can_live_execute") and vault_ready else "prepared" if access.get("is_live") else "simulation"
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "access": access,
+        "hold_state": hold_state,
+        "execution_mode": execution_mode,
+        "vault_ready": vault_ready,
+        "backend_is_state_master": True,
+        "states": ["WAIT", "READY", "ACTIVE", "PROTECT", "EXIT_RISK", "HOLD", "OBSERVE", "BLOCKED", "RELEASE_REQUIRED"],
+        "ts": now_ts(),
+    })
+
+
+@app.route("/api/support/ticket", methods=["POST"])
+def api_support_ticket_create():
+    body = request.get_json(silent=True) or {}
+    wallet = (
+        body.get("wallet")
+        or body.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet) if wallet else ""
+    if wallet and not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    category = str(body.get("category") or "General").strip()[:80]
+    subject = str(body.get("subject") or "Support request").strip()[:160]
+    message = str(body.get("message") or "").strip()
+    email = str(body.get("email") or "").strip()[:180]
+    if len(message) < 10:
+        return jsonify({"status": "error", "error": "message too short", "ts": now_ts()}), 400
+
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    try:
+        access = _compute_access_status(wa) if wa else _access_defaults()
+        meta = {**meta, "access_mode": access.get("mode"), "plan": access.get("plan"), "strategist_active": access.get("strategist_active")}
+    except Exception:
+        pass
+
+    ticket_id = "SUP-" + uuid.uuid4().hex[:10].upper()
+    now_i = now_ts()
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO support_tickets(ticket_id, wallet_address, email, category, subject, message, meta_json, status, created_ts, updated_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+            """,
+            (ticket_id, wa, email, category, subject, message[:5000], json.dumps(meta, ensure_ascii=False), now_i, now_i),
+        )
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "ok", "ticket_id": ticket_id, "message": "Support request received.", "ts": now_i})
+
+
+@app.route("/api/access/strategist/config", methods=["GET"])
+def api_access_strategist_config():
+    return jsonify({
+        "status": "ok",
+        "weekly_usd": float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20")),
+        "monthly_usd": float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50")),
+        "weekly_days": 7,
+        "monthly_days": 30,
+        "supported_tokens": ["USDC", "USDT"],
+        "note": "Strategist is a separate add-on from Core because it can run 24/7 in the background.",
+        "ts": now_ts(),
+    })
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
@@ -14450,6 +14704,14 @@ def api_ai_run():
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
         return ai_gate
+    if bool(st.get("is_live")) and not bool(st.get("can_use_strategist")):
+        return jsonify({
+            "status": "error",
+            "error": "strategist access required",
+            "upgrade_required": True,
+            "strategist_prices": st.get("strategist_prices"),
+            "ts": now_ts(),
+        }), 403
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
