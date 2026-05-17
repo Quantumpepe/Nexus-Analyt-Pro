@@ -1651,6 +1651,25 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_market_memory_wallet_ts ON market_memory(wallet_address, timestamp)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_market_memory_source_ts ON market_memory(source, timestamp)")
 
+    # Nexus Trading HOLD / OBSERVE state.
+    # This is the safety layer used after a Risk Exit / Protect Stop:
+    # minimum HOLD = 1-12h, maximum autonomous observation = 12h, then user release is required.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_trading_hold_state (
+            wallet_address TEXT PRIMARY KEY,
+            status TEXT DEFAULT 'PREPARED',
+            hold_hours REAL DEFAULT 1,
+            observe_max_hours REAL DEFAULT 12,
+            hold_started_ts INTEGER,
+            hold_until_ts INTEGER,
+            observe_until_ts INTEGER,
+            release_required INTEGER DEFAULT 0,
+            queue_json TEXT DEFAULT '[]',
+            reason TEXT DEFAULT '',
+            updated_ts INTEGER
+        )
+    """)
+
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
         cur.execute("PRAGMA table_info(ai_memory)")
@@ -8831,6 +8850,173 @@ def api_compare():
     except Exception as e:
         # Last resort: return JSON error (frontend can show message)
         return err(str(e), 500)
+
+
+
+def _nexus_trading_clamp_hold_hours(value) -> float:
+    try:
+        n = float(value)
+    except Exception:
+        n = 1.0
+    if not math.isfinite(n):
+        n = 1.0
+    return max(1.0, min(12.0, n))
+
+
+def _nexus_trading_hold_row_to_dict(row) -> dict:
+    if not row:
+        return {
+            "status": "PREPARED",
+            "hold_hours": 1.0,
+            "observe_max_hours": 12.0,
+            "hold_started_ts": None,
+            "hold_until_ts": None,
+            "observe_until_ts": None,
+            "release_required": False,
+            "queue": [],
+            "reason": "",
+            "updated_ts": now_ts(),
+        }
+    try:
+        queue = json.loads(row["queue_json"] or "[]")
+        if not isinstance(queue, list):
+            queue = []
+    except Exception:
+        queue = []
+    return {
+        "status": row["status"] or "PREPARED",
+        "hold_hours": float(row["hold_hours"] or 1),
+        "observe_max_hours": float(row["observe_max_hours"] or 12),
+        "hold_started_ts": row["hold_started_ts"],
+        "hold_until_ts": row["hold_until_ts"],
+        "observe_until_ts": row["observe_until_ts"],
+        "release_required": bool(row["release_required"]),
+        "queue": queue,
+        "reason": row["reason"] or "",
+        "updated_ts": row["updated_ts"] or now_ts(),
+    }
+
+
+def _nexus_trading_update_hold_phase(state: dict) -> dict:
+    """Advance HOLD -> OBSERVE -> RELEASE_REQUIRED without ever allowing blind re-entry."""
+    out = dict(state or {})
+    status = str(out.get("status") or "PREPARED").upper()
+    ts = now_ts()
+    hold_until = int(out.get("hold_until_ts") or 0)
+    observe_until = int(out.get("observe_until_ts") or 0)
+
+    if status in ("HOLD", "OBSERVE") and observe_until and ts >= observe_until:
+        out["status"] = "RELEASE_REQUIRED"
+        out["release_required"] = True
+        out["reason"] = "Max 12h observation reached. User release is required before new allocation."
+    elif status == "HOLD" and hold_until and ts >= hold_until:
+        out["status"] = "OBSERVE"
+        out["release_required"] = False
+        out["reason"] = "Minimum HOLD completed. Strategist continues observing; timer expiry is not trade approval."
+    return out
+
+
+@app.route("/api/nexus/trading/hold-state", methods=["GET", "POST"])
+def api_nexus_trading_hold_state():
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or (request.get_json(silent=True) or {}).get("wallet")
+        or ""
+    )
+    wa = _norm_addr(wallet)
+    if not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    body = request.get_json(silent=True) or {}
+    conn = _db()
+    cur = conn.cursor()
+
+    if request.method == "POST":
+        action = str(body.get("action") or "state").strip().lower()
+        now_i = now_ts()
+
+        if action in ("hold", "protect", "exit"):
+            hold_hours = _nexus_trading_clamp_hold_hours(body.get("hold_hours", 1))
+            hold_until = now_i + int(hold_hours * 3600)
+            observe_until = now_i + 12 * 3600
+            queue = body.get("queue") if isinstance(body.get("queue"), list) else []
+            reason = str(body.get("reason") or "capital_hold_observe").strip()[:500]
+            with DB_WRITE_LOCK:
+                cur.execute(
+                    """
+                    INSERT INTO nexus_trading_hold_state(
+                        wallet_address, status, hold_hours, observe_max_hours, hold_started_ts,
+                        hold_until_ts, observe_until_ts, release_required, queue_json, reason, updated_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(wallet_address) DO UPDATE SET
+                        status=excluded.status,
+                        hold_hours=excluded.hold_hours,
+                        observe_max_hours=excluded.observe_max_hours,
+                        hold_started_ts=excluded.hold_started_ts,
+                        hold_until_ts=excluded.hold_until_ts,
+                        observe_until_ts=excluded.observe_until_ts,
+                        release_required=excluded.release_required,
+                        queue_json=excluded.queue_json,
+                        reason=excluded.reason,
+                        updated_ts=excluded.updated_ts
+                    """,
+                    (wa, "HOLD", hold_hours, 12, now_i, hold_until, observe_until, 0, json.dumps(queue, ensure_ascii=False), reason, now_i),
+                )
+                conn.commit()
+
+        elif action == "release":
+            with DB_WRITE_LOCK:
+                cur.execute(
+                    """
+                    INSERT INTO nexus_trading_hold_state(wallet_address, status, hold_hours, observe_max_hours, release_required, queue_json, reason, updated_ts)
+                    VALUES (?, 'PREPARED', 1, 12, 0, '[]', 'released_by_user', ?)
+                    ON CONFLICT(wallet_address) DO UPDATE SET
+                        status='PREPARED', release_required=0, queue_json='[]', reason='released_by_user', updated_ts=excluded.updated_ts
+                    """,
+                    (wa, now_i),
+                )
+                conn.commit()
+
+        elif action == "state":
+            pass
+        else:
+            return jsonify({"status": "error", "error": "invalid action", "ts": now_ts()}), 400
+
+    cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+    state = _nexus_trading_hold_row_to_dict(cur.fetchone())
+    updated = _nexus_trading_update_hold_phase(state)
+
+    if updated.get("status") != state.get("status") or bool(updated.get("release_required")) != bool(state.get("release_required")):
+        with DB_WRITE_LOCK:
+            cur.execute(
+                """
+                INSERT INTO nexus_trading_hold_state(wallet_address, status, hold_hours, observe_max_hours, hold_started_ts, hold_until_ts, observe_until_ts, release_required, queue_json, reason, updated_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wallet_address) DO UPDATE SET
+                    status=excluded.status,
+                    release_required=excluded.release_required,
+                    reason=excluded.reason,
+                    updated_ts=excluded.updated_ts
+                """,
+                (
+                    wa,
+                    updated.get("status") or "PREPARED",
+                    float(updated.get("hold_hours") or 1),
+                    12,
+                    updated.get("hold_started_ts"),
+                    updated.get("hold_until_ts"),
+                    updated.get("observe_until_ts"),
+                    1 if updated.get("release_required") else 0,
+                    json.dumps(updated.get("queue") or [], ensure_ascii=False),
+                    updated.get("reason") or "",
+                    now_ts(),
+                ),
+            )
+            conn.commit()
+
+    return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "ts": now_ts()})
 
 
 @app.route("/api/trading/suitability", methods=["GET"])
