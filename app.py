@@ -3564,6 +3564,35 @@ def _stable_decimals(chain_id: int, symbol: str, token_address: str | None = Non
     return _USDT_DECIMALS if sym == "USDT" else _USDC_DECIMALS
 
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "25")))
+PRICE_STRATEGIST_WEEKLY_USD = float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20"))
+PRICE_STRATEGIST_MONTHLY_USD = float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50"))
+
+def _subscription_plan_meta(plan: str) -> dict:
+    """Plan pricing/expiry metadata for on-chain USDC/USDT payments."""
+    p = str(plan or "").strip().lower()
+    if p in ("pro", "core", "silver", "gold", "basic", "premium"):
+        return {
+            "plan": "pro",
+            "kind": "core",
+            "price_usd": float(PRICE_PRO_USD),
+            "seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
+        }
+    if p in ("strategist_weekly", "strategist-weekly", "strategist_7d", "strategist7d"):
+        return {
+            "plan": "strategist_weekly",
+            "kind": "strategist",
+            "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD),
+            "seconds": 60 * 60 * 24 * 7,
+        }
+    if p in ("strategist_monthly", "strategist-monthly", "strategist_30d", "strategist30d", "strategist"):
+        return {
+            "plan": "strategist_monthly",
+            "kind": "strategist",
+            "price_usd": float(PRICE_STRATEGIST_MONTHLY_USD),
+            "seconds": 60 * 60 * 24 * 30,
+        }
+    raise RuntimeError("unsupported subscription plan")
+
 # keccak256("Transfer(address,address,uint256)")
 ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
@@ -3781,11 +3810,9 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
     if not TREASURY_ADDRESS:
         raise RuntimeError("missing NEXUS_TREASURY_ADDRESS")
 
-    plan_l = (plan or "").strip().lower()
-    if plan_l not in ("pro", "silver", "gold", "basic", "premium"):
-        raise RuntimeError("plan must be 'pro'")
-
-    price = float(PRICE_PRO_USD)
+    meta = _subscription_plan_meta(plan)
+    plan_l = meta["plan"]
+    price = float(meta["price_usd"])
 
     txh = (tx_hash or "").strip().lower()
     if not txh.startswith("0x") or len(txh) < 20:
@@ -3855,6 +3882,8 @@ def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
                     "token_address": addr,
                     "amount_units": int(value),
                     "required_units": int(min_units_by_token[addr]),
+                    "plan": plan_l,
+                    "price_usd": price,
                 }
         except Exception:
             continue
@@ -6653,6 +6682,11 @@ def api_access_subscribe_config():
         "status": "ok",
         "plan": "pro",
         "price_usd": float(PRICE_PRO_USD),
+        "plans": {
+            "core": {"plan": "pro", "price_usd": float(PRICE_PRO_USD), "days": 30},
+            "strategist_weekly": {"plan": "strategist_weekly", "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD), "days": 7},
+            "strategist_monthly": {"plan": "strategist_monthly", "price_usd": float(PRICE_STRATEGIST_MONTHLY_USD), "days": 30},
+        },
         "treasury": TREASURY_ADDRESS,
         "tokens": tokens,
         "subscription_seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
@@ -6701,7 +6735,11 @@ def api_access_subscribe_verify():
 
     chain_id = body.get("chain_id")
     tx_hash = str(body.get("tx_hash") or "").strip()
-    plan = "pro"  # single core plan (25$/30d); client may still send plan but we ignore it
+    try:
+        plan_meta = _subscription_plan_meta(body.get("plan") or "pro")
+    except Exception as e:
+        return err(str(e), 400)
+    plan = plan_meta["plan"]
 
     try:
         chain_id = int(chain_id)
@@ -6740,44 +6778,63 @@ def api_access_subscribe_verify():
         conn.close()
         return err(str(e), 500)
 
-    # activate PRO subscription (default 30 days; configurable)
-    sub_seconds = int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30)))
-    expires_ts = now_ts() + sub_seconds
-    plan = "pro"
-    chains_allowed = list(_CHAINS_PRO_EFFECTIVE)
-    ai_limit = _AI_LIMIT_UNLIMITED
+    # Activate selected plan.
+    activated_plan = str(proof.get("plan") or plan).lower()
+    activated_meta = _subscription_plan_meta(activated_plan)
+    expires_ts = now_ts() + int(activated_meta["seconds"])
 
-    _access_state_put(
-        wallet_address=wa,
-        plan=plan,
-        source=str(proof.get("token") or "payment").lower(),
-        expires_ts=expires_ts,
-        chains_allowed=chains_allowed,
-        ai_limit=ai_limit,
-        can_open_new_trades=True,
-        conn=conn,
-        cur=cur,
-    )
+    if activated_meta["kind"] == "strategist":
+        # Strategist is a separate add-on and must not overwrite Core subscription state.
+        cur.execute(
+            "INSERT INTO nexus_strategist_access(wallet_address, plan, source, expires_ts, last_payment_tx_hash, updated_ts) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(wallet_address) DO UPDATE SET plan=excluded.plan, source=excluded.source, "
+            "expires_ts=excluded.expires_ts, last_payment_tx_hash=excluded.last_payment_tx_hash, updated_ts=excluded.updated_ts",
+            (
+                wa,
+                activated_plan,
+                str(proof.get("token") or "payment").lower(),
+                int(expires_ts),
+                tx_hash.lower(),
+                now_ts(),
+            ),
+        )
+    else:
+        # activate Core/PRO subscription (default 30 days; configurable)
+        chains_allowed = list(_CHAINS_PRO_EFFECTIVE)
+        ai_limit = _AI_LIMIT_UNLIMITED
 
-    # Keep auto-renew schedule aligned with the paid subscription.
-    # Does NOT enable auto-renew automatically; user must opt in separately.
-    cur.execute(
-        "UPDATE access_state SET next_billing_ts=?, preferred_token=COALESCE(NULLIF(preferred_token,''), ?), "
-        "preferred_chain=COALESCE(NULLIF(preferred_chain,''), ?), last_auto_renew_status=? WHERE wallet_address=?",
-        (
-            int(expires_ts),
-            str(proof.get("token") or "USDT").upper(),
-            _chain_key_from_id(int(chain_id)),
-            "subscription_verified",
-            wa,
-        ),
-    )
+        _access_state_put(
+            wallet_address=wa,
+            plan="pro",
+            source=str(proof.get("token") or "payment").lower(),
+            expires_ts=expires_ts,
+            chains_allowed=chains_allowed,
+            ai_limit=ai_limit,
+            can_open_new_trades=True,
+            conn=conn,
+            cur=cur,
+        )
+
+        # Keep auto-renew schedule aligned with the paid Core subscription.
+        # Does NOT enable auto-renew automatically; user must opt in separately.
+        cur.execute(
+            "UPDATE access_state SET next_billing_ts=?, preferred_token=COALESCE(NULLIF(preferred_token,''), ?), "
+            "preferred_chain=COALESCE(NULLIF(preferred_chain,''), ?), last_auto_renew_status=? WHERE wallet_address=?",
+            (
+                int(expires_ts),
+                str(proof.get("token") or "USDT").upper(),
+                _chain_key_from_id(int(chain_id)),
+                "subscription_verified",
+                wa,
+            ),
+        )
 
     conn.commit()
     conn.close()
 
     st = _compute_access_status(wa)
-    return jsonify({"status": "ok", "verified": True, "payment": proof, "access": st})
+    return jsonify({"status": "ok", "verified": True, "plan": activated_plan, "expires_ts": int(expires_ts), "payment": proof, "access": st})
 
 
 @app.route("/api/auth/verify", methods=["POST"])
