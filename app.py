@@ -21,6 +21,10 @@ import uuid
 import requests
 import random
 import math
+import smtplib
+import ssl
+import html
+from email.message import EmailMessage
 from typing import Optional, Dict, Any
 # --- Defaults for manual orders ---
 DEFAULT_SLIPPAGE_BPS = int(os.getenv("DEFAULT_SLIPPAGE_BPS", "500"))   # 500 bps = 5%
@@ -1640,6 +1644,23 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_wallet_ts ON support_tickets(wallet_address, created_ts)")
+
+    # Mail outbox/log. Every mail attempt is logged so failed SMTP delivery never breaks app flows.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mail_outbox (
+            mail_id TEXT PRIMARY KEY,
+            kind TEXT DEFAULT '',
+            recipient TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            status TEXT DEFAULT 'created',
+            error TEXT DEFAULT '',
+            meta_json TEXT DEFAULT '{}',
+            created_ts INTEGER,
+            sent_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mail_outbox_status_ts ON mail_outbox(status, created_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_mail_outbox_kind_ts ON mail_outbox(kind, created_ts)")
 
     # Adaptive Market Memory: structured snapshots for later outcome learning.
     # This stores behavior/state, not full AI text. Outcomes are intentionally nullable
@@ -6799,6 +6820,7 @@ def api_access_subscribe_verify():
     except Exception as e:
         return err(str(e), 400)
     plan = plan_meta["plan"]
+    billing_recipient = str(body.get("email") or body.get("billing_email") or "").strip()
 
     try:
         chain_id = int(chain_id)
@@ -6892,8 +6914,24 @@ def api_access_subscribe_verify():
     conn.commit()
     conn.close()
 
+    billing_mail = _send_billing_confirmation_mail(
+        billing_recipient,
+        wallet=wa,
+        plan=activated_plan,
+        token=str(proof.get("token") or ""),
+        tx_hash=tx_hash.lower(),
+        expires_ts=int(expires_ts),
+    ) if billing_recipient else {"ok": False, "status": "no_email_provided"}
     st = _compute_access_status(wa)
-    return jsonify({"status": "ok", "verified": True, "plan": activated_plan, "expires_ts": int(expires_ts), "payment": proof, "access": st})
+    return jsonify({
+        "status": "ok",
+        "verified": True,
+        "plan": activated_plan,
+        "expires_ts": int(expires_ts),
+        "payment": proof,
+        "billing_mail": billing_mail,
+        "access": st,
+    })
 
 
 @app.route("/api/auth/verify", methods=["POST"])
@@ -9812,6 +9850,320 @@ def api_nexus_trading_release_reservation():
     return jsonify({"status": "ok", "wallet": wa, "released": reservation_id, "execution": execution, "ts": now_ts()})
 
 
+
+# -------------------------
+# Nexus Mail Service
+# -------------------------
+def _env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+MAIL_ENABLED = _env_bool("MAIL_ENABLED", "0")
+SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT") or "465")
+SMTP_SECURE_SSL = _env_bool("SMTP_SECURE_SSL", "1")
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
+SMTP_PASS = (os.getenv("SMTP_PASS") or "").strip()
+SMTP_FROM = (os.getenv("SMTP_FROM") or "Nexus Analyt <support@nexus-analyt.com>").strip()
+SUPPORT_EMAIL = (os.getenv("SUPPORT_EMAIL") or "support@nexus-analyt.com").strip()
+BILLING_EMAIL = (os.getenv("BILLING_EMAIL") or "billing@nexus-analyt.com").strip()
+BILLING_FROM = (os.getenv("BILLING_FROM") or "Nexus Billing <billing@nexus-analyt.com>").strip()
+BILLING_USER = (os.getenv("BILLING_USER") or BILLING_EMAIL).strip()
+
+
+def _mail_escape(value) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _mail_brand_html(title: str, body_html: str) -> str:
+    title_e = _mail_escape(title)
+    return f"""<!doctype html>
+<html>
+  <body style="margin:0;background:#061613;color:#eafff6;font-family:Arial,Helvetica,sans-serif;">
+    <div style="max-width:720px;margin:0 auto;padding:24px;">
+      <div style="padding:18px 20px;border:1px solid rgba(57,217,138,.28);border-radius:18px;background:#0b241f;">
+        <h2 style="margin:0 0 12px;color:#39d98a;">{title_e}</h2>
+        <div style="font-size:14px;line-height:1.55;color:#d8fff1;">{body_html}</div>
+        <hr style="border:none;border-top:1px solid rgba(255,255,255,.10);margin:18px 0;">
+        <div style="font-size:12px;color:#8fb5a8;">
+          Nexus Analyt · Automated message
+        </div>
+      </div>
+    </div>
+  </body>
+</html>"""
+
+
+def _mail_text_from_html(value: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", str(value or ""), flags=re.I)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def _mail_log(kind: str, recipient: str, subject: str, status: str, error: str = "", meta: dict | None = None, mail_id: str | None = None):
+    mid = mail_id or ("MAIL-" + uuid.uuid4().hex[:12].upper())
+    try:
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO mail_outbox(mail_id, kind, recipient, subject, status, error, meta_json, created_ts, sent_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(mail_id) DO UPDATE SET
+                  status=excluded.status,
+                  error=excluded.error,
+                  sent_ts=excluded.sent_ts
+                """,
+                (
+                    mid,
+                    str(kind or "")[:80],
+                    str(recipient or "")[:250],
+                    str(subject or "")[:250],
+                    str(status or "")[:40],
+                    str(error or "")[:1000],
+                    json.dumps(meta or {}, ensure_ascii=False),
+                    now_ts(),
+                    now_ts() if status == "sent" else None,
+                ),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print("[MAIL] log failed:", e)
+    return mid
+
+
+def _send_mail(
+    *,
+    to: str,
+    subject: str,
+    html_body: str,
+    text_body: str | None = None,
+    kind: str = "general",
+    from_addr: str | None = None,
+    reply_to: str | None = None,
+    meta: dict | None = None,
+) -> dict:
+    """Central SMTP sender. Never raises into business logic."""
+    recipient = str(to or "").strip()
+    subj = str(subject or "").strip()
+    mail_id = _mail_log(kind, recipient, subj, "created", meta=meta)
+
+    if not MAIL_ENABLED:
+        _mail_log(kind, recipient, subj, "disabled", "MAIL_ENABLED is false", meta=meta, mail_id=mail_id)
+        return {"ok": False, "status": "disabled", "mail_id": mail_id}
+
+    if not recipient or "@" not in recipient:
+        _mail_log(kind, recipient, subj, "skipped", "invalid recipient", meta=meta, mail_id=mail_id)
+        return {"ok": False, "status": "skipped", "mail_id": mail_id, "error": "invalid recipient"}
+
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+        _mail_log(kind, recipient, subj, "failed", "SMTP env missing", meta=meta, mail_id=mail_id)
+        return {"ok": False, "status": "failed", "mail_id": mail_id, "error": "SMTP env missing"}
+
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subj
+        msg["From"] = from_addr or SMTP_FROM
+        msg["To"] = recipient
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        msg.set_content(text_body or _mail_text_from_html(html_body))
+        msg.add_alternative(html_body, subtype="html")
+
+        if SMTP_SECURE_SSL:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=20) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+                server.starttls(context=ssl.create_default_context())
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+
+        _mail_log(kind, recipient, subj, "sent", meta=meta, mail_id=mail_id)
+        return {"ok": True, "status": "sent", "mail_id": mail_id}
+    except Exception as e:
+        _mail_log(kind, recipient, subj, "failed", str(e), meta=meta, mail_id=mail_id)
+        print("[MAIL] send failed:", e)
+        return {"ok": False, "status": "failed", "mail_id": mail_id, "error": str(e)}
+
+
+def _send_support_ticket_mails(ticket_id: str, *, wallet: str, email: str, category: str, subject: str, message: str, meta: dict):
+    safe_message = _mail_escape(message).replace("\n", "<br>")
+    admin_html = _mail_brand_html(
+        f"Support Ticket {ticket_id}",
+        f"""
+        <p><b>Category:</b> {_mail_escape(category)}</p>
+        <p><b>Subject:</b> {_mail_escape(subject)}</p>
+        <p><b>Wallet:</b> {_mail_escape(wallet or "not connected")}</p>
+        <p><b>User email:</b> {_mail_escape(email or "not provided")}</p>
+        <p><b>Message:</b><br>{safe_message}</p>
+        <p><b>Meta:</b><br><code>{_mail_escape(json.dumps(meta or {}, ensure_ascii=False)[:2500])}</code></p>
+        """,
+    )
+    admin_res = _send_mail(
+        to=SUPPORT_EMAIL,
+        subject=f"[Nexus Support] {ticket_id} · {category} · {subject}",
+        html_body=admin_html,
+        kind="support_admin",
+        from_addr=SMTP_FROM,
+        reply_to=email if email else None,
+        meta={"ticket_id": ticket_id, "wallet": wallet, "category": category},
+    )
+
+    user_res = {"ok": False, "status": "no_user_email"}
+    if email and "@" in email:
+        user_html = _mail_brand_html(
+            "Support request received",
+            f"""
+            <p>We received your Nexus Analyt support request.</p>
+            <p><b>Ticket ID:</b> {_mail_escape(ticket_id)}</p>
+            <p><b>Category:</b> {_mail_escape(category)}</p>
+            <p>We will review it and reply as soon as possible.</p>
+            """,
+        )
+        user_res = _send_mail(
+            to=email,
+            subject=f"Nexus Analyt Support · {ticket_id}",
+            html_body=user_html,
+            kind="support_autoreply",
+            from_addr=SMTP_FROM,
+            reply_to=SUPPORT_EMAIL,
+            meta={"ticket_id": ticket_id, "wallet": wallet},
+        )
+    return {"admin": admin_res, "user": user_res}
+
+
+def _send_billing_confirmation_mail(to: str, *, wallet: str, plan: str, token: str, tx_hash: str, expires_ts: int | None):
+    if not to or "@" not in to:
+        return {"ok": False, "status": "no_billing_recipient"}
+    plan_label = {
+        "pro": "Nexus Core",
+        "strategist_weekly": "Strategist Weekly",
+        "strategist_monthly": "Strategist Monthly",
+    }.get(str(plan or "").lower(), str(plan or "Nexus Access"))
+    expiry = ""
+    if expires_ts:
+        try:
+            expiry = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(expires_ts)))
+        except Exception:
+            expiry = str(expires_ts)
+    body = _mail_brand_html(
+        "Payment confirmed",
+        f"""
+        <p>Your payment was verified and access has been activated.</p>
+        <p><b>Plan:</b> {_mail_escape(plan_label)}</p>
+        <p><b>Token:</b> {_mail_escape(token)}</p>
+        <p><b>Wallet:</b> {_mail_escape(wallet)}</p>
+        <p><b>Transaction:</b> {_mail_escape(tx_hash)}</p>
+        {f'<p><b>Valid until:</b> {_mail_escape(expiry)}</p>' if expiry else ''}
+        """,
+    )
+    return _send_mail(
+        to=to,
+        subject=f"Nexus Billing · {plan_label} activated",
+        html_body=body,
+        kind="billing_confirmation",
+        from_addr=BILLING_FROM,
+        reply_to=BILLING_EMAIL,
+        meta={"wallet": wallet, "plan": plan, "tx_hash": tx_hash},
+    )
+
+
+def _send_trading_alert_mail(to: str, *, wallet: str, alert_type: str, title: str, message: str, meta: dict | None = None):
+    if not to or "@" not in to:
+        return {"ok": False, "status": "no_recipient"}
+    body = _mail_brand_html(
+        title or "Nexus Trading Alert",
+        f"""
+        <p>{_mail_escape(message).replace(chr(10), '<br>')}</p>
+        <p><b>Alert:</b> {_mail_escape(alert_type)}</p>
+        <p><b>Wallet:</b> {_mail_escape(wallet)}</p>
+        """,
+    )
+    return _send_mail(
+        to=to,
+        subject=f"Nexus Alert · {alert_type}",
+        html_body=body,
+        kind="trading_alert",
+        from_addr=SMTP_FROM,
+        reply_to=SUPPORT_EMAIL,
+        meta={"wallet": wallet, "alert_type": alert_type, **(meta or {})},
+    )
+
+
+@app.route("/api/mail/test", methods=["POST"])
+def api_mail_test():
+    body = request.get_json(silent=True) or {}
+    to = str(body.get("to") or SUPPORT_EMAIL).strip()
+    kind = str(body.get("kind") or "test").strip()
+    res = _send_mail(
+        to=to,
+        subject="Nexus Analyt mail test",
+        html_body=_mail_brand_html("Mail test", "<p>This is a Nexus Analyt SMTP test message.</p>"),
+        kind=f"test_{kind}",
+        from_addr=SMTP_FROM,
+        reply_to=SUPPORT_EMAIL,
+        meta={"route": "/api/mail/test"},
+    )
+    code = 200 if res.get("ok") else 500 if res.get("status") == "failed" else 200
+    return jsonify({"status": "ok" if res.get("ok") else res.get("status"), "mail": res, "ts": now_ts()}), code
+
+
+
+@app.route("/api/mail/trading-alert", methods=["POST"])
+def api_mail_trading_alert():
+    body = request.get_json(silent=True) or {}
+    wallet = (
+        body.get("wallet")
+        or body.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet) if wallet else ""
+    if wallet and not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    to = str(body.get("email") or body.get("to") or "").strip()
+    alert_type = str(body.get("alert_type") or body.get("type") or "INFO").strip().upper()[:40]
+    title = str(body.get("title") or "Nexus Trading Alert").strip()[:160]
+    message = str(body.get("message") or "").strip()
+    if len(message) < 4:
+        return jsonify({"status": "error", "error": "message too short", "ts": now_ts()}), 400
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+
+    res = _send_trading_alert_mail(
+        to,
+        wallet=wa,
+        alert_type=alert_type,
+        title=title,
+        message=message,
+        meta=meta,
+    )
+    return jsonify({"status": "ok" if res.get("ok") else res.get("status"), "mail": res, "ts": now_ts()})
+
+
+@app.route("/api/mail/status", methods=["GET"])
+def api_mail_status():
+    return jsonify({
+        "status": "ok",
+        "mail_enabled": bool(MAIL_ENABLED),
+        "smtp_host_configured": bool(SMTP_HOST),
+        "smtp_user_configured": bool(SMTP_USER),
+        "smtp_pass_configured": bool(SMTP_PASS),
+        "smtp_port": int(SMTP_PORT),
+        "smtp_secure_ssl": bool(SMTP_SECURE_SSL),
+        "support_email": SUPPORT_EMAIL,
+        "billing_email": BILLING_EMAIL,
+        "ts": now_ts(),
+    })
+
+
+
 @app.route("/api/support/ticket", methods=["POST"])
 def api_support_ticket_create():
     body = request.get_json(silent=True) or {}
@@ -9853,7 +10205,22 @@ def api_support_ticket_create():
         )
         conn.commit()
         conn.close()
-    return jsonify({"status": "ok", "ticket_id": ticket_id, "message": "Support request received.", "ts": now_i})
+    mail_result = _send_support_ticket_mails(
+        ticket_id,
+        wallet=wa,
+        email=email,
+        category=category,
+        subject=subject,
+        message=message,
+        meta=meta,
+    )
+    return jsonify({
+        "status": "ok",
+        "ticket_id": ticket_id,
+        "message": "Support request received.",
+        "mail": mail_result,
+        "ts": now_i,
+    })
 
 
 @app.route("/api/access/strategist/config", methods=["GET"])
