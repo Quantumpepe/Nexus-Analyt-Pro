@@ -1702,6 +1702,65 @@ def init_db():
         )
     """)
 
+    # Nexus Execution Preparation Layer. Prepared state only; no Vault/on-chain execution.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_execution_queue (
+            id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            slot_id TEXT DEFAULT '',
+            asset TEXT DEFAULT '',
+            chain TEXT DEFAULT '',
+            action TEXT DEFAULT 'OBSERVE',
+            state TEXT DEFAULT 'WAIT',
+            priority REAL DEFAULT 0,
+            reserved_capital_usd REAL DEFAULT 0,
+            confidence REAL DEFAULT 0,
+            risk_score REAL DEFAULT 0,
+            reason TEXT DEFAULT '',
+            signals_json TEXT DEFAULT '{}',
+            meta_json TEXT DEFAULT '{}',
+            recheck_after_ts INTEGER,
+            expires_ts INTEGER,
+            created_ts INTEGER,
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_execution_queue_wallet_state ON nexus_execution_queue(wallet_address, state)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_execution_queue_wallet_priority ON nexus_execution_queue(wallet_address, priority, updated_ts)")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_capital_reservations (
+            reservation_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            slot_id TEXT DEFAULT '',
+            asset TEXT DEFAULT '',
+            amount_usd REAL DEFAULT 0,
+            state TEXT DEFAULT 'RESERVED',
+            reason TEXT DEFAULT '',
+            hold_until_ts INTEGER,
+            release_required INTEGER DEFAULT 0,
+            created_ts INTEGER,
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_capital_reservations_wallet_state ON nexus_capital_reservations(wallet_address, state)")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_simulation_events (
+            event_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            slot_id TEXT DEFAULT '',
+            asset TEXT DEFAULT '',
+            event_type TEXT DEFAULT '',
+            state_from TEXT DEFAULT '',
+            state_to TEXT DEFAULT '',
+            reason TEXT DEFAULT '',
+            meta_json TEXT DEFAULT '{}',
+            created_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_simulation_events_wallet_ts ON nexus_simulation_events(wallet_address, created_ts)")
+
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
         cur.execute("PRAGMA table_info(ai_memory)")
@@ -9489,6 +9548,147 @@ def api_nexus_trading_hold_state():
 
 
 
+
+# -------------------------
+# Nexus Execution Preparation Layer
+# -------------------------
+_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
+
+def _nexus_json_load(value, fallback):
+    try:
+        data = json.loads(value or "")
+        return data if isinstance(data, type(fallback)) else fallback
+    except Exception:
+        return fallback
+
+def _nexus_wallet_from_request():
+    body = request.get_json(silent=True) or {}
+    wallet = request.args.get("wallet") or request.args.get("wallet_address") or request.headers.get("X-Wallet-Address") or body.get("wallet") or body.get("wallet_address") or ""
+    wa = _norm_addr(wallet)
+    if not wa or not _looks_like_evm_addr(wa):
+        return "", (jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400)
+    return wa, None
+
+def _nexus_queue_row_to_dict(row) -> dict:
+    return {
+        "id": row["id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "", "chain": row["chain"] or "",
+        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
+        "reserved_capital_usd": float(row["reserved_capital_usd"] or 0), "confidence": float(row["confidence"] or 0),
+        "risk_score": float(row["risk_score"] or 0), "reason": row["reason"] or "",
+        "signals": _nexus_json_load(row["signals_json"], {}), "meta": _nexus_json_load(row["meta_json"], {}),
+        "recheck_after_ts": row["recheck_after_ts"], "expires_ts": row["expires_ts"],
+        "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
+    }
+
+def _nexus_reservation_row_to_dict(row) -> dict:
+    return {
+        "reservation_id": row["reservation_id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "",
+        "amount_usd": float(row["amount_usd"] or 0), "state": row["state"] or "RESERVED",
+        "reason": row["reason"] or "", "hold_until_ts": row["hold_until_ts"],
+        "release_required": bool(row["release_required"]), "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
+    }
+
+def _nexus_log_sim_event(cur, wallet_address, slot_id, asset, event_type, state_from, state_to, reason, meta=None):
+    cur.execute(
+        "INSERT INTO nexus_simulation_events(event_id,wallet_address,slot_id,asset,event_type,state_from,state_to,reason,meta_json,created_ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("SIM-" + uuid.uuid4().hex[:12].upper(), wallet_address, str(slot_id or ""), str(asset or "").upper(), str(event_type or ""), str(state_from or ""), str(state_to or ""), str(reason or "")[:500], json.dumps(meta or {}, ensure_ascii=False), now_ts()),
+    )
+
+def _nexus_execution_summary(cur, wallet_address):
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY priority DESC, updated_ts DESC LIMIT 25", (wallet_address,))
+    queue = [_nexus_queue_row_to_dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT * FROM nexus_capital_reservations WHERE wallet_address=? AND state IN ('RESERVED','HOLD','OBSERVE','RELEASE_REQUIRED') ORDER BY updated_ts DESC", (wallet_address,))
+    reservations = [_nexus_reservation_row_to_dict(r) for r in cur.fetchall()]
+    due_count = len([q for q in queue if not q.get("recheck_after_ts") or int(q.get("recheck_after_ts") or 0) <= now_ts()])
+    return {
+        "queue": queue, "reservations": reservations,
+        "reserved_capital_usd": round(sum(float(r.get("amount_usd") or 0) for r in reservations), 2),
+        "recheck_due_count": due_count, "queue_count": len(queue),
+        "simulation_only_until_vault": True, "vault_execution_enabled": False,
+    }
+
+def _nexus_recheck_apply(cur, wallet_address):
+    ts = now_ts()
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 20", (wallet_address, ts))
+    changed = []
+    for row in cur.fetchall():
+        item = _nexus_queue_row_to_dict(row)
+        old_state = str(item.get("state") or "WAIT").upper()
+        decision = _nexus_trading_decide_slot({"status": old_state, "symbol": item.get("asset"), "signals": item.get("signals") or {}, "confidence": item.get("confidence"), "risk_score": item.get("risk_score")}, {"risk_mode": "BALANCED"})
+        new_state = str(decision.get("state") or old_state).upper()
+        reason = str(decision.get("reason") or item.get("reason") or "Scheduled Strategist recheck").strip()
+        if old_state in ("WAIT","OBSERVE") and new_state == "ACTIVE":
+            new_state = "READY"
+            reason = "Recheck confirmed readiness, but Vault execution is not enabled yet."
+        if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
+            new_state = old_state
+        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
+        cur.execute("UPDATE nexus_execution_queue SET state=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?", (new_state, reason[:500], next_recheck, ts, item["id"], wallet_address))
+        if new_state != old_state:
+            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision})
+            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason})
+    return changed
+
+def _nexus_upsert_queue_item(cur, wallet_address, body):
+    slot_id = str(body.get("slot_id") or body.get("slot") or "").strip()[:80]
+    asset = str(body.get("asset") or body.get("symbol") or "").strip().upper()[:24]
+    chain = _normalize_chain_key(body.get("chain") or body.get("chain_key") or "")
+    requested_state = str(body.get("state") or "WAIT").strip().upper()
+    if requested_state not in _NEXUS_EXEC_ALLOWED_STATES:
+        requested_state = "WAIT"
+    signals = body.get("signals") if isinstance(body.get("signals"), dict) else {}
+    meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
+    risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
+    priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
+    decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": body.get("risk_mode") or "BALANCED"})
+    state = str(decision.get("state") or requested_state).upper()
+    if state not in _NEXUS_EXEC_ALLOWED_STATES:
+        state = requested_state
+    reason = str(body.get("reason") or decision.get("reason") or "Prepared by backend execution layer")[:500]
+    now_i = now_ts()
+    queue_id = str(body.get("id") or body.get("queue_id") or ("NQ-" + uuid.uuid4().hex[:12].upper()))
+    recheck_after_ts = int(body.get("recheck_after_ts") or (now_i + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))))
+    expires_ts = body.get("expires_ts")
+    try:
+        expires_ts = int(expires_ts) if expires_ts else None
+    except Exception:
+        expires_ts = None
+    reserved_capital_usd = _clamp_float(body.get("reserved_capital_usd", body.get("budget_usd", 0)), 0, 0, 1_000_000_000)
+    cur.execute(
+        """
+        INSERT INTO nexus_execution_queue(id,wallet_address,slot_id,asset,chain,action,state,priority,reserved_capital_usd,confidence,risk_score,reason,signals_json,meta_json,recheck_after_ts,expires_ts,created_ts,updated_ts)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET slot_id=excluded.slot_id,asset=excluded.asset,chain=excluded.chain,action=excluded.action,state=excluded.state,priority=excluded.priority,reserved_capital_usd=excluded.reserved_capital_usd,confidence=excluded.confidence,risk_score=excluded.risk_score,reason=excluded.reason,signals_json=excluded.signals_json,meta_json=excluded.meta_json,recheck_after_ts=excluded.recheck_after_ts,expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts
+        """,
+        (queue_id, wallet_address, slot_id, asset, chain, str(body.get("action") or "OBSERVE").upper()[:40], state, priority, reserved_capital_usd, confidence, risk_score, reason, json.dumps(signals, ensure_ascii=False), json.dumps(meta, ensure_ascii=False), recheck_after_ts, expires_ts, now_i, now_i),
+    )
+    _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "QUEUE_PREPARED", "", state, reason, {"queue_id": queue_id, "decision": decision})
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
+    return _nexus_queue_row_to_dict(cur.fetchone())
+
+def _nexus_reserve_capital(cur, wallet_address, body):
+    slot_id = str(body.get("slot_id") or body.get("slot") or "").strip()[:80]
+    asset = str(body.get("asset") or body.get("symbol") or "").strip().upper()[:24]
+    amount = _clamp_float(body.get("amount_usd", body.get("reserved_capital_usd", 0)), 0, 0, 1_000_000_000)
+    reason = str(body.get("reason") or "Capital reserved by Nexus Trader preparation layer")[:500]
+    hold_hours = _clamp_float(body.get("hold_hours", 1), 1, 1, 12)
+    now_i = now_ts()
+    hold_until = now_i + int(hold_hours * 3600)
+    reservation_id = str(body.get("reservation_id") or ("NR-" + uuid.uuid4().hex[:12].upper()))
+    cur.execute(
+        """
+        INSERT INTO nexus_capital_reservations(reservation_id,wallet_address,slot_id,asset,amount_usd,state,reason,hold_until_ts,release_required,created_ts,updated_ts)
+        VALUES (?,?,?,?,?,'RESERVED',?,?,0,?,?)
+        ON CONFLICT(reservation_id) DO UPDATE SET slot_id=excluded.slot_id,asset=excluded.asset,amount_usd=excluded.amount_usd,state=excluded.state,reason=excluded.reason,hold_until_ts=excluded.hold_until_ts,release_required=0,updated_ts=excluded.updated_ts
+        """,
+        (reservation_id, wallet_address, slot_id, asset, amount, reason, hold_until, now_i, now_i),
+    )
+    _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "CAPITAL_RESERVED", "", "RESERVED", reason, {"reservation_id": reservation_id, "amount_usd": amount})
+    cur.execute("SELECT * FROM nexus_capital_reservations WHERE reservation_id=? AND wallet_address=?", (reservation_id, wallet_address))
+    return _nexus_reservation_row_to_dict(cur.fetchone())
+
+
 @app.route("/api/nexus/trading/state", methods=["GET"])
 def api_nexus_trading_state():
     wallet = (
@@ -9510,17 +9710,106 @@ def api_nexus_trading_state():
         conn.close()
     vault_ready = bool(any((_VAULT_BY_CHAIN.get(int(cid)) or "").strip() for cid in _ENABLED_CHAIN_IDS)) if "_ENABLED_CHAIN_IDS" in globals() else False
     execution_mode = "live" if access.get("can_live_execute") and vault_ready else "prepared" if access.get("is_live") else "simulation"
+    execution = {"queue": [], "reservations": [], "reserved_capital_usd": 0, "recheck_due_count": 0, "queue_count": 0}
+    recheck_changes = []
+    if wa:
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            recheck_changes = _nexus_recheck_apply(cur, wa)
+            execution = _nexus_execution_summary(cur, wa)
+            conn.commit()
+            conn.close()
     return jsonify({
         "status": "ok",
         "wallet": wa,
         "access": access,
         "hold_state": hold_state,
+        "execution": execution,
+        "recheck_changes": recheck_changes,
         "execution_mode": execution_mode,
         "vault_ready": vault_ready,
         "backend_is_state_master": True,
         "states": ["WAIT", "READY", "ACTIVE", "PROTECT", "EXIT_RISK", "HOLD", "OBSERVE", "BLOCKED", "RELEASE_REQUIRED"],
         "ts": now_ts(),
     })
+
+
+
+@app.route("/api/nexus/trading/queue", methods=["GET", "POST"])
+def api_nexus_trading_queue():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    if request.method == "GET":
+        conn = _db()
+        cur = conn.cursor()
+        execution = _nexus_execution_summary(cur, wa)
+        conn.close()
+        return jsonify({"status": "ok", "wallet": wa, "execution": execution, "ts": now_ts()})
+    body = request.get_json(silent=True) or {}
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        item = _nexus_upsert_queue_item(cur, wa, body)
+        execution = _nexus_execution_summary(cur, wa)
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "ok", "wallet": wa, "item": item, "execution": execution, "ts": now_ts()})
+
+@app.route("/api/nexus/trading/recheck", methods=["POST"])
+def api_nexus_trading_recheck():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        changes = _nexus_recheck_apply(cur, wa)
+        execution = _nexus_execution_summary(cur, wa)
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "ok", "wallet": wa, "changes": changes, "execution": execution, "message": "Strategist recheck completed in preparation mode. No Vault execution was triggered.", "ts": now_ts()})
+
+@app.route("/api/nexus/trading/reserve", methods=["POST"])
+def api_nexus_trading_reserve():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    body = request.get_json(silent=True) or {}
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        reservation = _nexus_reserve_capital(cur, wa, body)
+        execution = _nexus_execution_summary(cur, wa)
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "ok", "wallet": wa, "reservation": reservation, "execution": execution, "ts": now_ts()})
+
+@app.route("/api/nexus/trading/release-reservation", methods=["POST"])
+def api_nexus_trading_release_reservation():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    body = request.get_json(silent=True) or {}
+    reservation_id = str(body.get("reservation_id") or "").strip()
+    if not reservation_id:
+        return err("missing reservation_id", 400)
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM nexus_capital_reservations WHERE reservation_id=? AND wallet_address=?", (reservation_id, wa))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return err("reservation not found", 404)
+        old_state = row["state"] or "RESERVED"
+        cur.execute("UPDATE nexus_capital_reservations SET state='RELEASED', release_required=0, updated_ts=? WHERE reservation_id=? AND wallet_address=?", (now_ts(), reservation_id, wa))
+        _nexus_log_sim_event(cur, wa, row["slot_id"], row["asset"], "CAPITAL_RELEASED", old_state, "RELEASED", "User released reserved capital.", {"reservation_id": reservation_id})
+        execution = _nexus_execution_summary(cur, wa)
+        conn.commit()
+        conn.close()
+    return jsonify({"status": "ok", "wallet": wa, "released": reservation_id, "execution": execution, "ts": now_ts()})
 
 
 @app.route("/api/support/ticket", methods=["POST"])
