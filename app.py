@@ -8916,6 +8916,257 @@ def _nexus_trading_update_hold_phase(state: dict) -> dict:
     return out
 
 
+
+
+# -------------------------
+# Nexus Trading Risk Decision Engine
+# -------------------------
+# Backend is the state/risk master. The frontend may display slot state, but the
+# decision whether an ACTIVE slot remains active, moves to PROTECT/REDUCE/EXIT,
+# or capital protection starts must come from here. This engine is intentionally
+# rule based: one normal red candle should not block a trade; hard blocks or a
+# confirmed cluster of risk signals are required.
+
+_NEXUS_TRADING_HARD_BLOCKS = {
+    "SECURITY_FAIL",
+    "HONEYPOT_RISK",
+    "UNSUPPORTED_CHAIN",
+    "NO_LIQUIDITY",
+    "EXTREME_SLIPPAGE",
+    "BUDGET_RULE_BREACH",
+}
+
+
+def _clamp_float(value, default=0.0, min_v=None, max_v=None) -> float:
+    try:
+        out = float(value)
+        if not math.isfinite(out):
+            out = float(default)
+    except Exception:
+        out = float(default)
+    if min_v is not None:
+        out = max(float(min_v), out)
+    if max_v is not None:
+        out = min(float(max_v), out)
+    return out
+
+
+def _nexus_trading_signal_value(slot: dict, signals: dict, *names, default=0.0) -> float:
+    for name in names:
+        if name in signals:
+            return _clamp_float(signals.get(name), default)
+        if name in slot:
+            return _clamp_float(slot.get(name), default)
+    return _clamp_float(default, default)
+
+
+def _nexus_trading_text_value(slot: dict, signals: dict, *names, default="") -> str:
+    for name in names:
+        v = signals.get(name) if name in signals else slot.get(name) if name in slot else None
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return str(default or "")
+
+
+def _nexus_trading_decide_slot(slot: dict, global_cfg: dict | None = None) -> dict:
+    """Return a precise state decision for one Nexus Trading slot.
+
+    State machine goal:
+      ACTIVE may remain ACTIVE, move to PROTECT, request REDUCE, or request EXIT.
+      EXIT/FORCE_EXIT then enters HOLD/OBSERVE through the existing hold-state layer.
+
+    Important rule:
+      Normal market noise is not enough for BLOCK/EXIT. Hard blocks or a confirmed
+      risk cluster are required.
+    """
+    cfg = global_cfg or {}
+    slot = slot if isinstance(slot, dict) else {}
+    signals = slot.get("signals") if isinstance(slot.get("signals"), dict) else {}
+    status = str(slot.get("status") or "WAIT").upper()
+    risk_mode = str(cfg.get("risk_mode") or slot.get("riskMode") or slot.get("risk_mode") or "BALANCED").upper()
+
+    caution_dd = _clamp_float(cfg.get("caution_drawdown_pct", slot.get("cautionDrawdownPct", 3)), 3, 0, 25)
+    hard_stop = _clamp_float(cfg.get("hard_stop_pct", slot.get("hardStopPct", 12)), 12, 1, 50)
+    max_slippage = _clamp_float(cfg.get("max_slippage_pct", slot.get("maxSlippagePct", 1.2)), 1.2, 0.05, 10)
+
+    if risk_mode == "DEFENSIVE":
+        caution_dd = max(0.5, caution_dd * 0.8)
+        hard_stop = max(1.0, hard_stop * 0.85)
+    elif risk_mode == "DYNAMIC":
+        caution_dd = min(25.0, caution_dd * 1.15)
+        hard_stop = min(50.0, hard_stop * 1.10)
+
+    # Inputs can come from future strategist/on-chain payloads. Missing values are
+    # neutral so the engine does not over-block before the data exists.
+    drawdown_pct = _nexus_trading_signal_value(slot, signals, "drawdown_pct", "drawdownPct", default=0)
+    exit_risk = _nexus_trading_signal_value(slot, signals, "exit_risk", "exitRisk", "exit_risk_score", default=0)
+    whale_sell = _nexus_trading_signal_value(slot, signals, "whale_sell_pressure", "whaleSellPressure", default=0)
+    liquidity_score = _nexus_trading_signal_value(slot, signals, "liquidity_score", "liquidityScore", default=70)
+    rvol = _nexus_trading_signal_value(slot, signals, "rvol", "relative_volume", default=1.0)
+    slippage_pct = _nexus_trading_signal_value(slot, signals, "slippage_pct", "slippagePct", default=0)
+    volatility = _nexus_trading_signal_value(slot, signals, "volatility_score", "volatility", default=45)
+    overextension = _nexus_trading_signal_value(slot, signals, "overextension_pct", "overextension", default=0)
+    structure = _nexus_trading_text_value(slot, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
+    security = _nexus_trading_text_value(slot, signals, "security", "security_status", "securityStatus", default="OK").upper()
+    chain_state = _nexus_trading_text_value(slot, signals, "chain_state", "chainStatus", default="OK").upper()
+
+    hard_blocks = []
+    if security in ("FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED"):
+        hard_blocks.append("SECURITY_FAIL")
+    if chain_state in ("UNSUPPORTED", "DISABLED"):
+        hard_blocks.append("UNSUPPORTED_CHAIN")
+    if liquidity_score <= 10:
+        hard_blocks.append("NO_LIQUIDITY")
+    if slippage_pct and slippage_pct >= max_slippage * 2.5:
+        hard_blocks.append("EXTREME_SLIPPAGE")
+    if drawdown_pct <= -abs(hard_stop):
+        hard_blocks.append("HARD_STOP_REACHED")
+
+    reasons = []
+    risk_points = 0
+    confirmations = 0
+
+    def add(points, reason, confirmed=True):
+        nonlocal risk_points, confirmations
+        risk_points += int(points)
+        reasons.append(reason)
+        if confirmed:
+            confirmations += 1
+
+    if drawdown_pct <= -abs(caution_dd):
+        add(18, f"Drawdown passed caution threshold ({drawdown_pct:.2f}%).")
+    if exit_risk >= 85:
+        add(38, "Exit risk is critical.")
+    elif exit_risk >= 70:
+        add(26, "Exit risk is elevated.")
+    elif exit_risk >= 55:
+        add(12, "Exit risk is rising.", confirmed=False)
+
+    if structure in ("BROKEN", "BREAKDOWN", "FAILED", "INVALIDATED"):
+        add(26, "Market structure is broken.")
+    elif structure in ("WEAK", "UNSTABLE", "DISTRIBUTION"):
+        add(14, "Market structure is unstable.")
+
+    if liquidity_score < 25:
+        add(28, "Liquidity is weak.")
+    elif liquidity_score < 45:
+        add(13, "Liquidity has deteriorated.")
+
+    if whale_sell >= 80:
+        add(26, "Strong whale sell pressure detected.")
+    elif whale_sell >= 60:
+        add(15, "Whale sell pressure is elevated.")
+
+    if rvol >= 1.8 and structure in ("BROKEN", "BREAKDOWN", "FAILED", "INVALIDATED", "WEAK", "UNSTABLE"):
+        add(16, "RVOL confirms the negative move.")
+    elif rvol < 0.75 and structure in ("WEAK", "UNSTABLE"):
+        add(8, "Weak volume confirmation.", confirmed=False)
+
+    if overextension >= 60 and rvol < 1.2:
+        add(14, "Overextension is not volume-confirmed.")
+    if volatility >= 85:
+        add(12, "Volatility shock is elevated.")
+    if slippage_pct and slippage_pct > max_slippage:
+        add(14, f"Slippage is above limit ({slippage_pct:.2f}%).")
+
+    # Decision rules. Hard blocks override everything. Otherwise require clusters.
+    action = "KEEP_ACTIVE"
+    next_status = status
+    decision = "ACTIVE_OK"
+    severity = "normal"
+
+    if hard_blocks:
+        action = "FORCE_EXIT"
+        next_status = "HOLD"
+        decision = "FORCE_EXIT_TO_HOLD"
+        severity = "critical"
+        reasons = [f"Hard block: {', '.join(hard_blocks)}."] + reasons
+    elif risk_points >= 70 and confirmations >= 3:
+        action = "EXIT"
+        next_status = "HOLD"
+        decision = "EXIT_TO_HOLD"
+        severity = "high"
+    elif risk_points >= 48 and confirmations >= 2:
+        action = "REDUCE"
+        next_status = "PROTECT"
+        decision = "REDUCE_PROTECT"
+        severity = "medium_high"
+    elif risk_points >= 28 or (confirmations >= 2 and risk_points >= 22):
+        action = "PROTECT"
+        next_status = "PROTECT"
+        decision = "PROTECT_MONITOR"
+        severity = "medium"
+    else:
+        # Explicitly tolerate normal noise. If a protected slot has normalized,
+        # the Trader may clear PROTECT back to ACTIVE, but never from HOLD/OBSERVE.
+        if status == "PROTECT":
+            action = "CLEAR_PROTECT"
+            next_status = "ACTIVE"
+            decision = "RISK_NORMALIZED_ACTIVE"
+            reasons.append("Risk cluster cleared. Slot may return to ACTIVE monitoring.")
+        elif not reasons:
+            reasons.append("No confirmed risk cluster. Normal market noise is tolerated.")
+        else:
+            reasons.append("Risk is not confirmed enough for exit; continue monitoring.")
+
+    can_trade = action in ("KEEP_ACTIVE", "CLEAR_PROTECT") and next_status in ("ACTIVE", "READY")
+    return {
+        "slot": slot.get("slot"),
+        "symbol": slot.get("symbol") or slot.get("asset") or "",
+        "previous_status": status,
+        "next_status": next_status,
+        "action": action,
+        "decision": decision,
+        "severity": severity,
+        "risk_score": max(0, min(100, int(risk_points))),
+        "confirmations": confirmations,
+        "hard_blocks": hard_blocks,
+        "reasons": reasons[:8],
+        "can_trade": bool(can_trade),
+    }
+
+
+@app.route("/api/nexus/trading/risk-decision", methods=["POST"])
+def api_nexus_trading_risk_decision():
+    body = request.get_json(silent=True) or {}
+    wallet = (
+        body.get("wallet")
+        or body.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    wa = _norm_addr(wallet)
+    # Keep endpoint useful in local/demo mode even if wallet is not connected yet.
+    if wallet and not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
+
+    queue = body.get("queue") if isinstance(body.get("queue"), list) else []
+    cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+    decisions = [_nexus_trading_decide_slot(slot, cfg) for slot in queue if isinstance(slot, dict)]
+
+    # Session-level escalation: if any slot must exit, protected capital flow starts.
+    final_action = "KEEP_ACTIVE"
+    if any(d.get("action") == "FORCE_EXIT" for d in decisions):
+        final_action = "FORCE_EXIT"
+    elif any(d.get("action") == "EXIT" for d in decisions):
+        final_action = "EXIT"
+    elif any(d.get("action") == "REDUCE" for d in decisions):
+        final_action = "REDUCE"
+    elif any(d.get("action") == "PROTECT" for d in decisions):
+        final_action = "PROTECT"
+    elif any(d.get("action") == "CLEAR_PROTECT" for d in decisions):
+        final_action = "CLEAR_PROTECT"
+
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "session_action": final_action,
+        "decisions": decisions,
+        "note": "Backend risk decision engine: hard blocks or confirmed risk clusters are required. Normal market noise is not enough for exit.",
+        "ts": now_ts(),
+    })
+
+
 @app.route("/api/nexus/trading/hold-state", methods=["GET", "POST"])
 def api_nexus_trading_hold_state():
     wallet = (
