@@ -15214,6 +15214,10 @@ NARRATIVE INTELLIGENCE RULES:
 - Explicitly classify confidence as high / medium / low when useful.
 - Mention whether a visible edge appears realistically tradable or only theoretically visible.
 - If data conflicts, say what conflicts and why that lowers confidence.
+- If strategist_depth_profile is present, use it silently as the hidden WHY / RISK / CONTEXT / INVALIDATION layer.
+- The user should see a calm interpretation, not the raw engine.
+- Always prefer probabilistic wording: "leans", "suggests", "weakens if", "improves if", "risk increases when".
+- Include invalidation logic whenever the answer discusses an opportunity, rotation, strategy, or risk.
 - For spread/rotation questions, distinguish clearly between:
   a) true exchange premium/discount,
   b) pair-relative spread,
@@ -15321,9 +15325,17 @@ Task:
 {_ai_kind_instructions(kind)}
 """
 
+    strategist_depth_profile = {}
+    try:
+        if isinstance(extra_context, dict):
+            strategist_depth_profile = extra_context.get("strategist_depth_profile") or _build_strategist_depth_profile(question, extra_context)
+    except Exception:
+        strategist_depth_profile = {}
+
     user_payload = {
         "kind": kind,
         "question": question,
+        "strategist_depth_profile": strategist_depth_profile,
         "profile": profile,
         "include_health": include_health,
         "requested_timeframe": timeframe_context.get("requested_timeframe"),
@@ -15383,11 +15395,257 @@ Task:
         "user_intent": strategist_intent,
         "response_language": response_language,
         "has_strategist_digest": bool(strategist_digest),
+        "has_strategist_depth_profile": bool(strategist_depth_profile),
         "strategist_followup": bool(strategist_followup_rule),
     }
     if ai_engine_v2:
         resp["ai_engine_v2"] = ai_engine_v2
     return resp, None
+
+
+
+
+# -------------------------
+# Nexus Strategist Depth Engine
+# -------------------------
+def _strategist_num(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        x = float(value)
+        if math.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return default
+
+
+def _strategist_text(value, default=""):
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is not None and not isinstance(value, (dict, list, tuple)):
+        s = str(value).strip()
+        if s:
+            return s
+    return default
+
+
+def _strategist_depth_first_pair(ctx: dict) -> dict:
+    """Pick the most relevant pair object from frontend context without exposing raw internals."""
+    if not isinstance(ctx, dict):
+        return {}
+    pools = []
+    for key in ("relevant_pairs", "all_compare_pairs", "movement_opportunities", "pair_alerts"):
+        v = ctx.get(key)
+        if isinstance(v, list):
+            pools.extend([x for x in v if isinstance(x, dict)])
+    if not pools:
+        engine = ctx.get("ai_engine_v2") if isinstance(ctx.get("ai_engine_v2"), dict) else {}
+        v = engine.get("pair_alerts")
+        if isinstance(v, list):
+            pools.extend([x for x in v if isinstance(x, dict)])
+    if not pools:
+        return {}
+
+    def score_pair(p):
+        base = _strategist_num(p.get("score"), 0) or 0
+        opp = _strategist_num(p.get("opportunity_score") or p.get("opportunityScore"), 0) or 0
+        mom = _strategist_num(p.get("momentum_score") or p.get("momentumScore"), 0) or 0
+        spread = abs(_strategist_num(p.get("spread_pct") or p.get("spreadPct"), 0) or 0)
+        rsi_gap = abs(_strategist_num(p.get("rsi_gap") or p.get("rsiGap"), 0) or 0)
+        return max(base, opp, mom) + min(spread * 1.5, 18) + min(rsi_gap * 0.5, 16)
+
+    return sorted(pools, key=score_pair, reverse=True)[0]
+
+
+def _strategist_depth_market_regime(ctx: dict) -> dict:
+    coins = ctx.get("coins") if isinstance(ctx, dict) else []
+    if not isinstance(coins, list):
+        coins = []
+
+    states = []
+    rvols = []
+    oes = []
+    changes = []
+    for c in coins:
+        if not isinstance(c, dict):
+            continue
+        mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
+        st = str(mc.get("state") or "").upper()
+        if st:
+            states.append(st)
+        rv = _strategist_num(mc.get("rvol"))
+        if rv is not None:
+            rvols.append(rv)
+        oe = _strategist_num(mc.get("oe_pct"))
+        if oe is not None:
+            oes.append(oe)
+        ch = _strategist_num(c.get("change_24h_pct") or c.get("change24h"))
+        if ch is not None:
+            changes.append(ch)
+
+    avg_rvol = sum(rvols) / len(rvols) if rvols else None
+    avg_oe = sum(oes) / len(oes) if oes else None
+    avg_ch = sum(changes) / len(changes) if changes else None
+
+    if "FAKE_MOVE" in states:
+        regime = "unstable / weak-confirmation movement"
+        risk = "high"
+        reason = "price movement is not broadly confirmed by participation."
+    elif "REAL_BREAKOUT" in states:
+        regime = "volume-backed momentum"
+        risk = "medium"
+        reason = "participation supports the move better than a weak pump."
+    elif "EARLY_ACCUMULATION" in states:
+        regime = "early accumulation / volume build"
+        risk = "medium"
+        reason = "volume is building before full extension."
+    elif avg_oe is not None and avg_oe >= 45 and (avg_rvol is None or avg_rvol < 1.25):
+        regime = "overextended / fragile"
+        risk = "high"
+        reason = "extension is elevated while confirmation is limited."
+    elif avg_rvol is not None and avg_rvol >= 1.5:
+        regime = "active participation"
+        risk = "medium"
+        reason = "volume participation is above normal."
+    elif avg_ch is not None and abs(avg_ch) >= 4:
+        regime = "active rotation"
+        risk = "medium"
+        reason = "recent movement is strong enough to require confirmation checks."
+    else:
+        regime = "mixed / normal"
+        risk = "controlled"
+        reason = "no dominant abnormal market-condition cluster is visible."
+
+    return {
+        "regime": regime,
+        "risk_bias": risk,
+        "reason": reason,
+        "avg_rvol": round(avg_rvol, 2) if avg_rvol is not None else None,
+        "avg_overextension_pct": round(avg_oe, 2) if avg_oe is not None else None,
+        "avg_24h_change_pct": round(avg_ch, 2) if avg_ch is not None else None,
+        "states_seen": sorted(list(set(states)))[:8],
+    }
+
+
+def _build_strategist_depth_profile(question: str, ai_context: dict | None = None) -> dict:
+    """Hidden deterministic intelligence layer for Nexus Strategist.
+
+    Purpose:
+      - Convert raw watchlist/compare/on-chain/market-condition context into
+        WHY / RISK / CONTEXT / INVALIDATION / CONFIDENCE.
+      - Keep complexity in the background.
+      - Never produce trade commands.
+    """
+    ctx = ai_context if isinstance(ai_context, dict) else {}
+    pair = _strategist_depth_first_pair(ctx)
+    regime = _strategist_depth_market_regime(ctx)
+
+    pair_name = _strategist_text(pair.get("pair"), "")
+    corr = _strategist_num(pair.get("corr"))
+    spread = _strategist_num(pair.get("spread_pct") or pair.get("spreadPct"))
+    rsi_gap = _strategist_num(pair.get("rsi_gap") or pair.get("rsiGap"))
+    score = _strategist_num(pair.get("score"))
+    momentum_score = _strategist_num(pair.get("momentum_score") or pair.get("momentumScore"))
+    opportunity_score = _strategist_num(pair.get("opportunity_score") or pair.get("opportunityScore"))
+
+    confirmations = []
+    risks = []
+    invalidations = []
+    why = []
+
+    if pair_name:
+        why.append(f"{pair_name} is the most relevant visible relationship in the current context.")
+    if corr is not None and corr >= 0.75:
+        confirmations.append("correlation is stable enough for relative-strength interpretation")
+    elif corr is not None and corr < 0.35:
+        risks.append("correlation is weak, so pair interpretation can be unreliable")
+        invalidations.append("correlation breaks down further")
+    if spread is not None and abs(spread) >= 5:
+        confirmations.append("spread is large enough to deserve attention")
+        why.append("spread pressure can create rotation or mean-reversion interest.")
+    elif spread is not None and abs(spread) < 1:
+        risks.append("spread edge is small")
+    if rsi_gap is not None and abs(rsi_gap) >= 14:
+        confirmations.append("momentum imbalance is visible through RSI divergence")
+        why.append("relative momentum is not evenly distributed between the assets.")
+    if momentum_score is not None and momentum_score >= 72:
+        confirmations.append("momentum is active")
+    if opportunity_score is not None and opportunity_score >= 78:
+        confirmations.append("opportunity score is elevated")
+    if score is not None and score < 55:
+        risks.append("overall pair score is not strong")
+    if str(regime.get("risk_bias")) == "high":
+        risks.append(regime.get("reason"))
+        invalidations.append("participation weakens while price remains extended")
+    elif str(regime.get("risk_bias")) == "medium":
+        confirmations.append(regime.get("reason"))
+
+    if not confirmations:
+        confirmations.append("confirmation is not strong enough for a clean thesis")
+    if not risks:
+        risks.append("main risk is false continuation or weak follow-through")
+    if not invalidations:
+        invalidations.extend([
+            "relative strength stops improving",
+            "volume confirmation fades",
+            "spread compresses without follow-through",
+        ])
+
+    conf_points = 48
+    conf_points += min(18, len(confirmations) * 6)
+    conf_points -= min(22, len(risks) * 6)
+    if str(regime.get("risk_bias")) == "controlled":
+        conf_points += 8
+    if pair_name:
+        conf_points += 6
+    confidence = max(20, min(88, int(round(conf_points))))
+    confidence_label = "HIGH" if confidence >= 74 else "MEDIUM" if confidence >= 55 else "LOW"
+
+    if str(regime.get("risk_bias")) == "high":
+        tactical_state = "protective / wait-for-confirmation"
+    elif opportunity_score is not None and opportunity_score >= 78:
+        tactical_state = "opportunity-watch"
+    elif momentum_score is not None and momentum_score >= 72:
+        tactical_state = "momentum-watch"
+    elif spread is not None and abs(spread) >= 5:
+        tactical_state = "rotation / spread-watch"
+    else:
+        tactical_state = "neutral observation"
+
+    q = str(question or "").lower()
+    if re.search(r"(warum|why|wieso|explain|erklär|erklaer)", q):
+        user_need = "explain_why"
+    elif re.search(r"(risk|risiko|gefährlich|gefaehrlich|fake|trap|invalid)", q):
+        user_need = "risk_check"
+    elif re.search(r"(lohnt|worth|besser|better|rotation|spread|exchange)", q):
+        user_need = "edge_quality"
+    else:
+        user_need = "market_read"
+
+    return {
+        "version": "strategist_depth_v1",
+        "user_need": user_need,
+        "context_role": "hidden_decision_support",
+        "market_structure": regime.get("regime"),
+        "risk_bias": regime.get("risk_bias"),
+        "tactical_state": tactical_state,
+        "confidence": confidence,
+        "confidence_label": confidence_label,
+        "primary_pair": pair_name,
+        "why": why[:4],
+        "confirmations": confirmations[:5],
+        "risks": risks[:5],
+        "invalidations": invalidations[:5],
+        "output_contract": {
+            "must_explain_why": True,
+            "must_include_risk": True,
+            "must_include_invalidation": True,
+            "probabilistic_language_only": True,
+            "no_direct_trade_commands": True,
+            "keep_complexity_hidden": True,
+        },
+    }
 
 
 
@@ -15446,6 +15704,13 @@ def api_ai_run():
     ai_signal_context = body.get("ai_signal_context") or body.get("ai_context") or {}
     if isinstance(ai_signal_context, dict):
         ai_signal_context = dict(ai_signal_context)
+        try:
+            ai_signal_context["strategist_depth_profile"] = _build_strategist_depth_profile(
+                body.get("raw_user_question") or question,
+                ai_signal_context,
+            )
+        except Exception:
+            pass
         if body.get("user_language"):
             ai_signal_context["user_language"] = body.get("user_language")
         if body.get("user_intent"):
@@ -15476,6 +15741,9 @@ def api_ai_run():
 Rules:
 - Always answer in the same language as the user's task.
 - The request is task-based; do not require coin symbols.
+- If strategist_depth_profile is present, use it silently to add WHY / RISK / INVALIDATION / CONFIDENCE.
+- Keep internal complexity hidden; show only clear reasoning.
+- Use probabilistic language and avoid direct trade commands.
 - Do not say that no symbols were provided unless the user specifically asked for coin-specific market analysis.
 - Do not invent live prices, volumes, market data, whale activity, or current market facts.
 - If the task requires live/current market data that is not provided, clearly say that the answer is based only on the supplied task/context.
@@ -15497,6 +15765,7 @@ Mode instructions:
         user_payload = {
             "kind": kind,
             "question": question,
+            "strategist_depth_profile": ai_signal_context.get("strategist_depth_profile") if isinstance(ai_signal_context, dict) else {},
             "profile": profile,
             "requested_timeframe": timeframe,
             "selected_timeframe": body.get("selected_timeframe"),
