@@ -14143,7 +14143,7 @@ def _append_strategist_depth_quality_block(text: str, user_payload: dict, lang: 
             conf_text += f" ({int(confidence)}%)"
         lines = [
             "",
-            "Strategist-Check:",
+            "Strategist Check:",
             f"Warum: {why or 'Die sichtbaren Signale zeigen noch keine vollständig saubere Bestätigung.'}",
             f"Kontext: {market_structure or 'gemischte Marktstruktur'}" + (f" · Fokus: {primary_pair}" if primary_pair else ""),
             f"Risiko: {risks or 'Das Setup kann durch schwache Folgebewegung oder falsche Bestätigung kippen.'}",
