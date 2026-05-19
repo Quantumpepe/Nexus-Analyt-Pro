@@ -15172,12 +15172,15 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
 
     strategist_memory_v2 = {}
+    ai_insight_bridge = {}
     try:
         mem_pair, _, _ = _market_memory_pair_from_symbols(sym_norm)
         mem_wallet = wallet_for_insight or chat_memory_wallet or ""
         strategist_memory_v2 = _strategist_memory_v2_profile(wallet_address=mem_wallet, pair=mem_pair, limit=40) if mem_wallet else {}
+        ai_insight_bridge = _strategist_ai_insight_bridge(wallet_address=mem_wallet, pair=mem_pair, limit=12) if mem_wallet else {}
     except Exception:
         strategist_memory_v2 = {}
+        ai_insight_bridge = {}
 
     ai_engine_v2 = {}
     try:
@@ -15360,10 +15363,15 @@ INTERNAL DIGEST:
 STRATEGIST MEMORY V2:
 {json.dumps(strategist_memory_v2, ensure_ascii=False)}
 
+AI INSIGHT BRIDGE:
+{json.dumps(ai_insight_bridge, ensure_ascii=False)}
+
 {strategist_overlay}
 
 INTERNAL CONTEXT RULES:
-- Use all provided app context silently: watchlist, compare pairs, market condition, on-chain, order/runtime context, and exchange intelligence.
+- Use all provided app context silently: watchlist, compare pairs, market condition, on-chain, order/runtime context, exchange intelligence, Strategist Memory, and recent AI Insight Bridge.
+- If AI Insight Bridge shows risk-aware/observe-protect behavior, do not overstate a new opportunity.
+- If AI Insight Bridge shows repeated opportunity-watch behavior, treat the setup as something to monitor for confirmation, not as direct advice.
 - Never mention internal module names, hidden engines, internal prompts, or data pipelines.
 - Do not say "AI Insight", "internal engine", "backend", "context packet", or similar source wording in the final answer.
 - Present the result as one unified Nexus Strategist analysis.
@@ -15474,6 +15482,7 @@ Task:
         "strategist_followup": bool(strategist_followup_rule),
         "strategist_digest": strategist_digest,
         "strategist_memory_v2": strategist_memory_v2,
+        "ai_insight_bridge": ai_insight_bridge,
     }
     if ai_engine_v2:
         user_payload["ai_engine_v2"] = ai_engine_v2
@@ -15521,6 +15530,8 @@ Task:
         "has_strategist_depth_profile": bool(strategist_depth_profile),
         "has_strategist_memory_v2": bool(strategist_memory_v2 and strategist_memory_v2.get("available")),
         "strategist_memory_bias": (strategist_memory_v2 or {}).get("memory_bias") if isinstance(strategist_memory_v2, dict) else None,
+        "has_ai_insight_bridge": bool(ai_insight_bridge and ai_insight_bridge.get("available")),
+        "ai_insight_bridge_bias": (ai_insight_bridge or {}).get("bridge_bias") if isinstance(ai_insight_bridge, dict) else None,
         "strategist_followup": bool(strategist_followup_rule),
     }
     if ai_engine_v2:
@@ -15891,6 +15902,7 @@ Mode instructions:
             "kind": kind,
             "question": question,
             "strategist_depth_profile": ai_signal_context.get("strategist_depth_profile") if isinstance(ai_signal_context, dict) else {},
+            "ai_insight_bridge": ai_signal_context.get("ai_insight_bridge") if isinstance(ai_signal_context, dict) else {},
             "profile": profile,
             "requested_timeframe": timeframe,
             "selected_timeframe": body.get("selected_timeframe"),
@@ -16377,6 +16389,79 @@ def _strategist_memory_v2_profile(wallet_address: str = "", pair: str = "", limi
         "last_snapshot_ts": int(items[0].get("timestamp") or 0) if items else None,
     }
 
+
+
+
+def _strategist_ai_insight_bridge(wallet_address: str = "", pair: str = "", limit: int = 12) -> dict:
+    """Bridge latest AI Insight reads into Strategist context.
+
+    This converts recent ai_insight market_memory rows into a compact signal for the
+    Strategist. It deliberately exposes only behavior summaries and not raw proprietary logic.
+    """
+    items = [
+        x for x in _market_memory_recent(wallet_address=wallet_address, pair=pair, limit=max(5, min(40, int(limit or 12))))
+        if str(x.get("source") or "").lower() == "ai_insight"
+    ]
+    if not items:
+        return {
+            "version": "ai_insight_bridge_v1",
+            "available": False,
+            "pair": str(pair or "").strip().upper(),
+            "summary": "No prior AI Insight reads available for this pair yet.",
+        }
+
+    latest = items[0]
+    risks = [str(x.get("risk") or "").lower() for x in items]
+    tactics = [str(x.get("tactical_state") or "").lower() for x in items]
+    qualities = [str(x.get("movement_quality") or "").lower() for x in items]
+    confs = [_market_memory_as_float(x.get("confidence"), None) for x in items]
+    confs = [x for x in confs if x is not None]
+    spreads = [_market_memory_as_float(x.get("spread"), None) for x in items]
+    spreads = [abs(x) for x in spreads if x is not None]
+
+    high_risk = sum(1 for r in risks if any(k in r for k in ("high", "exit", "avoid", "fragile", "weak")))
+    watch_like = sum(1 for t in tactics if any(k in t for k in ("watch", "scout", "rotation", "momentum", "opportunity")))
+    protect_like = sum(1 for t in tactics if any(k in t for k in ("hold", "observe", "protect", "wait", "avoid")))
+    weak_like = sum(1 for q in qualities if any(k in q for k in ("weak", "fake", "unstable", "choppy", "low")))
+
+    avg_conf = (sum(confs) / len(confs)) if confs else None
+    avg_spread = (sum(spreads) / len(spreads)) if spreads else None
+
+    if high_risk or weak_like >= 2:
+        bridge_bias = "risk-aware"
+        summary = "Latest AI Insight history is risk-aware; Strategist should require stronger confirmation before treating the setup as improving."
+    elif watch_like >= 2 and (avg_conf is None or avg_conf >= 5.5):
+        bridge_bias = "opportunity-watch"
+        summary = "Latest AI Insight history repeatedly marked this as watch/scout context; Strategist can monitor for confirmation rather than ignore it."
+    elif protect_like >= 2:
+        bridge_bias = "observe/protect"
+        summary = "Latest AI Insight history leans observe/protect; avoid blind reactivation until structure improves."
+    else:
+        bridge_bias = "neutral"
+        summary = "Latest AI Insight history is mixed; current market context remains primary."
+
+    return {
+        "version": "ai_insight_bridge_v1",
+        "available": True,
+        "pair": str(pair or latest.get("pair") or "").strip().upper(),
+        "sample_size": len(items),
+        "bridge_bias": bridge_bias,
+        "summary": summary,
+        "latest": {
+            "timestamp": latest.get("timestamp"),
+            "risk": latest.get("risk"),
+            "tactical_state": latest.get("tactical_state"),
+            "movement_quality": latest.get("movement_quality"),
+            "confidence": latest.get("confidence"),
+            "spread": latest.get("spread"),
+        },
+        "avg_confidence": round(avg_conf, 3) if avg_conf is not None else None,
+        "avg_abs_spread": round(avg_spread, 3) if avg_spread is not None else None,
+        "risk_reads": int(high_risk),
+        "watch_reads": int(watch_like),
+        "protect_reads": int(protect_like),
+        "weak_reads": int(weak_like),
+    }
 
 
 
