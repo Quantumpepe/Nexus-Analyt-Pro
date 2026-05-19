@@ -14075,6 +14075,104 @@ def _answer_looks_wrong_for_intent(ans: str, lang: str, intent: str) -> bool:
     return False
 
 
+
+def _strategist_depth_from_payload(user_payload: dict) -> dict:
+    if not isinstance(user_payload, dict):
+        return {}
+    direct = user_payload.get("strategist_depth_profile")
+    if isinstance(direct, dict):
+        return direct
+    ctx = user_payload.get("ai_signal_context")
+    if isinstance(ctx, dict) and isinstance(ctx.get("strategist_depth_profile"), dict):
+        return ctx.get("strategist_depth_profile")
+    return {}
+
+
+def _strategist_depth_line_list(values, limit=3) -> str:
+    if not isinstance(values, list):
+        return ""
+    clean = []
+    for v in values:
+        s = str(v or "").strip()
+        if not s:
+            continue
+        s = re.sub(r"\s+", " ", s)
+        if s not in clean:
+            clean.append(s)
+    return "; ".join(clean[:max(1, int(limit or 3))])
+
+
+def _strategist_answer_has_depth_contract(text: str, lang: str) -> bool:
+    s = str(text or "").lower()
+    if not s.strip():
+        return False
+    if lang == "de":
+        why_hit = any(x in s for x in ["warum", "grund", "weil", "spricht dafür", "deutet darauf"])
+        risk_hit = any(x in s for x in ["risiko", "riskant", "schwächt", "schwaecht", "kippt", "fake", "unsicher"])
+        invalid_hit = any(x in s for x in ["invalid", "ungültig", "ungueltig", "schwächer", "schwaecher", "bricht", "wenn"])
+        conf_hit = any(x in s for x in ["confidence", "vertrauen", "sicherheit", "hoch", "mittel", "niedrig"])
+    else:
+        why_hit = any(x in s for x in ["why", "because", "reason", "suggests", "points to"])
+        risk_hit = any(x in s for x in ["risk", "weakens", "fragile", "fake", "unstable"])
+        invalid_hit = any(x in s for x in ["invalid", "invalidation", "weakens if", "breaks if", "fails if"])
+        conf_hit = any(x in s for x in ["confidence", "high", "medium", "low"])
+    return why_hit and risk_hit and invalid_hit and conf_hit
+
+
+def _append_strategist_depth_quality_block(text: str, user_payload: dict, lang: str) -> str:
+    depth = _strategist_depth_from_payload(user_payload)
+    if not isinstance(depth, dict) or not depth:
+        return str(text or "").strip()
+
+    base = str(text or "").strip()
+    if _strategist_answer_has_depth_contract(base, lang):
+        return base
+
+    confidence_label = str(depth.get("confidence_label") or "").upper()
+    confidence = depth.get("confidence")
+    tactical = str(depth.get("tactical_state") or "").strip()
+    market_structure = str(depth.get("market_structure") or "").strip()
+    primary_pair = str(depth.get("primary_pair") or "").strip()
+    why = _strategist_depth_line_list(depth.get("why") or depth.get("confirmations"), limit=2)
+    risks = _strategist_depth_line_list(depth.get("risks"), limit=2)
+    invalidations = _strategist_depth_line_list(depth.get("invalidations"), limit=3)
+
+    if lang == "de":
+        conf_text = f"{confidence_label or 'MEDIUM'}"
+        if isinstance(confidence, (int, float)):
+            conf_text += f" ({int(confidence)}%)"
+        lines = [
+            "",
+            "Strategist-Check:",
+            f"Warum: {why or 'Die sichtbaren Signale zeigen noch keine vollständig saubere Bestätigung.'}",
+            f"Kontext: {market_structure or 'gemischte Marktstruktur'}" + (f" · Fokus: {primary_pair}" if primary_pair else ""),
+            f"Risiko: {risks or 'Das Setup kann durch schwache Folgebewegung oder falsche Bestätigung kippen.'}",
+            f"Invalidation: {invalidations or 'Die Einschätzung wird schwächer, wenn Relative Strength, Volumen oder Spread-Bestätigung nachlassen.'}",
+            f"Confidence: {conf_text}" + (f" · Taktischer Zustand: {tactical}" if tactical else ""),
+        ]
+    else:
+        conf_text = f"{confidence_label or 'MEDIUM'}"
+        if isinstance(confidence, (int, float)):
+            conf_text += f" ({int(confidence)}%)"
+        lines = [
+            "",
+            "Strategist Check:",
+            f"Why: {why or 'The visible signals do not yet show fully clean confirmation.'}",
+            f"Context: {market_structure or 'mixed market structure'}" + (f" · Focus: {primary_pair}" if primary_pair else ""),
+            f"Risk: {risks or 'The setup can weaken through poor follow-through or false confirmation.'}",
+            f"Invalidation: {invalidations or 'The read weakens if relative strength, volume, or spread confirmation fades.'}",
+            f"Confidence: {conf_text}" + (f" · Tactical state: {tactical}" if tactical else ""),
+        ]
+
+    combined = (base + "\n".join(lines)).strip()
+    # Keep it compact; do not allow the quality block to create a huge report.
+    max_chars = 2600 if lang == "de" else 2400
+    if len(combined) > max_chars:
+        combined = combined[:max_chars].rsplit("\n", 1)[0].strip()
+    return combined
+
+
+
 def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
     ctx = user_payload.get("ai_signal_context") if isinstance(user_payload, dict) else {}
     lang = _detect_user_language_from_text(str((ctx or {}).get("raw_user_question") or user_payload.get("question") or ""), (ctx or {}).get("user_language") if isinstance(ctx, dict) else None)
@@ -14087,8 +14185,21 @@ def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
     if _answer_looks_wrong_for_intent(cleaned, lang, intent):
         if intent == "rotation_spread":
             # Deterministic fallback prevents generic Trading/Grid reports for rotation/spread questions.
-            return _deterministic_rotation_spread_answer(user_payload, lang if lang in ("de", "en") else "en")
-        return cleaned.strip() or str(ans or "").strip()
+            cleaned = _deterministic_rotation_spread_answer(user_payload, lang if lang in ("de", "en") else "en")
+        else:
+            cleaned = cleaned.strip() or str(ans or "").strip()
+
+    # Phase 2 quality gate:
+    # If the LLM gives a usable answer but misses the hidden WHY/RISK/INVALIDATION/CONFIDENCE contract,
+    # append a compact Strategist Check. This keeps the UI calm while making every useful answer explainable.
+    try:
+        cleaned = _append_strategist_depth_quality_block(cleaned, user_payload if isinstance(user_payload, dict) else {}, lang if lang in ("de", "en") else "en")
+    except Exception:
+        pass
+
+    cleaned = _normalize_strategist_language_leaks(str(cleaned or ""), lang)
+    cleaned = _strip_forbidden_strategist_sections(cleaned, intent, lang)
+    cleaned = _limit_strategist_number_spam(cleaned, max_numeric_lines=8)
     return cleaned.strip()
 
 
