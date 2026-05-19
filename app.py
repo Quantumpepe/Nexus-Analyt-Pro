@@ -15413,7 +15413,7 @@ Rules:
    - NORMAL = no strong OE/RVOL anomaly.
 19) Never treat Market Condition as a direct buy/sell signal. It is probability / behavior context only.
 20) For AI Insight Level 2, always translate the combined data into behavior + strategy fit + risk reason.
-21) AI Insight mode: standard = balanced professional interpretation; extreme = more sensitive to early momentum, rebound, spread, and high-risk/high-reward structures, while still warning clearly about invalidation.
+21) AI Insight mode: standard = balanced professional interpretation; extreme = visibly different: higher sensitivity to early momentum, rebound, spread, and high-risk/high-reward structures. In extreme mode, explicitly use language like early-signal, scout, fragile edge, faster invalidation, wider range, or higher false-signal risk when relevant.
 22) Custom Compare weights influence interpretation priority. Momentum weight increases focus on shifts/RSI gaps; opportunity weight increases focus on spread/hidden setups; stability weight increases focus on correlation and volatility quality.
 23) If ai_engine_v2.pair_alerts exists, use it as movement-chance context across all Compare pairs, not only the selected pair.
 24) If ai_engine_v2.market_behavior or ai_engine_v2.market_phase exists, use it as INTERNAL interpretation context only. Do not dump raw behavior fields; translate the strongest regime/phase signal into the paragraph, Edge, Risk, or Setup bias.
