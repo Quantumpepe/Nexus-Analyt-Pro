@@ -15171,6 +15171,14 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     strategist_digest = _strategist_context_digest(extra_context if isinstance(extra_context, dict) else {})
     strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
 
+    strategist_memory_v2 = {}
+    try:
+        mem_pair, _, _ = _market_memory_pair_from_symbols(sym_norm)
+        mem_wallet = wallet_for_insight or chat_memory_wallet or ""
+        strategist_memory_v2 = _strategist_memory_v2_profile(wallet_address=mem_wallet, pair=mem_pair, limit=40) if mem_wallet else {}
+    except Exception:
+        strategist_memory_v2 = {}
+
     ai_engine_v2 = {}
     try:
         if short_insight_mode:
@@ -15349,6 +15357,9 @@ NARRATIVE INTELLIGENCE RULES:
 INTERNAL DIGEST:
 {json.dumps(strategist_digest, ensure_ascii=False)}
 
+STRATEGIST MEMORY V2:
+{json.dumps(strategist_memory_v2, ensure_ascii=False)}
+
 {strategist_overlay}
 
 INTERNAL CONTEXT RULES:
@@ -15462,6 +15473,7 @@ Task:
         "response_profile": strategist_profile,
         "strategist_followup": bool(strategist_followup_rule),
         "strategist_digest": strategist_digest,
+        "strategist_memory_v2": strategist_memory_v2,
     }
     if ai_engine_v2:
         user_payload["ai_engine_v2"] = ai_engine_v2
@@ -15507,6 +15519,8 @@ Task:
         "response_language": response_language,
         "has_strategist_digest": bool(strategist_digest),
         "has_strategist_depth_profile": bool(strategist_depth_profile),
+        "has_strategist_memory_v2": bool(strategist_memory_v2 and strategist_memory_v2.get("available")),
+        "strategist_memory_bias": (strategist_memory_v2 or {}).get("memory_bias") if isinstance(strategist_memory_v2, dict) else None,
         "strategist_followup": bool(strategist_followup_rule),
     }
     if ai_engine_v2:
@@ -15922,6 +15936,29 @@ Mode instructions:
     if err_pair:
         msg, code = err_pair
         return err(msg, code)
+
+    # Strategist Memory v2: store compact behavior snapshot for AI Analyst/Strategist runs too.
+    # This keeps future answers aware of whether a pair/setup has been improving, fading or repeatedly risky.
+    try:
+        pair, symbol_a, symbol_b = _market_memory_pair_from_symbols(sym_norm)
+        snap = _market_memory_extract_snapshot(
+            source="strategist_run",
+            pair=pair,
+            symbol_a=symbol_a,
+            symbol_b=symbol_b,
+            wallet_address=wa,
+            payload=resp if isinstance(resp, dict) else {},
+            extra_context=ai_signal_context if isinstance(ai_signal_context, dict) else {},
+        )
+        sid = _market_memory_save_snapshot(snap)
+        if sid and isinstance(resp, dict):
+            resp["market_memory_snapshot_id"] = sid
+    except Exception as e:
+        try:
+            print("[WARN] market_memory strategist_run hook failed:", e)
+        except Exception:
+            pass
+
     return jsonify(resp)
 
 
@@ -16230,6 +16267,117 @@ def _market_memory_recent(wallet_address: str = "", pair: str = "", limit: int =
         return rows
     finally:
         conn.close()
+
+
+def _strategist_memory_v2_profile(wallet_address: str = "", pair: str = "", limit: int = 40) -> dict:
+    """Build a compact behavioral memory profile from recent market_memory snapshots.
+
+    This is not a signal by itself. It is a context layer that helps the Strategist
+    recognize whether the current setup has been strengthening, fading, repeating,
+    or repeatedly failing/flagging risk.
+    """
+    items = _market_memory_recent(wallet_address=wallet_address, pair=pair, limit=limit)
+    if not items:
+        return {
+            "version": "strategist_memory_v2",
+            "available": False,
+            "summary": "No recent Strategist memory available yet.",
+            "sample_size": 0,
+            "pair": str(pair or "").strip().upper(),
+        }
+
+    # oldest -> newest for trend calculation
+    ordered = list(reversed(items))
+    risks = [str(x.get("risk") or "").strip().lower() for x in ordered]
+    tactics = [str(x.get("tactical_state") or "").strip().lower() for x in ordered]
+    qualities = [str(x.get("movement_quality") or "").strip().lower() for x in ordered]
+    regimes = [str(x.get("regime") or "").strip().lower() for x in ordered]
+    confs = []
+    spreads = []
+    mov_scores = []
+    for x in ordered:
+        c = _market_memory_as_float(x.get("confidence"), None)
+        if c is not None:
+            confs.append(c)
+        s = _market_memory_as_float(x.get("spread"), None)
+        if s is not None:
+            spreads.append(abs(s))
+        m = _market_memory_as_float(x.get("movement_score"), None)
+        if m is not None:
+            mov_scores.append(m)
+
+    def avg(vals):
+        return (sum(vals) / len(vals)) if vals else None
+
+    def delta(vals):
+        if len(vals) < 2:
+            return None
+        # compare latest half vs earlier half
+        mid = max(1, len(vals) // 2)
+        early = vals[:mid]
+        late = vals[mid:]
+        if not late:
+            return None
+        return avg(late) - avg(early)
+
+    conf_delta = delta(confs)
+    spread_delta = delta(spreads)
+    mov_delta = delta(mov_scores)
+
+    high_risk_count = sum(1 for r in risks if any(k in r for k in ("high", "risk", "fragile", "exit", "avoid", "weak")))
+    protect_count = sum(1 for t in tactics if any(k in t for k in ("protect", "wait", "observe", "hold", "avoid")))
+    scout_count = sum(1 for t in tactics if any(k in t for k in ("scout", "watch", "opportunity", "momentum", "rotation")))
+    fake_count = sum(1 for q in qualities + regimes if any(k in q for k in ("fake", "unstable", "choppy", "weak", "low")))
+
+    if conf_delta is not None and conf_delta > 0.6:
+        direction = "strengthening"
+    elif conf_delta is not None and conf_delta < -0.6:
+        direction = "weakening"
+    elif spread_delta is not None and spread_delta > 1.0:
+        direction = "spread-expanding"
+    elif spread_delta is not None and spread_delta < -1.0:
+        direction = "spread-compressing"
+    else:
+        direction = "stable/mixed"
+
+    if high_risk_count >= max(2, len(items) * 0.35) or fake_count >= max(2, len(items) * 0.30):
+        memory_bias = "caution"
+    elif scout_count >= max(2, len(items) * 0.35) and direction in ("strengthening", "spread-expanding"):
+        memory_bias = "constructive-watch"
+    elif protect_count >= max(2, len(items) * 0.35):
+        memory_bias = "observe/protect"
+    else:
+        memory_bias = "neutral"
+
+    if memory_bias == "caution":
+        summary = "Recent memory shows repeated risk/weak-confirmation behavior; new opportunities need stronger confirmation."
+    elif memory_bias == "constructive-watch":
+        summary = "Recent memory shows improving scout/opportunity behavior; continuation depends on confirmation quality."
+    elif memory_bias == "observe/protect":
+        summary = "Recent memory leans observe/protect; avoid blind re-entry until structure improves."
+    else:
+        summary = "Recent memory is mixed; current structure should be weighted more than history."
+
+    return {
+        "version": "strategist_memory_v2",
+        "available": True,
+        "pair": str(pair or (items[0].get("pair") if items else "") or "").strip().upper(),
+        "sample_size": len(items),
+        "direction": direction,
+        "memory_bias": memory_bias,
+        "summary": summary,
+        "avg_confidence": round(avg(confs), 3) if confs else None,
+        "confidence_delta": round(conf_delta, 3) if conf_delta is not None else None,
+        "spread_delta": round(spread_delta, 3) if spread_delta is not None else None,
+        "movement_score_delta": round(mov_delta, 3) if mov_delta is not None else None,
+        "risk_events": int(high_risk_count),
+        "protect_events": int(protect_count),
+        "scout_events": int(scout_count),
+        "fake_or_weak_events": int(fake_count),
+        "last_snapshot_ts": int(items[0].get("timestamp") or 0) if items else None,
+    }
+
+
 
 
 @app.route("/api/market-memory/recent", methods=["GET"])
