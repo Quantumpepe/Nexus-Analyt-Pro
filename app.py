@@ -1723,6 +1723,22 @@ def init_db():
         )
     """)
 
+    # Nexus Risk Synchronization State.
+    # Single backend-owned risk state shared by Strategist, HOLD/OBSERVE and prepared execution.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_risk_state (
+            wallet_address TEXT PRIMARY KEY,
+            global_status TEXT DEFAULT 'ACTIVE_OK',
+            risk_score REAL DEFAULT 0,
+            cooldown_until_ts INTEGER,
+            last_action TEXT DEFAULT '',
+            invalidation_json TEXT DEFAULT '{}',
+            blocked_reason TEXT DEFAULT '',
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_risk_state_status_ts ON nexus_risk_state(global_status, updated_ts)")
+
     # Nexus Execution Preparation Layer. Prepared state only; no Vault/on-chain execution.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS nexus_execution_queue (
@@ -9233,6 +9249,149 @@ def _nexus_trading_update_hold_phase(state: dict) -> dict:
 
 
 
+def _nexus_risk_state_default() -> dict:
+    return {
+        "global_status": "ACTIVE_OK",
+        "risk_score": 0.0,
+        "cooldown_until_ts": None,
+        "cooldown_active": False,
+        "last_action": "",
+        "invalidations": [],
+        "blocked_reason": "",
+        "updated_ts": now_ts(),
+    }
+
+
+def _nexus_risk_state_row_to_dict(row) -> dict:
+    out = _nexus_risk_state_default()
+    if not row:
+        return out
+    try:
+        invalidations = json.loads(row["invalidation_json"] or "[]")
+        if isinstance(invalidations, dict):
+            invalidations = invalidations.get("items") or []
+        if not isinstance(invalidations, list):
+            invalidations = []
+    except Exception:
+        invalidations = []
+    cooldown_until = row["cooldown_until_ts"]
+    try:
+        cooldown_until = int(cooldown_until) if cooldown_until else None
+    except Exception:
+        cooldown_until = None
+    out.update({
+        "global_status": row["global_status"] or "ACTIVE_OK",
+        "risk_score": float(row["risk_score"] or 0),
+        "cooldown_until_ts": cooldown_until,
+        "cooldown_active": bool(cooldown_until and cooldown_until > now_ts()),
+        "last_action": row["last_action"] or "",
+        "invalidations": invalidations,
+        "blocked_reason": row["blocked_reason"] or "",
+        "updated_ts": row["updated_ts"] or now_ts(),
+    })
+    if out["global_status"] == "COOLDOWN" and not out["cooldown_active"]:
+        out["global_status"] = "ACTIVE_OK"
+        out["blocked_reason"] = "Cooldown completed. New allocation still requires fresh Strategist confirmation."
+    return out
+
+
+def _nexus_risk_state_load(cur, wallet_address: str) -> dict:
+    cur.execute("SELECT * FROM nexus_risk_state WHERE wallet_address=?", (wallet_address,))
+    return _nexus_risk_state_row_to_dict(cur.fetchone())
+
+
+def _nexus_risk_state_build(decisions: list[dict], hold_state: dict | None = None, previous: dict | None = None, cfg: dict | None = None) -> dict:
+    ts = now_ts()
+    decisions = decisions if isinstance(decisions, list) else []
+    hold_state = hold_state if isinstance(hold_state, dict) else {}
+    previous = previous if isinstance(previous, dict) else _nexus_risk_state_default()
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    scores = [_clamp_float(d.get("risk_score"), 0, 0, 100) for d in decisions if isinstance(d, dict)]
+    max_score = max(scores) if scores else _clamp_float(previous.get("risk_score"), 0, 0, 100)
+    actions = [str(d.get("action") or "KEEP_ACTIVE").upper() for d in decisions if isinstance(d, dict)]
+
+    invalidations = []
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        reasons = d.get("reasons") if isinstance(d.get("reasons"), list) else []
+        hard = d.get("hard_blocks") if isinstance(d.get("hard_blocks"), list) else []
+        if not reasons and not hard:
+            continue
+        invalidations.append({
+            "slot": d.get("slot"),
+            "symbol": d.get("symbol") or "",
+            "action": d.get("action") or "",
+            "decision": d.get("decision") or "",
+            "risk_score": d.get("risk_score") or 0,
+            "hard_blocks": hard[:5],
+            "reasons": reasons[:5],
+        })
+
+    hold_status = str(hold_state.get("status") or "").upper()
+    global_status = "ACTIVE_OK"
+    reason = "Risk synchronized. No confirmed global block."
+    cooldown_until = previous.get("cooldown_until_ts")
+    try:
+        cooldown_until = int(cooldown_until) if cooldown_until else None
+    except Exception:
+        cooldown_until = None
+
+    if hold_status in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        global_status = hold_status
+        reason = str(hold_state.get("reason") or "Capital is protected by HOLD/OBSERVE state.")[:500]
+    elif "FORCE_EXIT" in actions or "EXIT" in actions:
+        global_status = "COOLDOWN"
+        cooldown_sec = int(os.getenv("NEXUS_RISK_COOLDOWN_SEC", str(cfg.get("cooldown_sec") or 1800)))
+        cooldown_until = max(int(cooldown_until or 0), ts + max(60, min(24 * 3600, cooldown_sec)))
+        reason = "Exit risk triggered cooldown. New allocation is blocked until cooldown ends and Strategist confirms clean conditions."
+    elif "REDUCE" in actions or "PROTECT" in actions:
+        global_status = "PROTECT"
+        reason = "Protect state synchronized globally. No add-ons until risk cluster normalizes."
+    elif cooldown_until and cooldown_until > ts:
+        global_status = "COOLDOWN"
+        reason = str(previous.get("blocked_reason") or "Risk cooldown is active.")[:500]
+    else:
+        cooldown_until = None
+
+    return {
+        "global_status": global_status,
+        "risk_score": round(float(max_score), 2),
+        "cooldown_until_ts": cooldown_until,
+        "cooldown_active": bool(cooldown_until and cooldown_until > ts),
+        "last_action": next((a for a in ("FORCE_EXIT", "EXIT", "REDUCE", "PROTECT", "CLEAR_PROTECT") if a in actions), actions[0] if actions else "KEEP_ACTIVE"),
+        "invalidations": invalidations[:10],
+        "blocked_reason": reason,
+        "updated_ts": ts,
+    }
+
+
+def _nexus_risk_state_save(cur, wallet_address: str, state: dict) -> dict:
+    if not wallet_address:
+        return state
+    ts = int(state.get("updated_ts") or now_ts())
+    cur.execute(
+        """
+        INSERT INTO nexus_risk_state(wallet_address,global_status,risk_score,cooldown_until_ts,last_action,invalidation_json,blocked_reason,updated_ts)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(wallet_address) DO UPDATE SET global_status=excluded.global_status,risk_score=excluded.risk_score,cooldown_until_ts=excluded.cooldown_until_ts,last_action=excluded.last_action,invalidation_json=excluded.invalidation_json,blocked_reason=excluded.blocked_reason,updated_ts=excluded.updated_ts
+        """,
+        (
+            wallet_address,
+            state.get("global_status") or "ACTIVE_OK",
+            float(state.get("risk_score") or 0),
+            state.get("cooldown_until_ts"),
+            state.get("last_action") or "",
+            json.dumps(state.get("invalidations") or [], ensure_ascii=False),
+            str(state.get("blocked_reason") or "")[:500],
+            ts,
+        ),
+    )
+    return state
+
+
+
 # -------------------------
 # Nexus Trading Risk Decision Engine
 # -------------------------
@@ -9459,6 +9618,21 @@ def api_nexus_trading_risk_decision():
     cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
     decisions = [_nexus_trading_decide_slot(slot, cfg) for slot in queue if isinstance(slot, dict)]
 
+    risk_state = _nexus_risk_state_default()
+    if wa:
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+            hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+            previous_risk = _nexus_risk_state_load(cur, wa)
+            risk_state = _nexus_risk_state_build(decisions, hold_state, previous_risk, cfg)
+            _nexus_risk_state_save(cur, wa, risk_state)
+            conn.commit()
+            conn.close()
+    else:
+        risk_state = _nexus_risk_state_build(decisions, {}, None, cfg)
+
     # Session-level escalation: if any slot must exit, protected capital flow starts.
     final_action = "KEEP_ACTIVE"
     if any(d.get("action") == "FORCE_EXIT" for d in decisions):
@@ -9476,6 +9650,8 @@ def api_nexus_trading_risk_decision():
         "status": "ok",
         "wallet": wa,
         "session_action": final_action,
+        "risk_state": risk_state,
+        "global_risk_state": risk_state,
         "decisions": decisions,
         "note": "Backend risk decision engine: hard blocks or confirmed risk clusters are required. Normal market noise is not enough for exit.",
         "ts": now_ts(),
@@ -9530,6 +9706,19 @@ def api_nexus_trading_hold_state():
                     """,
                     (wa, "HOLD", hold_hours, 12, now_i, hold_until, observe_until, 0, json.dumps(queue, ensure_ascii=False), reason, now_i),
                 )
+                hold_snapshot = _nexus_trading_hold_row_to_dict({
+                    "status": "HOLD",
+                    "hold_hours": hold_hours,
+                    "observe_max_hours": 12,
+                    "hold_started_ts": now_i,
+                    "hold_until_ts": hold_until,
+                    "observe_until_ts": observe_until,
+                    "release_required": 0,
+                    "queue_json": json.dumps(queue, ensure_ascii=False),
+                    "reason": reason,
+                    "updated_ts": now_i,
+                })
+                _nexus_risk_state_save(cur, wa, _nexus_risk_state_build([], hold_snapshot, _nexus_risk_state_load(cur, wa), {}))
                 conn.commit()
 
         elif action == "release":
@@ -9543,6 +9732,13 @@ def api_nexus_trading_hold_state():
                     """,
                     (wa, now_i),
                 )
+                _nexus_risk_state_save(cur, wa, {
+                    **_nexus_risk_state_default(),
+                    "global_status": "ACTIVE_OK",
+                    "last_action": "RELEASE",
+                    "blocked_reason": "Capital released by user. Fresh Strategist confirmation is required before any new allocation.",
+                    "updated_ts": now_i,
+                })
                 conn.commit()
 
         elif action == "state":
@@ -9580,9 +9776,17 @@ def api_nexus_trading_hold_state():
                     now_ts(),
                 ),
             )
+            risk_sync = _nexus_risk_state_build([], updated, _nexus_risk_state_load(cur, wa), {})
+            _nexus_risk_state_save(cur, wa, risk_sync)
             conn.commit()
 
-    return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "ts": now_ts()})
+    risk_state = _nexus_risk_state_load(cur, wa)
+    if str(updated.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        risk_state = _nexus_risk_state_build([], updated, risk_state, {})
+        _nexus_risk_state_save(cur, wa, risk_state)
+        conn.commit()
+
+    return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "risk_state": risk_state, "global_risk_state": risk_state, "ts": now_ts()})
 
 
 
@@ -9740,11 +9944,17 @@ def api_nexus_trading_state():
         return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
     access = _compute_access_status(wa) if wa else _access_apply_strategist_meta(_access_defaults(), None)
     hold_state = _nexus_trading_hold_row_to_dict(None)
+    risk_state = _nexus_risk_state_default()
     if wa:
         conn = _db()
         cur = conn.cursor()
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        risk_state = _nexus_risk_state_load(cur, wa)
+        if str(hold_state.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+            risk_state = _nexus_risk_state_build([], hold_state, risk_state, {})
+            _nexus_risk_state_save(cur, wa, risk_state)
+            conn.commit()
         conn.close()
     vault_ready = bool(any((_VAULT_BY_CHAIN.get(int(cid)) or "").strip() for cid in _ENABLED_CHAIN_IDS)) if "_ENABLED_CHAIN_IDS" in globals() else False
     execution_mode = "live" if access.get("can_live_execute") and vault_ready else "prepared" if access.get("is_live") else "simulation"
@@ -9763,6 +9973,8 @@ def api_nexus_trading_state():
         "wallet": wa,
         "access": access,
         "hold_state": hold_state,
+        "risk_state": risk_state,
+        "global_risk_state": risk_state,
         "execution": execution,
         "recheck_changes": recheck_changes,
         "execution_mode": execution_mode,
