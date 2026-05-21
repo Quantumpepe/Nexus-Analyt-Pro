@@ -1723,6 +1723,44 @@ def init_db():
         )
     """)
 
+    # Nexus Risk Synchronization State.
+    # Single backend-owned risk state shared by Strategist, HOLD/OBSERVE and prepared execution.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_risk_state (
+            wallet_address TEXT PRIMARY KEY,
+            global_status TEXT DEFAULT 'ACTIVE_OK',
+            risk_score REAL DEFAULT 0,
+            cooldown_until_ts INTEGER,
+            last_action TEXT DEFAULT '',
+            invalidation_json TEXT DEFAULT '{}',
+            blocked_reason TEXT DEFAULT '',
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_risk_state_status_ts ON nexus_risk_state(global_status, updated_ts)")
+
+    # Shadow / Simulation Executor runs.
+    # This is intentionally off-chain and cannot trigger Vault execution. It validates
+    # virtual fills, reallocation behavior, stop/re-entry rules, and long-runtime stability
+    # before live Vault integration.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_shadow_executor_runs (
+            run_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            mode TEXT DEFAULT 'SHADOW',
+            source TEXT DEFAULT 'manual',
+            status TEXT DEFAULT 'completed',
+            summary_json TEXT DEFAULT '{}',
+            events_json TEXT DEFAULT '[]',
+            queue_json TEXT DEFAULT '[]',
+            config_json TEXT DEFAULT '{}',
+            created_ts INTEGER,
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_shadow_runs_wallet_ts ON nexus_shadow_executor_runs(wallet_address, created_ts)")
+
+
     # Nexus Execution Preparation Layer. Prepared state only; no Vault/on-chain execution.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS nexus_execution_queue (
@@ -1781,27 +1819,6 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_simulation_events_wallet_ts ON nexus_simulation_events(wallet_address, created_ts)")
-
-    # Shadow / Simulation Executor runs.
-    # This is intentionally off-chain and cannot trigger Vault execution. It validates
-    # virtual fills, reallocation behavior, stop/re-entry rules, and long-runtime stability
-    # before live Vault integration.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS nexus_shadow_executor_runs (
-            run_id TEXT PRIMARY KEY,
-            wallet_address TEXT NOT NULL,
-            mode TEXT DEFAULT 'SHADOW',
-            source TEXT DEFAULT 'manual',
-            status TEXT DEFAULT 'completed',
-            summary_json TEXT DEFAULT '{}',
-            events_json TEXT DEFAULT '[]',
-            queue_json TEXT DEFAULT '[]',
-            config_json TEXT DEFAULT '{}',
-            created_ts INTEGER,
-            updated_ts INTEGER
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_shadow_runs_wallet_ts ON nexus_shadow_executor_runs(wallet_address, created_ts)")
 
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
@@ -9254,6 +9271,149 @@ def _nexus_trading_update_hold_phase(state: dict) -> dict:
 
 
 
+def _nexus_risk_state_default() -> dict:
+    return {
+        "global_status": "ACTIVE_OK",
+        "risk_score": 0.0,
+        "cooldown_until_ts": None,
+        "cooldown_active": False,
+        "last_action": "",
+        "invalidations": [],
+        "blocked_reason": "",
+        "updated_ts": now_ts(),
+    }
+
+
+def _nexus_risk_state_row_to_dict(row) -> dict:
+    out = _nexus_risk_state_default()
+    if not row:
+        return out
+    try:
+        invalidations = json.loads(row["invalidation_json"] or "[]")
+        if isinstance(invalidations, dict):
+            invalidations = invalidations.get("items") or []
+        if not isinstance(invalidations, list):
+            invalidations = []
+    except Exception:
+        invalidations = []
+    cooldown_until = row["cooldown_until_ts"]
+    try:
+        cooldown_until = int(cooldown_until) if cooldown_until else None
+    except Exception:
+        cooldown_until = None
+    out.update({
+        "global_status": row["global_status"] or "ACTIVE_OK",
+        "risk_score": float(row["risk_score"] or 0),
+        "cooldown_until_ts": cooldown_until,
+        "cooldown_active": bool(cooldown_until and cooldown_until > now_ts()),
+        "last_action": row["last_action"] or "",
+        "invalidations": invalidations,
+        "blocked_reason": row["blocked_reason"] or "",
+        "updated_ts": row["updated_ts"] or now_ts(),
+    })
+    if out["global_status"] == "COOLDOWN" and not out["cooldown_active"]:
+        out["global_status"] = "ACTIVE_OK"
+        out["blocked_reason"] = "Cooldown completed. New allocation still requires fresh Strategist confirmation."
+    return out
+
+
+def _nexus_risk_state_load(cur, wallet_address: str) -> dict:
+    cur.execute("SELECT * FROM nexus_risk_state WHERE wallet_address=?", (wallet_address,))
+    return _nexus_risk_state_row_to_dict(cur.fetchone())
+
+
+def _nexus_risk_state_build(decisions: list[dict], hold_state: dict | None = None, previous: dict | None = None, cfg: dict | None = None) -> dict:
+    ts = now_ts()
+    decisions = decisions if isinstance(decisions, list) else []
+    hold_state = hold_state if isinstance(hold_state, dict) else {}
+    previous = previous if isinstance(previous, dict) else _nexus_risk_state_default()
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    scores = [_clamp_float(d.get("risk_score"), 0, 0, 100) for d in decisions if isinstance(d, dict)]
+    max_score = max(scores) if scores else _clamp_float(previous.get("risk_score"), 0, 0, 100)
+    actions = [str(d.get("action") or "KEEP_ACTIVE").upper() for d in decisions if isinstance(d, dict)]
+
+    invalidations = []
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        reasons = d.get("reasons") if isinstance(d.get("reasons"), list) else []
+        hard = d.get("hard_blocks") if isinstance(d.get("hard_blocks"), list) else []
+        if not reasons and not hard:
+            continue
+        invalidations.append({
+            "slot": d.get("slot"),
+            "symbol": d.get("symbol") or "",
+            "action": d.get("action") or "",
+            "decision": d.get("decision") or "",
+            "risk_score": d.get("risk_score") or 0,
+            "hard_blocks": hard[:5],
+            "reasons": reasons[:5],
+        })
+
+    hold_status = str(hold_state.get("status") or "").upper()
+    global_status = "ACTIVE_OK"
+    reason = "Risk synchronized. No confirmed global block."
+    cooldown_until = previous.get("cooldown_until_ts")
+    try:
+        cooldown_until = int(cooldown_until) if cooldown_until else None
+    except Exception:
+        cooldown_until = None
+
+    if hold_status in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        global_status = hold_status
+        reason = str(hold_state.get("reason") or "Capital is protected by HOLD/OBSERVE state.")[:500]
+    elif "FORCE_EXIT" in actions or "EXIT" in actions:
+        global_status = "COOLDOWN"
+        cooldown_sec = int(os.getenv("NEXUS_RISK_COOLDOWN_SEC", str(cfg.get("cooldown_sec") or 1800)))
+        cooldown_until = max(int(cooldown_until or 0), ts + max(60, min(24 * 3600, cooldown_sec)))
+        reason = "Exit risk triggered cooldown. New allocation is blocked until cooldown ends and Strategist confirms clean conditions."
+    elif "REDUCE" in actions or "PROTECT" in actions:
+        global_status = "PROTECT"
+        reason = "Protect state synchronized globally. No add-ons until risk cluster normalizes."
+    elif cooldown_until and cooldown_until > ts:
+        global_status = "COOLDOWN"
+        reason = str(previous.get("blocked_reason") or "Risk cooldown is active.")[:500]
+    else:
+        cooldown_until = None
+
+    return {
+        "global_status": global_status,
+        "risk_score": round(float(max_score), 2),
+        "cooldown_until_ts": cooldown_until,
+        "cooldown_active": bool(cooldown_until and cooldown_until > ts),
+        "last_action": next((a for a in ("FORCE_EXIT", "EXIT", "REDUCE", "PROTECT", "CLEAR_PROTECT") if a in actions), actions[0] if actions else "KEEP_ACTIVE"),
+        "invalidations": invalidations[:10],
+        "blocked_reason": reason,
+        "updated_ts": ts,
+    }
+
+
+def _nexus_risk_state_save(cur, wallet_address: str, state: dict) -> dict:
+    if not wallet_address:
+        return state
+    ts = int(state.get("updated_ts") or now_ts())
+    cur.execute(
+        """
+        INSERT INTO nexus_risk_state(wallet_address,global_status,risk_score,cooldown_until_ts,last_action,invalidation_json,blocked_reason,updated_ts)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(wallet_address) DO UPDATE SET global_status=excluded.global_status,risk_score=excluded.risk_score,cooldown_until_ts=excluded.cooldown_until_ts,last_action=excluded.last_action,invalidation_json=excluded.invalidation_json,blocked_reason=excluded.blocked_reason,updated_ts=excluded.updated_ts
+        """,
+        (
+            wallet_address,
+            state.get("global_status") or "ACTIVE_OK",
+            float(state.get("risk_score") or 0),
+            state.get("cooldown_until_ts"),
+            state.get("last_action") or "",
+            json.dumps(state.get("invalidations") or [], ensure_ascii=False),
+            str(state.get("blocked_reason") or "")[:500],
+            ts,
+        ),
+    )
+    return state
+
+
+
 # -------------------------
 # Nexus Trading Risk Decision Engine
 # -------------------------
@@ -9480,6 +9640,21 @@ def api_nexus_trading_risk_decision():
     cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
     decisions = [_nexus_trading_decide_slot(slot, cfg) for slot in queue if isinstance(slot, dict)]
 
+    risk_state = _nexus_risk_state_default()
+    if wa:
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+            hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+            previous_risk = _nexus_risk_state_load(cur, wa)
+            risk_state = _nexus_risk_state_build(decisions, hold_state, previous_risk, cfg)
+            _nexus_risk_state_save(cur, wa, risk_state)
+            conn.commit()
+            conn.close()
+    else:
+        risk_state = _nexus_risk_state_build(decisions, {}, None, cfg)
+
     # Session-level escalation: if any slot must exit, protected capital flow starts.
     final_action = "KEEP_ACTIVE"
     if any(d.get("action") == "FORCE_EXIT" for d in decisions):
@@ -9497,6 +9672,8 @@ def api_nexus_trading_risk_decision():
         "status": "ok",
         "wallet": wa,
         "session_action": final_action,
+        "risk_state": risk_state,
+        "global_risk_state": risk_state,
         "decisions": decisions,
         "note": "Backend risk decision engine: hard blocks or confirmed risk clusters are required. Normal market noise is not enough for exit.",
         "ts": now_ts(),
@@ -9551,6 +9728,19 @@ def api_nexus_trading_hold_state():
                     """,
                     (wa, "HOLD", hold_hours, 12, now_i, hold_until, observe_until, 0, json.dumps(queue, ensure_ascii=False), reason, now_i),
                 )
+                hold_snapshot = _nexus_trading_hold_row_to_dict({
+                    "status": "HOLD",
+                    "hold_hours": hold_hours,
+                    "observe_max_hours": 12,
+                    "hold_started_ts": now_i,
+                    "hold_until_ts": hold_until,
+                    "observe_until_ts": observe_until,
+                    "release_required": 0,
+                    "queue_json": json.dumps(queue, ensure_ascii=False),
+                    "reason": reason,
+                    "updated_ts": now_i,
+                })
+                _nexus_risk_state_save(cur, wa, _nexus_risk_state_build([], hold_snapshot, _nexus_risk_state_load(cur, wa), {}))
                 conn.commit()
 
         elif action == "release":
@@ -9564,6 +9754,13 @@ def api_nexus_trading_hold_state():
                     """,
                     (wa, now_i),
                 )
+                _nexus_risk_state_save(cur, wa, {
+                    **_nexus_risk_state_default(),
+                    "global_status": "ACTIVE_OK",
+                    "last_action": "RELEASE",
+                    "blocked_reason": "Capital released by user. Fresh Strategist confirmation is required before any new allocation.",
+                    "updated_ts": now_i,
+                })
                 conn.commit()
 
         elif action == "state":
@@ -9601,9 +9798,17 @@ def api_nexus_trading_hold_state():
                     now_ts(),
                 ),
             )
+            risk_sync = _nexus_risk_state_build([], updated, _nexus_risk_state_load(cur, wa), {})
+            _nexus_risk_state_save(cur, wa, risk_sync)
             conn.commit()
 
-    return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "ts": now_ts()})
+    risk_state = _nexus_risk_state_load(cur, wa)
+    if str(updated.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        risk_state = _nexus_risk_state_build([], updated, risk_state, {})
+        _nexus_risk_state_save(cur, wa, risk_state)
+        conn.commit()
+
+    return jsonify({"status": "ok", "wallet": wa, "hold_state": updated, "risk_state": risk_state, "global_risk_state": risk_state, "ts": now_ts()})
 
 
 
@@ -9761,16 +9966,22 @@ def api_nexus_trading_state():
         return jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400
     access = _compute_access_status(wa) if wa else _access_apply_strategist_meta(_access_defaults(), None)
     hold_state = _nexus_trading_hold_row_to_dict(None)
+    risk_state = _nexus_risk_state_default()
     if wa:
         conn = _db()
         cur = conn.cursor()
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        risk_state = _nexus_risk_state_load(cur, wa)
+        if str(hold_state.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+            risk_state = _nexus_risk_state_build([], hold_state, risk_state, {})
+            _nexus_risk_state_save(cur, wa, risk_state)
+            conn.commit()
         conn.close()
     vault_ready = bool(any((_VAULT_BY_CHAIN.get(int(cid)) or "").strip() for cid in _ENABLED_CHAIN_IDS)) if "_ENABLED_CHAIN_IDS" in globals() else False
     execution_mode = "live" if access.get("can_live_execute") and vault_ready else "prepared" if access.get("is_live") else "simulation"
     execution = {"queue": [], "reservations": [], "reserved_capital_usd": 0, "recheck_due_count": 0, "queue_count": 0}
-    shadow_executor = {"mode": "SHADOW_ONLY", "last_run": None, "ready_for_vault": False}
+    shadow_executor = {"mode": "SHADOW_ONLY", "last_run": None, "ready_for_vault": False, "live_execution_triggered": False}
     recheck_changes = []
     if wa:
         with DB_WRITE_LOCK:
@@ -9797,6 +10008,8 @@ def api_nexus_trading_state():
         "wallet": wa,
         "access": access,
         "hold_state": hold_state,
+        "risk_state": risk_state,
+        "global_risk_state": risk_state,
         "execution": execution,
         "shadow_executor": shadow_executor,
         "recheck_changes": recheck_changes,
@@ -9883,6 +10096,7 @@ def api_nexus_trading_release_reservation():
         conn.commit()
         conn.close()
     return jsonify({"status": "ok", "wallet": wa, "released": reservation_id, "execution": execution, "ts": now_ts()})
+
 
 
 # -------------------------
@@ -10155,6 +10369,7 @@ def api_nexus_shadow_executor():
         "message": "Shadow Executor simulated virtual fills/reallocation/stop-reentry only. No Vault execution was triggered.",
         "ts": now_ts(),
     })
+
 
 
 
@@ -13305,6 +13520,110 @@ def _market_behavior_from_pair(pair_ctx: dict | None, coins: list, ai_mode: str 
     }
 
 
+
+# -------------------------
+# Nexus Movement Quality Filter v2
+# -------------------------
+def nexus_movement_quality_filter(rows: list[dict]) -> list[dict]:
+    """
+    Institutional movement cleanup layer.
+
+    Goals:
+    - Noise cluster filtering
+    - Duplicate rotation compression
+    - Low-liquidity rejection when liquidity data exists
+    - Fake-spike reduction
+    - Overextended suppression
+    - Signal quality prioritization
+
+    IMPORTANT:
+    This layer is additive and non-destructive. Missing liquidity data reduces
+    confidence, but does not automatically delete pair-alert rows.
+    """
+    if not isinstance(rows, list):
+        return []
+
+    cleaned = []
+    seen_symbols = set()
+
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+
+        symbol = str(raw.get("symbol") or raw.get("pair") or "").upper().strip()
+        if not symbol:
+            continue
+
+        if symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+
+        has_volume = any(k in raw and raw.get(k) not in (None, "") for k in ("volume24h", "volume", "liquidity_usd", "liquidityUsd"))
+        volume = _safe_float(raw.get("volume24h") or raw.get("volume") or raw.get("liquidity_usd") or raw.get("liquidityUsd") or 0)
+        move_pct = abs(_safe_float(raw.get("change24h") or raw.get("movement_pct") or raw.get("spread_pct") or raw.get("spreadPct") or 0))
+        rvol = _safe_float(raw.get("rvol") or raw.get("relative_volume") or 1)
+        overextension = abs(_safe_float(raw.get("overextension") or raw.get("oe_pct") or raw.get("overextension_pct") or 0))
+
+        quality_score = 50.0
+        reasons = []
+        rejection_reason = ""
+
+        if has_volume and volume < 25000:
+            rejection_reason = "low_liquidity"
+            reasons.append("low liquidity")
+            quality_score -= 35
+        elif not has_volume:
+            reasons.append("liquidity data missing")
+            quality_score -= 6
+
+        if move_pct > 35 and rvol < 1.2:
+            rejection_reason = rejection_reason or "fake_spike"
+            reasons.append("possible fake spike")
+            quality_score -= 25
+
+        if overextension > 45:
+            reasons.append("overextended movement")
+            quality_score -= 20
+
+        if rvol >= 1.8:
+            reasons.append("relative volume confirms movement")
+            quality_score += 15
+
+        base_score = _safe_float(raw.get("score") or raw.get("movement_chance_score") or 0)
+        if base_score >= 75:
+            quality_score += 8
+        elif base_score < 45:
+            quality_score -= 6
+
+        quality_score = max(0, min(100, round(quality_score, 2)))
+
+        out_row = dict(raw)
+        out_row["movement_quality_score"] = quality_score
+        out_row["movement_quality_state"] = (
+            "high" if quality_score >= 75 else
+            "medium" if quality_score >= 55 else
+            "weak"
+        )
+        out_row["movement_rejection_reason"] = rejection_reason
+        out_row["movement_quality_reasons"] = reasons[:5]
+
+        # Hard rejection only when strong evidence exists; missing volume alone must not delete alerts.
+        if quality_score < 25 and rejection_reason:
+            continue
+
+        cleaned.append(out_row)
+
+    cleaned.sort(
+        key=lambda x: (
+            float(x.get("movement_quality_score") or 0),
+            float(x.get("score") or x.get("movement_chance_score") or 0),
+            float(x.get("volume24h") or x.get("volume") or x.get("liquidity_usd") or x.get("liquidityUsd") or 0),
+        ),
+        reverse=True,
+    )
+
+    return cleaned
+
 def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None = None, ai_mode: str = "standard") -> list[dict]:
     """Scan all Compare pairs for hidden opportunities, not only the selected/top pair.
     Deterministic and informational only; no buy/sell instructions.
@@ -13397,7 +13716,21 @@ def _build_ai_pair_alerts(pairs: list, coins: list, compare_weights: dict | None
             "reasons": list(dict.fromkeys((reasons or []) + list(movement.get("reasons") or [])))[:6],
         })
 
-    alerts.sort(key=lambda x: (x.get("movement_chance_score") or x.get("score") or 0), reverse=True)
+    # Movement Opportunity Quality Filter v2 is applied after the original scanner
+    # so old movement logic remains intact, but low-quality/noisy duplicates are compressed.
+    if "nexus_movement_quality_filter" in globals():
+        try:
+            alerts = nexus_movement_quality_filter(alerts)
+        except Exception:
+            pass
+
+    alerts.sort(
+        key=lambda x: (
+            x.get("movement_quality_score") or 0,
+            x.get("movement_chance_score") or x.get("score") or 0,
+        ),
+        reverse=True,
+    )
     return alerts[:8]
 
 
@@ -19181,94 +19514,3 @@ def api_nexus_fee_policy():
     profit_usd = _safe_float(request.args.get("profitUsd") or request.args.get("profit_usd") or 0)
     stable = str(request.args.get("feeStable") or request.args.get("fee_stable") or "").strip().upper()
     return jsonify({"status": "ok", "chain": chain, "feePolicy": _nexus_fee_preview(profit_usd, chain, stable), "ts": now_ts()})
-
-# -------------------------
-# Nexus Movement Quality Filter v2
-# -------------------------
-def nexus_movement_quality_filter(rows: list[dict]) -> list[dict]:
-    """
-    Institutional movement cleanup layer.
-
-    Goals:
-    - Noise cluster filtering
-    - Duplicate rotation compression
-    - Low liquidity rejection
-    - Fake spike reduction
-    - Overextended suppression
-    - Signal quality prioritization
-
-    IMPORTANT:
-    This layer is intentionally additive and non-destructive.
-    Existing movement engines still work if fields are missing.
-    """
-    if not isinstance(rows, list):
-        return []
-
-    cleaned = []
-    seen_symbols = set()
-
-    for raw in rows:
-        if not isinstance(raw, dict):
-            continue
-
-        symbol = str(raw.get("symbol") or raw.get("pair") or "").upper().strip()
-        if not symbol:
-            continue
-
-        # Duplicate compression
-        if symbol in seen_symbols:
-            continue
-        seen_symbols.add(symbol)
-
-        volume = _safe_float(raw.get("volume24h") or raw.get("volume") or 0)
-        move_pct = abs(_safe_float(raw.get("change24h") or raw.get("movement_pct") or 0))
-        rvol = _safe_float(raw.get("rvol") or 1)
-        overextension = abs(_safe_float(raw.get("overextension") or raw.get("oe_pct") or 0))
-
-        quality_score = 50.0
-        rejection_reason = ""
-
-        # Low liquidity rejection
-        if volume < 25000:
-            rejection_reason = "low_liquidity"
-            quality_score -= 35
-
-        # Fake spike reduction
-        if move_pct > 35 and rvol < 1.2:
-            rejection_reason = rejection_reason or "fake_spike"
-            quality_score -= 25
-
-        # Overextended suppression
-        if overextension > 45:
-            quality_score -= 20
-
-        # Healthy relative volume
-        if rvol >= 1.8:
-            quality_score += 15
-
-        quality_score = max(0, min(100, round(quality_score, 2)))
-
-        out = dict(raw)
-        out["movement_quality_score"] = quality_score
-        out["movement_quality_state"] = (
-            "high" if quality_score >= 75 else
-            "medium" if quality_score >= 55 else
-            "weak"
-        )
-        out["movement_rejection_reason"] = rejection_reason
-
-        # Hard rejection only for extremely weak setups
-        if quality_score < 25:
-            continue
-
-        cleaned.append(out)
-
-    cleaned.sort(
-        key=lambda x: (
-            float(x.get("movement_quality_score") or 0),
-            float(x.get("volume24h") or x.get("volume") or 0)
-        ),
-        reverse=True
-    )
-
-    return cleaned
