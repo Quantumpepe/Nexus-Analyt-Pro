@@ -9834,12 +9834,14 @@ def _nexus_wallet_from_request():
     return wa, None
 
 def _nexus_queue_row_to_dict(row) -> dict:
+    meta = _nexus_json_load(row["meta_json"], {})
+    session_id = str(meta.get("session_id") or meta.get("trade_session_id") or meta.get("rotation_session_id") or "")
     return {
         "id": row["id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "", "chain": row["chain"] or "",
         "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
         "reserved_capital_usd": float(row["reserved_capital_usd"] or 0), "confidence": float(row["confidence"] or 0),
         "risk_score": float(row["risk_score"] or 0), "reason": row["reason"] or "",
-        "signals": _nexus_json_load(row["signals_json"], {}), "meta": _nexus_json_load(row["meta_json"], {}),
+        "signals": _nexus_json_load(row["signals_json"], {}), "meta": meta, "session_id": session_id,
         "recheck_after_ts": row["recheck_after_ts"], "expires_ts": row["expires_ts"],
         "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
     }
@@ -9902,6 +9904,11 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         requested_state = "WAIT"
     signals = body.get("signals") if isinstance(body.get("signals"), dict) else {}
     meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+    # Optional multi-session identifier. This keeps separate user-approved Trading/Rotation blocks traceable
+    # without changing the DB schema or affecting existing queues.
+    session_id = str(body.get("session_id") or body.get("trade_session_id") or body.get("rotation_session_id") or meta.get("session_id") or "").strip()[:80]
+    if session_id:
+        meta = {**meta, "session_id": session_id}
     confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
