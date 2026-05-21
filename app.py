@@ -1782,6 +1782,27 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_simulation_events_wallet_ts ON nexus_simulation_events(wallet_address, created_ts)")
 
+    # Shadow / Simulation Executor runs.
+    # This is intentionally off-chain and cannot trigger Vault execution. It validates
+    # virtual fills, reallocation behavior, stop/re-entry rules, and long-runtime stability
+    # before live Vault integration.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_shadow_executor_runs (
+            run_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            mode TEXT DEFAULT 'SHADOW',
+            source TEXT DEFAULT 'manual',
+            status TEXT DEFAULT 'completed',
+            summary_json TEXT DEFAULT '{}',
+            events_json TEXT DEFAULT '[]',
+            queue_json TEXT DEFAULT '[]',
+            config_json TEXT DEFAULT '{}',
+            created_ts INTEGER,
+            updated_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_shadow_runs_wallet_ts ON nexus_shadow_executor_runs(wallet_address, created_ts)")
+
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
         cur.execute("PRAGMA table_info(ai_memory)")
@@ -9749,6 +9770,7 @@ def api_nexus_trading_state():
     vault_ready = bool(any((_VAULT_BY_CHAIN.get(int(cid)) or "").strip() for cid in _ENABLED_CHAIN_IDS)) if "_ENABLED_CHAIN_IDS" in globals() else False
     execution_mode = "live" if access.get("can_live_execute") and vault_ready else "prepared" if access.get("is_live") else "simulation"
     execution = {"queue": [], "reservations": [], "reserved_capital_usd": 0, "recheck_due_count": 0, "queue_count": 0}
+    shadow_executor = {"mode": "SHADOW_ONLY", "last_run": None, "ready_for_vault": False}
     recheck_changes = []
     if wa:
         with DB_WRITE_LOCK:
@@ -9756,6 +9778,18 @@ def api_nexus_trading_state():
             cur = conn.cursor()
             recheck_changes = _nexus_recheck_apply(cur, wa)
             execution = _nexus_execution_summary(cur, wa)
+            try:
+                cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 1", (wa,))
+                last_shadow = _shadow_row_to_dict(cur.fetchone()) if "_shadow_row_to_dict" in globals() else None
+                last_summary = (last_shadow or {}).get("summary") or {}
+                shadow_executor = {
+                    "mode": "SHADOW_ONLY",
+                    "last_run": last_shadow,
+                    "ready_for_vault": str(last_summary.get("readiness") or "") == "VAULT_READY_CANDIDATE",
+                    "live_execution_triggered": False,
+                }
+            except Exception:
+                shadow_executor = {"mode": "SHADOW_ONLY", "last_run": None, "ready_for_vault": False, "live_execution_triggered": False}
             conn.commit()
             conn.close()
     return jsonify({
@@ -9764,6 +9798,7 @@ def api_nexus_trading_state():
         "access": access,
         "hold_state": hold_state,
         "execution": execution,
+        "shadow_executor": shadow_executor,
         "recheck_changes": recheck_changes,
         "execution_mode": execution_mode,
         "vault_ready": vault_ready,
@@ -9848,6 +9883,278 @@ def api_nexus_trading_release_reservation():
         conn.commit()
         conn.close()
     return jsonify({"status": "ok", "wallet": wa, "released": reservation_id, "execution": execution, "ts": now_ts()})
+
+
+# -------------------------
+# Nexus Shadow / Simulation Executor
+# -------------------------
+def _shadow_row_to_dict(row):
+    if not row:
+        return None
+    return {
+        "run_id": row["run_id"],
+        "wallet": row["wallet_address"],
+        "mode": row["mode"] or "SHADOW",
+        "source": row["source"] or "manual",
+        "status": row["status"] or "completed",
+        "summary": _nexus_json_load(row["summary_json"], {}),
+        "events": _nexus_json_load(row["events_json"], []),
+        "queue": _nexus_json_load(row["queue_json"], []),
+        "config": _nexus_json_load(row["config_json"], {}),
+        "created_ts": row["created_ts"],
+        "updated_ts": row["updated_ts"],
+    }
+
+
+def _shadow_normalize_queue_item(item, idx=0):
+    if not isinstance(item, dict):
+        item = {}
+    slot = str(item.get("slot") or item.get("slot_id") or item.get("id") or f"S{idx + 1}").strip()[:40]
+    symbol = str(item.get("symbol") or item.get("asset") or item.get("pair") or "ASSET").strip().upper()[:24]
+    state = str(item.get("status") or item.get("state") or "WAIT").strip().upper()
+    amount = _clamp_float(item.get("amountUsd", item.get("reserved_capital_usd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
+    priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+    confidence_raw = item.get("confidence", item.get("confidence_score", 0))
+    if isinstance(confidence_raw, str):
+        confidence = {"LOW": 35, "MEDIUM": 62, "HIGH": 82}.get(confidence_raw.upper(), 50)
+    else:
+        confidence = _clamp_float(confidence_raw, 0, 0, 100)
+    risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
+    return {
+        **item,
+        "slot": slot,
+        "symbol": symbol,
+        "status": state,
+        "amountUsd": amount,
+        "priority": priority,
+        "confidence_score": confidence,
+        "risk_score": risk_score,
+    }
+
+
+def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
+    """Run an off-chain shadow execution validation pass.
+
+    This function never creates transactions, never calls Vault execution routes, and never
+    mutates live Grid orders. It only produces validation events and a safety summary.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    hold = hold_state if isinstance(hold_state, dict) else {}
+    runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 1, 1, 168)
+    max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 6)), 1, 1, 200))
+    reentry_blocked = str(hold.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
+    events = []
+    virtual_fills = 0
+    blocked = 0
+    protect_count = 0
+    reallocation_tests = 0
+    stop_tests = 0
+
+    normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue if isinstance(queue, list) else [])]
+    if not normalized:
+        events.append({
+            "type": "NO_QUEUE",
+            "severity": "info",
+            "message": "No execution queue was provided. Shadow executor stayed idle.",
+        })
+
+    for idx, item in enumerate(normalized):
+        state = str(item.get("status") or "WAIT").upper()
+        risk = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
+        confidence = _clamp_float(item.get("confidence_score", 0), 0, 0, 100)
+        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+        symbol = item.get("symbol") or "ASSET"
+        slot = item.get("slot") or f"S{idx + 1}"
+
+        if reentry_blocked:
+            blocked += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "REENTRY_BLOCKED",
+                "severity": "high",
+                "message": "HOLD/OBSERVE state blocks blind re-entry in shadow validation.",
+            })
+            continue
+
+        if state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+            blocked += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "STATE_BLOCKED",
+                "severity": "medium",
+                "message": f"Slot state {state} is not executable in shadow mode.",
+            })
+            continue
+
+        if risk >= 70:
+            blocked += 1
+            stop_tests += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "VIRTUAL_STOP_BLOCK",
+                "severity": "high",
+                "risk_score": risk,
+                "message": "Virtual execution blocked because risk score is too high.",
+            })
+            continue
+
+        if risk >= 48:
+            protect_count += 1
+            stop_tests += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "VIRTUAL_PROTECT",
+                "severity": "medium_high",
+                "risk_score": risk,
+                "message": "Shadow executor would reduce/protect before any live entry.",
+            })
+            continue
+
+        if confidence >= 55 and priority >= 35 and virtual_fills < max_trades:
+            virtual_fills += 1
+            reallocation_tests += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "VIRTUAL_FILL",
+                "severity": "normal",
+                "confidence": confidence,
+                "priority": priority,
+                "message": "Virtual fill accepted for simulation only. No Vault execution triggered.",
+            })
+        else:
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "VIRTUAL_WAIT",
+                "severity": "info",
+                "confidence": confidence,
+                "priority": priority,
+                "message": "Setup remains in WAIT during shadow validation.",
+            })
+
+    total = max(1, len(normalized))
+    safety_score = 100
+    safety_score -= min(35, blocked * 8)
+    safety_score -= min(24, protect_count * 6)
+    safety_score += min(10, virtual_fills * 2)
+    safety_score = max(0, min(100, int(safety_score)))
+
+    status = "passed" if safety_score >= 72 and not reentry_blocked else "watch" if safety_score >= 45 else "blocked"
+    if reentry_blocked:
+        status = "blocked"
+
+    summary = {
+        "shadow_only": True,
+        "live_execution_triggered": False,
+        "status": status,
+        "safety_score": safety_score,
+        "runtime_hours": runtime_hours,
+        "slots_tested": len(normalized),
+        "virtual_fills": virtual_fills,
+        "virtual_blocks": blocked,
+        "protect_tests": protect_count,
+        "reallocation_tests": reallocation_tests,
+        "stop_reentry_tests": stop_tests,
+        "reentry_allowed": not reentry_blocked and status == "passed",
+        "readiness": "VAULT_READY_CANDIDATE" if status == "passed" else "NEEDS_OBSERVATION" if status == "watch" else "NOT_READY_FOR_VAULT",
+        "message": "Shadow Executor completed without live Vault execution.",
+    }
+    return {"summary": summary, "events": events[:200], "queue": normalized}
+
+
+@app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
+def api_nexus_shadow_executor():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+
+    if request.method == "GET":
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
+            (wa,),
+        )
+        runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+        execution = _nexus_execution_summary(cur, wa)
+        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        conn.close()
+        return jsonify({
+            "status": "ok",
+            "wallet": wa,
+            "mode": "SHADOW_ONLY",
+            "live_execution_triggered": False,
+            "last_run": runs[0] if runs else None,
+            "runs": runs,
+            "execution": execution,
+            "hold_state": hold_state,
+            "ts": now_ts(),
+        })
+
+    body = request.get_json(silent=True) or {}
+    cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+    source = str(body.get("source") or "manual").strip()[:80]
+
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        execution = _nexus_execution_summary(cur, wa)
+        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        queue = body.get("queue") if isinstance(body.get("queue"), list) else execution.get("queue", [])
+        result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
+        run_id = str(body.get("run_id") or ("NSH-" + uuid.uuid4().hex[:12].upper()))
+        now_i = now_ts()
+        cur.execute(
+            """
+            INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                run_id,
+                wa,
+                "SHADOW",
+                source,
+                result["summary"].get("status") or "completed",
+                json.dumps(result["summary"], ensure_ascii=False),
+                json.dumps(result["events"], ensure_ascii=False),
+                json.dumps(result["queue"], ensure_ascii=False),
+                json.dumps(cfg, ensure_ascii=False),
+                now_i,
+                now_i,
+            ),
+        )
+        _nexus_log_sim_event(
+            cur,
+            wa,
+            "shadow_executor",
+            "SHADOW",
+            "SHADOW_EXECUTOR_RUN",
+            "",
+            result["summary"].get("status") or "completed",
+            "Shadow Executor validation completed. No live Vault execution was triggered.",
+            {"run_id": run_id, "summary": result["summary"]},
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wa))
+        run = _shadow_row_to_dict(cur.fetchone())
+        execution = _nexus_execution_summary(cur, wa)
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "run": run,
+        "execution": execution,
+        "message": "Shadow Executor simulated virtual fills/reallocation/stop-reentry only. No Vault execution was triggered.",
+        "ts": now_ts(),
+    })
 
 
 
