@@ -1361,6 +1361,17 @@ def coingecko_simple_price():
     except Exception as e:
         return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
 
+@app.route("/api/coingecko/global", methods=["GET"])
+def coingecko_global_market():
+    """Proxy CoinGecko global market data for the top header market banner."""
+    url = f"{COINGECKO_BASE}/global"
+    try:
+        data = _cg_get(url)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": "coingecko_global_failed", "detail": str(e)}), 502
+
+
 @app.route("/api/coingecko/token_price/<platform>", methods=["GET"])
 def coingecko_token_price(platform: str):
     qs = request.query_string.decode("utf-8", errors="ignore")
