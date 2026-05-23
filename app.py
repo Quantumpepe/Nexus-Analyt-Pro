@@ -9884,26 +9884,120 @@ def _nexus_execution_summary(cur, wallet_address):
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
+def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
+    """Score one prepared slot for Shadow/rotation readiness without live execution.
+
+    This is intentionally deterministic and local to the queue row. It does not call
+    external services and it never triggers Vault execution. The goal is to make
+    Shadow behave like a realistic prepared/live preview: good WAIT slots can move
+    to READY, weak slots stay WAIT, and risky slots move to PROTECT/BLOCKED.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    item = item if isinstance(item, dict) else {}
+    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+
+    confidence = _clamp_float(item.get("confidence", item.get("confidence_score", signals.get("confidence", 0))), 0, 0, 100)
+    risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
+    priority_raw = item.get("priority", None)
+    priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
+
+    liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=70)
+    rvol = _nexus_trading_signal_value(item, signals, "rvol", "relative_volume", default=1.0)
+    slippage = _nexus_trading_signal_value(item, signals, "slippage_pct", "slippagePct", default=0)
+    overextension = _nexus_trading_signal_value(item, signals, "overextension_pct", "overextension", default=0)
+    structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
+    security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
+
+    max_slippage = _clamp_float(cfg.get("max_slippage_pct", item.get("maxSlippagePct", 1.2)), 1.2, 0.05, 10)
+    quality = priority
+    if confidence >= 70:
+        quality += 10
+    elif confidence >= 55:
+        quality += 5
+    if liquidity >= 60:
+        quality += 5
+    elif liquidity < 35:
+        quality -= 12
+    if rvol >= 1.2:
+        quality += 4
+    elif rvol < 0.7:
+        quality -= 5
+    if structure in ("BREAKOUT", "ACCUMULATION", "INTACT", "STRONG", "UPTREND"):
+        quality += 6
+    if structure in ("WEAK", "UNSTABLE", "DISTRIBUTION"):
+        quality -= 8
+    if overextension >= 60 and rvol < 1.2:
+        quality -= 10
+    if slippage and slippage > max_slippage:
+        quality -= 14
+
+    hard_block = security in ("FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED") or liquidity <= 10 or (slippage and slippage >= max_slippage * 2.5)
+    return {
+        "confidence": max(0, min(100, confidence)),
+        "risk_score": max(0, min(100, risk)),
+        "priority": max(-100, min(100, priority)),
+        "quality": max(-100, min(100, quality)),
+        "hard_block": bool(hard_block),
+    }
+
+
 def _nexus_recheck_apply(cur, wallet_address):
     ts = now_ts()
     cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 20", (wallet_address, ts))
     changed = []
+    active_like = 0
+    max_shadow_ready = int(os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6"))
+
     for row in cur.fetchall():
         item = _nexus_queue_row_to_dict(row)
         old_state = str(item.get("state") or "WAIT").upper()
-        decision = _nexus_trading_decide_slot({"status": old_state, "symbol": item.get("asset"), "signals": item.get("signals") or {}, "confidence": item.get("confidence"), "risk_score": item.get("risk_score")}, {"risk_mode": "BALANCED"})
-        new_state = str(decision.get("state") or old_state).upper()
-        reason = str(decision.get("reason") or item.get("reason") or "Scheduled Strategist recheck").strip()
-        if old_state in ("WAIT","OBSERVE") and new_state == "ACTIVE":
+        quality = _nexus_shadow_slot_quality(item, {"risk_mode": "BALANCED"})
+        decision = _nexus_trading_decide_slot({
+            "status": old_state,
+            "symbol": item.get("asset"),
+            "signals": item.get("signals") or {},
+            "confidence": quality.get("confidence"),
+            "risk_score": quality.get("risk_score"),
+            "priority": quality.get("priority"),
+        }, {"risk_mode": "BALANCED"})
+
+        new_state = str(decision.get("next_status") or decision.get("state") or old_state).upper()
+        reason = "; ".join(decision.get("reasons") or []) or item.get("reason") or "Scheduled Strategist recheck"
+
+        if quality.get("hard_block"):
+            new_state = "BLOCKED"
+            reason = "Shadow recheck blocked this slot because security/liquidity/slippage rules failed."
+        elif quality.get("risk_score", 0) >= 70:
+            new_state = "HOLD"
+            reason = "Shadow recheck detected high risk; slot is protected in HOLD."
+        elif quality.get("risk_score", 0) >= 48:
+            new_state = "PROTECT"
+            reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
+        elif old_state in ("WAIT", "OBSERVE", "READY"):
+            if quality.get("confidence", 0) >= 55 and quality.get("quality", 0) >= 35 and active_like < max_shadow_ready:
+                new_state = "READY"
+                active_like += 1
+                reason = "Shadow recheck promoted this slot to READY based on confidence, priority and controlled risk."
+            else:
+                new_state = "WAIT"
+                reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
+        elif old_state == "PROTECT" and quality.get("risk_score", 0) < 35 and quality.get("quality", 0) >= 35:
             new_state = "READY"
-            reason = "Recheck confirmed readiness, but Vault execution is not enabled yet."
+            active_like += 1
+            reason = "Risk normalized; Shadow recheck returned this slot to READY."
+        elif old_state == "ACTIVE":
+            active_like += 1
+
         if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
             new_state = old_state
         next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
-        cur.execute("UPDATE nexus_execution_queue SET state=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?", (new_state, reason[:500], next_recheck, ts, item["id"], wallet_address))
+        cur.execute(
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, quality.get("quality", item.get("priority") or 0), quality.get("confidence", item.get("confidence") or 0), quality.get("risk_score", item.get("risk_score") or 0), reason[:500], next_recheck, ts, item["id"], wallet_address),
+        )
         if new_state != old_state:
-            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision})
-            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason})
+            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision, "quality": quality})
+            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason, "quality": quality})
     return changed
 
 def _nexus_upsert_queue_item(cur, wallet_address, body):
@@ -10164,23 +10258,65 @@ def _shadow_normalize_queue_item(item, idx=0):
     }
 
 
+def _nexus_shadow_item_blocked_by_hold(item: dict, hold: dict) -> bool:
+    """Return True only when HOLD/OBSERVE applies to this slot/session.
+
+    Older Shadow logic used the wallet-level HOLD status as a global blocker. That made
+    every slot look frozen although only protected capital/slots should be blocked.
+    """
+    status = str((hold or {}).get("status") or "").upper()
+    if status not in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        return False
+
+    hold_queue = (hold or {}).get("queue") if isinstance((hold or {}).get("queue"), list) else []
+    if not hold_queue:
+        # Keep backward compatibility: if backend has no slot list, block only slots already
+        # explicitly in a protected state, not every WAIT/READY candidate.
+        return str((item or {}).get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
+
+    slot = str((item or {}).get("slot") or (item or {}).get("slot_id") or "").strip().upper()
+    symbol = str((item or {}).get("symbol") or (item or {}).get("asset") or "").strip().upper()
+    session_id = str((item or {}).get("session_id") or ((item or {}).get("meta") or {}).get("session_id") or "").strip().upper()
+
+    for q in hold_queue:
+        if not isinstance(q, dict):
+            continue
+        qslot = str(q.get("slot") or q.get("slot_id") or q.get("id") or "").strip().upper()
+        qsymbol = str(q.get("symbol") or q.get("asset") or "").strip().upper()
+        qsession = str(q.get("session_id") or (q.get("meta") or {}).get("session_id") or "").strip().upper()
+        if slot and qslot and slot == qslot:
+            return True
+        if session_id and qsession and session_id == qsession:
+            return True
+        if symbol and qsymbol and symbol == qsymbol:
+            return True
+    return False
+
+
 def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     """Run an off-chain shadow execution validation pass.
 
     This function never creates transactions, never calls Vault execution routes, and never
-    mutates live Grid orders. It only produces validation events and a safety summary.
+    mutates live Grid orders. It produces a realistic Shadow rotation preview: WAIT slots
+    can become READY, READY/ACTIVE slots can produce virtual fills, risky slots move to
+    PROTECT/HOLD, and protected slots stay blocked only when the hold applies to them.
     """
     cfg = config if isinstance(config, dict) else {}
     hold = hold_state if isinstance(hold_state, dict) else {}
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 1, 1, 168)
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 6)), 1, 1, 200))
-    reentry_blocked = str(hold.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
+    max_ready_slots = int(_clamp_float(cfg.get("max_ready_slots", os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6")), 6, 1, 50))
+    persist_state = str(cfg.get("persist_state", cfg.get("persistState", os.getenv("NEXUS_SHADOW_PERSIST_QUEUE", "1")))).strip().lower() in ("1", "true", "yes", "on")
+
     events = []
     virtual_fills = 0
+    virtual_waits = 0
     blocked = 0
     protect_count = 0
+    ready_count = 0
     reallocation_tests = 0
     stop_tests = 0
+    queue_out = []
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue if isinstance(queue, list) else [])]
     if not normalized:
@@ -10192,94 +10328,143 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
 
     for idx, item in enumerate(normalized):
         state = str(item.get("status") or "WAIT").upper()
-        risk = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
-        confidence = _clamp_float(item.get("confidence_score", 0), 0, 0, 100)
-        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+        quality = _nexus_shadow_slot_quality(item, cfg)
+        risk = _clamp_float(quality.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
+        confidence = _clamp_float(quality.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
+        priority = _clamp_float(quality.get("priority", item.get("priority", 0)), 0, -100, 100)
+        quality_score = _clamp_float(quality.get("quality", priority), 0, -100, 100)
         symbol = item.get("symbol") or "ASSET"
         slot = item.get("slot") or f"S{idx + 1}"
+        next_state = state
+        transition_reason = ""
 
-        if reentry_blocked:
+        if _nexus_shadow_item_blocked_by_hold(item, hold):
             blocked += 1
+            next_state = "RELEASE_REQUIRED" if str(hold.get("status") or "").upper() == "RELEASE_REQUIRED" else state if state in ("HOLD", "OBSERVE") else "OBSERVE"
+            transition_reason = "Protected HOLD/OBSERVE applies to this slot; Shadow blocks blind re-entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "REENTRY_BLOCKED",
                 "severity": "high",
-                "message": "HOLD/OBSERVE state blocks blind re-entry in shadow validation.",
+                "from": state,
+                "to": next_state,
+                "message": transition_reason,
             })
-            continue
-
-        if state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+        elif state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
             blocked += 1
+            next_state = state
+            transition_reason = f"Slot state {state} is protected and not executable in shadow mode."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "STATE_BLOCKED",
                 "severity": "medium",
-                "message": f"Slot state {state} is not executable in shadow mode.",
+                "from": state,
+                "to": next_state,
+                "message": transition_reason,
             })
-            continue
-
-        if risk >= 70:
+        elif quality.get("hard_block") or risk >= 70:
             blocked += 1
             stop_tests += 1
+            next_state = "HOLD"
+            transition_reason = "Virtual execution blocked because risk/security/liquidity rules are too high."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_STOP_BLOCK",
                 "severity": "high",
+                "from": state,
+                "to": next_state,
                 "risk_score": risk,
-                "message": "Virtual execution blocked because risk score is too high.",
+                "message": transition_reason,
             })
-            continue
-
-        if risk >= 48:
+        elif risk >= 48:
             protect_count += 1
             stop_tests += 1
+            next_state = "PROTECT"
+            transition_reason = "Shadow executor would reduce/protect before any live entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_PROTECT",
                 "severity": "medium_high",
+                "from": state,
+                "to": next_state,
                 "risk_score": risk,
-                "message": "Shadow executor would reduce/protect before any live entry.",
+                "message": transition_reason,
             })
-            continue
-
-        if confidence >= 55 and priority >= 35 and virtual_fills < max_trades:
-            virtual_fills += 1
-            reallocation_tests += 1
-            events.append({
-                "slot": slot,
-                "symbol": symbol,
-                "type": "VIRTUAL_FILL",
-                "severity": "normal",
-                "confidence": confidence,
-                "priority": priority,
-                "message": "Virtual fill accepted for simulation only. No Vault execution triggered.",
-            })
+        elif confidence >= 55 and quality_score >= 35 and ready_count < max_ready_slots:
+            ready_count += 1
+            if virtual_fills < max_trades:
+                virtual_fills += 1
+                reallocation_tests += 1
+                next_state = "ACTIVE" if state == "ACTIVE" else "READY"
+                transition_reason = "Virtual fill accepted for simulation only. Slot is ready/active in Shadow preview."
+                events.append({
+                    "slot": slot,
+                    "symbol": symbol,
+                    "type": "VIRTUAL_FILL",
+                    "severity": "normal",
+                    "from": state,
+                    "to": next_state,
+                    "confidence": confidence,
+                    "priority": priority,
+                    "quality": quality_score,
+                    "message": transition_reason,
+                })
+            else:
+                virtual_waits += 1
+                next_state = "READY"
+                transition_reason = "Slot is ready, but max virtual trade count is reached for this Shadow pass."
+                events.append({
+                    "slot": slot,
+                    "symbol": symbol,
+                    "type": "VIRTUAL_READY_WAIT",
+                    "severity": "info",
+                    "from": state,
+                    "to": next_state,
+                    "confidence": confidence,
+                    "priority": priority,
+                    "quality": quality_score,
+                    "message": transition_reason,
+                })
         else:
+            virtual_waits += 1
+            next_state = "WAIT"
+            transition_reason = "Setup remains in WAIT; quality is not clean enough yet."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_WAIT",
                 "severity": "info",
+                "from": state,
+                "to": next_state,
                 "confidence": confidence,
                 "priority": priority,
-                "message": "Setup remains in WAIT during shadow validation.",
+                "quality": quality_score,
+                "message": transition_reason,
             })
 
-    total = max(1, len(normalized))
+        out_item = {
+            **item,
+            "status": next_state,
+            "state": next_state,
+            "priority": quality_score,
+            "confidence_score": confidence,
+            "confidence": confidence,
+            "risk_score": risk,
+            "shadow_transition": {"from": state, "to": next_state, "reason": transition_reason},
+        }
+        queue_out.append(out_item)
+
     safety_score = 100
     safety_score -= min(35, blocked * 8)
     safety_score -= min(24, protect_count * 6)
     safety_score += min(10, virtual_fills * 2)
     safety_score = max(0, min(100, int(safety_score)))
 
-    status = "passed" if safety_score >= 72 and not reentry_blocked else "watch" if safety_score >= 45 else "blocked"
-    if reentry_blocked:
-        status = "blocked"
-
+    status = "passed" if safety_score >= 72 and virtual_fills > 0 else "watch" if safety_score >= 45 else "blocked"
     summary = {
         "shadow_only": True,
         "live_execution_triggered": False,
@@ -10287,16 +10472,67 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
         "safety_score": safety_score,
         "runtime_hours": runtime_hours,
         "slots_tested": len(normalized),
+        "ready_slots": ready_count,
         "virtual_fills": virtual_fills,
+        "virtual_waits": virtual_waits,
         "virtual_blocks": blocked,
         "protect_tests": protect_count,
         "reallocation_tests": reallocation_tests,
         "stop_reentry_tests": stop_tests,
-        "reentry_allowed": not reentry_blocked and status == "passed",
+        "reentry_allowed": status == "passed",
         "readiness": "VAULT_READY_CANDIDATE" if status == "passed" else "NEEDS_OBSERVATION" if status == "watch" else "NOT_READY_FOR_VAULT",
-        "message": "Shadow Executor completed without live Vault execution.",
+        "persist_state": persist_state,
+        "message": "Shadow Executor completed a realistic slot rotation preview without live Vault execution.",
     }
-    return {"summary": summary, "events": events[:200], "queue": normalized}
+    return {"summary": summary, "events": events[:200], "queue": queue_out}
+
+
+def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: list) -> list:
+    """Persist Shadow slot preview back into nexus_execution_queue.
+
+    Only prepared/simulation queue state is updated. This never touches Grid orders,
+    Vault balances, routers or live execution paths.
+    """
+    ts = now_ts()
+    changed = []
+    for item in shadow_queue if isinstance(shadow_queue, list) else []:
+        if not isinstance(item, dict):
+            continue
+        new_state = str(item.get("state") or item.get("status") or "WAIT").upper()
+        if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
+            continue
+        queue_id = str(item.get("id") or item.get("queue_id") or "").strip()
+        slot_id = str(item.get("slot_id") or item.get("slot") or "").strip()
+        asset = str(item.get("asset") or item.get("symbol") or "").strip().upper()
+        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+        confidence = _clamp_float(item.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
+        risk_score = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
+        transition = item.get("shadow_transition") if isinstance(item.get("shadow_transition"), dict) else {}
+        reason = str(transition.get("reason") or item.get("reason") or "Shadow rotation preview updated this slot.")[:500]
+        old_state = None
+        row = None
+        if queue_id:
+            cur.execute("SELECT id,state,slot_id,asset FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
+            row = cur.fetchone()
+        if row is None and slot_id:
+            cur.execute("SELECT id,state,slot_id,asset FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, slot_id))
+            row = cur.fetchone()
+        if row is None and asset:
+            cur.execute("SELECT id,state,slot_id,asset FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
+            row = cur.fetchone()
+        if row is None:
+            continue
+        old_state = str(row["state"] or "WAIT").upper()
+        rid = row["id"]
+        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
+        cur.execute(
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, priority, confidence, risk_score, reason, next_recheck, ts, rid, wallet_address),
+        )
+        if new_state != old_state:
+            _nexus_log_sim_event(cur, wallet_address, row["slot_id"], row["asset"], "SHADOW_ROTATION", old_state, new_state, reason, {"queue_id": rid, "shadow": transition})
+            changed.append({"id": rid, "from": old_state, "to": new_state, "reason": reason})
+    return changed
 
 
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
@@ -10341,6 +10577,8 @@ def api_nexus_shadow_executor():
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
         queue = body.get("queue") if isinstance(body.get("queue"), list) else execution.get("queue", [])
         result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
+        persist_shadow_state = bool(((result.get("summary") or {}).get("persist_state", True)))
+        shadow_state_changes = _nexus_shadow_persist_queue_preview(cur, wa, result.get("queue") or []) if persist_shadow_state else []
         run_id = str(body.get("run_id") or ("NSH-" + uuid.uuid4().hex[:12].upper()))
         now_i = now_ts()
         cur.execute(
@@ -10371,7 +10609,7 @@ def api_nexus_shadow_executor():
             "",
             result["summary"].get("status") or "completed",
             "Shadow Executor validation completed. No live Vault execution was triggered.",
-            {"run_id": run_id, "summary": result["summary"]},
+            {"run_id": run_id, "summary": result["summary"], "shadow_state_changes": shadow_state_changes},
         )
         conn.commit()
         cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wa))
@@ -10384,7 +10622,8 @@ def api_nexus_shadow_executor():
         "wallet": wa,
         "run": run,
         "execution": execution,
-        "message": "Shadow Executor simulated virtual fills/reallocation/stop-reentry only. No Vault execution was triggered.",
+        "shadow_state_changes": shadow_state_changes,
+        "message": "Shadow Executor simulated realistic slot rotation/reallocation only. No Vault execution was triggered.",
         "ts": now_ts(),
     })
 
