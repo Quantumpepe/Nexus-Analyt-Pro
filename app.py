@@ -10330,6 +10330,23 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 1, 1, 168)
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 6)), 1, 1, 200))
     max_ready_slots = int(_clamp_float(cfg.get("max_ready_slots", os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6")), 6, 1, 50))
+    min_ready_slots = int(_clamp_float(cfg.get("min_ready_slots", cfg.get("minReadySlots", os.getenv("NEXUS_SHADOW_MIN_READY_SLOTS", "3"))), 3, 0, 50))
+    # In Shadow mode the user must be able to see whether the rotation engine can move
+    # more than the first slot. These are still conservative: risky/protected/hard-blocked
+    # slots are never forced ready, but clean WAIT slots can be promoted into a visible
+    # READY preview even when their raw confidence is incomplete or stale.
+    shadow_ready_confidence_floor = _clamp_float(
+        cfg.get("shadow_ready_confidence_floor", cfg.get("shadowReadyConfidenceFloor", os.getenv("NEXUS_SHADOW_READY_CONFIDENCE_FLOOR", "50"))),
+        50,
+        0,
+        100,
+    )
+    shadow_ready_quality_floor = _clamp_float(
+        cfg.get("shadow_ready_quality_floor", cfg.get("shadowReadyQualityFloor", os.getenv("NEXUS_SHADOW_READY_QUALITY_FLOOR", "25"))),
+        25,
+        -100,
+        100,
+    )
     persist_state = str(cfg.get("persist_state", cfg.get("persistState", os.getenv("NEXUS_SHADOW_PERSIST_QUEUE", "1")))).strip().lower() in ("1", "true", "yes", "on")
 
     events = []
@@ -10343,6 +10360,36 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     queue_out = []
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue if isinstance(queue, list) else [])]
+    quality_by_idx = {}
+    forced_ready_indices = set()
+
+    if normalized:
+        candidates = []
+        for i, candidate in enumerate(normalized):
+            candidate_state = str(candidate.get("status") or "WAIT").upper()
+            q = _nexus_shadow_slot_quality(candidate, cfg)
+            quality_by_idx[i] = q
+            candidate_risk = _clamp_float(q.get("risk_score", candidate.get("risk_score", 0)), 0, 0, 100)
+            candidate_quality = _clamp_float(q.get("quality", q.get("priority", 0)), 0, -100, 100)
+            candidate_confidence = _clamp_float(q.get("confidence", candidate.get("confidence_score", 0)), 0, 0, 100)
+
+            # Only clean, currently waiting/ready/active slots can be included in the
+            # visible Shadow rotation preview. Protected states remain protected.
+            if candidate_state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+                continue
+            if _nexus_shadow_item_blocked_by_hold(candidate, hold):
+                continue
+            if q.get("hard_block") or candidate_risk >= 48:
+                continue
+
+            # If external signals are sparse, use quality + priority ranking so Shadow can
+            # still demonstrate slot rotation instead of leaving every non-slot-1 card WAIT.
+            candidates.append((candidate_quality, candidate_confidence, _clamp_float(candidate.get("priority", 0), 0, -100, 100), i))
+
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        target_ready = max(0, min(max_ready_slots, min_ready_slots, len(candidates)))
+        forced_ready_indices = {i for *_rest, i in candidates[:target_ready]}
+
     if not normalized:
         events.append({
             "type": "NO_QUEUE",
@@ -10352,7 +10399,7 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
 
     for idx, item in enumerate(normalized):
         state = str(item.get("status") or "WAIT").upper()
-        quality = _nexus_shadow_slot_quality(item, cfg)
+        quality = quality_by_idx.get(idx) or _nexus_shadow_slot_quality(item, cfg)
         risk = _clamp_float(quality.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
         confidence = _clamp_float(quality.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
         priority = _clamp_float(quality.get("priority", item.get("priority", 0)), 0, -100, 100)
@@ -10418,13 +10465,20 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
                 "risk_score": risk,
                 "message": transition_reason,
             })
-        elif confidence >= 55 and quality_score >= 35 and ready_count < max_ready_slots:
+        elif (
+            (confidence >= 55 and quality_score >= 35)
+            or (idx in forced_ready_indices and confidence >= shadow_ready_confidence_floor and quality_score >= shadow_ready_quality_floor)
+            or (idx in forced_ready_indices and quality_score >= shadow_ready_quality_floor + 10)
+        ) and ready_count < max_ready_slots:
             ready_count += 1
             if virtual_fills < max_trades:
                 virtual_fills += 1
                 reallocation_tests += 1
-                next_state = "ACTIVE" if state == "ACTIVE" else "READY"
-                transition_reason = "Virtual fill accepted for simulation only. Slot is ready/active in Shadow preview."
+                # Shadow must demonstrate the future Live scheduler more realistically:
+                # multiple clean slots can become active in the preview. This is not
+                # on-chain execution and does not touch Vault/Grid routes.
+                next_state = "ACTIVE" if (state == "ACTIVE" or idx in forced_ready_indices) else "READY"
+                transition_reason = "Virtual fill accepted for simulation only. Slot is active/ready in Shadow rotation preview."
                 events.append({
                     "slot": slot,
                     "symbol": symbol,
@@ -10497,6 +10551,8 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
         "runtime_hours": runtime_hours,
         "slots_tested": len(normalized),
         "ready_slots": ready_count,
+        "min_ready_slots": min_ready_slots,
+        "forced_ready_slots": len(forced_ready_indices),
         "virtual_fills": virtual_fills,
         "virtual_waits": virtual_waits,
         "virtual_blocks": blocked,
