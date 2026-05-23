@@ -2808,7 +2808,22 @@ def _refresh_user_insight_profile(wallet_address: str, conn=None) -> tuple[dict,
             conn.close()
 
 def _norm_addr(addr: str) -> str:
-    return (addr or "").strip().lower()
+    """Normalize a wallet/token address.
+
+    Some browsers/proxies merge duplicate case-insensitive wallet headers into
+    a comma-separated value like "0xabc..., 0xabc...". Pick the first real
+    EVM address so backend validation stays robust while still lowercasing
+    ordinary strings.
+    """
+    if addr is None:
+        return ""
+    if isinstance(addr, (list, tuple, set)):
+        addr = next((x for x in addr if x), "")
+    s = str(addr or "").strip()
+    m = re.search(r"0x[a-fA-F0-9]{40}", s)
+    if m:
+        return m.group(0).lower()
+    return s.lower()
 
 def _looks_like_evm_addr(s: str) -> bool:
     s = (s or "").strip()
@@ -9838,7 +9853,16 @@ def _nexus_json_load(value, fallback):
 
 def _nexus_wallet_from_request():
     body = request.get_json(silent=True) or {}
-    wallet = request.args.get("wallet") or request.args.get("wallet_address") or request.headers.get("X-Wallet-Address") or body.get("wallet") or body.get("wallet_address") or ""
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or request.headers.get("x-wallet-address")
+        or body.get("wallet")
+        or body.get("wallet_address")
+        or body.get("walletAddress")
+        or ""
+    )
     wa = _norm_addr(wallet)
     if not wa or not _looks_like_evm_addr(wa):
         return "", (jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400)
