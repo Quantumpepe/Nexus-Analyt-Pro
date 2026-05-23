@@ -8805,17 +8805,28 @@ def api_watchlist_snapshot():
             ordered.append(it)
 
         if not ordered:
-            return jsonify({"status": "ok", "results": [], "ts": int(time.time())})
+            out = jsonify({"status": "ok", "results": [], "ts": int(time.time())})
+            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return out
 
 
         # Fast-path cache (avoid repeated upstream calls while user clicks quickly).
         # A forced request bypasses this cache so a second device can hydrate full price/volume/market-cap
         # data instead of receiving an early partial/pending snapshot.
         wl_cache_key = _key_from_items(ordered)
-        force_refresh = str(request.args.get("force") or request.args.get("refresh") or request.args.get("_") or "").strip() not in ("", "0", "false", "False")
+        force_refresh = str(
+            request.args.get("force")
+            or request.args.get("refresh")
+            or request.args.get("_")
+            or (body.get("force_refresh") if isinstance(body, dict) else "")
+            or (body.get("no_cache") if isinstance(body, dict) else "")
+            or ""
+        ).strip() not in ("", "0", "false", "False", "none", "None")
         fresh_cached = None if force_refresh else _cache_get_fresh(_WATCH_SNAP_CACHE, wl_cache_key, _WATCH_SNAP_TTL_SEC)
         if fresh_cached is not None:
-            return jsonify(fresh_cached)
+            out = jsonify(fresh_cached)
+            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return out
 
         # ---- Market batch (CoinGecko) ----
         market_items = [it for it in ordered if it.get("mode") == "market"]
@@ -8985,7 +8996,9 @@ def api_watchlist_snapshot():
                     break
         if cacheable:
             _cache_set(_WATCH_SNAP_CACHE, wl_cache_key, resp_payload)
-        return jsonify(resp_payload)
+        out = jsonify(resp_payload)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
     except Exception as e:
         # Never hard-fail the UI; return stale cache or an empty-but-OK payload.
         stale = _cache_get_any(_WATCH_SNAP_CACHE, wl_cache_key)
@@ -8994,8 +9007,12 @@ def api_watchlist_snapshot():
             stale["status"] = "partial"
             stale["partial"] = True
             stale["error"] = str(e)
-            return jsonify(stale), 200
-        return jsonify({"status": "partial", "partial": True, "error": str(e), "results": [], "ts": int(time.time())}), 200
+            out = jsonify(stale)
+            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            return out, 200
+        out = jsonify({"status": "partial", "partial": True, "error": str(e), "results": [], "ts": int(time.time())})
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out, 200
 
 
 
