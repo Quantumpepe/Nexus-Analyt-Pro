@@ -8465,7 +8465,7 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
     if not wa:
         return [], 0
     clean = _watch_items_normalize(items)
-    nowi = int(time.time())
+    nowi = int(time.time() * 1000)
     conn = _db()
     try:
         with DB_WRITE_LOCK:
@@ -8527,7 +8527,7 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         base["indexMode"] = bool(index_mode)
     if isinstance(ai_selected, list):
         base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
-    nowi = int(time.time())
+    nowi = int(time.time() * 1000)
     conn = _db()
     try:
         with DB_WRITE_LOCK:
