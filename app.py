@@ -9945,10 +9945,18 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     item = item if isinstance(item, dict) else {}
     signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
 
-    confidence = _clamp_float(item.get("confidence", item.get("confidence_score", signals.get("confidence", 0))), 0, 0, 100)
+    raw_confidence = item.get("confidence", item.get("confidence_score", signals.get("confidence", None)))
+    confidence = _clamp_float(raw_confidence, 0, 0, 100) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
     risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
     priority_raw = item.get("priority", None)
     priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
+
+    # If Strategist/Frontend provides priority but not confidence, do not treat the
+    # slot as untradeable in Shadow. Priority is already a prepared signal, so convert
+    # it into a conservative Shadow confidence for simulation visibility only.
+    confidence_missing = raw_confidence is None or str(raw_confidence).strip() in ("", "0", "0.0")
+    if confidence_missing and priority > 0 and risk < 48:
+        confidence = min(82, max(45, priority + 12))
 
     liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=70)
     rvol = _nexus_trading_signal_value(item, signals, "rvol", "relative_volume", default=1.0)
@@ -10023,10 +10031,16 @@ def _nexus_recheck_apply(cur, wallet_address):
             new_state = "PROTECT"
             reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
         elif old_state in ("WAIT", "OBSERVE", "READY"):
-            if quality.get("confidence", 0) >= 55 and quality.get("quality", 0) >= 35 and active_like < max_shadow_ready:
+            # Recheck should mirror Shadow behavior: a clean prepared slot may become
+            # READY even when explicit confidence is missing, as long as priority/quality
+            # and risk are acceptable. This is still preparation-only, no Vault execution.
+            if (
+                (quality.get("confidence", 0) >= 50 and quality.get("quality", 0) >= 30)
+                or quality.get("quality", 0) >= 38
+            ) and active_like < max_shadow_ready:
                 new_state = "READY"
                 active_like += 1
-                reason = "Shadow recheck promoted this slot to READY based on confidence, priority and controlled risk."
+                reason = "Shadow recheck promoted this slot to READY based on priority, quality and controlled risk."
             else:
                 new_state = "WAIT"
                 reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
@@ -10289,12 +10303,23 @@ def _shadow_normalize_queue_item(item, idx=0):
     state = str(item.get("status") or item.get("state") or "WAIT").strip().upper()
     amount = _clamp_float(item.get("amountUsd", item.get("reserved_capital_usd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
     priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
-    confidence_raw = item.get("confidence", item.get("confidence_score", 0))
+    confidence_raw = item.get("confidence", item.get("confidence_score", None))
     if isinstance(confidence_raw, str):
         confidence = {"LOW": 35, "MEDIUM": 62, "HIGH": 82}.get(confidence_raw.upper(), 50)
+    elif confidence_raw is None or str(confidence_raw).strip() == "":
+        confidence = 0
     else:
         confidence = _clamp_float(confidence_raw, 0, 0, 100)
     risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
+
+    # Shadow slots often arrive from the prepared UI with a useful priority but
+    # without a dedicated confidence score yet. In that case, derive a conservative
+    # Shadow-only confidence from priority so the simulator can visibly test rotation
+    # instead of leaving every non-slot-1 row in WAIT forever. This never affects
+    # live/Vault execution.
+    confidence_missing = confidence_raw is None or str(confidence_raw).strip() in ("", "0", "0.0")
+    if confidence_missing and priority > 0 and risk_score < 48:
+        confidence = max(confidence, min(82, max(45, priority + 12)))
     return {
         **item,
         "slot": slot,
@@ -10361,13 +10386,13 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     # slots are never forced ready, but clean WAIT slots can be promoted into a visible
     # READY preview even when their raw confidence is incomplete or stale.
     shadow_ready_confidence_floor = _clamp_float(
-        cfg.get("shadow_ready_confidence_floor", cfg.get("shadowReadyConfidenceFloor", os.getenv("NEXUS_SHADOW_READY_CONFIDENCE_FLOOR", "50"))),
+        cfg.get("shadow_ready_confidence_floor", cfg.get("shadowReadyConfidenceFloor", os.getenv("NEXUS_SHADOW_READY_CONFIDENCE_FLOOR", "45"))),
         50,
         0,
         100,
     )
     shadow_ready_quality_floor = _clamp_float(
-        cfg.get("shadow_ready_quality_floor", cfg.get("shadowReadyQualityFloor", os.getenv("NEXUS_SHADOW_READY_QUALITY_FLOOR", "25"))),
+        cfg.get("shadow_ready_quality_floor", cfg.get("shadowReadyQualityFloor", os.getenv("NEXUS_SHADOW_READY_QUALITY_FLOOR", "20"))),
         25,
         -100,
         100,
@@ -10491,9 +10516,9 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
                 "message": transition_reason,
             })
         elif (
-            (confidence >= 55 and quality_score >= 35)
-            or (idx in forced_ready_indices and confidence >= shadow_ready_confidence_floor and quality_score >= shadow_ready_quality_floor)
-            or (idx in forced_ready_indices and quality_score >= shadow_ready_quality_floor + 10)
+            (confidence >= 50 and quality_score >= 30)
+            or (idx in forced_ready_indices and quality_score >= shadow_ready_quality_floor)
+            or quality_score >= 38
         ) and ready_count < max_ready_slots:
             ready_count += 1
             if virtual_fills < max_trades:
