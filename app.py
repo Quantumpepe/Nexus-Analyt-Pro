@@ -10706,24 +10706,9 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
 
         old_state = str(row["state"] or "WAIT").upper()
         rid = row["id"]
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        session_id = str(
-            item.get("session_id")
-            or item.get("sessionId")
-            or item.get("trade_session_id")
-            or meta.get("session_id")
-            or ""
-        ).strip()[:80]
-        if session_id:
-            meta = {**meta, "session_id": session_id}
-        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
-        reserved_capital_usd = _clamp_float(
-            item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", 0))),
-            0, 0, 1_000_000_000,
-        )
         cur.execute(
-            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, chain=COALESCE(NULLIF(?,''), chain), reserved_capital_usd=CASE WHEN ?>0 THEN ? ELSE reserved_capital_usd END, meta_json=CASE WHEN ?!='{}' THEN ? ELSE meta_json END, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
-            (new_state, priority, confidence, risk_score, reason, chain, reserved_capital_usd, reserved_capital_usd, json.dumps(meta, ensure_ascii=False), json.dumps(meta, ensure_ascii=False), next_recheck, ts, rid, wallet_address),
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, priority, confidence, risk_score, reason, next_recheck, ts, rid, wallet_address),
         )
         if new_state != old_state:
             _nexus_log_sim_event(cur, wallet_address, row["slot_id"], row["asset"], "SHADOW_ROTATION", old_state, new_state, reason, {"queue_id": rid, "shadow": transition})
@@ -10788,16 +10773,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     max_active = int(_clamp_float(cfg.get("shadow_active_slots", cfg.get("active_slots", os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1"))), 1, 1, 10))
 
     execution = _nexus_execution_summary(cur, wallet_address)
-    seed_queue = cfg.get("_seed_queue") if isinstance(cfg.get("_seed_queue"), list) else []
-    if seed_queue:
-        # Prefer the frontend-selected/session queue when supplied by the control action.
-        # This avoids a stale persisted queue or a wrong active display chain from making
-        # Start/Pause/Resume/Stop appear to do nothing until page refresh.
-        queue = _nexus_shadow_filter_queue_for_cfg(seed_queue, {k: v for k, v in cfg.items() if k != "chain" or str(v or "").strip()})
-        if not queue:
-            queue = seed_queue
-    else:
-        queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
+    queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
     if not queue:
         return {"runtime_status": "idle", "events": [{"type": "NO_QUEUE", "message": "No queue available for Shadow runtime."}], "queue": [], "changed": []}
 
@@ -10920,18 +10896,66 @@ def api_nexus_shadow_executor():
         return error_resp
 
     if request.method == "GET":
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
-            (wa,),
-        )
-        runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
-        execution = _nexus_execution_summary(cur, wa)
-        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
-        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-        runtime = _nexus_shadow_latest_runtime(cur, wa)
-        conn.close()
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+
+            # Backend-first Shadow heartbeat:
+            # The browser can sleep/throttle intervals for hours. A live-like paper
+            # runtime must therefore advance from the backend whenever state is read,
+            # not only when the frontend timer fires. This never touches Vault/live routes.
+            runtime = _nexus_shadow_latest_runtime(cur, wa)
+            runtime_status = str(runtime.get("status") or "idle").lower()
+            runtime_cfg = {}
+            try:
+                runtime_cfg = dict(((runtime.get("run") or {}).get("config") or {}))
+            except Exception:
+                runtime_cfg = {}
+            runtime_meta = runtime.get("runtime") if isinstance(runtime.get("runtime"), dict) else {}
+            tick_sec = int(_clamp_float(runtime_meta.get("tick_sec", runtime_cfg.get("tick_sec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "60"))), 60, 15, 3600))
+            last_updated = int(((runtime.get("run") or {}).get("updated_ts") or (runtime.get("run") or {}).get("created_ts") or 0) or 0)
+
+            if runtime_status == "running" and (not last_updated or now_ts() - last_updated >= tick_sec):
+                tick_result = _nexus_shadow_runtime_tick(cur, wa, runtime_cfg, action="tick")
+                now_i = now_ts()
+                run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+                tick_summary = {
+                    "shadow_only": True,
+                    "live_execution_triggered": False,
+                    "status": "running",
+                    "runtime_status": tick_result.get("runtime_status") or "running",
+                    "runtime": {
+                        "status": tick_result.get("runtime_status") or "running",
+                        "action": "auto_tick",
+                        "tick_sec": tick_result.get("tick_sec") or tick_sec,
+                        "active_count": tick_result.get("active_count", 0),
+                        "promoted": tick_result.get("promoted", 0),
+                        "updated_ts": now_i,
+                    },
+                    "readiness": "SHADOW_RUNTIME_ACTIVE",
+                    "message": "Shadow backend heartbeat advanced paper runtime. No Vault execution was triggered.",
+                }
+                cur.execute(
+                    """
+                    INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (run_id, wa, "SHADOW", "backend_shadow_heartbeat", "running", json.dumps(tick_summary, ensure_ascii=False), json.dumps(tick_result.get("events") or [], ensure_ascii=False), json.dumps(tick_result.get("queue") or [], ensure_ascii=False), json.dumps({**runtime_cfg, "action": "auto_tick"}, ensure_ascii=False), now_i, now_i),
+                )
+                _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "SHADOW_AUTO_TICK", "running", "running", "Shadow backend heartbeat tick completed. Paper-only; no Vault execution.", {"run_id": run_id, "summary": tick_summary})
+                conn.commit()
+                runtime = _nexus_shadow_latest_runtime(cur, wa)
+
+            cur.execute(
+                "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
+                (wa,),
+            )
+            runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+            execution = _nexus_execution_summary(cur, wa)
+            cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+            hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+            runtime = _nexus_shadow_latest_runtime(cur, wa)
+            conn.close()
         return jsonify({
             "status": "ok",
             "wallet": wa,
@@ -10962,8 +10986,6 @@ def api_nexus_shadow_executor():
         # wallet/session queue. Otherwise Shadow buttons look broken and Test can
         # clear/replace visible slots with an empty preview.
         queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
-        if isinstance(queue, list) and queue:
-            cfg = {**cfg, "_seed_queue": queue}
 
         if action in ("start", "tick", "pause", "resume", "stop"):
             if action in ("start", "resume"):
