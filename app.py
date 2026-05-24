@@ -10706,9 +10706,24 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
 
         old_state = str(row["state"] or "WAIT").upper()
         rid = row["id"]
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        session_id = str(
+            item.get("session_id")
+            or item.get("sessionId")
+            or item.get("trade_session_id")
+            or meta.get("session_id")
+            or ""
+        ).strip()[:80]
+        if session_id:
+            meta = {**meta, "session_id": session_id}
+        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+        reserved_capital_usd = _clamp_float(
+            item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", 0))),
+            0, 0, 1_000_000_000,
+        )
         cur.execute(
-            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
-            (new_state, priority, confidence, risk_score, reason, next_recheck, ts, rid, wallet_address),
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, chain=COALESCE(NULLIF(?,''), chain), reserved_capital_usd=CASE WHEN ?>0 THEN ? ELSE reserved_capital_usd END, meta_json=CASE WHEN ?!='{}' THEN ? ELSE meta_json END, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, priority, confidence, risk_score, reason, chain, reserved_capital_usd, reserved_capital_usd, json.dumps(meta, ensure_ascii=False), json.dumps(meta, ensure_ascii=False), next_recheck, ts, rid, wallet_address),
         )
         if new_state != old_state:
             _nexus_log_sim_event(cur, wallet_address, row["slot_id"], row["asset"], "SHADOW_ROTATION", old_state, new_state, reason, {"queue_id": rid, "shadow": transition})
@@ -10773,7 +10788,16 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     max_active = int(_clamp_float(cfg.get("shadow_active_slots", cfg.get("active_slots", os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1"))), 1, 1, 10))
 
     execution = _nexus_execution_summary(cur, wallet_address)
-    queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
+    seed_queue = cfg.get("_seed_queue") if isinstance(cfg.get("_seed_queue"), list) else []
+    if seed_queue:
+        # Prefer the frontend-selected/session queue when supplied by the control action.
+        # This avoids a stale persisted queue or a wrong active display chain from making
+        # Start/Pause/Resume/Stop appear to do nothing until page refresh.
+        queue = _nexus_shadow_filter_queue_for_cfg(seed_queue, {k: v for k, v in cfg.items() if k != "chain" or str(v or "").strip()})
+        if not queue:
+            queue = seed_queue
+    else:
+        queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
     if not queue:
         return {"runtime_status": "idle", "events": [{"type": "NO_QUEUE", "message": "No queue available for Shadow runtime."}], "queue": [], "changed": []}
 
@@ -10938,6 +10962,8 @@ def api_nexus_shadow_executor():
         # wallet/session queue. Otherwise Shadow buttons look broken and Test can
         # clear/replace visible slots with an empty preview.
         queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
+        if isinstance(queue, list) and queue:
+            cfg = {**cfg, "_seed_queue": queue}
 
         if action in ("start", "tick", "pause", "resume", "stop"):
             if action in ("start", "resume"):
