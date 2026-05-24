@@ -1996,6 +1996,7 @@ def init_db():
             timeframe TEXT DEFAULT '90D',
             index_mode INTEGER DEFAULT 1,
             ai_selected_json TEXT DEFAULT '[]',
+            ui_state_json TEXT DEFAULT '{}',
             updated_ts INTEGER
         )
     """)
@@ -2036,6 +2037,7 @@ def init_db():
             "timeframe": "timeframe TEXT DEFAULT '90D'",
             "index_mode": "index_mode INTEGER DEFAULT 1",
             "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
+            "ui_state_json": "ui_state_json TEXT DEFAULT '{}'",
             "updated_ts": "updated_ts INTEGER",
         })
         _db_ensure_columns(conn, "user_insight_profile", {
@@ -8484,14 +8486,14 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
 def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
     conn = _db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
+        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
         row = cur.fetchone()
         if not row:
-            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
         try:
             compare = json.loads(row["compare_json"] or "[]")
         except Exception:
@@ -8500,11 +8502,18 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
             ai_selected = json.loads(row["ai_selected_json"] or "[]")
         except Exception:
             ai_selected = []
+        try:
+            ui_state = json.loads(row["ui_state_json"] or "{}")
+            if not isinstance(ui_state, dict):
+                ui_state = {}
+        except Exception:
+            ui_state = {}
         return {
             "compare": [str(x).strip().upper() for x in (compare if isinstance(compare, list) else []) if str(x).strip()],
             "timeframe": str(row["timeframe"] or "90D"),
             "indexMode": bool(int(row["index_mode"] or 0)),
             "aiSelected": [str(x).strip().upper() for x in (ai_selected if isinstance(ai_selected, list) else []) if str(x).strip()],
+            "ui": ui_state,
         }, int(row["updated_ts"] or 0)
     finally:
         conn.close()
@@ -8513,12 +8522,13 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
 def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
     base, _ = _db_get_user_app_state(wa)
     compare = payload.get("compare") if isinstance(payload, dict) else None
     timeframe = payload.get("timeframe") if isinstance(payload, dict) else None
     index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
     ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
+    ui_state = payload.get("ui") if isinstance(payload, dict) else None
     if isinstance(compare, list):
         base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:20]
     if isinstance(timeframe, str) and timeframe.strip():
@@ -8527,15 +8537,30 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         base["indexMode"] = bool(index_mode)
     if isinstance(ai_selected, list):
         base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
+    if isinstance(ui_state, dict):
+        allowed = {
+            "watchSortMode", "gridMode", "gridChain", "gridItem",
+            "tradingRuntimeHours", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
+            "tradingRiskMode", "tradingCautionDrawdownPct", "tradingHardStopPct",
+            "tradingProfitLockPct", "tradingMaxSlippagePct", "tradingMaxTrades",
+            "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput"
+        }
+        clean_ui = {}
+        for k, v in ui_state.items():
+            if k not in allowed:
+                continue
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                clean_ui[k] = v
+        base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
     nowi = int(time.time() * 1000)
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, updated_ts) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, updated_ts=excluded.updated_ts",
-                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), nowi),
+                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, ui_state_json=excluded.ui_state_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), json.dumps(base.get("ui") if isinstance(base.get("ui"), dict) else {}, separators=(",", ":")), nowi),
             )
             conn.commit()
         return base, nowi
