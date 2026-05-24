@@ -10625,11 +10625,62 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
         if row is None and asset:
             cur.execute("SELECT id,state,slot_id,asset FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
             row = cur.fetchone()
+        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
+
+        # Backend-first rule: if a Shadow-visible slot does not yet exist in
+        # nexus_execution_queue, create it instead of skipping it. Older sessions
+        # could exist only in frontend/app-state, which made Shadow look unchanged
+        # on every device after refresh.
         if row is None:
+            rid = queue_id or ("NQ-" + uuid.uuid4().hex[:12].upper())
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            session_id = str(
+                item.get("session_id")
+                or item.get("sessionId")
+                or item.get("trade_session_id")
+                or meta.get("session_id")
+                or ""
+            ).strip()[:80]
+            if session_id:
+                meta = {**meta, "session_id": session_id}
+            chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+            action = str(item.get("action") or "OBSERVE").upper()[:40]
+            reserved_capital_usd = _clamp_float(
+                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", 0))),
+                0, 0, 1_000_000_000,
+            )
+            cur.execute(
+                """
+                INSERT INTO nexus_execution_queue(
+                    id,wallet_address,slot_id,asset,chain,action,state,priority,
+                    reserved_capital_usd,confidence,risk_score,reason,signals_json,meta_json,
+                    recheck_after_ts,expires_ts,created_ts,updated_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    slot_id=excluded.slot_id,asset=excluded.asset,chain=excluded.chain,
+                    action=excluded.action,state=excluded.state,priority=excluded.priority,
+                    reserved_capital_usd=excluded.reserved_capital_usd,confidence=excluded.confidence,
+                    risk_score=excluded.risk_score,reason=excluded.reason,signals_json=excluded.signals_json,
+                    meta_json=excluded.meta_json,recheck_after_ts=excluded.recheck_after_ts,
+                    expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts
+                """,
+                (
+                    rid, wallet_address, slot_id or str(item.get("slot") or ""), asset, chain,
+                    action, new_state, priority, reserved_capital_usd, confidence, risk_score,
+                    reason,
+                    json.dumps(item.get("signals") if isinstance(item.get("signals"), dict) else {}, ensure_ascii=False),
+                    json.dumps(meta, ensure_ascii=False), next_recheck, None, ts, ts,
+                ),
+            )
+            _nexus_log_sim_event(
+                cur, wallet_address, slot_id, asset, "SHADOW_QUEUE_CREATED", "", new_state,
+                reason, {"queue_id": rid, "shadow": transition},
+            )
+            changed.append({"id": rid, "from": "", "to": new_state, "reason": reason, "created": True})
             continue
+
         old_state = str(row["state"] or "WAIT").upper()
         rid = row["id"]
-        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
         cur.execute(
             "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
             (new_state, priority, confidence, risk_score, reason, next_recheck, ts, rid, wallet_address),
