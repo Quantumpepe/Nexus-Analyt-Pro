@@ -10933,7 +10933,11 @@ def api_nexus_shadow_executor():
         execution = _nexus_execution_summary(cur, wa)
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-        queue = body.get("queue") if isinstance(body.get("queue"), list) else execution.get("queue", [])
+        body_queue = body.get("queue") if isinstance(body.get("queue"), list) else None
+        # Backend-first: an empty frontend queue must not override the persisted
+        # wallet/session queue. Otherwise Shadow buttons look broken and Test can
+        # clear/replace visible slots with an empty preview.
+        queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
 
         if action in ("start", "tick", "pause", "resume", "stop"):
             if action in ("start", "resume"):
@@ -10964,7 +10968,12 @@ def api_nexus_shadow_executor():
             shadow_state_changes = runtime_result.get("changed") or []
         else:
             result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
-            persist_shadow_state = bool(((result.get("summary") or {}).get("persist_state", True)))
+            # One-shot validation/test must be read-only by default. It should show
+            # whether Shadow would work, but it must not rewrite the live-like paper
+            # runtime queue unless the caller explicitly asks for persist_state.
+            persist_shadow_state = bool(cfg.get("persist_state") is True)
+            if isinstance(result.get("summary"), dict):
+                result["summary"]["persist_state"] = persist_shadow_state
             shadow_state_changes = _nexus_shadow_persist_queue_preview(cur, wa, result.get("queue") or []) if persist_shadow_state else []
 
         run_id = str(body.get("run_id") or ("NSH-" + uuid.uuid4().hex[:12].upper()))
