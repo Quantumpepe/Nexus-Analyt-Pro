@@ -9867,7 +9867,7 @@ def api_nexus_trading_hold_state():
 # -------------------------
 # Nexus Execution Preparation Layer
 # -------------------------
-_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
+_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT","STOPPED","CLOSED","CANCELLED","RELEASED"}
 
 def _nexus_json_load(value, fallback):
     try:
@@ -9896,9 +9896,15 @@ def _nexus_wallet_from_request():
 def _nexus_queue_row_to_dict(row) -> dict:
     meta = _nexus_json_load(row["meta_json"], {})
     session_id = str(meta.get("session_id") or meta.get("trade_session_id") or meta.get("rotation_session_id") or "")
+    state = str(row["state"] or "WAIT").upper()
     return {
         "id": row["id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "", "chain": row["chain"] or "",
-        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
+        "action": row["action"] or "OBSERVE",
+        # Frontend cards historically read `status`, while the SQLite queue stores `state`.
+        # Always expose both so ACTIVE / READY / SIMULATED_EXIT cannot be rendered as WAIT after hydration.
+        "state": state, "status": state,
+        "shadow_display_state": str(meta.get("shadow_display_state") or state).upper(),
+        "priority": float(row["priority"] or 0),
         "reserved_capital_usd": float(row["reserved_capital_usd"] or 0), "confidence": float(row["confidence"] or 0),
         "risk_score": float(row["risk_score"] or 0), "reason": row["reason"] or "",
         "signals": _nexus_json_load(row["signals_json"], {}), "meta": meta, "session_id": session_id,
@@ -9921,82 +9927,15 @@ def _nexus_log_sim_event(cur, wallet_address, slot_id, asset, event_type, state_
     )
 
 def _nexus_execution_summary(cur, wallet_address):
-    # Backend-first multi-session summary. Do not cap too aggressively here: the UI
-    # needs every open Trading budget/session so the dropdown can select old and new
-    # budgets without mixing their slot queues.
-    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY updated_ts DESC, priority DESC LIMIT 250", (wallet_address,))
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state NOT IN ('STOPPED','CLOSED','CANCELLED','RELEASED') ORDER BY priority DESC, updated_ts DESC LIMIT 25", (wallet_address,))
     queue = [_nexus_queue_row_to_dict(r) for r in cur.fetchall()]
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE wallet_address=? AND state IN ('RESERVED','HOLD','OBSERVE','RELEASE_REQUIRED') ORDER BY updated_ts DESC", (wallet_address,))
     reservations = [_nexus_reservation_row_to_dict(r) for r in cur.fetchall()]
     due_count = len([q for q in queue if not q.get("recheck_after_ts") or int(q.get("recheck_after_ts") or 0) <= now_ts()])
-
-    sessions_by_id = {}
-    closed_states = {"STOPPED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED"}
-    for q in queue:
-        meta = q.get("meta") if isinstance(q.get("meta"), dict) else {}
-        sid = str(q.get("session_id") or q.get("sessionId") or q.get("trade_session_id") or meta.get("session_id") or "").strip()
-        if not sid:
-            continue
-        sess = sessions_by_id.setdefault(sid, {
-            "id": sid,
-            "type": "TRADING",
-            "budgetUsd": 0.0,
-            "assets": [],
-            "chains": [],
-            "slots": 0,
-            "status": "WAIT",
-            "createdAt": None,
-            "updatedAt": 0,
-            "runtime": {},
-            "paperPnlUsd": 0.0,
-            "paperPnlPct": 0.0,
-        })
-        state = str(q.get("state") or q.get("status") or "WAIT").upper()
-        amount = _safe_float(q.get("reserved_capital_usd", q.get("amountUsd", 0)), 0)
-        sess["budgetUsd"] += amount
-        sess["slots"] += 1
-        asset = str(q.get("asset") or q.get("symbol") or "").upper()
-        chain = _normalize_chain_key(q.get("chain") or q.get("chain_key") or "")
-        if asset and asset not in sess["assets"]:
-            sess["assets"].append(asset)
-        if chain and chain not in sess["chains"]:
-            sess["chains"].append(chain)
-        created_ts = int(q.get("created_ts") or 0)
-        updated_ts = int(q.get("updated_ts") or 0)
-        if created_ts and (sess["createdAt"] is None or created_ts < sess["createdAt"]):
-            sess["createdAt"] = created_ts
-        if updated_ts > int(sess.get("updatedAt") or 0):
-            sess["updatedAt"] = updated_ts
-        if state == "PROTECT":
-            sess["status"] = "PROTECT"
-        elif state == "ACTIVE" and sess["status"] not in ("PROTECT",):
-            sess["status"] = "ACTIVE"
-        elif state == "READY" and sess["status"] not in ("PROTECT", "ACTIVE"):
-            sess["status"] = "READY"
-        elif state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED") and sess["status"] not in ("PROTECT", "ACTIVE", "READY"):
-            sess["status"] = state
-        elif state in closed_states:
-            sess["status"] = state
-        # Roll up paper PnL if Shadow runtime wrote it into meta.
-        try:
-            pnl_usd = _safe_float(meta.get("shadow_pnl_usd", meta.get("paper_pnl_usd", 0)), 0)
-            sess["paperPnlUsd"] += pnl_usd
-        except Exception:
-            pass
-        if meta.get("shadow_runtime_status"):
-            sess["runtime"]["status"] = str(meta.get("shadow_runtime_status") or "")
-
-    sessions = sorted(sessions_by_id.values(), key=lambda x: int(x.get("updatedAt") or 0), reverse=True)
-    for sess in sessions:
-        if sess.get("budgetUsd"):
-            sess["paperPnlPct"] = round((_safe_float(sess.get("paperPnlUsd"), 0) / max(_safe_float(sess.get("budgetUsd"), 0), 1)) * 100, 4)
-        sess["budgetUsd"] = round(_safe_float(sess.get("budgetUsd"), 0), 2)
-        sess["paperPnlUsd"] = round(_safe_float(sess.get("paperPnlUsd"), 0), 4)
-
     return {
-        "queue": queue, "sessions": sessions, "reservations": reservations,
+        "queue": queue, "reservations": reservations,
         "reserved_capital_usd": round(sum(float(r.get("amount_usd") or 0) for r in reservations), 2),
-        "recheck_due_count": due_count, "queue_count": len(queue), "session_count": len(sessions),
+        "recheck_due_count": due_count, "queue_count": len(queue),
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
@@ -10392,6 +10331,7 @@ def _shadow_normalize_queue_item(item, idx=0):
         "slot": slot,
         "symbol": symbol,
         "status": state,
+        "state": state,
         "amountUsd": amount,
         "priority": priority,
         "confidence_score": confidence,
@@ -10708,48 +10648,53 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
         reason = str(transition.get("reason") or item.get("reason") or "Shadow rotation preview updated this slot.")[:500]
         old_state = None
         row = None
-        item_meta_lookup = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        item_session_id = str(
+        item_meta_for_match = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        session_id_for_match = str(
             item.get("session_id")
             or item.get("sessionId")
             or item.get("trade_session_id")
-            or item_meta_lookup.get("session_id")
+            or item_meta_for_match.get("session_id")
             or ""
         ).strip()
-        item_chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+        chain_for_match = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+
+        def _row_matches_session_chain(candidate):
+            if candidate is None:
+                return False
+            cmeta = _nexus_json_load(candidate["meta_json"] if "meta_json" in candidate.keys() else "{}", {}) if hasattr(candidate, "keys") else {}
+            csid = str(cmeta.get("session_id") or cmeta.get("trade_session_id") or "").strip()
+            if session_id_for_match and csid and csid != session_id_for_match:
+                return False
+            try:
+                cchain = _normalize_chain_key(candidate["chain"] if "chain" in candidate.keys() else "")
+            except Exception:
+                cchain = ""
+            if chain_for_match and cchain and cchain != chain_for_match:
+                return False
+            return True
 
         if queue_id:
-            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
+            cur.execute("SELECT id,state,slot_id,asset,chain,meta_json FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
+            candidate = cur.fetchone()
+            if _row_matches_session_chain(candidate):
+                row = candidate
+        if row is None and slot_id and session_id_for_match:
+            cur.execute("SELECT id,state,slot_id,asset,chain,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 80", (wallet_address, slot_id))
+            for candidate in cur.fetchall():
+                cmeta = _nexus_json_load(candidate["meta_json"] if "meta_json" in candidate.keys() else "{}", {}) if hasattr(candidate, "keys") else {}
+                csid = str(cmeta.get("session_id") or cmeta.get("trade_session_id") or "").strip()
+                cchain = _normalize_chain_key(candidate["chain"] if "chain" in candidate.keys() else "")
+                if csid == session_id_for_match and ((not chain_for_match) or (not cchain) or cchain == chain_for_match):
+                    row = candidate
+                    break
+        if row is None and slot_id and not session_id_for_match:
+            cur.execute("SELECT id,state,slot_id,asset,chain,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, slot_id))
             row = cur.fetchone()
-        if row is None and item_session_id and slot_id and item_chain:
-            cur.execute(
-                """
-                SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue
-                WHERE wallet_address=? AND slot_id=? AND chain=?
-                  AND json_extract(meta_json, '$.session_id')=?
-                ORDER BY updated_ts DESC LIMIT 1
-                """,
-                (wallet_address, slot_id, item_chain, item_session_id),
-            )
-            row = cur.fetchone()
-        if row is None and item_session_id and slot_id:
-            cur.execute(
-                """
-                SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue
-                WHERE wallet_address=? AND slot_id=?
-                  AND json_extract(meta_json, '$.session_id')=?
-                ORDER BY updated_ts DESC LIMIT 1
-                """,
-                (wallet_address, slot_id, item_session_id),
-            )
-            row = cur.fetchone()
-        # Only legacy rows without a session id may use broad slot/asset fallback.
-        # Otherwise a new budget can overwrite an older budget's slot with the same slot number.
-        if row is None and not item_session_id and slot_id:
-            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, slot_id))
-            row = cur.fetchone()
-        if row is None and not item_session_id and asset:
-            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
+        # Never match by asset when a session id is present; that can update a slot
+        # from another independent Budget/Trading session and makes stopped sessions
+        # come back after refresh.
+        if row is None and asset and not session_id_for_match:
+            cur.execute("SELECT id,state,slot_id,asset,chain,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
             row = cur.fetchone()
         next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
 
@@ -10811,7 +10756,7 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
         item_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         merged_meta = {**(existing_meta if isinstance(existing_meta, dict) else {}), **item_meta}
         # Persist Shadow runtime timing fields even when they are top-level in the preview item.
-        for mk in ["shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts", "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy"]:
+        for mk in ["shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts", "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy", "shadow_display_state"]:
             if item.get(mk) is not None:
                 merged_meta[mk] = item.get(mk)
         item_signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
@@ -10852,11 +10797,11 @@ def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
         meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or "").strip()
         ch = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
-        # If a session is selected, never let legacy/no-session rows leak into the
-        # runtime. Each approved budget has its own session/tick/queue.
-        if session_id:
-            if not sid or sid != session_id:
-                continue
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st in ("STOPPED", "CLOSED", "CANCELLED", "RELEASED"):
+            continue
+        if session_id and sid and sid != session_id:
+            continue
         if chain and ch and ch != chain:
             continue
         out.append(item)
@@ -10909,12 +10854,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         old = str(item.get("status") or item.get("state") or "WAIT").upper()
         ns = str(new_state or old).upper()
         item["status"] = item["state"] = ns
+        item["shadow_display_state"] = ns
         meta = get_meta(item)
         if old != ns:
             meta["shadow_state_entered_ts"] = ts
             meta["shadow_last_transition_ts"] = ts
         meta["shadow_last_decision_ts"] = ts
-        meta["shadow_runtime_status"] = "running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running")
+        meta["shadow_display_state"] = ns
+        meta["shadow_runtime_status"] = "stopped" if ns == "STOPPED" else ("running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running"))
         set_meta(item, meta)
         item["shadow_transition"] = {"from": old, "to": ns, "reason": reason}
         return {"type": event_type, "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
@@ -10931,11 +10878,32 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
     if action == "stop":
         events = []
+        stop_session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
         for item in normalized:
             st = str(item.get("status") or item.get("state") or "WAIT").upper()
-            if st in ("ACTIVE", "READY", "PROTECT", "SIMULATED_EXIT"):
-                events.append(set_state(item, "WAIT", "Shadow stopped by user; paper slot returned to WAIT.", "SHADOW_STOPPED_SLOT"))
+            if st not in ("STOPPED", "CLOSED", "CANCELLED", "RELEASED"):
+                meta = get_meta(item)
+                meta["shadow_stopped_ts"] = ts
+                meta["shadow_runtime_status"] = "stopped"
+                if stop_session_id:
+                    meta["session_id"] = stop_session_id
+                set_meta(item, meta)
+                events.append(set_state(item, "STOPPED", "Shadow stopped by user; this Budget session is removed from active runtime.", "SHADOW_STOPPED_SLOT"))
         changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+        if stop_session_id:
+            # Authoritative backend cleanup: mark every queue row of this independent
+            # Budget/Trading session as STOPPED so refresh/other devices cannot hydrate
+            # it back into active WAIT/READY slots.
+            cur.execute("SELECT id,meta_json FROM nexus_execution_queue WHERE wallet_address=?", (wallet_address,))
+            for r in cur.fetchall():
+                meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {}) if hasattr(r, "keys") else {}
+                sid = str(meta.get("session_id") or meta.get("trade_session_id") or "").strip()
+                if sid == stop_session_id:
+                    meta["shadow_stopped_ts"] = ts
+                    meta["shadow_runtime_status"] = "stopped"
+                    cur.execute("UPDATE nexus_execution_queue SET state='STOPPED', reason=?, meta_json=?, updated_ts=? WHERE id=? AND wallet_address=?", (
+                        "Shadow stopped by user; Budget session closed.", json.dumps(meta, ensure_ascii=False), ts, r["id"], wallet_address
+                    ))
         return {"runtime_status": "stopped", "events": events or [{"type": "SHADOW_STOPPED", "message": "Shadow runtime stopped."}], "queue": normalized, "changed": changed, "strategist": {"status": "stopped"}}
 
     latest = _nexus_shadow_latest_runtime(cur, wallet_address)
