@@ -9921,15 +9921,82 @@ def _nexus_log_sim_event(cur, wallet_address, slot_id, asset, event_type, state_
     )
 
 def _nexus_execution_summary(cur, wallet_address):
-    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY priority DESC, updated_ts DESC LIMIT 25", (wallet_address,))
+    # Backend-first multi-session summary. Do not cap too aggressively here: the UI
+    # needs every open Trading budget/session so the dropdown can select old and new
+    # budgets without mixing their slot queues.
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY updated_ts DESC, priority DESC LIMIT 250", (wallet_address,))
     queue = [_nexus_queue_row_to_dict(r) for r in cur.fetchall()]
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE wallet_address=? AND state IN ('RESERVED','HOLD','OBSERVE','RELEASE_REQUIRED') ORDER BY updated_ts DESC", (wallet_address,))
     reservations = [_nexus_reservation_row_to_dict(r) for r in cur.fetchall()]
     due_count = len([q for q in queue if not q.get("recheck_after_ts") or int(q.get("recheck_after_ts") or 0) <= now_ts()])
+
+    sessions_by_id = {}
+    closed_states = {"STOPPED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED"}
+    for q in queue:
+        meta = q.get("meta") if isinstance(q.get("meta"), dict) else {}
+        sid = str(q.get("session_id") or q.get("sessionId") or q.get("trade_session_id") or meta.get("session_id") or "").strip()
+        if not sid:
+            continue
+        sess = sessions_by_id.setdefault(sid, {
+            "id": sid,
+            "type": "TRADING",
+            "budgetUsd": 0.0,
+            "assets": [],
+            "chains": [],
+            "slots": 0,
+            "status": "WAIT",
+            "createdAt": None,
+            "updatedAt": 0,
+            "runtime": {},
+            "paperPnlUsd": 0.0,
+            "paperPnlPct": 0.0,
+        })
+        state = str(q.get("state") or q.get("status") or "WAIT").upper()
+        amount = _safe_float(q.get("reserved_capital_usd", q.get("amountUsd", 0)), 0)
+        sess["budgetUsd"] += amount
+        sess["slots"] += 1
+        asset = str(q.get("asset") or q.get("symbol") or "").upper()
+        chain = _normalize_chain_key(q.get("chain") or q.get("chain_key") or "")
+        if asset and asset not in sess["assets"]:
+            sess["assets"].append(asset)
+        if chain and chain not in sess["chains"]:
+            sess["chains"].append(chain)
+        created_ts = int(q.get("created_ts") or 0)
+        updated_ts = int(q.get("updated_ts") or 0)
+        if created_ts and (sess["createdAt"] is None or created_ts < sess["createdAt"]):
+            sess["createdAt"] = created_ts
+        if updated_ts > int(sess.get("updatedAt") or 0):
+            sess["updatedAt"] = updated_ts
+        if state == "PROTECT":
+            sess["status"] = "PROTECT"
+        elif state == "ACTIVE" and sess["status"] not in ("PROTECT",):
+            sess["status"] = "ACTIVE"
+        elif state == "READY" and sess["status"] not in ("PROTECT", "ACTIVE"):
+            sess["status"] = "READY"
+        elif state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED") and sess["status"] not in ("PROTECT", "ACTIVE", "READY"):
+            sess["status"] = state
+        elif state in closed_states:
+            sess["status"] = state
+        # Roll up paper PnL if Shadow runtime wrote it into meta.
+        try:
+            pnl_usd = _safe_float(meta.get("shadow_pnl_usd", meta.get("paper_pnl_usd", 0)), 0)
+            sess["paperPnlUsd"] += pnl_usd
+        except Exception:
+            pass
+        if meta.get("shadow_runtime_status"):
+            sess["runtime"]["status"] = str(meta.get("shadow_runtime_status") or "")
+
+    sessions = sorted(sessions_by_id.values(), key=lambda x: int(x.get("updatedAt") or 0), reverse=True)
+    for sess in sessions:
+        if sess.get("budgetUsd"):
+            sess["paperPnlPct"] = round((_safe_float(sess.get("paperPnlUsd"), 0) / max(_safe_float(sess.get("budgetUsd"), 0), 1)) * 100, 4)
+        sess["budgetUsd"] = round(_safe_float(sess.get("budgetUsd"), 0), 2)
+        sess["paperPnlUsd"] = round(_safe_float(sess.get("paperPnlUsd"), 0), 4)
+
     return {
-        "queue": queue, "reservations": reservations,
+        "queue": queue, "sessions": sessions, "reservations": reservations,
         "reserved_capital_usd": round(sum(float(r.get("amount_usd") or 0) for r in reservations), 2),
-        "recheck_due_count": due_count, "queue_count": len(queue),
+        "recheck_due_count": due_count, "queue_count": len(queue), "session_count": len(sessions),
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
@@ -10641,13 +10708,47 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
         reason = str(transition.get("reason") or item.get("reason") or "Shadow rotation preview updated this slot.")[:500]
         old_state = None
         row = None
+        item_meta_lookup = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        item_session_id = str(
+            item.get("session_id")
+            or item.get("sessionId")
+            or item.get("trade_session_id")
+            or item_meta_lookup.get("session_id")
+            or ""
+        ).strip()
+        item_chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+
         if queue_id:
             cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
             row = cur.fetchone()
-        if row is None and slot_id:
+        if row is None and item_session_id and slot_id and item_chain:
+            cur.execute(
+                """
+                SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue
+                WHERE wallet_address=? AND slot_id=? AND chain=?
+                  AND json_extract(meta_json, '$.session_id')=?
+                ORDER BY updated_ts DESC LIMIT 1
+                """,
+                (wallet_address, slot_id, item_chain, item_session_id),
+            )
+            row = cur.fetchone()
+        if row is None and item_session_id and slot_id:
+            cur.execute(
+                """
+                SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue
+                WHERE wallet_address=? AND slot_id=?
+                  AND json_extract(meta_json, '$.session_id')=?
+                ORDER BY updated_ts DESC LIMIT 1
+                """,
+                (wallet_address, slot_id, item_session_id),
+            )
+            row = cur.fetchone()
+        # Only legacy rows without a session id may use broad slot/asset fallback.
+        # Otherwise a new budget can overwrite an older budget's slot with the same slot number.
+        if row is None and not item_session_id and slot_id:
             cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, slot_id))
             row = cur.fetchone()
-        if row is None and asset:
+        if row is None and not item_session_id and asset:
             cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
             row = cur.fetchone()
         next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
@@ -10710,7 +10811,7 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
         item_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         merged_meta = {**(existing_meta if isinstance(existing_meta, dict) else {}), **item_meta}
         # Persist Shadow runtime timing fields even when they are top-level in the preview item.
-        for mk in ["shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts", "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy", "shadow_entry_price", "shadow_mark_price", "shadow_exit_price", "shadow_pnl_pct", "shadow_pnl_usd", "shadow_total_pnl_usd", "shadow_last_pnl_pct", "shadow_last_pnl_usd", "shadow_unrealized_pnl_pct", "shadow_unrealized_pnl_usd"]:
+        for mk in ["shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts", "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy"]:
             if item.get(mk) is not None:
                 merged_meta[mk] = item.get(mk)
         item_signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
@@ -10751,130 +10852,16 @@ def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
         meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or "").strip()
         ch = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
-        if session_id and sid and sid != session_id:
-            continue
+        # If a session is selected, never let legacy/no-session rows leak into the
+        # runtime. Each approved budget has its own session/tick/queue.
+        if session_id:
+            if not sid or sid != session_id:
+                continue
         if chain and ch and ch != chain:
             continue
         out.append(item)
     return out
 
-
-
-
-def _nexus_shadow_price_for_item(item: dict) -> float:
-    """Best-effort paper price source for Shadow. Never calls Vault/live execution."""
-    item = item if isinstance(item, dict) else {}
-    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
-    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    for src in (item, signals, meta):
-        for key in ("price", "current_price", "currentPrice", "entry_price", "mark_price", "last_price"):
-            try:
-                v = float(src.get(key))
-                if math.isfinite(v) and v > 0:
-                    return v
-            except Exception:
-                pass
-    return 1.0
-
-
-def _nexus_shadow_projected_pnl_pct(item: dict, quality: float, risk: float, ts: int, tick_sec: int) -> float:
-    """Deterministic paper PnL curve for demo/shadow when no real fill price exists yet.
-
-    The point is not to fake profit, but to make the future live lifecycle visible:
-    active paper slots can move positive or negative depending on quality/risk/time.
-    """
-    try:
-        raw_slot = str((item or {}).get("slot") or (item or {}).get("slot_id") or "1")
-        m = re.search(r"\d+", raw_slot)
-        slot_no = int(m.group(0)) if m else 1
-    except Exception:
-        slot_no = 1
-    cycle = int(ts // max(30, int(tick_sec or 180)))
-    # Quality is the main driver; a small deterministic wave avoids all slots being static.
-    base = (float(quality or 0) - (float(risk or 0) * 0.65) - 36.0) * 0.045
-    wave = (((cycle + slot_no * 3) % 9) - 4) * 0.11
-    pnl = base + wave
-    return round(max(-4.5, min(5.5, pnl)), 3)
-
-
-def _nexus_shadow_apply_paper_pnl(item: dict, quality: float, risk: float, ts: int, tick_sec: int, closed: bool = False) -> dict:
-    item = item if isinstance(item, dict) else {}
-    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    amount = _clamp_float(item.get("amountUsd", item.get("reserved_capital_usd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
-    entry = _clamp_float(meta.get("shadow_entry_price", item.get("shadow_entry_price", _nexus_shadow_price_for_item(item))), 1.0, 0.0000000001, None)
-    target_pct = _nexus_shadow_projected_pnl_pct(item, quality, risk, ts, tick_sec)
-    entered = int(meta.get("shadow_active_started_ts") or meta.get("shadow_state_entered_ts") or ts)
-    progress = 1.0 if closed else max(0.05, min(1.0, (ts - entered) / max(30, int(tick_sec or 180))))
-    pnl_pct = round(target_pct * progress, 3)
-    exit_price = entry * (1.0 + pnl_pct / 100.0)
-    pnl_usd = round(amount * pnl_pct / 100.0, 4)
-    meta.update({
-        "shadow_entry_price": entry,
-        "shadow_mark_price": exit_price,
-        "shadow_unrealized_pnl_pct": pnl_pct if not closed else 0,
-        "shadow_unrealized_pnl_usd": pnl_usd if not closed else 0,
-        "shadow_last_pnl_pct": pnl_pct,
-        "shadow_last_pnl_usd": pnl_usd,
-        "shadow_total_pnl_usd": round(float(meta.get("shadow_total_pnl_usd") or 0) + (pnl_usd if closed else 0), 4),
-    })
-    if closed:
-        meta["shadow_exit_price"] = exit_price
-        meta["shadow_closed_ts"] = ts
-    item["meta"] = meta
-    item["shadow_entry_price"] = entry
-    item["shadow_mark_price"] = exit_price
-    item["shadow_pnl_pct"] = pnl_pct
-    item["shadow_pnl_usd"] = pnl_usd
-    item["shadow_total_pnl_usd"] = meta.get("shadow_total_pnl_usd", 0)
-    return item
-
-
-def _nexus_shadow_record_runtime_run(cur, wallet_address: str, source: str, action: str, runtime_result: dict, cfg: dict | None = None) -> dict | None:
-    """Persist one Shadow runtime result as the latest run row."""
-    cfg = cfg if isinstance(cfg, dict) else {}
-    now_i = now_ts()
-    run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
-    summary = {
-        "shadow_only": True,
-        "live_execution_triggered": False,
-        "status": "running" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or action or "updated"),
-        "runtime_status": runtime_result.get("runtime_status"),
-        "runtime": {
-            "status": runtime_result.get("runtime_status"),
-            "action": action,
-            "tick_sec": runtime_result.get("tick_sec"),
-            "active_count": runtime_result.get("active_count", 0),
-            "ready_count": runtime_result.get("ready_count", 0),
-            "simulated_exits": runtime_result.get("simulated_exits", 0),
-            "promoted": runtime_result.get("promoted", 0),
-            "strategist": runtime_result.get("strategist") or {},
-            "updated_ts": now_i,
-        },
-        "readiness": "SHADOW_RUNTIME_ACTIVE" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle").upper(),
-        "message": "Shadow backend heartbeat updated paper execution state only. No Vault execution was triggered.",
-    }
-    cur.execute(
-        """
-        INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            run_id,
-            wallet_address,
-            "SHADOW",
-            source,
-            summary.get("status") or "running",
-            json.dumps(summary, ensure_ascii=False),
-            json.dumps(runtime_result.get("events") or [], ensure_ascii=False),
-            json.dumps(runtime_result.get("queue") or [], ensure_ascii=False),
-            json.dumps({**cfg, "action": action}, ensure_ascii=False),
-            now_i,
-            now_i,
-        ),
-    )
-    _nexus_log_sim_event(cur, wallet_address, "shadow_executor", "SHADOW", "SHADOW_RUNTIME_HEARTBEAT", "", summary.get("status") or "running", "Shadow backend heartbeat/tick completed. No live Vault execution was triggered.", {"run_id": run_id, "summary": summary})
-    cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wallet_address))
-    return _shadow_row_to_dict(cur.fetchone())
 
 def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
     """Backend-first Strategist-controlled Shadow runtime.
@@ -10981,21 +10968,6 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         elif row["risk"] >= 48:
             events.append(set_state(item, "PROTECT", "Strategist detected elevated risk; paper slot moves to PROTECT.", "STRATEGIST_PROTECT"))
 
-    # 1b) A simulated exit should be visible for one cycle, then capital returns
-    # to the candidate pool. Without this, slots can sit in SIMULATED_EXIT forever.
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st != "SIMULATED_EXIT":
-            continue
-        meta = get_meta(item)
-        exited = int(meta.get("shadow_last_exit_ts") or meta.get("shadow_closed_ts") or item.get("updated_ts") or ts)
-        if ts - exited >= max(30, int(tick_sec)):
-            if row["quality"] >= 25 and row["risk"] < 48 and not row["hard_block"]:
-                events.append(set_state(item, "READY", "Strategist re-opened this paper slot after the simulated exit cooldown.", "STRATEGIST_REOPEN_READY"))
-            else:
-                events.append(set_state(item, "WAIT", "Strategist returned this paper slot to WAIT after simulated exit.", "STRATEGIST_REOPEN_WAIT"))
-
     # 2) Close active paper slots after one runtime cycle or if quality deteriorates.
     active_rows = []
     for row in scored:
@@ -11006,17 +10978,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta = get_meta(item)
         entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
         elapsed = max(0, ts - entered)
-        # Keep paper PnL moving while ACTIVE so the user can see whether the
-        # live-like Shadow would currently be in profit or loss.
-        _nexus_shadow_apply_paper_pnl(item, row["quality"], row["risk"], ts, tick_sec, closed=False)
         if elapsed >= tick_sec or row["quality"] < 28 or row["risk"] >= 40:
-            _nexus_shadow_apply_paper_pnl(item, row["quality"], row["risk"], ts, tick_sec, closed=True)
-            meta = get_meta(item)
             meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
             meta["shadow_last_exit_ts"] = ts
             set_meta(item, meta)
-            pnl = _clamp_float(meta.get("shadow_last_pnl_pct", item.get("shadow_pnl_pct", 0)), 0)
-            events.append(set_state(item, "SIMULATED_EXIT", f"Strategist completed one paper cycle; paper PnL {pnl:+.2f}% and capital can rotate.", "SHADOW_PAPER_EXIT"))
+            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate.", "SHADOW_PAPER_EXIT"))
         else:
             active_rows.append(row)
 
@@ -11054,9 +11020,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_state_entered_ts"] = ts
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
-        meta["shadow_entry_price"] = _nexus_shadow_price_for_item(item)
         set_meta(item, meta)
-        _nexus_shadow_apply_paper_pnl(item, row["quality"], row["risk"], ts, tick_sec, closed=False)
         events.append(set_state(item, "ACTIVE", "Strategist promoted the best clean slot to paper-active Shadow execution.", "SHADOW_ACTIVE"))
         active_count += 1
         promoted += 1
@@ -11145,26 +11109,6 @@ def api_nexus_shadow_executor():
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
         runtime = _nexus_shadow_latest_runtime(cur, wa)
-        # Backend heartbeat: when a Shadow runtime is RUNNING, reading the state
-        # advances the paper lifecycle if the last tick is due. This prevents the
-        # runtime from depending only on a frontend timer or page refresh.
-        try:
-            rt = runtime.get("runtime") if isinstance(runtime.get("runtime"), dict) else {}
-            last_run = runtime.get("run") if isinstance(runtime.get("run"), dict) else None
-            cfg = (last_run or {}).get("config") if isinstance((last_run or {}).get("config"), dict) else {}
-            heartbeat_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "180"))), 180, 30, 3600))
-            last_ts = int(rt.get("updated_ts") or (last_run or {}).get("updated_ts") or 0)
-            if str(runtime.get("status") or "").lower() == "running" and now_ts() - last_ts >= heartbeat_sec:
-                runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action="tick")
-                heartbeat_run = _nexus_shadow_record_runtime_run(cur, wa, "backend_shadow_heartbeat", "tick", runtime_result, cfg)
-                conn.commit()
-                cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5", (wa,))
-                runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
-                execution = _nexus_execution_summary(cur, wa)
-                runtime = _nexus_shadow_latest_runtime(cur, wa)
-        except Exception as _heartbeat_error:
-            _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "SHADOW_HEARTBEAT_ERROR", "", "error", str(_heartbeat_error), {})
-            conn.commit()
         conn.close()
         return jsonify({
             "status": "ok",
