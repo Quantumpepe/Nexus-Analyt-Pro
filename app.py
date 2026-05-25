@@ -9919,15 +9919,20 @@ def _nexus_wallet_from_request():
 def _nexus_queue_row_to_dict(row) -> dict:
     meta = _nexus_json_load(row["meta_json"], {})
     session_id = str(meta.get("session_id") or meta.get("trade_session_id") or meta.get("rotation_session_id") or "")
-    return {
-        "id": row["id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "", "chain": row["chain"] or "",
-        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
-        "reserved_capital_usd": float(row["reserved_capital_usd"] or 0), "confidence": float(row["confidence"] or 0),
+    reserved_usd = float(row["reserved_capital_usd"] or 0)
+    out = {
+        "id": row["id"], "slot_id": row["slot_id"] or "", "slot": row["slot_id"] or "", "asset": row["asset"] or "", "symbol": row["asset"] or "", "chain": row["chain"] or "",
+        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "status": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
+        "reserved_capital_usd": reserved_usd, "amountUsd": reserved_usd, "amount_usd": reserved_usd, "confidence": float(row["confidence"] or 0),
         "risk_score": float(row["risk_score"] or 0), "reason": row["reason"] or "",
         "signals": _nexus_json_load(row["signals_json"], {}), "meta": meta, "session_id": session_id,
         "recheck_after_ts": row["recheck_after_ts"], "expires_ts": row["expires_ts"],
         "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
     }
+    for mk in ["paper_entry_price", "paper_mark_price", "paper_exit_price", "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd", "paper_quantity", "paper_position_usd"]:
+        if meta.get(mk) is not None:
+            out[mk] = meta.get(mk)
+    return out
 
 def _nexus_reservation_row_to_dict(row) -> dict:
     return {
@@ -10406,6 +10411,8 @@ def _shadow_normalize_queue_item(item, idx=0):
         "symbol": symbol,
         "status": state,
         "amountUsd": amount,
+        "amount_usd": amount,
+        "reserved_capital_usd": amount,
         "priority": priority,
         "confidence_score": confidence,
         "risk_score": risk_score,
@@ -10981,6 +10988,69 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["meta"] = meta if isinstance(meta, dict) else {}
         return item
 
+    def _paper_base_price(item, meta):
+        for value in [
+            item.get("current_price"), item.get("price"), item.get("priceUsd"), item.get("mark_price"),
+            meta.get("paper_mark_price"), meta.get("paper_entry_price"), cfg.get("current_price"), cfg.get("price"), cfg.get("mark_price"), 1,
+        ]:
+            try:
+                n = float(value)
+                if math.isfinite(n) and n > 0:
+                    return n
+            except Exception:
+                continue
+        return 1.0
+
+    def update_paper_accounting(item, quality=0, force_exit=False):
+        meta = get_meta(item)
+        amount = _clamp_float(item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))), 0, 0, 1_000_000_000)
+        if amount <= 0:
+            amount = _clamp_float(meta.get("paper_position_usd", 0), 0, 0, 1_000_000_000)
+        if amount <= 0:
+            return item
+        entry = _clamp_float(meta.get("paper_entry_price", 0), 0, 0, 1_000_000_000)
+        if entry <= 0:
+            entry = _paper_base_price(item, meta)
+            meta["paper_entry_price"] = round(entry, 10)
+            meta["paper_entry_ts"] = ts
+        entered = int(meta.get("paper_entry_ts") or meta.get("shadow_active_started_ts") or meta.get("shadow_state_entered_ts") or ts)
+        elapsed_min = max(0, (ts - entered) / 60.0)
+        q = _clamp_float(quality, 0, -100, 100)
+        # Deterministic paper drift: strong slots drift slightly positive, weak/risky slots negative.
+        slot_seed = slot_no(item, 1)
+        drift_pct = max(-4.5, min(4.5, ((q - 50.0) / 50.0) * 1.15 + min(1.8, elapsed_min / 60.0 * 0.35) + ((slot_seed % 3) - 1) * 0.18))
+        if force_exit:
+            drift_pct = max(-8.0, min(8.0, drift_pct))
+        mark = entry * (1 + drift_pct / 100.0)
+        qty = amount / entry if entry > 0 else 0
+        pnl_usd = amount * (drift_pct / 100.0)
+        realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
+        meta["paper_position_usd"] = round(amount, 2)
+        meta["paper_quantity"] = round(qty, 10)
+        meta["paper_mark_price"] = round(mark, 10)
+        meta["paper_pnl_pct"] = round(drift_pct, 4)
+        meta["paper_pnl_usd"] = round(pnl_usd, 4)
+        if force_exit:
+            meta["paper_exit_price"] = round(mark, 10)
+            realized_total = round(realized_total + pnl_usd, 4)
+            meta["paper_realized_total_usd"] = realized_total
+            meta["paper_pnl_total_usd"] = realized_total
+        else:
+            meta["paper_pnl_total_usd"] = round(realized_total + pnl_usd, 4)
+        item["amountUsd"] = amount
+        item["amount_usd"] = amount
+        item["reserved_capital_usd"] = amount
+        item["paper_entry_price"] = meta.get("paper_entry_price")
+        item["paper_mark_price"] = meta.get("paper_mark_price")
+        item["paper_exit_price"] = meta.get("paper_exit_price")
+        item["paper_pnl_pct"] = meta.get("paper_pnl_pct")
+        item["paper_pnl_usd"] = meta.get("paper_pnl_usd")
+        item["paper_pnl_total_usd"] = meta.get("paper_pnl_total_usd")
+        item["paper_quantity"] = meta.get("paper_quantity")
+        item["paper_position_usd"] = meta.get("paper_position_usd")
+        set_meta(item, meta)
+        return item
+
     def set_state(item, new_state, reason, event_type="SHADOW_STATE"):
         old = str(item.get("status") or item.get("state") or "WAIT").upper()
         ns = str(new_state or old).upper()
@@ -11053,11 +11123,19 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
         elapsed = max(0, ts - entered)
         if elapsed >= tick_sec or row["quality"] < 28 or row["risk"] >= 40:
+            update_paper_accounting(item, row["quality"], force_exit=True)
+            meta = get_meta(item)
             meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
             meta["shadow_last_exit_ts"] = ts
             set_meta(item, meta)
-            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate.", "SHADOW_PAPER_EXIT"))
+            pnl_msg = ""
+            try:
+                pnl_msg = f" Paper PnL: {float(meta.get('paper_pnl_usd') or 0):+.2f} USD ({float(meta.get('paper_pnl_pct') or 0):+.2f}%)."
+            except Exception:
+                pnl_msg = ""
+            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate." + pnl_msg, "SHADOW_PAPER_EXIT"))
         else:
+            update_paper_accounting(item, row["quality"], force_exit=False)
             active_rows.append(row)
 
     # 3) Keep only max_active active slots; demote extras by quality.
@@ -11096,6 +11174,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
         events.append(set_state(item, "ACTIVE", "Strategist promoted the best clean slot to paper-active Shadow execution.", "SHADOW_ACTIVE"))
+        update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
 
