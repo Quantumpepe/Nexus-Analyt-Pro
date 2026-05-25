@@ -9794,6 +9794,43 @@ def api_nexus_trading_hold_state():
                 _nexus_risk_state_save(cur, wa, _nexus_risk_state_build([], hold_snapshot, _nexus_risk_state_load(cur, wa), {}))
                 conn.commit()
 
+        elif action == "stop":
+            session_id = str(body.get("session_id") or body.get("sessionId") or body.get("trade_session_id") or "").strip()
+            stopped_queue = body.get("stopped_queue") if isinstance(body.get("stopped_queue"), list) else []
+            reason = str(body.get("reason") or "session_stopped_by_user").strip()[:500]
+            with DB_WRITE_LOCK:
+                if session_id:
+                    cur.execute("SELECT id, meta_json FROM nexus_execution_queue WHERE wallet_address=?", (wa,))
+                    for r in cur.fetchall():
+                        meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {})
+                        sid = str(meta.get("session_id") or meta.get("trade_session_id") or "").strip()
+                        if sid == session_id:
+                            meta["session_id"] = session_id
+                            meta["shadow_runtime_status"] = "stopped"
+                            meta["shadow_stopped_ts"] = now_i
+                            cur.execute(
+                                "UPDATE nexus_execution_queue SET state='STOPPED', reason=?, meta_json=?, updated_ts=? WHERE id=? AND wallet_address=?",
+                                (reason, json.dumps(meta, ensure_ascii=False), now_i, r["id"], wa),
+                            )
+                cur.execute(
+                    """
+                    INSERT INTO nexus_trading_hold_state(wallet_address, status, hold_hours, observe_max_hours, release_required, queue_json, reason, updated_ts)
+                    VALUES (?, 'PREPARED', 1, 12, 0, '[]', ?, ?)
+                    ON CONFLICT(wallet_address) DO UPDATE SET
+                        status='PREPARED', release_required=0, queue_json='[]', reason=excluded.reason, updated_ts=excluded.updated_ts
+                    """,
+                    (wa, f"stopped_session:{session_id or 'unknown'}", now_i),
+                )
+                _nexus_risk_state_save(cur, wa, {
+                    **_nexus_risk_state_default(),
+                    "global_status": "ACTIVE_OK",
+                    "last_action": "STOP",
+                    "blocked_reason": "Selected Trading session stopped by user. It must not hydrate back after refresh.",
+                    "updated_ts": now_i,
+                })
+                _nexus_log_sim_event(cur, wa, session_id or "trading", "TRADING", "SESSION_STOPPED", "ACTIVE", "STOPPED", reason, {"session_id": session_id, "stopped_queue_len": len(stopped_queue)})
+                conn.commit()
+
         elif action == "release":
             with DB_WRITE_LOCK:
                 cur.execute(
@@ -10800,8 +10837,12 @@ def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
         st = str(item.get("status") or item.get("state") or "WAIT").upper()
         if st in ("STOPPED", "CLOSED", "CANCELLED", "RELEASED"):
             continue
-        if session_id and sid and sid != session_id:
-            continue
+        if session_id:
+            # Strict session isolation: when a Budget/Trading session is selected,
+            # rows without this exact session_id must never enter the runtime. Old
+            # rows without session_id were the reason for duplicate/mixed slot cards.
+            if not sid or sid != session_id:
+                continue
         if chain and ch and ch != chain:
             continue
         out.append(item)
