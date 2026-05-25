@@ -11101,6 +11101,117 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     events = []
     strategist_reason = []
 
+    def recycle_completed_shadow_cycle():
+        """Recycle paper capital when a running session has completed all slots.
+
+        A professional Shadow session must not stop at SIMULATED_EXIT. Once every
+        slot is exited, realized paper PnL is added to the session capital, the
+        capital is redistributed across the same slots, and a new cycle begins.
+        The cumulative realized PnL stays visible in meta while per-cycle PnL is
+        reset to zero for the new paper positions.
+        """
+        if not normalized:
+            return False
+
+        terminal_states = {"SIMULATED_EXIT"}
+        blocking_states = {"HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT"}
+        states = [str(x.get("status") or x.get("state") or "WAIT").upper() for x in normalized]
+        if any(st in blocking_states for st in states):
+            return False
+        if not states or not all(st in terminal_states for st in states):
+            return False
+
+        base_total = 0.0
+        fresh_realized_delta = 0.0
+        for item in normalized:
+            meta = get_meta(item)
+            amount = _clamp_float(
+                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))),
+                0, 0, 1_000_000_000
+            )
+            base_total += amount
+
+            realized_total = _clamp_float(
+                meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)),
+                0, -1_000_000_000, 1_000_000_000
+            )
+            already_recycled = _clamp_float(
+                meta.get("paper_recycled_until_total_usd", 0),
+                0, -1_000_000_000, 1_000_000_000
+            )
+            delta = realized_total - already_recycled
+            if math.isfinite(delta):
+                fresh_realized_delta += delta
+
+        if base_total <= 0:
+            # Fallback for older sessions with missing slot amounts.
+            cfg_budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", 0))), 0, 0, 1_000_000_000)
+            base_total = cfg_budget if cfg_budget > 0 else float(len(normalized) * 100)
+
+        next_total = max(0.01, base_total + fresh_realized_delta)
+        weights = []
+        for item in normalized:
+            meta = get_meta(item)
+            amount = _clamp_float(
+                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))),
+                0, 0, 1_000_000_000
+            )
+            weights.append(amount if amount > 0 else 1.0)
+        weight_sum = sum(weights) if sum(weights) > 0 else float(len(normalized) or 1)
+
+        sorted_rows = sorted(scored, key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
+        active_idx = {r["idx"] for r in sorted_rows[:max_active]}
+        ready_idx = {r["idx"] for r in sorted_rows[max_active:max_active + max(0, ready_slots_target)]}
+
+        for idx, item in enumerate(normalized):
+            meta = get_meta(item)
+            realized_total = _clamp_float(
+                meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)),
+                0, -1_000_000_000, 1_000_000_000
+            )
+            next_amount = round(next_total * (weights[idx] / weight_sum), 2)
+            item["amountUsd"] = next_amount
+            item["amount_usd"] = next_amount
+            item["reserved_capital_usd"] = next_amount
+
+            # Start a clean paper position for the new cycle, while preserving cumulative realized PnL.
+            base_price = _paper_base_price(item, meta)
+            meta["paper_position_usd"] = next_amount
+            meta["paper_quantity"] = round(next_amount / base_price, 10) if base_price > 0 else 0
+            meta["paper_entry_price"] = round(base_price, 10)
+            meta["paper_mark_price"] = round(base_price, 10)
+            meta.pop("paper_exit_price", None)
+            meta["paper_pnl_pct"] = 0
+            meta["paper_pnl_usd"] = 0
+            meta["paper_pnl_total_usd"] = round(realized_total, 4)
+            meta["paper_realized_total_usd"] = round(realized_total, 4)
+            meta["paper_recycled_until_total_usd"] = round(realized_total, 4)
+            meta["paper_entry_ts"] = ts
+            meta["shadow_cycle_recycled_ts"] = ts
+            meta["shadow_runtime_status"] = "running"
+            meta["shadow_strategy"] = "recycled_profit_rotation"
+            item["paper_entry_price"] = meta["paper_entry_price"]
+            item["paper_mark_price"] = meta["paper_mark_price"]
+            item["paper_exit_price"] = None
+            item["paper_pnl_pct"] = 0
+            item["paper_pnl_usd"] = 0
+            item["paper_pnl_total_usd"] = meta["paper_pnl_total_usd"]
+            item["paper_position_usd"] = next_amount
+            item["paper_quantity"] = meta["paper_quantity"]
+            set_meta(item, meta)
+
+            if idx in active_idx:
+                events.append(set_state(item, "ACTIVE", "Shadow recycled realized paper capital and started a new active cycle.", "SHADOW_CAPITAL_RECYCLED"))
+            elif idx in ready_idx:
+                events.append(set_state(item, "READY", "Shadow recycled realized paper capital; slot is ready for the next paper entry.", "SHADOW_CAPITAL_RECYCLED"))
+            else:
+                events.append(set_state(item, "WAIT", "Shadow recycled realized paper capital; slot waits for a cleaner edge.", "SHADOW_CAPITAL_RECYCLED"))
+
+        strategist_reason.append(f"Recycled completed paper cycle: capital {base_total:.2f} USD, realized delta {fresh_realized_delta:+.2f} USD, next cycle {next_total:.2f} USD.")
+        return True
+
+    cycle_recycled = recycle_completed_shadow_cycle()
+
     # 1) Protect/block risky slots immediately.
     for row in scored:
         item = row["item"]
