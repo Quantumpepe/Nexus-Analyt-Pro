@@ -10876,26 +10876,62 @@ def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
 
     strict = []
     legacy = []
+    allow_legacy_fallback = bool(cfg.get("allow_legacy_session_fallback") is True)
+
     for item in queue:
         if not isinstance(item, dict):
             continue
+
         meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-        ch = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or meta.get("chain") or "")
+
+        # Never resurrect previously stopped/archived shadow rows.
+        runtime_status = str(
+            meta.get("shadow_runtime_status")
+            or item.get("runtime_status")
+            or item.get("status")
+            or item.get("state")
+            or ""
+        ).upper()
+
+        if runtime_status in ("STOPPED", "ARCHIVED"):
+            continue
+
+        sid = str(
+            item.get("session_id")
+            or item.get("sessionId")
+            or meta.get("session_id")
+            or meta.get("trade_session_id")
+            or ""
+        ).strip()
+
+        ch = _normalize_chain_key(
+            item.get("chain")
+            or item.get("chain_key")
+            or item.get("network")
+            or meta.get("chain")
+            or ""
+        )
+
         if chain and ch and ch != chain:
             continue
+
         if session_id:
+            # STRICT session isolation:
+            # Only hydrate rows belonging to the currently selected session.
+            # Old legacy/no-session rows must never silently attach themselves
+            # to a newer runtime session, otherwise stopped POL sessions can
+            # suddenly reappear as duplicated active sessions.
             if sid == session_id:
                 strict.append(item)
-            elif not sid:
+            elif allow_legacy_fallback and not sid:
                 legacy.append(item)
             continue
+
         strict.append(item)
-    # For a selected session, use exact session rows if they exist. If the session was
-    # created before every row carried a session_id, fall back to legacy rows instead
-    # of returning an empty queue. The runtime tick will stamp those rows with the
-    # selected session_id before persisting them, so refresh hydration stays intact.
-    return strict if strict else (legacy if session_id else strict)
+
+    # Legacy fallback is now opt-in only. This prevents accidental session mixing
+    # and duplicate runtime resurrection after refresh/recovery.
+    return strict if strict else (legacy if (session_id and allow_legacy_fallback) else strict)
 
 
 def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain: str = "") -> int:
@@ -11155,7 +11191,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             cfg_budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", 0))), 0, 0, 1_000_000_000)
             base_total = cfg_budget if cfg_budget > 0 else float(len(normalized) * 100)
 
-        next_total = max(0.01, base_total + fresh_realized_delta)
+        # IMPORTANT:
+        # A completed Shadow cycle must restart from the ORIGINAL allocated
+        # paper capital only. Realized paper profit remains visible in the
+        # cumulative statistics, but it must NOT automatically compound into
+        # the next simulated cycle. Otherwise sessions slowly inflate and can
+        # desynchronize from the user's intended budget/runtime behavior.
+        next_total = max(0.01, base_total)
         weights = []
         for item in normalized:
             meta = get_meta(item)
