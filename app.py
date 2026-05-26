@@ -11396,6 +11396,23 @@ def _nexus_shadow_runtime_cfg_key(cfg: dict | None, run: dict | None = None) -> 
     return session_id, chain
 
 
+
+def _nexus_shadow_run_has_no_queue(run: dict) -> bool:
+    """True only for stale Shadow runtime runs that ended because the active queue was missing.
+
+    This is deliberately narrow: stopped/paused runs must still win over older RUNNING rows.
+    """
+    if not isinstance(run, dict):
+        return False
+    events = run.get("events") if isinstance(run.get("events"), list) else []
+    for ev in events:
+        if isinstance(ev, dict) and str(ev.get("type") or "").upper() == "NO_QUEUE":
+            return True
+    summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+    strategist = summary.get("strategist") if isinstance(summary.get("strategist"), dict) else {}
+    reason = str(strategist.get("reason") or summary.get("message") or "").lower()
+    return "no queue" in reason
+
 def _nexus_shadow_runtime_due(latest: dict, now_i: int | None = None) -> tuple[bool, dict]:
     """Check whether one persisted runtime needs a backend tick."""
     now_i = int(now_i or now_ts())
@@ -11444,8 +11461,19 @@ def _nexus_shadow_latest_runtimes_by_session(cur, wallet_address: str, limit: in
         sid, ch = _nexus_shadow_runtime_cfg_key(cfg, run)
         if sid or ch:
             key = (sid or "NO_SESSION", ch or "NO_CHAIN")
-            if key not in latest_by_key:
+            current = latest_by_key.get(key)
+            if current is None:
                 latest_by_key[key] = {"status": status, "run": run, "runtime": runtime, "key": key}
+            else:
+                # Narrow fix for stale NO_QUEUE rows:
+                # If the newest row for this same session/chain is only an idle NO_QUEUE marker,
+                # do not let it hide an older RUNNING runtime. This does not override STOPPED/PAUSED.
+                if (
+                    str(current.get("status") or "").lower() == "idle"
+                    and _nexus_shadow_run_has_no_queue(current.get("run"))
+                    and status == "running"
+                ):
+                    latest_by_key[key] = {"status": status, "run": run, "runtime": runtime, "key": key}
         elif global_latest is None:
             global_latest = {"status": status, "run": run, "runtime": runtime, "key": ("", "")}
 
@@ -11553,6 +11581,12 @@ def api_nexus_shadow_executor():
             cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
             hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
             runtime = _nexus_shadow_latest_runtime(cur, wa)
+            # Narrow display/runtime-status fix: an old NO_QUEUE row must not make the UI
+            # show IDLE while there is still an active queue and a RUNNING session exists.
+            if str(runtime.get("status") or "").lower() == "idle" and _nexus_shadow_run_has_no_queue(runtime.get("run")):
+                running_candidates = [r for r in _nexus_shadow_latest_runtimes_by_session(cur, wa) if str(r.get("status") or "").lower() == "running"]
+                if running_candidates:
+                    runtime = running_candidates[0]
             conn.close()
         return jsonify({
             "status": "ok",
