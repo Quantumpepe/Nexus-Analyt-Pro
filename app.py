@@ -11355,6 +11355,90 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     }
 
 
+def _nexus_shadow_runtime_should_autotick(latest: dict, now_i: int | None = None) -> tuple[bool, dict]:
+    """Return whether a persisted Shadow runtime is due for a backend tick.
+
+    The frontend often polls the Shadow executor with GET while the browser stays open.
+    Before this helper, only explicit POST {action:"tick"} changed the queue. That made
+    long-running sessions appear frozen for hours after Start/Recycle.
+    """
+    now_i = int(now_i or now_ts())
+    if not isinstance(latest, dict):
+        return False, {}
+    if str(latest.get("status") or "").lower() != "running":
+        return False, {}
+    run = latest.get("run") if isinstance(latest.get("run"), dict) else {}
+    cfg = dict(run.get("config") if isinstance(run.get("config"), dict) else {})
+    runtime = latest.get("runtime") if isinstance(latest.get("runtime"), dict) else {}
+    tick_sec = int(_clamp_float(
+        runtime.get("tick_sec", cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300")))),
+        300, 30, 3600
+    ))
+    updated_ts = int(runtime.get("updated_ts") or run.get("updated_ts") or run.get("created_ts") or 0)
+    if updated_ts <= 0:
+        return True, cfg
+    # small grace so repeated GETs within the same interval stay read-only
+    return (now_i - updated_ts) >= max(30, tick_sec), cfg
+
+def _nexus_shadow_record_runtime_run(cur, wallet_address: str, result: dict, cfg: dict, action: str, source: str = "runtime_auto") -> dict:
+    """Persist a Shadow runtime result as a normal run row and return the run dict."""
+    run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+    now_i = now_ts()
+    summary = {
+        "shadow_only": True,
+        "live_execution_triggered": False,
+        "status": "running" if action in ("start", "resume", "tick") else str(action or "completed"),
+        "runtime_status": result.get("runtime_status"),
+        "runtime": {
+            "status": result.get("runtime_status"),
+            "action": action,
+            "tick_sec": result.get("tick_sec"),
+            "active_count": result.get("active_count", 0),
+            "ready_count": result.get("ready_count", 0),
+            "simulated_exits": result.get("simulated_exits", 0),
+            "promoted": result.get("promoted", 0),
+            "strategist": result.get("strategist") or {},
+            "session_id": str((cfg or {}).get("session_id") or (cfg or {}).get("sessionId") or ""),
+            "chain": _normalize_chain_key((cfg or {}).get("chain") or (cfg or {}).get("chain_key") or (cfg or {}).get("network") or ""),
+            "updated_ts": now_i,
+        },
+        "readiness": "SHADOW_RUNTIME_ACTIVE" if result.get("runtime_status") == "running" else str(result.get("runtime_status") or "idle").upper(),
+        "message": "Shadow runtime backend tick updated paper execution state only. No Vault execution was triggered.",
+    }
+    cur.execute(
+        """
+        INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            run_id,
+            wallet_address,
+            "SHADOW",
+            source,
+            summary.get("status") or "running",
+            json.dumps(summary, ensure_ascii=False),
+            json.dumps(result.get("events") or [], ensure_ascii=False),
+            json.dumps(result.get("queue") or [], ensure_ascii=False),
+            json.dumps({**(cfg or {}), "action": action, "auto_tick": True}, ensure_ascii=False),
+            now_i,
+            now_i,
+        ),
+    )
+    _nexus_log_sim_event(
+        cur,
+        wallet_address,
+        "shadow_executor",
+        "SHADOW",
+        "SHADOW_RUNTIME_AUTO_TICK",
+        "",
+        summary.get("status") or "running",
+        "Shadow backend auto-tick advanced a running paper session during polling.",
+        {"run_id": run_id, "summary": summary, "shadow_state_changes": result.get("changed") or []},
+    )
+    cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wallet_address))
+    return _shadow_row_to_dict(cur.fetchone())
+
+
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
 def api_nexus_shadow_executor():
     wa, error_resp = _nexus_wallet_from_request()
@@ -11362,18 +11446,31 @@ def api_nexus_shadow_executor():
         return error_resp
 
     if request.method == "GET":
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
-            (wa,),
-        )
-        runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
-        execution = _nexus_execution_summary(cur, wa)
-        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
-        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-        runtime = _nexus_shadow_latest_runtime(cur, wa)
-        conn.close()
+        # GET is the normal polling path from the UI. If a Shadow runtime is marked
+        # running and its tick interval has passed, advance it here. Otherwise the
+        # queue can stay visually unchanged for hours unless the frontend sends a
+        # separate POST tick. This keeps the backend as the source of truth.
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            runtime = _nexus_shadow_latest_runtime(cur, wa)
+            auto_tick_run = None
+            should_tick, tick_cfg = _nexus_shadow_runtime_should_autotick(runtime, now_ts())
+            if should_tick:
+                runtime_result = _nexus_shadow_runtime_tick(cur, wa, tick_cfg, action="tick")
+                auto_tick_run = _nexus_shadow_record_runtime_run(cur, wa, runtime_result, tick_cfg, "tick", source="runtime_auto")
+                conn.commit()
+                runtime = _nexus_shadow_latest_runtime(cur, wa, tick_cfg)
+
+            cur.execute(
+                "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
+                (wa,),
+            )
+            runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+            execution = _nexus_execution_summary(cur, wa)
+            cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+            hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+            conn.close()
         return jsonify({
             "status": "ok",
             "wallet": wa,
@@ -11381,6 +11478,8 @@ def api_nexus_shadow_executor():
             "live_execution_triggered": False,
             "runtime_status": runtime.get("status") or "idle",
             "runtime": runtime.get("runtime") or {},
+            "auto_tick": bool(auto_tick_run),
+            "auto_tick_run": auto_tick_run,
             "last_run": runs[0] if runs else None,
             "runs": runs,
             "execution": execution,
