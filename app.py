@@ -10925,6 +10925,118 @@ def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain:
         _nexus_log_sim_event(cur, wallet_address, sid, "", "SESSION_STOPPED", "ACTIVE", "STOPPED", "User stopped selected Trading/Shadow session; active queue rows archived.", {"session_id": sid, "deleted_queue_rows": len(ids)})
     return len(ids)
 
+
+def _nexus_shadow_queue_from_latest_run(cur, wallet_address: str, cfg: dict | None = None, limit: int = 80) -> list:
+    """Recover the active Shadow queue from recent run history when nexus_execution_queue is empty.
+
+    This is a safety repair for Render restarts, stale frontend state, and older
+    sessions where the visible slots still exist in nexus_shadow_executor_runs but
+    the active queue table has no rows. Without this fallback the runtime reports
+    NO_QUEUE forever and cannot recycle/re-enter.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        cur.execute(
+            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT ?",
+            (wallet_address, int(limit or 80)),
+        )
+        rows = cur.fetchall()
+    except Exception:
+        return []
+
+    for row in rows:
+        try:
+            run = _shadow_row_to_dict(row)
+        except Exception:
+            run = None
+        if not isinstance(run, dict):
+            continue
+        summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+        runtime = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
+        status = str(runtime.get("status") or summary.get("runtime_status") or run.get("status") or "").lower()
+        if status in ("stopped", "paused"):
+            # A newer explicit stop/pause must not resurrect old slots for that session.
+            continue
+        q = run.get("queue") if isinstance(run.get("queue"), list) else []
+        if not q:
+            continue
+        filtered = _nexus_shadow_filter_queue_for_cfg(q, cfg)
+        if filtered:
+            return [dict(x) for x in filtered if isinstance(x, dict)]
+    return []
+
+
+def _nexus_shadow_build_fallback_queue(wallet_address: str, cfg: dict | None = None) -> list:
+    """Create a minimal session queue if no persisted queue can be recovered.
+
+    This should only be used for a running/resumed Shadow session that has lost its
+    queue. It preserves backend-first behavior by generating deterministic slot ids
+    from session_id + chain + slot number and immediately persisting them on tick.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    session_id = str(cfg.get("session_id") or cfg.get("sessionId") or cfg.get("trade_session_id") or "").strip()
+    if not session_id:
+        return []
+    chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or cfg.get("allowedChains") or "") or "POL"
+    asset_raw = str(cfg.get("asset") or cfg.get("symbol") or cfg.get("allowedAssets") or cfg.get("allowed_assets") or "").strip().upper()
+    # If a comma-separated asset list was stored, choose the item matching the selected chain first.
+    assets = [x.strip().upper() for x in re.split(r"[,/|\s]+", asset_raw) if x.strip()]
+    asset = chain if chain in assets or not assets else assets[0]
+    try:
+        slot_count = int(_clamp_float(cfg.get("slot_count", cfg.get("slots", cfg.get("maxTrades", cfg.get("max_trades", 5)))), 5, 1, 20))
+    except Exception:
+        slot_count = 5
+    budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", cfg.get("approved_budget_usd", 0)))), 0, 0, 1_000_000_000)
+    if budget <= 0:
+        budget = float(slot_count * 100)
+    per_slot = round(budget / max(1, slot_count), 2)
+    out = []
+    for i in range(slot_count):
+        slot_no = i + 1
+        state = "ACTIVE" if i == 0 else "READY" if i <= 2 else "WAIT"
+        priority = max(45, 100 - (i * 8))
+        meta = {
+            "session_id": session_id,
+            "trade_session_id": session_id,
+            "chain": chain,
+            "asset": asset,
+            "slot": str(slot_no),
+            "paper_position_usd": per_slot,
+            "paper_entry_price": 1,
+            "paper_mark_price": 1,
+            "paper_pnl_pct": 0,
+            "paper_pnl_usd": 0,
+            "paper_pnl_total_usd": 0,
+            "paper_realized_total_usd": 0,
+            "shadow_runtime_status": "running",
+            "shadow_recovered_queue_ts": now_ts(),
+        }
+        out.append({
+            "id": "NQ-" + uuid.uuid5(uuid.NAMESPACE_URL, f"{wallet_address}|{session_id}|{chain}|{slot_no}|{asset}").hex[:12].upper(),
+            "session_id": session_id,
+            "sessionId": session_id,
+            "trade_session_id": session_id,
+            "slot": str(slot_no),
+            "slot_id": str(slot_no),
+            "asset": asset,
+            "symbol": asset,
+            "chain": chain,
+            "chain_key": chain,
+            "action": "OBSERVE",
+            "state": state,
+            "status": state,
+            "priority": priority,
+            "confidence": 65,
+            "confidence_score": 65,
+            "risk_score": 0,
+            "reserved_capital_usd": per_slot,
+            "amountUsd": per_slot,
+            "amount_usd": per_slot,
+            "reason": "Shadow queue was rebuilt from session config after NO_QUEUE recovery.",
+            "meta": meta,
+        })
+    return out
+
 def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
     """Backend-first Strategist-controlled Shadow runtime.
 
@@ -10944,6 +11056,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
     execution = _nexus_execution_summary(cur, wallet_address)
     queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
+    recovered_queue_source = "active_queue"
+    if not queue:
+        queue = _nexus_shadow_queue_from_latest_run(cur, wallet_address, cfg)
+        recovered_queue_source = "latest_run" if queue else recovered_queue_source
+    if not queue and action in ("start", "resume", "tick"):
+        queue = _nexus_shadow_build_fallback_queue(wallet_address, cfg)
+        recovered_queue_source = "session_config" if queue else recovered_queue_source
     if not queue:
         return {
             "runtime_status": "idle",
@@ -10954,6 +11073,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         }
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue)]
+    if recovered_queue_source != "active_queue":
+        # Persist recovered rows immediately so future ticks no longer depend on run history.
+        _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
 
     # Legacy migration: if frontend/backend selected a budget session but older queue
     # rows have no session id, stamp the in-memory runtime rows before persisting.
@@ -11100,6 +11222,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
     events = []
     strategist_reason = []
+    if recovered_queue_source != "active_queue":
+        events.append({
+            "type": "SHADOW_QUEUE_RECOVERED",
+            "message": f"Shadow runtime recovered queue from {recovered_queue_source}; paper session can continue instead of staying NO_QUEUE.",
+        })
+        strategist_reason.append(f"Recovered Shadow queue from {recovered_queue_source} after active queue was empty.")
 
     def recycle_completed_shadow_cycle():
         """Recycle paper capital when a running session has completed all slots.
@@ -11355,13 +11483,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     }
 
 
-def _nexus_shadow_runtime_should_autotick(latest: dict, now_i: int | None = None) -> tuple[bool, dict]:
-    """Return whether a persisted Shadow runtime is due for a backend tick.
 
-    The frontend often polls the Shadow executor with GET while the browser stays open.
-    Before this helper, only explicit POST {action:"tick"} changed the queue. That made
-    long-running sessions appear frozen for hours after Start/Recycle.
-    """
+def _nexus_shadow_runtime_should_autotick(latest: dict, now_i: int | None = None) -> tuple[bool, dict]:
+    """Return whether a persisted Shadow runtime is due for a backend tick."""
     now_i = int(now_i or now_ts())
     if not isinstance(latest, dict):
         return False, {}
@@ -11377,8 +11501,8 @@ def _nexus_shadow_runtime_should_autotick(latest: dict, now_i: int | None = None
     updated_ts = int(runtime.get("updated_ts") or run.get("updated_ts") or run.get("created_ts") or 0)
     if updated_ts <= 0:
         return True, cfg
-    # small grace so repeated GETs within the same interval stay read-only
     return (now_i - updated_ts) >= max(30, tick_sec), cfg
+
 
 def _nexus_shadow_record_runtime_run(cur, wallet_address: str, result: dict, cfg: dict, action: str, source: str = "runtime_auto") -> dict:
     """Persist a Shadow runtime result as a normal run row and return the run dict."""
@@ -11446,10 +11570,9 @@ def api_nexus_shadow_executor():
         return error_resp
 
     if request.method == "GET":
-        # GET is the normal polling path from the UI. If a Shadow runtime is marked
-        # running and its tick interval has passed, advance it here. Otherwise the
-        # queue can stay visually unchanged for hours unless the frontend sends a
-        # separate POST tick. This keeps the backend as the source of truth.
+        # GET is the normal UI polling path. If a Shadow runtime is marked RUNNING
+        # and its tick interval has passed, advance it here so the session does not
+        # freeze when the frontend does not send a separate POST tick.
         with DB_WRITE_LOCK:
             conn = _db()
             cur = conn.cursor()
