@@ -10834,6 +10834,84 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             changed.append({"id": rid, "from": old_state, "to": new_state, "reason": reason})
     return changed
 
+
+
+def _nexus_shadow_prune_duplicate_chain_sessions(cur, wallet_address: str) -> dict:
+    """Defensive Shadow cleanup: one active Shadow session per chain.
+
+    Bad recovery builds can leave multiple active queues for the same chain (for example
+    POL 1000 + POL 600). That creates ghost sessions after refresh. Keep the largest
+    active session per chain and remove smaller duplicates. Set
+    NEXUS_SHADOW_SINGLE_SESSION_PER_CHAIN=0 later if true same-chain multi-session
+    support is intentionally enabled.
+    """
+    if str(os.getenv("NEXUS_SHADOW_SINGLE_SESSION_PER_CHAIN", "1")).strip().lower() not in ("1", "true", "yes", "on"):
+        return {"pruned": 0, "chains": []}
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"pruned": 0, "chains": []}
+    try:
+        cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=?", (wa,))
+        rows = cur.fetchall()
+    except Exception:
+        return {"pruned": 0, "chains": []}
+
+    stopped_states = {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "RELEASED"}
+    grouped = {}
+    row_meta = []
+    for r in rows:
+        try:
+            meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {})
+            state = str(r["state"] or "WAIT").upper()
+            meta_status = str(meta.get("session_status") or meta.get("runtime_status") or meta.get("status") or "").upper()
+            if state in stopped_states or meta_status in stopped_states:
+                continue
+            if meta.get("session_stopped") or meta.get("archived") or meta.get("deleted"):
+                continue
+            chain = _normalize_chain_key(r["chain"] or meta.get("chain") or "")
+            if not chain:
+                continue
+            sid = str(meta.get("session_id") or meta.get("trade_session_id") or "NO_SESSION").strip() or "NO_SESSION"
+            amount = _clamp_float(r["reserved_capital_usd"], 0, 0, 1_000_000_000)
+            updated = int(r["updated_ts"] or 0)
+            key = (chain, sid)
+            grouped.setdefault(key, {"amount": 0.0, "updated": 0, "ids": []})
+            grouped[key]["amount"] += amount
+            grouped[key]["updated"] = max(grouped[key]["updated"], updated)
+            grouped[key]["ids"].append(str(r["id"]))
+            row_meta.append((chain, sid, str(r["id"]), amount, updated))
+        except Exception:
+            continue
+
+    by_chain = {}
+    for (chain, sid), info in grouped.items():
+        by_chain.setdefault(chain, []).append((sid, info))
+
+    delete_ids = []
+    affected = []
+    for chain, sessions in by_chain.items():
+        if len(sessions) <= 1:
+            continue
+        # Keep the session with the largest real capital; if equal, the newest.
+        keep_sid, keep_info = sorted(sessions, key=lambda x: (float(x[1].get("amount") or 0), int(x[1].get("updated") or 0)), reverse=True)[0]
+        for sid, info in sessions:
+            if sid == keep_sid:
+                continue
+            delete_ids.extend(info.get("ids") or [])
+        affected.append({"chain": chain, "kept_session": keep_sid, "removed_sessions": [sid for sid, _ in sessions if sid != keep_sid]})
+
+    for rid in delete_ids:
+        try:
+            cur.execute("DELETE FROM nexus_execution_queue WHERE wallet_address=? AND id=?", (wa, rid))
+        except Exception:
+            pass
+    if delete_ids:
+        try:
+            _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "SHADOW_GHOST_SESSION_PRUNED", "ACTIVE", "ARCHIVED", f"Pruned {len(delete_ids)} duplicate Shadow queue rows for same-chain ghost sessions.", {"deleted_queue_rows": len(delete_ids), "chains": affected})
+        except Exception:
+            pass
+    return {"pruned": len(delete_ids), "chains": affected}
+
 def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = None) -> dict:
     """Read latest Shadow runtime metadata, optionally scoped to one budget session."""
     cfg = cfg if isinstance(cfg, dict) else {}
@@ -10919,123 +10997,20 @@ def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain:
     # old no-session rows from reappearing after a user stops the selected legacy session.
     if not ids and legacy_ids:
         ids = legacy_ids
+    # If single-session-per-chain guard is enabled, stopping a selected chain should
+    # also remove ghost rows for the same chain that belong to old duplicate sessions.
+    # This fixes POL/BNB ghost sessions reappearing after refresh.
+    if ch_filter and str(os.getenv("NEXUS_SHADOW_SINGLE_SESSION_PER_CHAIN", "1")).strip().lower() in ("1", "true", "yes", "on"):
+        for r in rows:
+            meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {})
+            rchain = _normalize_chain_key(r["chain"] or meta.get("chain") or "")
+            if rchain == ch_filter and str(r["id"]) not in ids:
+                ids.append(r["id"])
     for rid in ids:
         cur.execute("DELETE FROM nexus_execution_queue WHERE wallet_address=? AND id=?", (wallet_address, rid))
     if ids:
         _nexus_log_sim_event(cur, wallet_address, sid, "", "SESSION_STOPPED", "ACTIVE", "STOPPED", "User stopped selected Trading/Shadow session; active queue rows archived.", {"session_id": sid, "deleted_queue_rows": len(ids)})
     return len(ids)
-
-
-def _nexus_shadow_queue_from_latest_run(cur, wallet_address: str, cfg: dict | None = None, limit: int = 80) -> list:
-    """Recover the active Shadow queue from recent run history when nexus_execution_queue is empty.
-
-    This is a safety repair for Render restarts, stale frontend state, and older
-    sessions where the visible slots still exist in nexus_shadow_executor_runs but
-    the active queue table has no rows. Without this fallback the runtime reports
-    NO_QUEUE forever and cannot recycle/re-enter.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    try:
-        cur.execute(
-            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT ?",
-            (wallet_address, int(limit or 80)),
-        )
-        rows = cur.fetchall()
-    except Exception:
-        return []
-
-    for row in rows:
-        try:
-            run = _shadow_row_to_dict(row)
-        except Exception:
-            run = None
-        if not isinstance(run, dict):
-            continue
-        summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
-        runtime = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
-        status = str(runtime.get("status") or summary.get("runtime_status") or run.get("status") or "").lower()
-        if status in ("stopped", "paused"):
-            # A newer explicit stop/pause must not resurrect old slots for that session.
-            continue
-        q = run.get("queue") if isinstance(run.get("queue"), list) else []
-        if not q:
-            continue
-        filtered = _nexus_shadow_filter_queue_for_cfg(q, cfg)
-        if filtered:
-            return [dict(x) for x in filtered if isinstance(x, dict)]
-    return []
-
-
-def _nexus_shadow_build_fallback_queue(wallet_address: str, cfg: dict | None = None) -> list:
-    """Create a minimal session queue if no persisted queue can be recovered.
-
-    This should only be used for a running/resumed Shadow session that has lost its
-    queue. It preserves backend-first behavior by generating deterministic slot ids
-    from session_id + chain + slot number and immediately persisting them on tick.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    session_id = str(cfg.get("session_id") or cfg.get("sessionId") or cfg.get("trade_session_id") or "").strip()
-    if not session_id:
-        return []
-    chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or cfg.get("allowedChains") or "") or "POL"
-    asset_raw = str(cfg.get("asset") or cfg.get("symbol") or cfg.get("allowedAssets") or cfg.get("allowed_assets") or "").strip().upper()
-    # If a comma-separated asset list was stored, choose the item matching the selected chain first.
-    assets = [x.strip().upper() for x in re.split(r"[,/|\s]+", asset_raw) if x.strip()]
-    asset = chain if chain in assets or not assets else assets[0]
-    try:
-        slot_count = int(_clamp_float(cfg.get("slot_count", cfg.get("slots", cfg.get("maxTrades", cfg.get("max_trades", 5)))), 5, 1, 20))
-    except Exception:
-        slot_count = 5
-    budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", cfg.get("approved_budget_usd", 0)))), 0, 0, 1_000_000_000)
-    if budget <= 0:
-        budget = float(slot_count * 100)
-    per_slot = round(budget / max(1, slot_count), 2)
-    out = []
-    for i in range(slot_count):
-        slot_no = i + 1
-        state = "ACTIVE" if i == 0 else "READY" if i <= 2 else "WAIT"
-        priority = max(45, 100 - (i * 8))
-        meta = {
-            "session_id": session_id,
-            "trade_session_id": session_id,
-            "chain": chain,
-            "asset": asset,
-            "slot": str(slot_no),
-            "paper_position_usd": per_slot,
-            "paper_entry_price": 1,
-            "paper_mark_price": 1,
-            "paper_pnl_pct": 0,
-            "paper_pnl_usd": 0,
-            "paper_pnl_total_usd": 0,
-            "paper_realized_total_usd": 0,
-            "shadow_runtime_status": "running",
-            "shadow_recovered_queue_ts": now_ts(),
-        }
-        out.append({
-            "id": "NQ-" + uuid.uuid5(uuid.NAMESPACE_URL, f"{wallet_address}|{session_id}|{chain}|{slot_no}|{asset}").hex[:12].upper(),
-            "session_id": session_id,
-            "sessionId": session_id,
-            "trade_session_id": session_id,
-            "slot": str(slot_no),
-            "slot_id": str(slot_no),
-            "asset": asset,
-            "symbol": asset,
-            "chain": chain,
-            "chain_key": chain,
-            "action": "OBSERVE",
-            "state": state,
-            "status": state,
-            "priority": priority,
-            "confidence": 65,
-            "confidence_score": 65,
-            "risk_score": 0,
-            "reserved_capital_usd": per_slot,
-            "amountUsd": per_slot,
-            "amount_usd": per_slot,
-            "reason": "Shadow queue was rebuilt from session config after NO_QUEUE recovery.",
-            "meta": meta,
-        })
-    return out
 
 def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
     """Backend-first Strategist-controlled Shadow runtime.
@@ -11054,15 +11029,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     max_active = int(_clamp_float(cfg.get("shadow_active_slots", cfg.get("active_slots", os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1"))), 1, 1, 10))
     ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", "2"))), 2, 1, 10))
 
+    # Before every runtime tick, remove ghost duplicate same-chain sessions left by older builds.
+    _nexus_shadow_prune_duplicate_chain_sessions(cur, wallet_address)
     execution = _nexus_execution_summary(cur, wallet_address)
     queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
-    recovered_queue_source = "active_queue"
-    if not queue:
-        queue = _nexus_shadow_queue_from_latest_run(cur, wallet_address, cfg)
-        recovered_queue_source = "latest_run" if queue else recovered_queue_source
-    if not queue and action in ("start", "resume", "tick"):
-        queue = _nexus_shadow_build_fallback_queue(wallet_address, cfg)
-        recovered_queue_source = "session_config" if queue else recovered_queue_source
     if not queue:
         return {
             "runtime_status": "idle",
@@ -11073,9 +11043,6 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         }
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue)]
-    if recovered_queue_source != "active_queue":
-        # Persist recovered rows immediately so future ticks no longer depend on run history.
-        _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
 
     # Legacy migration: if frontend/backend selected a budget session but older queue
     # rows have no session id, stamp the in-memory runtime rows before persisting.
@@ -11222,12 +11189,6 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
     events = []
     strategist_reason = []
-    if recovered_queue_source != "active_queue":
-        events.append({
-            "type": "SHADOW_QUEUE_RECOVERED",
-            "message": f"Shadow runtime recovered queue from {recovered_queue_source}; paper session can continue instead of staying NO_QUEUE.",
-        })
-        strategist_reason.append(f"Recovered Shadow queue from {recovered_queue_source} after active queue was empty.")
 
     def recycle_completed_shadow_cycle():
         """Recycle paper capital when a running session has completed all slots.
@@ -11483,86 +11444,6 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     }
 
 
-
-def _nexus_shadow_runtime_should_autotick(latest: dict, now_i: int | None = None) -> tuple[bool, dict]:
-    """Return whether a persisted Shadow runtime is due for a backend tick."""
-    now_i = int(now_i or now_ts())
-    if not isinstance(latest, dict):
-        return False, {}
-    if str(latest.get("status") or "").lower() != "running":
-        return False, {}
-    run = latest.get("run") if isinstance(latest.get("run"), dict) else {}
-    cfg = dict(run.get("config") if isinstance(run.get("config"), dict) else {})
-    runtime = latest.get("runtime") if isinstance(latest.get("runtime"), dict) else {}
-    tick_sec = int(_clamp_float(
-        runtime.get("tick_sec", cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300")))),
-        300, 30, 3600
-    ))
-    updated_ts = int(runtime.get("updated_ts") or run.get("updated_ts") or run.get("created_ts") or 0)
-    if updated_ts <= 0:
-        return True, cfg
-    return (now_i - updated_ts) >= max(30, tick_sec), cfg
-
-
-def _nexus_shadow_record_runtime_run(cur, wallet_address: str, result: dict, cfg: dict, action: str, source: str = "runtime_auto") -> dict:
-    """Persist a Shadow runtime result as a normal run row and return the run dict."""
-    run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
-    now_i = now_ts()
-    summary = {
-        "shadow_only": True,
-        "live_execution_triggered": False,
-        "status": "running" if action in ("start", "resume", "tick") else str(action or "completed"),
-        "runtime_status": result.get("runtime_status"),
-        "runtime": {
-            "status": result.get("runtime_status"),
-            "action": action,
-            "tick_sec": result.get("tick_sec"),
-            "active_count": result.get("active_count", 0),
-            "ready_count": result.get("ready_count", 0),
-            "simulated_exits": result.get("simulated_exits", 0),
-            "promoted": result.get("promoted", 0),
-            "strategist": result.get("strategist") or {},
-            "session_id": str((cfg or {}).get("session_id") or (cfg or {}).get("sessionId") or ""),
-            "chain": _normalize_chain_key((cfg or {}).get("chain") or (cfg or {}).get("chain_key") or (cfg or {}).get("network") or ""),
-            "updated_ts": now_i,
-        },
-        "readiness": "SHADOW_RUNTIME_ACTIVE" if result.get("runtime_status") == "running" else str(result.get("runtime_status") or "idle").upper(),
-        "message": "Shadow runtime backend tick updated paper execution state only. No Vault execution was triggered.",
-    }
-    cur.execute(
-        """
-        INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            run_id,
-            wallet_address,
-            "SHADOW",
-            source,
-            summary.get("status") or "running",
-            json.dumps(summary, ensure_ascii=False),
-            json.dumps(result.get("events") or [], ensure_ascii=False),
-            json.dumps(result.get("queue") or [], ensure_ascii=False),
-            json.dumps({**(cfg or {}), "action": action, "auto_tick": True}, ensure_ascii=False),
-            now_i,
-            now_i,
-        ),
-    )
-    _nexus_log_sim_event(
-        cur,
-        wallet_address,
-        "shadow_executor",
-        "SHADOW",
-        "SHADOW_RUNTIME_AUTO_TICK",
-        "",
-        summary.get("status") or "running",
-        "Shadow backend auto-tick advanced a running paper session during polling.",
-        {"run_id": run_id, "summary": summary, "shadow_state_changes": result.get("changed") or []},
-    )
-    cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wallet_address))
-    return _shadow_row_to_dict(cur.fetchone())
-
-
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
 def api_nexus_shadow_executor():
     wa, error_resp = _nexus_wallet_from_request()
@@ -11570,20 +11451,57 @@ def api_nexus_shadow_executor():
         return error_resp
 
     if request.method == "GET":
-        # GET is the normal UI polling path. If a Shadow runtime is marked RUNNING
-        # and its tick interval has passed, advance it here so the session does not
-        # freeze when the frontend does not send a separate POST tick.
         with DB_WRITE_LOCK:
             conn = _db()
             cur = conn.cursor()
+            ghost_cleanup = _nexus_shadow_prune_duplicate_chain_sessions(cur, wa)
             runtime = _nexus_shadow_latest_runtime(cur, wa)
-            auto_tick_run = None
-            should_tick, tick_cfg = _nexus_shadow_runtime_should_autotick(runtime, now_ts())
-            if should_tick:
-                runtime_result = _nexus_shadow_runtime_tick(cur, wa, tick_cfg, action="tick")
-                auto_tick_run = _nexus_shadow_record_runtime_run(cur, wa, runtime_result, tick_cfg, "tick", source="runtime_auto")
-                conn.commit()
-                runtime = _nexus_shadow_latest_runtime(cur, wa, tick_cfg)
+
+            # Backend-first auto tick: if Shadow is running and the browser polls this
+            # endpoint, advance exactly the latest running session config. Do not build
+            # recovery queues here; no queue means no queue, not a reason to invent one.
+            try:
+                run = runtime.get("run") if isinstance(runtime, dict) else None
+                cfg_auto = (run or {}).get("config") if isinstance((run or {}).get("config"), dict) else {}
+                rt = runtime.get("runtime") if isinstance(runtime.get("runtime"), dict) else {}
+                tick_sec_auto = int(_clamp_float(cfg_auto.get("tick_sec", cfg_auto.get("tickSec", rt.get("tick_sec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300")))), 300, 30, 3600))
+                updated_ts = int(rt.get("updated_ts") or (run or {}).get("updated_ts") or 0)
+                if str(runtime.get("status") or "").lower() == "running" and (now_ts() - updated_ts) >= tick_sec_auto:
+                    runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg_auto, action="tick")
+                    summary = {
+                        "shadow_only": True,
+                        "live_execution_triggered": False,
+                        "status": "running" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle"),
+                        "runtime_status": runtime_result.get("runtime_status"),
+                        "runtime": {
+                            "status": runtime_result.get("runtime_status"),
+                            "action": "auto_tick",
+                            "tick_sec": runtime_result.get("tick_sec"),
+                            "active_count": runtime_result.get("active_count", 0),
+                            "ready_count": runtime_result.get("ready_count", 0),
+                            "simulated_exits": runtime_result.get("simulated_exits", 0),
+                            "promoted": runtime_result.get("promoted", 0),
+                            "strategist": runtime_result.get("strategist") or {},
+                            "updated_ts": now_ts(),
+                        },
+                        "readiness": "SHADOW_RUNTIME_ACTIVE" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle").upper(),
+                        "message": "Shadow runtime auto-ticked from backend GET polling. No Vault execution was triggered.",
+                    }
+                    run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+                    cur.execute(
+                        """
+                        INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (run_id, wa, "SHADOW", "auto_tick", summary.get("status") or "running", json.dumps(summary, ensure_ascii=False), json.dumps(runtime_result.get("events") or [], ensure_ascii=False), json.dumps(runtime_result.get("queue") or [], ensure_ascii=False), json.dumps({**cfg_auto, "action": "auto_tick"}, ensure_ascii=False), now_ts(), now_ts()),
+                    )
+                    conn.commit()
+                    runtime = _nexus_shadow_latest_runtime(cur, wa)
+                elif ghost_cleanup.get("pruned"):
+                    conn.commit()
+            except Exception:
+                if ghost_cleanup.get("pruned"):
+                    conn.commit()
 
             cur.execute(
                 "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
@@ -11593,6 +11511,7 @@ def api_nexus_shadow_executor():
             execution = _nexus_execution_summary(cur, wa)
             cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
             hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+            runtime = _nexus_shadow_latest_runtime(cur, wa)
             conn.close()
         return jsonify({
             "status": "ok",
@@ -11601,12 +11520,11 @@ def api_nexus_shadow_executor():
             "live_execution_triggered": False,
             "runtime_status": runtime.get("status") or "idle",
             "runtime": runtime.get("runtime") or {},
-            "auto_tick": bool(auto_tick_run),
-            "auto_tick_run": auto_tick_run,
             "last_run": runs[0] if runs else None,
             "runs": runs,
             "execution": execution,
             "hold_state": hold_state,
+            "ghost_cleanup": ghost_cleanup,
             "ts": now_ts(),
         })
 
@@ -11625,14 +11543,25 @@ def api_nexus_shadow_executor():
         # Backend-first: an empty frontend queue must not override the persisted
         # wallet/session queue. Otherwise Shadow buttons look broken and Test can
         # clear/replace visible slots with an empty preview.
-        queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
+        raw_queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
+        # Critical: never seed/persist the full wallet queue for one selected session.
+        # Older builds mixed ETH/BNB/POL and created ghost same-chain queues. The selected
+        # session/chain scope must be applied before validation and before persistence.
+        queue = _nexus_shadow_filter_queue_for_cfg(raw_queue, cfg)
 
         if action in ("start", "tick", "pause", "resume", "stop"):
+            # Remove old ghost rows first. This is safe and prevents stopped duplicate
+            # sessions from coming back after refresh.
+            ghost_cleanup = _nexus_shadow_prune_duplicate_chain_sessions(cur, wa)
             if action in ("start", "resume"):
                 # First run the validator once so sparse frontend queues are persisted before runtime starts.
-                seed = _nexus_shadow_executor_simulate(queue, {**cfg, "persist_state": True}, hold_state)
-                _nexus_shadow_persist_queue_preview(cur, wa, seed.get("queue") or [])
+                # Only the selected session/chain queue is allowed to be persisted.
+                if queue:
+                    seed = _nexus_shadow_executor_simulate(queue, {**cfg, "persist_state": True}, hold_state)
+                    _nexus_shadow_persist_queue_preview(cur, wa, seed.get("queue") or [])
             runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
+            if ghost_cleanup.get("pruned"):
+                runtime_result.setdefault("events", []).insert(0, {"type": "SHADOW_GHOST_SESSION_PRUNED", "message": f"Removed {ghost_cleanup.get('pruned')} duplicate same-chain Shadow queue row(s)."})
             result = {
                 "summary": {
                     "shadow_only": True,
