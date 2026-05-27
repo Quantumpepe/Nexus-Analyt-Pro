@@ -10781,7 +10781,9 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             "shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts",
             "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy",
             "paper_entry_price", "paper_mark_price", "paper_exit_price", "paper_pnl_pct",
-            "paper_pnl_usd", "paper_pnl_total_usd", "paper_quantity", "paper_position_usd",
+            "paper_pnl_usd", "paper_pnl_total_usd", "paper_realized_total_usd",
+            "paper_collected_profit_usd", "paper_recycled_until_total_usd",
+            "paper_quantity", "paper_position_usd", "paper_entry_ts",
         ]:
             if item.get(mk) is not None:
                 meta[mk] = item.get(mk)
@@ -11119,6 +11121,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["paper_exit_price"] = round(mark, 10)
             realized_total = round(realized_total + pnl_usd, 4)
             meta["paper_realized_total_usd"] = realized_total
+            meta["paper_collected_profit_usd"] = realized_total
             meta["paper_pnl_total_usd"] = realized_total
         else:
             meta["paper_pnl_total_usd"] = round(realized_total + pnl_usd, 4)
@@ -11131,6 +11134,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["paper_pnl_pct"] = meta.get("paper_pnl_pct")
         item["paper_pnl_usd"] = meta.get("paper_pnl_usd")
         item["paper_pnl_total_usd"] = meta.get("paper_pnl_total_usd")
+        item["paper_realized_total_usd"] = meta.get("paper_realized_total_usd")
+        item["paper_collected_profit_usd"] = meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd"))
         item["paper_quantity"] = meta.get("paper_quantity")
         item["paper_position_usd"] = meta.get("paper_position_usd")
         set_meta(item, meta)
@@ -11190,10 +11195,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         """Recycle paper capital when a running session has completed all slots.
 
         A professional Shadow session must not stop at SIMULATED_EXIT. Once every
-        slot is exited, realized paper PnL is added to the session capital, the
-        capital is redistributed across the same slots, and a new cycle begins.
-        The cumulative realized PnL stays visible in meta while per-cycle PnL is
-        reset to zero for the new paper positions.
+        slot is exited, only the originally released capital is recycled into the
+        next paper cycle. Realized profit is collected separately and must not be
+        auto-compounded. The cumulative realized PnL stays visible in meta while
+        per-cycle PnL is reset to zero for the new paper positions.
         """
         if not normalized:
             return False
