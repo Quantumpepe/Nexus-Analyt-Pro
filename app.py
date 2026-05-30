@@ -10070,9 +10070,28 @@ def _nexus_queue_row_to_dict(row) -> dict:
         "recheck_after_ts": row["recheck_after_ts"], "expires_ts": row["expires_ts"],
         "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
     }
-    for mk in ["paper_entry_price", "paper_mark_price", "paper_exit_price", "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd", "paper_quantity", "paper_position_usd"]:
+    for mk in [
+        "paper_entry_price", "paper_mark_price", "paper_exit_price",
+        "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd",
+        "paper_cycle_realized_usd",
+        "paper_realized_total_usd", "paper_collected_profit_usd",
+        "collected_profit_usd", "realized_profit_usd",
+        "paper_recycled_until_total_usd",
+        "paper_quantity", "paper_position_usd",
+    ]:
         if meta.get(mk) is not None:
             out[mk] = meta.get(mk)
+
+    # Session/UI aggregation must be able to read protected profit without
+    # digging through meta_json. Keep top-level aliases in sync.
+    collected = _clamp_float(
+        meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd", meta.get("collected_profit_usd", 0))),
+        0, -1_000_000_000, 1_000_000_000
+    )
+    out["paper_collected_profit_usd"] = collected
+    out["paper_realized_total_usd"] = _clamp_float(meta.get("paper_realized_total_usd", collected), 0, -1_000_000_000, 1_000_000_000)
+    out["collected_profit_usd"] = collected
+    out["realized_profit_usd"] = collected
     return out
 
 def _nexus_reservation_row_to_dict(row) -> dict:
@@ -10152,9 +10171,30 @@ def _nexus_execution_summary(cur, wallet_address):
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE wallet_address=? AND state IN ('RESERVED','HOLD','OBSERVE','RELEASE_REQUIRED') ORDER BY updated_ts DESC", (wallet_address,))
     reservations = [_nexus_reservation_row_to_dict(r) for r in cur.fetchall()]
     due_count = len([q for q in queue if not q.get("recheck_after_ts") or int(q.get("recheck_after_ts") or 0) <= now_ts()])
+
+    # Aggregate protected/collected profit per session and globally for the UI.
+    # Important: this is read-only aggregation; it does not change runtime logic.
+    session_profit = {}
+    for q in queue:
+        meta = q.get("meta") if isinstance(q.get("meta"), dict) else {}
+        sid = str(q.get("session_id") or meta.get("session_id") or meta.get("trade_session_id") or "NO_SESSION").strip() or "NO_SESSION"
+        chain = _normalize_chain_key(q.get("chain") or meta.get("chain") or "")
+        asset = str(q.get("asset") or q.get("symbol") or meta.get("asset") or chain or "ASSET").upper()
+        key = f"{sid}::{asset or chain or 'ASSET'}"
+        profit = _clamp_float(
+            q.get("paper_collected_profit_usd", meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd", 0))),
+            0, -1_000_000_000, 1_000_000_000
+        )
+        session_profit[key] = round(session_profit.get(key, 0.0) + profit, 4)
+
+    total_collected_profit = round(sum(session_profit.values()), 4)
+
     return {
         "queue": queue, "reservations": reservations,
         "reserved_capital_usd": round(sum(float(r.get("amount_usd") or 0) for r in reservations), 2),
+        "collected_profit_usd": total_collected_profit,
+        "paper_collected_profit_usd": total_collected_profit,
+        "session_collected_profit_usd": session_profit,
         "recheck_due_count": due_count, "queue_count": len(queue),
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
@@ -10922,8 +10962,10 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             "shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts",
             "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy",
             "paper_entry_price", "paper_mark_price", "paper_exit_price", "paper_pnl_pct",
-            "paper_pnl_usd", "paper_pnl_total_usd", "paper_realized_total_usd",
-            "paper_collected_profit_usd", "paper_recycled_until_total_usd",
+            "paper_pnl_usd", "paper_pnl_total_usd", "paper_cycle_realized_usd",
+            "paper_realized_total_usd", "paper_collected_profit_usd",
+            "collected_profit_usd", "realized_profit_usd",
+            "paper_recycled_until_total_usd",
             "paper_quantity", "paper_position_usd", "paper_entry_ts",
         ]:
             if item.get(mk) is not None:
@@ -11268,6 +11310,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             cycle_realized = round(cycle_realized + pnl_usd, 4)
             meta["paper_realized_total_usd"] = realized_total
             meta["paper_collected_profit_usd"] = realized_total
+            meta["collected_profit_usd"] = realized_total
+            meta["realized_profit_usd"] = realized_total
             meta["paper_cycle_realized_usd"] = cycle_realized
             meta["paper_pnl_total_usd"] = cycle_realized
         else:
@@ -11284,6 +11328,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["paper_cycle_realized_usd"] = meta.get("paper_cycle_realized_usd")
         item["paper_realized_total_usd"] = meta.get("paper_realized_total_usd")
         item["paper_collected_profit_usd"] = meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd"))
+        item["collected_profit_usd"] = meta.get("collected_profit_usd", meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd")))
+        item["realized_profit_usd"] = meta.get("realized_profit_usd", meta.get("paper_realized_total_usd"))
         item["paper_quantity"] = meta.get("paper_quantity")
         item["paper_position_usd"] = meta.get("paper_position_usd")
         set_meta(item, meta)
@@ -11429,6 +11475,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["paper_pnl_total_usd"] = 0
             meta["paper_realized_total_usd"] = round(realized_total, 4)
             meta["paper_collected_profit_usd"] = round(realized_total, 4)
+            meta["collected_profit_usd"] = round(realized_total, 4)
+            meta["realized_profit_usd"] = round(realized_total, 4)
             meta["paper_recycled_until_total_usd"] = round(realized_total, 4)
             meta["paper_entry_ts"] = ts
             meta["shadow_cycle_recycled_ts"] = ts
@@ -11443,6 +11491,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             item["paper_cycle_realized_usd"] = meta["paper_cycle_realized_usd"]
             item["paper_realized_total_usd"] = meta["paper_realized_total_usd"]
             item["paper_collected_profit_usd"] = meta["paper_collected_profit_usd"]
+            item["collected_profit_usd"] = meta["collected_profit_usd"]
+            item["realized_profit_usd"] = meta["realized_profit_usd"]
             item["paper_position_usd"] = next_amount
             item["paper_quantity"] = meta["paper_quantity"]
             set_meta(item, meta)
