@@ -11111,7 +11111,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         mark = entry * (1 + drift_pct / 100.0)
         qty = amount / entry if entry > 0 else 0
         pnl_usd = amount * (drift_pct / 100.0)
-        realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
+        # Cumulative realized profit is the protected/collected account.
+        # paper_pnl_total_usd must stay cycle-local for the UI; otherwise old
+        # profits keep appearing inside the next run after a restart.
+        realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_collected_profit_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
+        cycle_realized = _clamp_float(meta.get("paper_cycle_realized_usd", 0), 0, -1_000_000_000, 1_000_000_000)
         meta["paper_position_usd"] = round(amount, 2)
         meta["paper_quantity"] = round(qty, 10)
         meta["paper_mark_price"] = round(mark, 10)
@@ -11120,11 +11124,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if force_exit:
             meta["paper_exit_price"] = round(mark, 10)
             realized_total = round(realized_total + pnl_usd, 4)
+            cycle_realized = round(cycle_realized + pnl_usd, 4)
             meta["paper_realized_total_usd"] = realized_total
             meta["paper_collected_profit_usd"] = realized_total
-            meta["paper_pnl_total_usd"] = realized_total
+            meta["paper_cycle_realized_usd"] = cycle_realized
+            meta["paper_pnl_total_usd"] = cycle_realized
         else:
-            meta["paper_pnl_total_usd"] = round(realized_total + pnl_usd, 4)
+            meta["paper_pnl_total_usd"] = round(cycle_realized + pnl_usd, 4)
         item["amountUsd"] = amount
         item["amount_usd"] = amount
         item["reserved_capital_usd"] = amount
@@ -11134,6 +11140,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["paper_pnl_pct"] = meta.get("paper_pnl_pct")
         item["paper_pnl_usd"] = meta.get("paper_pnl_usd")
         item["paper_pnl_total_usd"] = meta.get("paper_pnl_total_usd")
+        item["paper_cycle_realized_usd"] = meta.get("paper_cycle_realized_usd")
         item["paper_realized_total_usd"] = meta.get("paper_realized_total_usd")
         item["paper_collected_profit_usd"] = meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd"))
         item["paper_quantity"] = meta.get("paper_quantity")
@@ -11275,7 +11282,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta.pop("paper_exit_price", None)
             meta["paper_pnl_pct"] = 0
             meta["paper_pnl_usd"] = 0
-            meta["paper_pnl_total_usd"] = round(realized_total, 4)
+            # New cycle starts visually at zero. The protected cumulative profit
+            # stays in paper_realized_total_usd / paper_collected_profit_usd.
+            meta["paper_cycle_realized_usd"] = 0
+            meta["paper_pnl_total_usd"] = 0
             meta["paper_realized_total_usd"] = round(realized_total, 4)
             meta["paper_collected_profit_usd"] = round(realized_total, 4)
             meta["paper_recycled_until_total_usd"] = round(realized_total, 4)
@@ -11289,6 +11299,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             item["paper_pnl_pct"] = 0
             item["paper_pnl_usd"] = 0
             item["paper_pnl_total_usd"] = meta["paper_pnl_total_usd"]
+            item["paper_cycle_realized_usd"] = meta["paper_cycle_realized_usd"]
+            item["paper_realized_total_usd"] = meta["paper_realized_total_usd"]
+            item["paper_collected_profit_usd"] = meta["paper_collected_profit_usd"]
             item["paper_position_usd"] = next_amount
             item["paper_quantity"] = meta["paper_quantity"]
             set_meta(item, meta)
