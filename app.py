@@ -723,6 +723,54 @@ def _safe_float(v, default: float = 0.0) -> float:
     return float(default)
 
 
+def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | None = None) -> dict:
+    """Estimated Shadow execution costs for a complete paper roundtrip.
+
+    Shadow remains paper-only, but collected profit should behave closer to live:
+    gross PnL - estimated gas - estimated DEX fee - estimated slippage = net PnL.
+    These are conservative estimates and can later be replaced by router quotes.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    amt = max(0.0, _safe_float(amount_usd, 0.0))
+    ck = _normalize_chain_key(chain or cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+
+    default_gas = {"ETH": 3.00, "BNB": 0.15, "POL": 0.05}
+    gas_usd = _safe_float(
+        cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.50))))),
+        default_gas.get(ck, 0.50),
+    )
+
+    # Roundtrip DEX fee. Default 60 bps = 0.30% entry + 0.30% exit.
+    dex_fee_bps = _safe_float(
+        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "60"))),
+        60.0,
+    )
+
+    # Estimate practical slippage as a fraction of the user's max slippage tolerance.
+    # This keeps the Strategist usable while avoiding unrealistic gross-only results.
+    max_slip_pct = _safe_float(
+        cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", cfg.get("slippage_pct", cfg.get("slippage", 1.2)))),
+        1.2,
+    )
+    slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.35"), 0.35)
+    slippage_bps = max(0.0, min(300.0, max_slip_pct * 100.0 * slip_factor))
+
+    dex_fee_usd = amt * (dex_fee_bps / 10000.0)
+    slippage_usd = amt * (slippage_bps / 10000.0)
+    total = max(0.0, gas_usd + dex_fee_usd + slippage_usd)
+    return {
+        "chain": ck,
+        "notional_usd": round(amt, 4),
+        "gas_usd": round(gas_usd, 4),
+        "dex_fee_bps": round(dex_fee_bps, 4),
+        "dex_fee_usd": round(dex_fee_usd, 4),
+        "slippage_bps": round(slippage_bps, 4),
+        "slippage_usd": round(slippage_usd, 4),
+        "total_cost_usd": round(total, 4),
+        "model": "shadow_estimated_roundtrip_costs_v1",
+    }
+
+
 def _classify_market_condition(oe_pct: float, rvol: float) -> dict:
     """Classify OE + RVOL into an AI-ready market condition state."""
     oe = _safe_float(oe_pct)
@@ -10073,6 +10121,9 @@ def _nexus_queue_row_to_dict(row) -> dict:
     for mk in [
         "paper_entry_price", "paper_mark_price", "paper_exit_price",
         "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd",
+        "paper_gross_pnl_usd", "paper_net_pnl_usd",
+        "paper_estimated_costs_usd", "paper_estimated_gas_usd",
+        "paper_estimated_dex_fee_usd", "paper_estimated_slippage_usd",
         "paper_cycle_realized_usd",
         "paper_realized_total_usd", "paper_collected_profit_usd",
         "collected_profit_usd", "realized_profit_usd",
@@ -11406,8 +11457,23 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["paper_pnl_usd"] = round(pnl_usd, 4)
         if force_exit:
             meta["paper_exit_price"] = round(mark, 10)
-            realized_total = round(realized_total + pnl_usd, 4)
-            cycle_realized = round(cycle_realized + pnl_usd, 4)
+            cost = _nexus_shadow_cost_model(amount, item.get("chain") or meta.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
+            total_cost = _clamp_float(cost.get("total_cost_usd"), 0, 0, 1_000_000_000)
+            gross_pnl_usd = round(pnl_usd, 4)
+            net_pnl_usd = round(pnl_usd - total_cost, 4)
+
+            realized_total = round(realized_total + net_pnl_usd, 4)
+            cycle_realized = round(cycle_realized + net_pnl_usd, 4)
+
+            meta["paper_gross_pnl_usd"] = gross_pnl_usd
+            meta["paper_net_pnl_usd"] = net_pnl_usd
+            meta["paper_estimated_costs_usd"] = round(total_cost, 4)
+            meta["paper_estimated_gas_usd"] = cost.get("gas_usd", 0)
+            meta["paper_estimated_dex_fee_usd"] = cost.get("dex_fee_usd", 0)
+            meta["paper_estimated_slippage_usd"] = cost.get("slippage_usd", 0)
+            meta["paper_cost_model"] = cost
+
+            # Collected Profit is net profit after estimated live-like costs.
             meta["paper_realized_total_usd"] = realized_total
             meta["paper_collected_profit_usd"] = realized_total
             meta["collected_profit_usd"] = realized_total
@@ -11415,6 +11481,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["paper_cycle_realized_usd"] = cycle_realized
             meta["paper_pnl_total_usd"] = cycle_realized
         else:
+            # During an open paper position, show gross unrealized PnL only.
+            # Costs are applied once on SIMULATED_EXIT to avoid double counting.
+            meta["paper_gross_pnl_usd"] = round(pnl_usd, 4)
+            meta["paper_net_pnl_usd"] = None
+            meta["paper_estimated_costs_usd"] = 0
             meta["paper_pnl_total_usd"] = round(cycle_realized + pnl_usd, 4)
         item["amountUsd"] = amount
         item["amount_usd"] = amount
@@ -11426,6 +11497,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["paper_pnl_usd"] = meta.get("paper_pnl_usd")
         item["paper_pnl_total_usd"] = meta.get("paper_pnl_total_usd")
         item["paper_cycle_realized_usd"] = meta.get("paper_cycle_realized_usd")
+        item["paper_gross_pnl_usd"] = meta.get("paper_gross_pnl_usd")
+        item["paper_net_pnl_usd"] = meta.get("paper_net_pnl_usd")
+        item["paper_estimated_costs_usd"] = meta.get("paper_estimated_costs_usd")
+        item["paper_estimated_gas_usd"] = meta.get("paper_estimated_gas_usd")
+        item["paper_estimated_dex_fee_usd"] = meta.get("paper_estimated_dex_fee_usd")
+        item["paper_estimated_slippage_usd"] = meta.get("paper_estimated_slippage_usd")
         item["paper_realized_total_usd"] = meta.get("paper_realized_total_usd")
         item["paper_collected_profit_usd"] = meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd"))
         item["collected_profit_usd"] = meta.get("collected_profit_usd", meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd")))
@@ -11714,6 +11791,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             # stays in paper_realized_total_usd / paper_collected_profit_usd.
             meta["paper_cycle_realized_usd"] = 0
             meta["paper_pnl_total_usd"] = 0
+            meta["paper_gross_pnl_usd"] = 0
+            meta["paper_net_pnl_usd"] = 0
+            meta["paper_estimated_costs_usd"] = 0
+            meta["paper_estimated_gas_usd"] = 0
+            meta["paper_estimated_dex_fee_usd"] = 0
+            meta["paper_estimated_slippage_usd"] = 0
             meta["paper_realized_total_usd"] = round(realized_total, 4)
             meta["paper_collected_profit_usd"] = round(realized_total, 4)
             meta["collected_profit_usd"] = round(realized_total, 4)
@@ -11735,6 +11818,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             item["paper_pnl_usd"] = 0
             item["paper_pnl_total_usd"] = meta["paper_pnl_total_usd"]
             item["paper_cycle_realized_usd"] = meta["paper_cycle_realized_usd"]
+            item["paper_gross_pnl_usd"] = meta["paper_gross_pnl_usd"]
+            item["paper_net_pnl_usd"] = meta["paper_net_pnl_usd"]
+            item["paper_estimated_costs_usd"] = meta["paper_estimated_costs_usd"]
+            item["paper_estimated_gas_usd"] = meta["paper_estimated_gas_usd"]
+            item["paper_estimated_dex_fee_usd"] = meta["paper_estimated_dex_fee_usd"]
+            item["paper_estimated_slippage_usd"] = meta["paper_estimated_slippage_usd"]
             item["paper_realized_total_usd"] = meta["paper_realized_total_usd"]
             item["paper_collected_profit_usd"] = meta["paper_collected_profit_usd"]
             item["collected_profit_usd"] = meta["collected_profit_usd"]
