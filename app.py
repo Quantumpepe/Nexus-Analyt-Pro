@@ -10402,7 +10402,20 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         body.get("reuse_profit_pct", body.get("profit_reuse_pct", body.get("reuseProfitPct", body.get("profitReusePct", meta.get("reuse_profit_pct", meta.get("profit_reuse_pct", 0)))))),
         0, 0, 100
     )
-    meta = {**meta, "reuse_profit_pct": reuse_profit_pct, "profit_reuse_pct": reuse_profit_pct}
+    # User-controlled slot capital rotation cap. Default 0 means no slot combination.
+    max_combined_slots = int(_clamp_float(
+        body.get("max_combined_slots", body.get("maxCombinedSlots", body.get("slot_donor_cap", body.get("slotDonorCap", meta.get("max_combined_slots", meta.get("slot_donor_cap", 0)))))),
+        0, 0, 3
+    ))
+    meta = {
+        **meta,
+        "reuse_profit_pct": reuse_profit_pct,
+        "profit_reuse_pct": reuse_profit_pct,
+        "max_combined_slots": max_combined_slots,
+        "maxCombinedSlots": max_combined_slots,
+        "slot_donor_cap": max_combined_slots,
+        "slotDonorCap": max_combined_slots,
+    }
     confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
