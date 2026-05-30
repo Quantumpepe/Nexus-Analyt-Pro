@@ -11558,19 +11558,137 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 reuse_profit_pct = max(reuse_profit_pct, _clamp_float(_m.get("reuse_profit_pct", _m.get("profit_reuse_pct", 0)), 0, 0, 100))
         reusable_profit = max(0.0, fresh_realized_delta) * (reuse_profit_pct / 100.0)
         next_total = max(0.01, base_total + reusable_profit)
-        weights = []
+
+        sorted_rows = sorted(scored, key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
+        active_idx = {r["idx"] for r in sorted_rows[:max_active]}
+        ready_idx = {r["idx"] for r in sorted_rows[max_active:max_active + max(0, ready_slots_target)]}
+
+        # Intra-session capital rotation:
+        # The user-approved session budget remains the hard ceiling. The Strategist may
+        # redistribute that budget between slots at cycle restart when some slots show
+        # stronger quality/performance. This is NOT Vault rebalancing and does not move
+        # capital between chains/sessions. Safety rule: one slot can only receive the
+        # equivalent of a limited number of other slots, so no single slot can absorb
+        # the whole session budget.
+        base_amounts = []
         for item in normalized:
             meta = get_meta(item)
             amount = _clamp_float(
                 item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))),
                 0, 0, 1_000_000_000
             )
-            weights.append(amount if amount > 0 else 1.0)
-        weight_sum = sum(weights) if sum(weights) > 0 else float(len(normalized) or 1)
+            base_amounts.append(amount if amount > 0 else 1.0)
 
-        sorted_rows = sorted(scored, key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
-        active_idx = {r["idx"] for r in sorted_rows[:max_active]}
-        ready_idx = {r["idx"] for r in sorted_rows[max_active:max_active + max(0, ready_slots_target)]}
+        def _shadow_dynamic_slot_weights():
+            n = len(normalized)
+            if n <= 1:
+                return list(base_amounts), "single_slot_no_rotation", 0
+
+            risk_mode_raw = str(
+                cfg.get("risk_mode")
+                or cfg.get("riskMode")
+                or cfg.get("mode")
+                or cfg.get("runtime_mode")
+                or "BALANCED"
+            ).upper()
+            # User-controlled safety: this is the maximum donor count a single
+            # target slot can effectively receive. Risk mode may suggest a UI default,
+            # but the backend must respect the user/session permission first.
+            suggested_donor_slots = 3 if "DYNAMIC" in risk_mode_raw else 1 if "DEFENSIVE" in risk_mode_raw else 2
+            max_donor_slots = int(_clamp_float(
+                cfg.get("max_combined_slots", cfg.get("maxCombinedSlots", cfg.get("slot_donor_cap", cfg.get("slotDonorCap", suggested_donor_slots)))),
+                suggested_donor_slots, 0, 3
+            ))
+
+            # Only rotate capital when there is a real quality edge. Otherwise keep the
+            # user's original slot split intact.
+            top_quality = max((_clamp_float(r.get("quality"), 0, -100, 100) for r in scored), default=0.0)
+            avg_quality = sum(_clamp_float(r.get("quality"), 0, -100, 100) for r in scored) / max(1, len(scored))
+            quality_spread = top_quality - avg_quality
+            if top_quality < 42 or quality_spread < 6:
+                return list(base_amounts), "flat_split_no_clear_edge", max_donor_slots
+
+            score_by_idx = {int(r["idx"]): r for r in scored}
+            raw_weights = []
+            for idx, item in enumerate(normalized):
+                meta = get_meta(item)
+                row = score_by_idx.get(idx, {})
+                q = _clamp_float(row.get("quality"), 0, -100, 100)
+                conf = _clamp_float(row.get("confidence"), 0, 0, 100)
+                risk = _clamp_float(row.get("risk"), 0, 0, 100)
+                cycle_profit = _clamp_float(meta.get("paper_cycle_realized_usd", meta.get("paper_pnl_total_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
+                base_amt = max(0.01, float(base_amounts[idx]))
+                perf_pct = (cycle_profit / base_amt) * 100.0 if base_amt > 0 else 0.0
+
+                # Positive quality/confidence and recent slot performance increase allocation;
+                # risk decreases it. Keep the multiplier bounded to avoid hidden leverage.
+                quality_boost = max(0.0, (q - 40.0) / 60.0)
+                confidence_boost = max(0.0, (conf - 45.0) / 55.0) * 0.35
+                perf_boost = max(0.0, min(2.5, perf_pct)) * 0.18
+                risk_penalty = max(0.0, (risk - 25.0) / 75.0) * 0.65
+                multiplier = 1.0 + quality_boost + confidence_boost + perf_boost - risk_penalty
+                raw_weights.append(max(0.10, min(3.0 + max_donor_slots * 0.15, multiplier)) * base_amt)
+
+            # Cap: own base + at most N donor slots. This implements the safety idea
+            # that one slot may combine with only 2-3 other slots, never the full session.
+            sorted_base_desc = sorted([max(0.0, x) for x in base_amounts], reverse=True)
+            caps = []
+            for idx, own in enumerate(base_amounts):
+                donors = []
+                own_consumed = False
+                for val in sorted_base_desc:
+                    if not own_consumed and abs(val - own) <= 1e-9:
+                        own_consumed = True
+                        continue
+                    donors.append(val)
+                    if len(donors) >= max_donor_slots:
+                        break
+                caps.append(max(0.01, own + sum(donors)))
+
+            # Keep a small floor per slot so WAIT/READY candidates do not disappear.
+            floors = [max(1.0, amt * 0.12) for amt in base_amounts]
+
+            def _fit_allocations(raw, total, caps_, floors_):
+                alloc = [max(floors_[i], min(caps_[i], raw[i])) for i in range(len(raw))]
+                if sum(alloc) <= 0:
+                    return list(base_amounts)
+                # Iteratively scale the uncapped part to match the total while respecting floors/caps.
+                for _ in range(12):
+                    current = sum(alloc)
+                    if abs(current - total) <= 0.01:
+                        break
+                    if current < total:
+                        room_idx = [i for i in range(len(alloc)) if alloc[i] < caps_[i] - 0.01]
+                        room = sum(max(0.0, caps_[i] - alloc[i]) for i in room_idx)
+                        if room <= 0:
+                            break
+                        add = min(total - current, room)
+                        raw_room = sum(max(0.01, raw[i]) for i in room_idx)
+                        for i in room_idx:
+                            share = max(0.01, raw[i]) / raw_room if raw_room > 0 else 1.0 / len(room_idx)
+                            alloc[i] = min(caps_[i], alloc[i] + add * share)
+                    else:
+                        reducible_idx = [i for i in range(len(alloc)) if alloc[i] > floors_[i] + 0.01]
+                        reducible = sum(max(0.0, alloc[i] - floors_[i]) for i in reducible_idx)
+                        if reducible <= 0:
+                            break
+                        cut = min(current - total, reducible)
+                        for i in reducible_idx:
+                            share = max(0.0, alloc[i] - floors_[i]) / reducible if reducible > 0 else 1.0 / len(reducible_idx)
+                            alloc[i] = max(floors_[i], alloc[i] - cut * share)
+                # Final tiny rounding adjustment to keep total stable.
+                diff = total - sum(alloc)
+                if abs(diff) > 0.01 and alloc:
+                    best = max(range(len(alloc)), key=lambda i: caps_[i] - alloc[i] if diff > 0 else alloc[i] - floors_[i])
+                    alloc[best] = max(floors_[best], min(caps_[best], alloc[best] + diff))
+                return [round(max(0.01, x), 2) for x in alloc]
+
+            fitted = _fit_allocations(raw_weights, next_total, caps, floors)
+            changed = any(abs(float(fitted[i]) - float(base_amounts[i])) >= 0.50 for i in range(n))
+            return fitted if changed else list(base_amounts), "dynamic_slot_capital_rotation" if changed else "flat_split_rotation_not_needed", max_donor_slots
+
+        next_amounts, rotation_mode, rotation_donor_cap = _shadow_dynamic_slot_weights()
+        weight_sum = sum(next_amounts) if sum(next_amounts) > 0 else float(len(normalized) or 1)
 
         for idx, item in enumerate(normalized):
             meta = get_meta(item)
@@ -11578,7 +11696,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)),
                 0, -1_000_000_000, 1_000_000_000
             )
-            next_amount = round(next_total * (weights[idx] / weight_sum), 2)
+            next_amount = round(float(next_amounts[idx]) if idx < len(next_amounts) else next_total * (1.0 / max(1, len(normalized))), 2)
             item["amountUsd"] = next_amount
             item["amount_usd"] = next_amount
             item["reserved_capital_usd"] = next_amount
@@ -11606,8 +11724,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["shadow_runtime_status"] = "running"
             meta["reuse_profit_pct"] = round(reuse_profit_pct, 4)
             meta["profit_reuse_pct"] = round(reuse_profit_pct, 4)
-            meta["paper_reused_profit_usd"] = round(reusable_profit * (weights[idx] / weight_sum), 4) if weight_sum > 0 else 0
-            meta["shadow_strategy"] = "controlled_profit_reuse" if reuse_profit_pct > 0 else "fixed_released_capital_profit_collected"
+            meta["paper_reused_profit_usd"] = round(reusable_profit * (next_amount / max(0.01, next_total)), 4) if next_total > 0 else 0
+            meta["shadow_slot_allocation_mode"] = rotation_mode
+            meta["shadow_slot_rotation_donor_cap"] = int(rotation_donor_cap)
+            meta["shadow_strategy"] = "controlled_profit_reuse_with_slot_rotation" if reuse_profit_pct > 0 else "fixed_released_capital_with_slot_rotation"
             item["paper_entry_price"] = meta["paper_entry_price"]
             item["paper_mark_price"] = meta["paper_mark_price"]
             item["paper_exit_price"] = None
@@ -11622,6 +11742,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             item["reuse_profit_pct"] = meta["reuse_profit_pct"]
             item["profit_reuse_pct"] = meta["profit_reuse_pct"]
             item["paper_reused_profit_usd"] = meta["paper_reused_profit_usd"]
+            item["shadow_slot_allocation_mode"] = meta["shadow_slot_allocation_mode"]
+            item["shadow_slot_rotation_donor_cap"] = meta["shadow_slot_rotation_donor_cap"]
             item["paper_position_usd"] = next_amount
             item["paper_quantity"] = meta["paper_quantity"]
             set_meta(item, meta)
@@ -11633,7 +11755,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             else:
                 events.append(set_state(item, "WAIT", "Shadow restarted with released capital only; slot waits for a cleaner edge.", "SHADOW_CAPITAL_RECYCLED"))
 
-        strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total).")
+        strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total). Slot allocation: {rotation_mode}, donor cap {rotation_donor_cap}.")
         return True
 
     cycle_recycled = recycle_completed_shadow_cycle()
