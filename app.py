@@ -10031,7 +10031,7 @@ def api_nexus_trading_hold_state():
 # -------------------------
 # Nexus Execution Preparation Layer
 # -------------------------
-_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
+_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PAUSED","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
 
 def _nexus_json_load(value, fallback):
     try:
@@ -10287,6 +10287,9 @@ def _nexus_recheck_apply(cur, wallet_address):
         new_state = str(decision.get("next_status") or decision.get("state") or old_state).upper()
         reason = "; ".join(decision.get("reasons") or []) or item.get("reason") or "Scheduled Strategist recheck"
 
+        if old_state == "PAUSED":
+            # Expired/user-paused sessions are authoritative. Recheck must not revive them.
+            continue
         if quality.get("hard_block"):
             new_state = "BLOCKED"
             reason = "Shadow recheck blocked this slot because security/liquidity/slippage rules failed."
@@ -11195,6 +11198,97 @@ def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain:
         _nexus_log_sim_event(cur, wallet_address, sid or ch_filter, ch_filter, "SESSION_STOPPED", "ACTIVE", "STOPPED", "User stopped selected Trading/Shadow session; active queue rows removed and runtime recovery blocked.", {"session_id": sid, "chain": ch_filter, "deleted_queue_rows": len(ids)})
     return len(ids)
 
+
+def _nexus_session_expiry_ts_from_queue(queue: list, cfg: dict, now_i: int) -> int | None:
+    """Return the authoritative session expiry timestamp (seconds) for a Shadow session.
+
+    Priority:
+      1) explicit queue expires_ts / meta session_expires_ts
+      2) config expires_ts / session_expires_ts
+      3) earliest slot/session start + runtime_hours
+
+    This keeps the user-defined runtime as the hard autonomy window.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    candidates = []
+
+    def _to_sec(v):
+        try:
+            if v is None or str(v).strip() == "":
+                return None
+            n = float(v)
+            if not math.isfinite(n) or n <= 0:
+                return None
+            # frontend Date.now() values may arrive in ms
+            if n > 10_000_000_000:
+                n = n / 1000.0
+            return int(n)
+        except Exception:
+            return None
+
+    for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
+        vv = _to_sec(cfg.get(k))
+        if vv:
+            candidates.append(vv)
+
+    starts = []
+    for item in queue if isinstance(queue, list) else []:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
+            vv = _to_sec(item.get(k) if k in item else meta.get(k))
+            if vv:
+                candidates.append(vv)
+        for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts", "createdAt", "startedAt"):
+            vv = _to_sec(item.get(k) if k in item else meta.get(k))
+            if vv:
+                starts.append(vv)
+
+    if candidates:
+        # All slots in one selected session should share the same expiry. Use the earliest
+        # valid expiry as the safety boundary.
+        return min(candidates)
+
+    runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
+    if starts:
+        return int(min(starts) + runtime_hours * 3600)
+    return None
+
+
+def _nexus_shadow_expire_selected_session(cur, wallet_address: str, normalized: list, cfg: dict, expires_ts: int, now_i: int) -> list:
+    """Pause all slots of the selected expired session and persist the decision.
+
+    Expiry is not deletion. The session stays visible, collected profit stays visible,
+    but the Strategist cannot create new ACTIVE/READY entries until the user starts or
+    extends a new permission window.
+    """
+    changed = []
+    for item in normalized if isinstance(normalized, list) else []:
+        old = str(item.get("status") or item.get("state") or "WAIT").upper()
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        item["status"] = item["state"] = "PAUSED"
+        item["reason"] = "Session runtime expired; Strategist paused and cannot open new trades until user extends/starts a new session."
+        item["session_expired"] = True
+        item["session_expires_ts"] = int(expires_ts or 0)
+        meta["session_status"] = "PAUSED"
+        meta["runtime_status"] = "PAUSED"
+        meta["session_expired"] = True
+        meta["session_expired_ts"] = int(now_i)
+        meta["session_expires_ts"] = int(expires_ts or 0)
+        meta["pause_reason"] = "SESSION_EXPIRED"
+        meta["shadow_runtime_status"] = "paused"
+        item["meta"] = meta
+        item["shadow_transition"] = {"from": old, "to": "PAUSED", "reason": item["reason"]}
+        changed.append({"slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": "PAUSED", "reason": item["reason"]})
+
+    _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+    try:
+        sid = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
+        chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+        _nexus_log_sim_event(cur, wallet_address, sid or chain, chain, "SESSION_EXPIRED_PAUSED", "RUNNING", "PAUSED", "Session runtime expired; Strategist paused automatically.", {"session_id": sid, "chain": chain, "expires_ts": expires_ts, "changed": len(changed)})
+    except Exception:
+        pass
+    return changed
+
 def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
     """Backend-first Strategist-controlled Shadow runtime.
 
@@ -11369,6 +11463,20 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     latest = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
     if action == "tick" and latest.get("status") == "paused":
         return {"runtime_status": "paused", "events": [{"type": "SHADOW_PAUSED", "message": "Shadow runtime is paused."}], "queue": normalized, "changed": [], "strategist": {"status": "paused"}}
+
+    # Hard session-autonomy window: after expiry, the Strategist must not open new
+    # trades, re-enter slots, recycle cycles, or rebalance. It pauses the selected
+    # session visibly instead of deleting it.
+    expires_ts = _nexus_session_expiry_ts_from_queue(normalized, cfg, ts)
+    if expires_ts and ts >= int(expires_ts) and action not in ("stop", "pause"):
+        changed = _nexus_shadow_expire_selected_session(cur, wallet_address, normalized, cfg, int(expires_ts), ts)
+        return {
+            "runtime_status": "expired_paused",
+            "events": [{"type": "SESSION_EXPIRED_PAUSED", "message": "Session runtime expired; Strategist paused automatically. No new trades/re-entries/rebalancing until user starts or extends a new session."}],
+            "queue": normalized,
+            "changed": changed,
+            "strategist": {"status": "expired_paused", "expires_ts": int(expires_ts), "now_ts": ts},
+        }
 
     # Strategist scoring: quality is the brain input. Runtime only executes paper decisions.
     scored = []
