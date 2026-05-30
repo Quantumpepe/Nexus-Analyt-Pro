@@ -247,27 +247,99 @@ _WHALE_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
 # CoinGecko proxy (avoid browser CORS + basic throttling)
 # -------------------------
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
-_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "20"))
+
+# IMPORTANT:
+# CoinGecko market data must not be fetched per UI refresh. The Strategist can
+# still use recent market data, but expensive endpoints are protected by a
+# backend-wide cache, in-flight request dedupe and rate-limit cooldown.
+_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "900"))  # generic/simple endpoints
+_CG_STALE_TTL_SEC = int(os.getenv("COINGECKO_STALE_TTL_SEC", "604800"))  # 7 days fallback
+_CG_RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("COINGECKO_RATE_LIMIT_COOLDOWN_SEC", "300"))
+_CG_COOLDOWN_UNTIL = 0.0
+_CG_LOCK = threading.RLock()
+_CG_INFLIGHT: dict[str, threading.Event] = {}
 
 # -------------------------
 # Market Condition (Overextension + RVOL)
 # -------------------------
 _MARKET_CONDITION_CACHE: dict[str, tuple[float, dict]] = {}
-_MARKET_CONDITION_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_TTL_SEC", "900"))
+# Market-condition uses 20d daily data. It does NOT need second-by-second refresh.
+_MARKET_CONDITION_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_TTL_SEC", "21600"))  # 6h
+_MARKET_CONDITION_STALE_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_STALE_TTL_SEC", "604800"))
+_MARKET_CONDITION_LOCK = threading.RLock()
+_MARKET_CONDITION_INFLIGHT: dict[str, threading.Event] = {}
 
 def _cg_get(url: str) -> dict:
+    """CoinGecko GET with shared cache, stale fallback and in-flight dedupe.
+
+    This protects the monthly CoinGecko credit budget and prevents frontend
+    refresh storms from becoming real upstream API storms.
+    """
+    global _CG_COOLDOWN_UNTIL
     now = time.time()
-    hit = _CG_CACHE.get(url)
-    if hit and (now - hit[0]) < _CG_TTL_SEC:
-        return hit[1]
-    headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
-    if COINGECKO_API_KEY:
-        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
-    r = requests.get(url, headers=headers, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    _CG_CACHE[url] = (now, data)
-    return data
+
+    # Fast fresh/stale cache checks and in-flight coordination.
+    with _CG_LOCK:
+        hit = _CG_CACHE.get(url)
+        if hit and (now - hit[0]) < _CG_TTL_SEC:
+            return hit[1]
+
+        # During cooldown, never hit CoinGecko again if we have usable stale data.
+        if hit and (now < _CG_COOLDOWN_UNTIL) and (now - hit[0]) < _CG_STALE_TTL_SEC:
+            data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
+            if isinstance(data, dict):
+                data["_stale"] = True
+                data["_stale_reason"] = "coingecko_cooldown"
+            return data
+
+        ev = _CG_INFLIGHT.get(url)
+        if ev is None:
+            ev = threading.Event()
+            _CG_INFLIGHT[url] = ev
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        ev.wait(timeout=20)
+        with _CG_LOCK:
+            hit = _CG_CACHE.get(url)
+            if hit and (time.time() - hit[0]) < _CG_STALE_TTL_SEC:
+                data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
+                if isinstance(data, dict) and (time.time() - hit[0]) >= _CG_TTL_SEC:
+                    data["_stale"] = True
+                    data["_stale_reason"] = "waited_for_inflight"
+                return data
+        raise RuntimeError("CoinGecko upstream unavailable and no cache")
+
+    try:
+        headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
+        if COINGECKO_API_KEY:
+            headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+        r = requests.get(url, headers=headers, timeout=12)
+
+        if r.status_code == 429:
+            with _CG_LOCK:
+                _CG_COOLDOWN_UNTIL = time.time() + _CG_RATE_LIMIT_COOLDOWN_SEC
+                hit = _CG_CACHE.get(url)
+                if hit and (time.time() - hit[0]) < _CG_STALE_TTL_SEC:
+                    data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
+                    if isinstance(data, dict):
+                        data["_stale"] = True
+                        data["_stale_reason"] = "coingecko_429"
+                    return data
+            r.raise_for_status()
+
+        r.raise_for_status()
+        data = r.json()
+        with _CG_LOCK:
+            _CG_CACHE[url] = (time.time(), data)
+        return data
+    finally:
+        with _CG_LOCK:
+            ev = _CG_INFLIGHT.pop(url, None)
+            if ev:
+                ev.set()
 
 
 def _market_condition_coin_id(raw: str) -> str:
@@ -706,6 +778,41 @@ def _classify_market_condition(oe_pct: float, rvol: float) -> dict:
     }
 
 
+def _market_condition_fallback(coin_or_symbol: str, coin_id: str, days_i: int, reason: str = "") -> dict:
+    """Safe degraded market-condition response. Never break Strategist/UI because CoinGecko is rate-limited."""
+    classification = _classify_market_condition(0.0, 0.0)
+    return {
+        "status": "degraded",
+        "coin_id": coin_id,
+        "input": str(coin_or_symbol or "").strip(),
+        "days": days_i,
+        "current_price": 0,
+        "ma20": 0,
+        "current_volume": 0,
+        "avg_volume_20d": 0,
+        "oe_pct": 0,
+        "rvol": 0,
+        "condition": classification,
+        "state": classification.get("state"),
+        "label": "Market condition temporarily cached/unavailable",
+        "level": "neutral",
+        "confidence": "LOW",
+        "score_delta": 0,
+        "ai_context": {
+            "market_condition_state": "DEGRADED",
+            "market_condition_label": "CoinGecko unavailable/rate-limited; using neutral fallback so Strategist is not blocked.",
+            "overextension_pct": 0,
+            "relative_volume": 0,
+            "interpretation": "Market-condition data is temporarily unavailable. Do not treat this as a bullish or bearish signal.",
+        },
+        "cached": False,
+        "stale": True,
+        "stale_reason": "fallback",
+        "error": reason,
+        "ts": now_ts(),
+    }
+
+
 def _market_condition_for_coin(coin_or_symbol: str, days: int = 20) -> dict:
     """Calculate Overextension (OE) and Relative Volume (RVOL) from CoinGecko market_chart."""
     coin_id = _market_condition_coin_id(coin_or_symbol)
@@ -715,14 +822,55 @@ def _market_condition_for_coin(coin_or_symbol: str, days: int = 20) -> dict:
     days_i = max(20, min(90, int(days or 20)))
     cache_key = f"{coin_id}|{days_i}"
     now_f = time.time()
-    hit = _MARKET_CONDITION_CACHE.get(cache_key)
-    if hit and (now_f - hit[0]) < _MARKET_CONDITION_TTL_SEC:
-        cached = dict(hit[1])
-        cached["cached"] = True
-        return cached
+
+    with _MARKET_CONDITION_LOCK:
+        hit = _MARKET_CONDITION_CACHE.get(cache_key)
+        if hit and (now_f - hit[0]) < _MARKET_CONDITION_TTL_SEC:
+            cached = dict(hit[1])
+            cached["cached"] = True
+            return cached
+
+        ev = _MARKET_CONDITION_INFLIGHT.get(cache_key)
+        if ev is None:
+            ev = threading.Event()
+            _MARKET_CONDITION_INFLIGHT[cache_key] = ev
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        ev.wait(timeout=20)
+        with _MARKET_CONDITION_LOCK:
+            hit = _MARKET_CONDITION_CACHE.get(cache_key)
+            if hit and (time.time() - hit[0]) < _MARKET_CONDITION_STALE_TTL_SEC:
+                cached = dict(hit[1])
+                cached["cached"] = True
+                if (time.time() - hit[0]) >= _MARKET_CONDITION_TTL_SEC:
+                    cached["stale"] = True
+                    cached["stale_reason"] = "waited_for_inflight"
+                return cached
+        # Continue with a safe fallback below if the owner did not populate cache.
 
     url = f"{COINGECKO_BASE}/coins/{requests.utils.quote(coin_id)}/market_chart?vs_currency=usd&days={days_i}&interval=daily"
-    data = _cg_get(url)
+    try:
+        data = _cg_get(url)
+    except Exception as e:
+        with _MARKET_CONDITION_LOCK:
+            hit = _MARKET_CONDITION_CACHE.get(cache_key)
+            if hit and (time.time() - hit[0]) < _MARKET_CONDITION_STALE_TTL_SEC:
+                cached = dict(hit[1])
+                cached["cached"] = True
+                cached["stale"] = True
+                cached["stale_reason"] = "coingecko_unavailable"
+                cached["error"] = str(e)
+                return cached
+        return _market_condition_fallback(coin_or_symbol, coin_id, days_i, str(e))
+    finally:
+        if owner:
+            with _MARKET_CONDITION_LOCK:
+                ev2 = _MARKET_CONDITION_INFLIGHT.pop(cache_key, None)
+                if ev2:
+                    ev2.set()
 
     prices_raw = data.get("prices") if isinstance(data, dict) else []
     volumes_raw = data.get("total_volumes") if isinstance(data, dict) else []
@@ -803,12 +951,9 @@ def api_market_condition():
     try:
         return jsonify(_market_condition_for_coin(coin, days=days))
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "input": str(coin or "").strip(),
-            "ts": now_ts(),
-        }), 502
+        # Never let CoinGecko/market-condition break the UI or Strategist pipeline.
+        cid = _market_condition_coin_id(coin) or str(coin or "").strip().lower()
+        return jsonify(_market_condition_fallback(coin, cid, max(20, min(90, days)), str(e))), 200
 
 
 @app.route("/api/market-condition/<coin_id>", methods=["GET"])
@@ -821,12 +966,8 @@ def api_market_condition_by_id(coin_id):
     try:
         return jsonify(_market_condition_for_coin(coin_id, days=days))
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "input": str(coin_id or "").strip(),
-            "ts": now_ts(),
-        }), 502
+        cid = _market_condition_coin_id(coin_id) or str(coin_id or "").strip().lower()
+        return jsonify(_market_condition_fallback(coin_id, cid, max(20, min(90, days)), str(e))), 200
 
 
 @app.route("/api/onchain/whale-signal", methods=["GET"])
