@@ -10346,6 +10346,12 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
     session_id = str(body.get("session_id") or body.get("trade_session_id") or body.get("rotation_session_id") or meta.get("session_id") or "").strip()[:80]
     if session_id:
         meta = {**meta, "session_id": session_id}
+    # User-controlled profit reuse permission (0-100%). Default 0 protects all realized profit.
+    reuse_profit_pct = _clamp_float(
+        body.get("reuse_profit_pct", body.get("profit_reuse_pct", body.get("reuseProfitPct", body.get("profitReusePct", meta.get("reuse_profit_pct", meta.get("profit_reuse_pct", 0)))))),
+        0, 0, 100
+    )
+    meta = {**meta, "reuse_profit_pct": reuse_profit_pct, "profit_reuse_pct": reuse_profit_pct}
     confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
@@ -11540,9 +11546,18 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             cfg_budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", 0))), 0, 0, 1_000_000_000)
             base_total = cfg_budget if cfg_budget > 0 else float(len(normalized) * 100)
 
-        # Fixed-budget restart: only the user-released capital is reused.
-        # Realized profit is collected separately and must not be auto-compounded.
-        next_total = max(0.01, base_total)
+        # Controlled compounding: by default only the user-released capital is reused.
+        # The user can explicitly allow a percentage of fresh collected profit to be reused.
+        reuse_profit_pct = _clamp_float(
+            cfg.get("reuse_profit_pct", cfg.get("profit_reuse_pct", cfg.get("reuseProfitPct", cfg.get("profitReusePct", 0)))),
+            0, 0, 100
+        )
+        if reuse_profit_pct <= 0:
+            for _it in normalized:
+                _m = get_meta(_it)
+                reuse_profit_pct = max(reuse_profit_pct, _clamp_float(_m.get("reuse_profit_pct", _m.get("profit_reuse_pct", 0)), 0, 0, 100))
+        reusable_profit = max(0.0, fresh_realized_delta) * (reuse_profit_pct / 100.0)
+        next_total = max(0.01, base_total + reusable_profit)
         weights = []
         for item in normalized:
             meta = get_meta(item)
@@ -11589,7 +11604,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["paper_entry_ts"] = ts
             meta["shadow_cycle_recycled_ts"] = ts
             meta["shadow_runtime_status"] = "running"
-            meta["shadow_strategy"] = "fixed_released_capital_profit_collected"
+            meta["reuse_profit_pct"] = round(reuse_profit_pct, 4)
+            meta["profit_reuse_pct"] = round(reuse_profit_pct, 4)
+            meta["paper_reused_profit_usd"] = round(reusable_profit * (weights[idx] / weight_sum), 4) if weight_sum > 0 else 0
+            meta["shadow_strategy"] = "controlled_profit_reuse" if reuse_profit_pct > 0 else "fixed_released_capital_profit_collected"
             item["paper_entry_price"] = meta["paper_entry_price"]
             item["paper_mark_price"] = meta["paper_mark_price"]
             item["paper_exit_price"] = None
@@ -11601,6 +11619,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             item["paper_collected_profit_usd"] = meta["paper_collected_profit_usd"]
             item["collected_profit_usd"] = meta["collected_profit_usd"]
             item["realized_profit_usd"] = meta["realized_profit_usd"]
+            item["reuse_profit_pct"] = meta["reuse_profit_pct"]
+            item["profit_reuse_pct"] = meta["profit_reuse_pct"]
+            item["paper_reused_profit_usd"] = meta["paper_reused_profit_usd"]
             item["paper_position_usd"] = next_amount
             item["paper_quantity"] = meta["paper_quantity"]
             set_meta(item, meta)
@@ -11612,7 +11633,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             else:
                 events.append(set_state(item, "WAIT", "Shadow restarted with released capital only; slot waits for a cleaner edge.", "SHADOW_CAPITAL_RECYCLED"))
 
-        strategist_reason.append(f"Restarted completed paper cycle with fixed released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD is kept separate; next cycle {next_total:.2f} USD.")
+        strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total).")
         return True
 
     cycle_recycled = recycle_completed_shadow_cycle()
