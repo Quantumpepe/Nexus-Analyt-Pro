@@ -8729,9 +8729,10 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
     if isinstance(ui_state, dict):
         allowed = {
             "watchSortMode", "gridMode", "gridChain", "gridItem",
-            "tradingRuntimeHours", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
+            "tradingRuntimeHours", "tradingRuntimeUnit", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
             "tradingRiskMode", "tradingCautionDrawdownPct", "tradingHardStopPct",
-            "tradingProfitLockPct", "tradingMaxSlippagePct", "tradingMaxTrades",
+            "tradingProfitLockPct", "tradingReuseProfitPct", "tradingMaxCombinedSlots",
+            "tradingMaxSlippagePct", "tradingMaxTrades",
             "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput",
             "tradingSessions", "activeTradingSessionId",
             "rotationRuntimeHours", "rotationMaxActiveSessions", "rotationRiskLimit",
