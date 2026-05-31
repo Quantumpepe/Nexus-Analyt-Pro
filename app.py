@@ -8992,7 +8992,7 @@ def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int
         conn.close()
 
 
-def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_session_id: str = "") -> tuple[list[dict], str, int]:
+def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_session_id: str = "", replace_missing: bool = True) -> tuple[list[dict], str, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
         return [], "", 0
@@ -9002,6 +9002,23 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
     try:
         with DB_WRITE_LOCK:
             cur = conn.cursor()
+            incoming_ids = set()
+            for sess in clean:
+                sid_preview = _rotation_session_id(sess)
+                if sid_preview:
+                    incoming_ids.add(sid_preview)
+            # Frontend sends the full wallet-bound Rotation session list.
+            # If a stopped session was deleted in the UI, it must be removed from DB too;
+            # otherwise the next GET resurrects it. Keep compatibility for partial updates.
+            if replace_missing:
+                if incoming_ids:
+                    placeholders = ",".join(["?"] * len(incoming_ids))
+                    params = [wa, *sorted(incoming_ids)]
+                    cur.execute(f"DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id NOT IN ({placeholders})", params)
+                    cur.execute(f"DELETE FROM rotation_events WHERE wallet_address=? AND session_id NOT IN ({placeholders})", params)
+                else:
+                    cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=?", (wa,))
+                    cur.execute("DELETE FROM rotation_events WHERE wallet_address=?", (wa,))
             for sess in clean:
                 vals = _rotation_session_to_db_tuple(wa, sess, nowi)
                 sid = vals[1]
@@ -9072,6 +9089,53 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
         conn.close()
 
 
+
+
+@app.route("/api/rotation-sessions/<session_id>", methods=["DELETE"])
+def api_rotation_session_delete(session_id):
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    sid = str(session_id or "").strip()
+    if not sid:
+        return err("session_id required", 400)
+    wa_norm = _norm_addr(wa)
+    nowi = int(time.time() * 1000)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            # Safety: do not delete an open/live-running position by accident.
+            cur.execute("SELECT status, session_json FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
+            row = cur.fetchone()
+            if row:
+                st = str(row["status"] or "").strip().upper()
+                try:
+                    sess = json.loads(row["session_json"] or "{}") or {}
+                except Exception:
+                    sess = {}
+                position_state = str(sess.get("positionState") or sess.get("position_state") or sess.get("readiness") or "").strip().upper()
+                hard_delete_ok = st in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"} or position_state in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"}
+                if not hard_delete_ok:
+                    return err("rotation session can only be deleted after STOPPED/COMPLETE/EXPIRED/ERROR/PROTECTED", 409)
+            cur.execute("DELETE FROM rotation_events WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
+            cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
+            cur.execute("SELECT active_session_id FROM rotation_ui_state WHERE wallet_address=?", (wa_norm,))
+            ui_row = cur.fetchone()
+            if ui_row and str(ui_row["active_session_id"] or "") == sid:
+                cur.execute("SELECT session_id FROM rotation_sessions WHERE wallet_address=? ORDER BY updated_ts DESC LIMIT 1", (wa_norm,))
+                next_row = cur.fetchone()
+                next_active = str(next_row["session_id"] or "") if next_row else ""
+                cur.execute("INSERT INTO rotation_ui_state(wallet_address, active_session_id, updated_ts) VALUES(?,?,?) ON CONFLICT(wallet_address) DO UPDATE SET active_session_id=excluded.active_session_id, updated_ts=excluded.updated_ts", (wa_norm, next_active, nowi))
+            conn.commit()
+        sessions, active, updated_ts = _db_get_rotation_sessions(wa_norm)
+        out = jsonify({"status": "ok", "wallet": wa_norm, "deleted": sid, "sessions": sessions, "activeRotationSessionId": active, "updated_ts": updated_ts or nowi, "ts": now_ts()})
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    finally:
+        conn.close()
+
+
 @app.route("/api/rotation-sessions", methods=["GET", "POST"])
 def api_rotation_sessions():
     wa = _require_auth() or _pick_wallet_from_request()
@@ -9080,12 +9144,15 @@ def api_rotation_sessions():
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
         sessions = body.get("sessions") if isinstance(body, dict) else []
-        # Compatibility: allow posting a single updated session as {session: {...}}
+        # Compatibility: allow posting a single updated session as {session: {...}}.
+        # Single-session updates must not delete the other wallet sessions.
+        replace_missing = isinstance(sessions, list)
         if not isinstance(sessions, list):
             session = body.get("session") if isinstance(body, dict) else None
             sessions = [session] if isinstance(session, dict) else []
+            replace_missing = False
         active_id = str((body.get("activeRotationSessionId") or body.get("active_session_id") or "") if isinstance(body, dict) else "").strip()
-        saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id)
+        saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id, replace_missing=replace_missing)
         out = jsonify({
             "status": "ok",
             "wallet": wa,
