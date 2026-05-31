@@ -8732,7 +8732,11 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
             "tradingRuntimeHours", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
             "tradingRiskMode", "tradingCautionDrawdownPct", "tradingHardStopPct",
             "tradingProfitLockPct", "tradingMaxSlippagePct", "tradingMaxTrades",
-            "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput"
+            "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput",
+            "tradingSessions", "activeTradingSessionId",
+            "rotationRuntimeHours", "rotationMaxActiveSessions", "rotationRiskLimit",
+            "rotationMaxSlippage", "rotationMinNetAdvantage", "rotationMode",
+            "rotationNetworkScope", "rotationSessions", "activeRotationSessionId"
         }
         clean_ui = {}
         for k, v in ui_state.items():
@@ -8740,6 +8744,8 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
                 continue
             if isinstance(v, (str, int, float, bool)) or v is None:
                 clean_ui[k] = v
+            elif k in ("tradingSessions", "rotationSessions") and isinstance(v, list):
+                clean_ui[k] = [x for x in v[:30] if isinstance(x, dict)]
         base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
     nowi = int(time.time() * 1000)
     conn = _db()
