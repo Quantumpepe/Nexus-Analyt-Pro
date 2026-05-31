@@ -2190,6 +2190,64 @@ def init_db():
         )
     """)
 
+
+    # --- Nexus Rotation persistence (wallet-bound, Trading-style lifecycle storage) ---
+    # Rotation runtime state must not live only in ui_state_json. The UI state may keep
+    # display preferences, but the session/event lifecycle is persisted here so refresh,
+    # reconnect and multi-device recovery behave like Nexus Trading/Grid runtime state.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rotation_sessions (
+            wallet_address TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            status TEXT DEFAULT 'WAITING',
+            chain TEXT DEFAULT '',
+            base_asset TEXT DEFAULT 'USDC',
+            target_symbol TEXT DEFAULT '',
+            budget_usd REAL DEFAULT 0,
+            working_capital_usd REAL DEFAULT 0,
+            collected_profit_usd REAL DEFAULT 0,
+            gross_profit_usd REAL DEFAULT 0,
+            costs_usd REAL DEFAULT 0,
+            net_profit_usd REAL DEFAULT 0,
+            runtime_hours REAL DEFAULT 24,
+            started_ts INTEGER DEFAULT 0,
+            expires_ts INTEGER DEFAULT 0,
+            updated_ts INTEGER DEFAULT 0,
+            session_json TEXT DEFAULT '{}',
+            PRIMARY KEY (wallet_address, session_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_sessions_wallet_updated ON rotation_sessions(wallet_address, updated_ts);")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_sessions_wallet_status ON rotation_sessions(wallet_address, status);")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rotation_events (
+            event_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            event_ts INTEGER DEFAULT 0,
+            status TEXT DEFAULT '',
+            chain TEXT DEFAULT '',
+            base_asset TEXT DEFAULT 'USDC',
+            target_asset TEXT DEFAULT '',
+            buy_usd REAL DEFAULT 0,
+            sell_usd REAL DEFAULT 0,
+            gross_usd REAL DEFAULT 0,
+            costs_usd REAL DEFAULT 0,
+            net_usd REAL DEFAULT 0,
+            event_json TEXT DEFAULT '{}'
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_events_wallet_session ON rotation_events(wallet_address, session_id, event_ts);")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rotation_ui_state (
+            wallet_address TEXT PRIMARY KEY,
+            active_session_id TEXT DEFAULT '',
+            updated_ts INTEGER DEFAULT 0
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_coin_ratings (
             wallet_address TEXT NOT NULL,
@@ -2228,6 +2286,41 @@ def init_db():
             "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
             "ui_state_json": "ui_state_json TEXT DEFAULT '{}'",
             "updated_ts": "updated_ts INTEGER",
+        })
+
+        _db_ensure_columns(conn, "rotation_sessions", {
+            "status": "status TEXT DEFAULT 'WAITING'",
+            "chain": "chain TEXT DEFAULT ''",
+            "base_asset": "base_asset TEXT DEFAULT 'USDC'",
+            "target_symbol": "target_symbol TEXT DEFAULT ''",
+            "budget_usd": "budget_usd REAL DEFAULT 0",
+            "working_capital_usd": "working_capital_usd REAL DEFAULT 0",
+            "collected_profit_usd": "collected_profit_usd REAL DEFAULT 0",
+            "gross_profit_usd": "gross_profit_usd REAL DEFAULT 0",
+            "costs_usd": "costs_usd REAL DEFAULT 0",
+            "net_profit_usd": "net_profit_usd REAL DEFAULT 0",
+            "runtime_hours": "runtime_hours REAL DEFAULT 24",
+            "started_ts": "started_ts INTEGER DEFAULT 0",
+            "expires_ts": "expires_ts INTEGER DEFAULT 0",
+            "updated_ts": "updated_ts INTEGER DEFAULT 0",
+            "session_json": "session_json TEXT DEFAULT '{}'",
+        })
+        _db_ensure_columns(conn, "rotation_events", {
+            "event_ts": "event_ts INTEGER DEFAULT 0",
+            "status": "status TEXT DEFAULT ''",
+            "chain": "chain TEXT DEFAULT ''",
+            "base_asset": "base_asset TEXT DEFAULT 'USDC'",
+            "target_asset": "target_asset TEXT DEFAULT ''",
+            "buy_usd": "buy_usd REAL DEFAULT 0",
+            "sell_usd": "sell_usd REAL DEFAULT 0",
+            "gross_usd": "gross_usd REAL DEFAULT 0",
+            "costs_usd": "costs_usd REAL DEFAULT 0",
+            "net_usd": "net_usd REAL DEFAULT 0",
+            "event_json": "event_json TEXT DEFAULT '{}'",
+        })
+        _db_ensure_columns(conn, "rotation_ui_state", {
+            "active_session_id": "active_session_id TEXT DEFAULT ''",
+            "updated_ts": "updated_ts INTEGER DEFAULT 0",
         })
         _db_ensure_columns(conn, "user_insight_profile", {
             "order_memory_json": "order_memory_json TEXT DEFAULT '{}'",
@@ -8737,7 +8830,7 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
             "tradingSessions", "activeTradingSessionId",
             "rotationRuntimeHours", "rotationMaxActiveSessions", "rotationRiskLimit",
             "rotationMaxSlippage", "rotationMinNetAdvantage", "rotationMode",
-            "rotationNetworkScope", "rotationSessions", "activeRotationSessionId"
+            "rotationNetworkScope"
         }
         clean_ui = {}
         for k, v in ui_state.items():
@@ -8745,7 +8838,7 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
                 continue
             if isinstance(v, (str, int, float, bool)) or v is None:
                 clean_ui[k] = v
-            elif k in ("tradingSessions", "rotationSessions") and isinstance(v, list):
+            elif k in ("tradingSessions",) and isinstance(v, list):
                 clean_ui[k] = [x for x in v[:30] if isinstance(x, dict)]
         base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
     nowi = int(time.time() * 1000)
@@ -8762,6 +8855,258 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         return base, nowi
     finally:
         conn.close()
+
+
+def _rotation_session_id(sess: dict) -> str:
+    if not isinstance(sess, dict):
+        return ""
+    sid = (
+        sess.get("id")
+        or sess.get("session_id")
+        or sess.get("rotation_session_id")
+        or sess.get("rotationSessionId")
+        or ""
+    )
+    return str(sid or "").strip()
+
+
+def _rotation_event_id(ev: dict) -> str:
+    if not isinstance(ev, dict):
+        return ""
+    eid = ev.get("id") or ev.get("event_id") or ev.get("rotation_event_id") or ""
+    return str(eid or "").strip()
+
+
+def _rotation_ms(value, default: int = 0) -> int:
+    try:
+        n = int(float(value or 0))
+        return n if n > 0 else int(default or 0)
+    except Exception:
+        return int(default or 0)
+
+
+def _rotation_float(value, default: float = 0.0) -> float:
+    try:
+        n = float(value if value is not None else default)
+        return n if math.isfinite(n) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _rotation_status_for_db(sess: dict) -> str:
+    raw = str((sess or {}).get("status") or (sess or {}).get("runtimeStatus") or "WAITING").strip().upper()
+    if raw in ("READY", "APPROVED"):
+        return "WAITING"
+    if raw in ("RUNNING", "ACTIVE"):
+        # Session is active, but the card/runtime status should remain tied to the shadow action.
+        action = str(((sess or {}).get("meta") or {}).get("rotation_action") or (sess or {}).get("readiness") or "").upper()
+        if action in ("WAIT_NET_EDGE", "SEARCHING"):
+            return "WAITING"
+        return "ACTIVE"
+    return raw or "WAITING"
+
+
+def _rotation_session_to_db_tuple(wa: str, sess: dict, nowi: int):
+    sid = _rotation_session_id(sess)
+    if not sid:
+        sid = f"ROT-{uuid.uuid4().hex[:12].upper()}"
+        sess["id"] = sid
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    status = _rotation_status_for_db(sess)
+    chain = str(sess.get("chain") or meta.get("chain") or "").strip().upper()
+    base_asset = str(sess.get("baseAsset") or sess.get("payoutAsset") or meta.get("base_asset") or "USDC").strip().upper()
+    target_symbol = str(sess.get("symbol") or sess.get("targetAsset") or meta.get("target_asset") or "").strip().upper()
+    budget_usd = _rotation_float(sess.get("budgetUsd") or sess.get("budget_usd"), 0.0)
+    working_capital_usd = _rotation_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("working_capital_usd"), budget_usd)
+    collected_profit_usd = _rotation_float(sess.get("collectedProfitUsd") or sess.get("rotationProfitUsd") or sess.get("profitUsd") or meta.get("collectedProfitUsd"), 0.0)
+    gross_profit_usd = _rotation_float(sess.get("grossProfitUsd") or sess.get("gross_usd"), 0.0)
+    costs_usd = _rotation_float(sess.get("costsUsd") or sess.get("costs_usd"), 0.0)
+    net_profit_usd = _rotation_float(sess.get("netProfitUsd") or sess.get("net_usd"), collected_profit_usd)
+    runtime_hours = _rotation_float(sess.get("runtimeHours") or sess.get("runtime_hours") or meta.get("runtime_hours"), 24.0)
+    started_ts = _rotation_ms(sess.get("startedAt") or sess.get("started_at") or sess.get("createdAt") or sess.get("created_ts"), nowi)
+    expires_ts = _rotation_ms(sess.get("expiresAt") or sess.get("expires_at") or meta.get("expires_at"), 0)
+    updated_ts = _rotation_ms(sess.get("updatedAt") or sess.get("updated_ts"), nowi)
+    sess_json = json.dumps(sess if isinstance(sess, dict) else {}, separators=(",", ":"), ensure_ascii=False)
+    return (
+        wa, sid, status, chain, base_asset, target_symbol,
+        budget_usd, working_capital_usd, collected_profit_usd,
+        gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
+        started_ts, expires_ts, updated_ts, sess_json,
+    )
+
+
+def _rotation_event_to_db_tuple(wa: str, sid: str, ev: dict):
+    eid = _rotation_event_id(ev)
+    if not eid:
+        eid = f"ROT-EVT-{uuid.uuid4().hex[:12].upper()}"
+        ev["id"] = eid
+    event_ts = _rotation_ms(ev.get("ts") or ev.get("event_ts") or ev.get("createdAt"), now_ts() * 1000)
+    status = str(ev.get("status") or "").strip().upper()
+    chain = str(ev.get("chain") or "").strip().upper()
+    base_asset = str(ev.get("baseAsset") or ev.get("fromAsset") or "USDC").strip().upper()
+    target_asset = str(ev.get("targetAsset") or ev.get("symbol") or "").strip().upper()
+    return (
+        eid, wa, sid, event_ts, status, chain, base_asset, target_asset,
+        _rotation_float(ev.get("buyUsd") or ev.get("buy_usd"), 0.0),
+        _rotation_float(ev.get("sellUsd") or ev.get("sell_usd"), 0.0),
+        _rotation_float(ev.get("grossUsd") or ev.get("gross_usd"), 0.0),
+        _rotation_float(ev.get("costsUsd") or ev.get("costs_usd"), 0.0),
+        _rotation_float(ev.get("netUsd") or ev.get("net_usd"), 0.0),
+        json.dumps(ev if isinstance(ev, dict) else {}, separators=(",", ":"), ensure_ascii=False),
+    )
+
+
+def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return [], "", 0
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT active_session_id, updated_ts FROM rotation_ui_state WHERE wallet_address=?", (wa,))
+        ui_row = cur.fetchone()
+        active_id = str(ui_row["active_session_id"] or "") if ui_row else ""
+        updated_ts = int(ui_row["updated_ts"] or 0) if ui_row else 0
+        cur.execute(
+            "SELECT session_id, session_json, status, updated_ts FROM rotation_sessions WHERE wallet_address=? ORDER BY updated_ts DESC LIMIT 30",
+            (wa,),
+        )
+        rows = cur.fetchall()
+        sessions = []
+        for row in rows:
+            try:
+                sess = json.loads(row["session_json"] or "{}")
+                if not isinstance(sess, dict):
+                    sess = {}
+            except Exception:
+                sess = {}
+            sess.setdefault("id", row["session_id"])
+            # DB scalar status is canonical if the JSON was stale or said READY.
+            db_status = str(row["status"] or "").strip().upper()
+            if db_status:
+                sess["status"] = db_status
+            sessions.append(sess)
+            updated_ts = max(updated_ts, int(row["updated_ts"] or 0))
+        return sessions, active_id, updated_ts
+    finally:
+        conn.close()
+
+
+def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_session_id: str = "") -> tuple[list[dict], str, int]:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return [], "", 0
+    clean = [dict(x) for x in (sessions if isinstance(sessions, list) else []) if isinstance(x, dict)][:30]
+    nowi = int(time.time() * 1000)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            for sess in clean:
+                vals = _rotation_session_to_db_tuple(wa, sess, nowi)
+                sid = vals[1]
+                cur.execute(
+                    """
+                    INSERT INTO rotation_sessions(
+                        wallet_address, session_id, status, chain, base_asset, target_symbol,
+                        budget_usd, working_capital_usd, collected_profit_usd,
+                        gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
+                        started_ts, expires_ts, updated_ts, session_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(wallet_address, session_id) DO UPDATE SET
+                        status=excluded.status,
+                        chain=excluded.chain,
+                        base_asset=excluded.base_asset,
+                        target_symbol=excluded.target_symbol,
+                        budget_usd=excluded.budget_usd,
+                        working_capital_usd=excluded.working_capital_usd,
+                        collected_profit_usd=excluded.collected_profit_usd,
+                        gross_profit_usd=excluded.gross_profit_usd,
+                        costs_usd=excluded.costs_usd,
+                        net_profit_usd=excluded.net_profit_usd,
+                        runtime_hours=excluded.runtime_hours,
+                        started_ts=excluded.started_ts,
+                        expires_ts=excluded.expires_ts,
+                        updated_ts=excluded.updated_ts,
+                        session_json=excluded.session_json
+                    """,
+                    vals,
+                )
+                for ev in (sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else [])[:50]:
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_vals = _rotation_event_to_db_tuple(wa, sid, dict(ev))
+                    cur.execute(
+                        """
+                        INSERT INTO rotation_events(
+                            event_id, wallet_address, session_id, event_ts, status, chain, base_asset, target_asset,
+                            buy_usd, sell_usd, gross_usd, costs_usd, net_usd, event_json
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(event_id) DO UPDATE SET
+                            status=excluded.status,
+                            event_ts=excluded.event_ts,
+                            chain=excluded.chain,
+                            base_asset=excluded.base_asset,
+                            target_asset=excluded.target_asset,
+                            buy_usd=excluded.buy_usd,
+                            sell_usd=excluded.sell_usd,
+                            gross_usd=excluded.gross_usd,
+                            costs_usd=excluded.costs_usd,
+                            net_usd=excluded.net_usd,
+                            event_json=excluded.event_json
+                        """,
+                        ev_vals,
+                    )
+            active_clean = str(active_session_id or "").strip()
+            if not active_clean and clean:
+                active_clean = _rotation_session_id(clean[0])
+            cur.execute(
+                "INSERT INTO rotation_ui_state(wallet_address, active_session_id, updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET active_session_id=excluded.active_session_id, updated_ts=excluded.updated_ts",
+                (wa, active_clean, nowi),
+            )
+            conn.commit()
+        saved, active, updated_ts = _db_get_rotation_sessions(wa)
+        return saved, active, updated_ts or nowi
+    finally:
+        conn.close()
+
+
+@app.route("/api/rotation-sessions", methods=["GET", "POST"])
+def api_rotation_sessions():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        sessions = body.get("sessions") if isinstance(body, dict) else []
+        # Compatibility: allow posting a single updated session as {session: {...}}
+        if not isinstance(sessions, list):
+            session = body.get("session") if isinstance(body, dict) else None
+            sessions = [session] if isinstance(session, dict) else []
+        active_id = str((body.get("activeRotationSessionId") or body.get("active_session_id") or "") if isinstance(body, dict) else "").strip()
+        saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id)
+        out = jsonify({
+            "status": "ok",
+            "wallet": wa,
+            "sessions": saved,
+            "activeRotationSessionId": active,
+            "updated_ts": updated_ts,
+            "ts": now_ts(),
+        })
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    sessions, active, updated_ts = _db_get_rotation_sessions(wa)
+    out = jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "sessions": sessions,
+        "activeRotationSessionId": active,
+        "updated_ts": updated_ts,
+        "ts": now_ts(),
+    })
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
 
 
 @app.route("/api/watchlist", methods=["GET", "POST"])
