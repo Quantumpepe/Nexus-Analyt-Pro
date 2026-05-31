@@ -14313,6 +14313,7 @@ def api_grid_budgets_by_chain():
 
 
 @app.route("/api/grid/order/stop", methods=["POST"])
+@app.route("/api/grid/order/pause", methods=["POST"])
 def api_grid_order_stop():
     """Fast-path stop/cancel for a single visible SQLite order.
 
