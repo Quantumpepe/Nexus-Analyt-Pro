@@ -2248,6 +2248,18 @@ def init_db():
         )
     """)
 
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rotation_deleted_sessions (
+            wallet_address TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            deleted_ts INTEGER DEFAULT 0,
+            reason TEXT DEFAULT '',
+            PRIMARY KEY (wallet_address, session_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_deleted_wallet_ts ON rotation_deleted_sessions(wallet_address, deleted_ts);")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_coin_ratings (
             wallet_address TEXT NOT NULL,
@@ -2295,11 +2307,23 @@ def init_db():
             "target_symbol": "target_symbol TEXT DEFAULT ''",
             "budget_usd": "budget_usd REAL DEFAULT 0",
             "working_capital_usd": "working_capital_usd REAL DEFAULT 0",
+            "reserved_usd": "reserved_usd REAL DEFAULT 0",
             "collected_profit_usd": "collected_profit_usd REAL DEFAULT 0",
             "gross_profit_usd": "gross_profit_usd REAL DEFAULT 0",
             "costs_usd": "costs_usd REAL DEFAULT 0",
             "net_profit_usd": "net_profit_usd REAL DEFAULT 0",
             "runtime_hours": "runtime_hours REAL DEFAULT 24",
+            "risk_limit_pct": "risk_limit_pct REAL DEFAULT 0",
+            "min_net_advantage_pct": "min_net_advantage_pct REAL DEFAULT 0",
+            "max_slippage_pct": "max_slippage_pct REAL DEFAULT 0",
+            "max_active_rotations": "max_active_rotations INTEGER DEFAULT 3",
+            "execution_mode": "execution_mode TEXT DEFAULT 'shadow'",
+            "position_state": "position_state TEXT DEFAULT 'WAITING'",
+            "lifecycle_state": "lifecycle_state TEXT DEFAULT 'WAITING'",
+            "locked_target_symbol": "locked_target_symbol TEXT DEFAULT ''",
+            "locked_chain": "locked_chain TEXT DEFAULT ''",
+            "locked_base_asset": "locked_base_asset TEXT DEFAULT 'USDC'",
+            "deleted_ts": "deleted_ts INTEGER DEFAULT 0",
             "started_ts": "started_ts INTEGER DEFAULT 0",
             "expires_ts": "expires_ts INTEGER DEFAULT 0",
             "updated_ts": "updated_ts INTEGER DEFAULT 0",
@@ -2308,6 +2332,8 @@ def init_db():
         _db_ensure_columns(conn, "rotation_events", {
             "event_ts": "event_ts INTEGER DEFAULT 0",
             "status": "status TEXT DEFAULT ''",
+            "event_type": "event_type TEXT DEFAULT ''",
+            "execution_mode": "execution_mode TEXT DEFAULT 'shadow'",
             "chain": "chain TEXT DEFAULT ''",
             "base_asset": "base_asset TEXT DEFAULT 'USDC'",
             "target_asset": "target_asset TEXT DEFAULT ''",
@@ -2321,6 +2347,10 @@ def init_db():
         _db_ensure_columns(conn, "rotation_ui_state", {
             "active_session_id": "active_session_id TEXT DEFAULT ''",
             "updated_ts": "updated_ts INTEGER DEFAULT 0",
+        })
+        _db_ensure_columns(conn, "rotation_deleted_sessions", {
+            "deleted_ts": "deleted_ts INTEGER DEFAULT 0",
+            "reason": "reason TEXT DEFAULT ''",
         })
         _db_ensure_columns(conn, "user_insight_profile", {
             "order_memory_json": "order_memory_json TEXT DEFAULT '{}'",
@@ -8893,6 +8923,152 @@ def _rotation_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+ROTATION_TERMINAL_STATUSES = {"STOPPED", "CLOSED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED", "DELETED", "ARCHIVED"}
+ROTATION_LOCKED_STATUSES = {"WAITING", "SEARCHING", "ACTIVE", "OPEN", "ENTERING", "EXITING", "PAUSED"}
+ROTATION_ALLOWED_BASE_ASSETS = {"USDC", "USDT"}
+
+
+def _rotation_terminal_status(value) -> bool:
+    return str(value or "").strip().upper() in ROTATION_TERMINAL_STATUSES
+
+
+def _rotation_base_asset(value) -> str:
+    base = str(value or "USDC").strip().upper()
+    return base if base in ROTATION_ALLOWED_BASE_ASSETS else "USDC"
+
+
+def _rotation_norm_symbol(value) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper()).strip()
+
+
+def _rotation_position_state(sess: dict, status: str) -> str:
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    raw = str(sess.get("positionState") or sess.get("position_state") or sess.get("readiness") or meta.get("rotation_action") or "").strip().upper()
+    if status in {"STOPPED", "DELETED", "EXPIRED", "ERROR", "PROTECTED"}:
+        return status
+    if raw in {"WAIT_NET_EDGE", "SEARCHING", "READY", "APPROVED", ""}:
+        return "WAITING" if raw != "SEARCHING" else "SEARCHING"
+    if raw in {"ROTATION_OPEN", "POSITION_OPEN", "OPEN"}:
+        return "OPEN"
+    if raw in {"EXIT_PENDING", "EXITING"}:
+        return "EXITING"
+    if raw in {"SIMULATED_ROTATION_CLOSED", "CLOSED", "COMPLETE", "COMPLETED"}:
+        return "CLOSED"
+    if raw in {"USER_PAUSED", "PAUSED"}:
+        return "PAUSED"
+    return raw or "WAITING"
+
+
+def _rotation_live_normalize_session(sess: dict, existing: dict | None = None, existing_status: str = "") -> dict:
+    """Backend truth for Rotation sessions.
+
+    Live/Vault safety rules enforced here:
+    - STOPPED/DELETED/terminal states cannot be revived by a stale frontend sync.
+    - Existing non-terminal sessions keep their locked target/base/chain until stopped/completed/expired.
+    - Base asset is restricted to USDC/USDT in the current vault-ready flow.
+    - Session JSON carries explicit lifecycle/execution fields so the frontend is only presentation/cache.
+    """
+    src = dict(sess or {})
+    existing = dict(existing or {})
+    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+    ex_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+
+    existing_status_u = str(existing_status or existing.get("status") or "").strip().upper()
+    incoming_status = _rotation_status_for_db(src)
+    status = existing_status_u if _rotation_terminal_status(existing_status_u) and not _rotation_terminal_status(incoming_status) else incoming_status
+    if status in ("READY", "APPROVED", "RUNNING"):
+        status = "WAITING" if status != "RUNNING" else "ACTIVE"
+
+    now_ms = int(time.time() * 1000)
+    started_ts = _rotation_ms(src.get("startedAt") or src.get("started_at") or src.get("createdAt") or src.get("created_ts"), _rotation_ms(existing.get("startedAt") or existing.get("started_at") or existing.get("createdAt") or existing.get("created_ts"), now_ms))
+    runtime_hours = _rotation_float(src.get("runtimeHours") or src.get("runtime_hours") or meta.get("runtime_hours") or existing.get("runtimeHours") or existing.get("runtime_hours") or ex_meta.get("runtime_hours"), 24.0)
+    expires_ts = _rotation_ms(src.get("expiresAt") or src.get("expires_at") or meta.get("expires_at") or existing.get("expiresAt") or existing.get("expires_at") or ex_meta.get("expires_at"), started_ts + int(runtime_hours * 3600000))
+    if expires_ts and expires_ts <= now_ms and not _rotation_terminal_status(status):
+        status = "EXPIRED"
+
+    existing_target = _rotation_norm_symbol(existing.get("sourceSymbol") or existing.get("symbol") or existing.get("targetAsset") or ex_meta.get("source_symbol") or ex_meta.get("target_asset"))
+    incoming_target = _rotation_norm_symbol(src.get("sourceSymbol") or src.get("symbol") or src.get("targetAsset") or meta.get("source_symbol") or meta.get("target_asset"))
+    target = existing_target if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_target
+
+    existing_chain = str(existing.get("chain") or ex_meta.get("chain") or "").strip().upper()
+    incoming_chain = str(src.get("chain") or meta.get("chain") or "").strip().upper()
+    chain = existing_chain if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_chain
+
+    existing_base = _rotation_base_asset(existing.get("baseAsset") or existing.get("payoutAsset") or ex_meta.get("base_asset"))
+    incoming_base = _rotation_base_asset(src.get("baseAsset") or src.get("payoutAsset") or meta.get("base_asset"))
+    base_asset = existing_base if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_base
+
+    budget_usd = _rotation_float(src.get("budgetUsd") or src.get("budget_usd") or existing.get("budgetUsd") or existing.get("budget_usd"), 0.0)
+    working_capital = _rotation_float(src.get("workingCapitalUsd") or src.get("sessionCapitalUsd") or src.get("working_capital_usd") or existing.get("workingCapitalUsd") or existing.get("sessionCapitalUsd"), budget_usd)
+    collected = _rotation_float(src.get("collectedProfitUsd") or src.get("rotationProfitUsd") or src.get("profitUsd") or meta.get("collectedProfitUsd") or existing.get("collectedProfitUsd"), 0.0)
+    gross = _rotation_float(src.get("grossProfitUsd") or src.get("gross_usd") or existing.get("grossProfitUsd"), 0.0)
+    costs = _rotation_float(src.get("costsUsd") or src.get("costs_usd") or existing.get("costsUsd"), 0.0)
+    net = _rotation_float(src.get("netProfitUsd") or src.get("net_usd") or src.get("rotationProfitUsd") or existing.get("netProfitUsd"), collected)
+    risk = _rotation_float(src.get("riskLimitPct") or meta.get("risk_limit_pct") or existing.get("riskLimitPct"), 0.0)
+    min_net = _rotation_float(src.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct") or existing.get("minNetAdvantagePct"), 0.0)
+    max_slip = _rotation_float(src.get("maxSlippagePct") or meta.get("max_slippage_pct") or existing.get("maxSlippagePct"), 0.0)
+    max_active = int(max(1, min(12, _rotation_float(src.get("maxActiveRotations") or meta.get("max_active_rotations") or existing.get("maxActiveRotations"), 3))))
+    execution_mode = str(src.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
+    if execution_mode not in {"shadow", "live"}:
+        execution_mode = "shadow"
+    position_state = _rotation_position_state(src, status)
+
+    next_meta = {
+        **ex_meta,
+        **meta,
+        "capital_flow": "BASE_TO_TARGET_TO_BASE",
+        "base_asset": base_asset,
+        "target_asset": target,
+        "locked_target_symbol": target,
+        "locked_chain": chain,
+        "locked_base_asset": base_asset,
+        "execution_mode": execution_mode,
+        "vault_adapter": "rotation_vault_adapter_pending",
+        "live_vault_ready": False,
+        "risk_limit_pct": risk,
+        "min_net_advantage_pct": min_net,
+        "max_slippage_pct": max_slip,
+        "max_active_rotations": max_active,
+        "runtime_hours": runtime_hours,
+        "expires_at": expires_ts,
+    }
+
+    src.update({
+        "status": status,
+        "lifecycleState": status,
+        "positionState": position_state,
+        "executionMode": execution_mode,
+        "engineMode": src.get("engineMode") or "shadow_capital_manager_v1",
+        "liveVaultReady": False,
+        "chain": chain,
+        "symbol": target,
+        "sourceSymbol": target,
+        "targetAsset": target,
+        "baseAsset": base_asset,
+        "payoutAsset": base_asset,
+        "budgetUsd": budget_usd,
+        "workingCapitalUsd": working_capital,
+        "sessionCapitalUsd": working_capital,
+        "reservedUsd": 0.0 if _rotation_terminal_status(status) else budget_usd,
+        "collectedProfitUsd": collected,
+        "rotationProfitUsd": collected,
+        "grossProfitUsd": gross,
+        "costsUsd": costs,
+        "netProfitUsd": net,
+        "runtimeHours": runtime_hours,
+        "startedAt": started_ts,
+        "expiresAt": expires_ts,
+        "riskLimitPct": risk,
+        "minNetAdvantagePct": min_net,
+        "maxSlippagePct": max_slip,
+        "maxActiveRotations": max_active,
+        "active": not _rotation_terminal_status(status),
+        "updatedAt": _rotation_ms(src.get("updatedAt") or src.get("updated_ts"), now_ms),
+        "meta": next_meta,
+    })
+    return src
+
+
 def _rotation_status_for_db(sess: dict) -> str:
     raw = str((sess or {}).get("status") or (sess or {}).get("runtimeStatus") or "WAITING").strip().upper()
     if raw in ("READY", "APPROVED"):
@@ -8911,26 +9087,42 @@ def _rotation_session_to_db_tuple(wa: str, sess: dict, nowi: int):
     if not sid:
         sid = f"ROT-{uuid.uuid4().hex[:12].upper()}"
         sess["id"] = sid
+    sess = _rotation_live_normalize_session(sess)
     meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
     status = _rotation_status_for_db(sess)
     chain = str(sess.get("chain") or meta.get("chain") or "").strip().upper()
-    base_asset = str(sess.get("baseAsset") or sess.get("payoutAsset") or meta.get("base_asset") or "USDC").strip().upper()
-    target_symbol = str(sess.get("symbol") or sess.get("targetAsset") or meta.get("target_asset") or "").strip().upper()
+    base_asset = _rotation_base_asset(sess.get("baseAsset") or sess.get("payoutAsset") or meta.get("base_asset"))
+    target_symbol = _rotation_norm_symbol(sess.get("sourceSymbol") or sess.get("symbol") or sess.get("targetAsset") or meta.get("target_asset"))
     budget_usd = _rotation_float(sess.get("budgetUsd") or sess.get("budget_usd"), 0.0)
     working_capital_usd = _rotation_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("working_capital_usd"), budget_usd)
+    reserved_usd = 0.0 if _rotation_terminal_status(status) else _rotation_float(sess.get("reservedUsd") or sess.get("reserved_usd"), budget_usd)
     collected_profit_usd = _rotation_float(sess.get("collectedProfitUsd") or sess.get("rotationProfitUsd") or sess.get("profitUsd") or meta.get("collectedProfitUsd"), 0.0)
     gross_profit_usd = _rotation_float(sess.get("grossProfitUsd") or sess.get("gross_usd"), 0.0)
     costs_usd = _rotation_float(sess.get("costsUsd") or sess.get("costs_usd"), 0.0)
     net_profit_usd = _rotation_float(sess.get("netProfitUsd") or sess.get("net_usd"), collected_profit_usd)
     runtime_hours = _rotation_float(sess.get("runtimeHours") or sess.get("runtime_hours") or meta.get("runtime_hours"), 24.0)
+    risk_limit_pct = _rotation_float(sess.get("riskLimitPct") or meta.get("risk_limit_pct"), 0.0)
+    min_net_advantage_pct = _rotation_float(sess.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct"), 0.0)
+    max_slippage_pct = _rotation_float(sess.get("maxSlippagePct") or meta.get("max_slippage_pct"), 0.0)
+    max_active_rotations = int(max(1, min(12, _rotation_float(sess.get("maxActiveRotations") or meta.get("max_active_rotations"), 3))))
+    execution_mode = str(sess.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
+    position_state = str(sess.get("positionState") or sess.get("position_state") or "WAITING").strip().upper()
+    lifecycle_state = str(sess.get("lifecycleState") or status or "WAITING").strip().upper()
+    locked_target_symbol = target_symbol
+    locked_chain = chain
+    locked_base_asset = base_asset
+    deleted_ts = _rotation_ms(sess.get("deletedAt") or sess.get("deleted_ts"), 0)
     started_ts = _rotation_ms(sess.get("startedAt") or sess.get("started_at") or sess.get("createdAt") or sess.get("created_ts"), nowi)
     expires_ts = _rotation_ms(sess.get("expiresAt") or sess.get("expires_at") or meta.get("expires_at"), 0)
     updated_ts = _rotation_ms(sess.get("updatedAt") or sess.get("updated_ts"), nowi)
     sess_json = json.dumps(sess if isinstance(sess, dict) else {}, separators=(",", ":"), ensure_ascii=False)
     return (
         wa, sid, status, chain, base_asset, target_symbol,
-        budget_usd, working_capital_usd, collected_profit_usd,
+        budget_usd, working_capital_usd, reserved_usd, collected_profit_usd,
         gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
+        risk_limit_pct, min_net_advantage_pct, max_slippage_pct, max_active_rotations,
+        execution_mode, position_state, lifecycle_state,
+        locked_target_symbol, locked_chain, locked_base_asset, deleted_ts,
         started_ts, expires_ts, updated_ts, sess_json,
     )
 
@@ -8968,7 +9160,16 @@ def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int
         active_id = str(ui_row["active_session_id"] or "") if ui_row else ""
         updated_ts = int(ui_row["updated_ts"] or 0) if ui_row else 0
         cur.execute(
-            "SELECT session_id, session_json, status, updated_ts FROM rotation_sessions WHERE wallet_address=? ORDER BY updated_ts DESC LIMIT 30",
+            """
+            SELECT s.session_id, s.session_json, s.status, s.updated_ts
+            FROM rotation_sessions s
+            LEFT JOIN rotation_deleted_sessions d
+              ON d.wallet_address=s.wallet_address AND d.session_id=s.session_id
+            WHERE s.wallet_address=?
+              AND d.session_id IS NULL
+              AND COALESCE(s.status,'') <> 'DELETED'
+            ORDER BY s.updated_ts DESC LIMIT 30
+            """,
             (wa,),
         )
         rows = cur.fetchall()
@@ -9002,7 +9203,29 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
     try:
         with DB_WRITE_LOCK:
             cur = conn.cursor()
+            cur.execute("SELECT session_id, status, session_json FROM rotation_sessions WHERE wallet_address=?", (wa,))
+            existing_by_id = {}
+            existing_status_by_id = {}
+            for row in cur.fetchall():
+                sid_existing = str(row["session_id"] or "")
+                existing_status_by_id[sid_existing] = str(row["status"] or "").strip().upper()
+                try:
+                    existing_by_id[sid_existing] = json.loads(row["session_json"] or "{}") or {}
+                except Exception:
+                    existing_by_id[sid_existing] = {}
+            cur.execute("SELECT session_id FROM rotation_deleted_sessions WHERE wallet_address=?", (wa,))
+            deleted_ids = {str(r["session_id"] or "") for r in cur.fetchall()}
             incoming_ids = set()
+            normalized_clean = []
+            for raw_sess in clean:
+                sid_preview = _rotation_session_id(raw_sess)
+                if sid_preview and sid_preview in deleted_ids:
+                    continue
+                norm_sess = _rotation_live_normalize_session(raw_sess, existing_by_id.get(sid_preview), existing_status_by_id.get(sid_preview, ""))
+                if _rotation_session_id(norm_sess) in deleted_ids:
+                    continue
+                normalized_clean.append(norm_sess)
+            clean = normalized_clean
             for sess in clean:
                 sid_preview = _rotation_session_id(sess)
                 if sid_preview:
@@ -9026,22 +9249,37 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
                     """
                     INSERT INTO rotation_sessions(
                         wallet_address, session_id, status, chain, base_asset, target_symbol,
-                        budget_usd, working_capital_usd, collected_profit_usd,
+                        budget_usd, working_capital_usd, reserved_usd, collected_profit_usd,
                         gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
+                        risk_limit_pct, min_net_advantage_pct, max_slippage_pct, max_active_rotations,
+                        execution_mode, position_state, lifecycle_state,
+                        locked_target_symbol, locked_chain, locked_base_asset, deleted_ts,
                         started_ts, expires_ts, updated_ts, session_json
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(wallet_address, session_id) DO UPDATE SET
                         status=excluded.status,
-                        chain=excluded.chain,
-                        base_asset=excluded.base_asset,
-                        target_symbol=excluded.target_symbol,
+                        chain=CASE WHEN rotation_sessions.locked_chain <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_chain ELSE excluded.chain END,
+                        base_asset=CASE WHEN rotation_sessions.locked_base_asset <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_base_asset ELSE excluded.base_asset END,
+                        target_symbol=CASE WHEN rotation_sessions.locked_target_symbol <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_target_symbol ELSE excluded.target_symbol END,
                         budget_usd=excluded.budget_usd,
                         working_capital_usd=excluded.working_capital_usd,
+                        reserved_usd=excluded.reserved_usd,
                         collected_profit_usd=excluded.collected_profit_usd,
                         gross_profit_usd=excluded.gross_profit_usd,
                         costs_usd=excluded.costs_usd,
                         net_profit_usd=excluded.net_profit_usd,
                         runtime_hours=excluded.runtime_hours,
+                        risk_limit_pct=excluded.risk_limit_pct,
+                        min_net_advantage_pct=excluded.min_net_advantage_pct,
+                        max_slippage_pct=excluded.max_slippage_pct,
+                        max_active_rotations=excluded.max_active_rotations,
+                        execution_mode=excluded.execution_mode,
+                        position_state=excluded.position_state,
+                        lifecycle_state=excluded.lifecycle_state,
+                        locked_target_symbol=COALESCE(NULLIF(rotation_sessions.locked_target_symbol,''), excluded.locked_target_symbol),
+                        locked_chain=COALESCE(NULLIF(rotation_sessions.locked_chain,''), excluded.locked_chain),
+                        locked_base_asset=COALESCE(NULLIF(rotation_sessions.locked_base_asset,''), excluded.locked_base_asset),
+                        deleted_ts=excluded.deleted_ts,
                         started_ts=excluded.started_ts,
                         expires_ts=excluded.expires_ts,
                         updated_ts=excluded.updated_ts,
@@ -9118,6 +9356,11 @@ def api_rotation_session_delete(session_id):
                 hard_delete_ok = st in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"} or position_state in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"}
                 if not hard_delete_ok:
                     return err("rotation session can only be deleted after STOPPED/COMPLETE/EXPIRED/ERROR/PROTECTED", 409)
+            cur.execute(
+                "INSERT INTO rotation_deleted_sessions(wallet_address, session_id, deleted_ts, reason) VALUES(?,?,?,?) "
+                "ON CONFLICT(wallet_address, session_id) DO UPDATE SET deleted_ts=excluded.deleted_ts, reason=excluded.reason",
+                (wa_norm, sid, nowi, "user_delete"),
+            )
             cur.execute("DELETE FROM rotation_events WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
             cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
             cur.execute("SELECT active_session_id FROM rotation_ui_state WHERE wallet_address=?", (wa_norm,))
@@ -9153,22 +9396,38 @@ def api_rotation_sessions():
             replace_missing = False
         active_id = str((body.get("activeRotationSessionId") or body.get("active_session_id") or "") if isinstance(body, dict) else "").strip()
         saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id, replace_missing=replace_missing)
+        active_rows = [x for x in saved if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
         out = jsonify({
             "status": "ok",
             "wallet": wa,
             "sessions": saved,
             "activeRotationSessionId": active,
+            "summary": {
+                "active_count": len(active_rows),
+                "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
+                "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in saved), 6),
+                "execution_mode": "shadow",
+                "vault_ready": False,
+            },
             "updated_ts": updated_ts,
             "ts": now_ts(),
         })
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return out
     sessions, active, updated_ts = _db_get_rotation_sessions(wa)
+    active_rows = [x for x in sessions if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
     out = jsonify({
         "status": "ok",
         "wallet": wa,
         "sessions": sessions,
         "activeRotationSessionId": active,
+        "summary": {
+            "active_count": len(active_rows),
+            "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
+            "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in sessions), 6),
+            "execution_mode": "shadow",
+            "vault_ready": False,
+        },
         "updated_ts": updated_ts,
         "ts": now_ts(),
     })
