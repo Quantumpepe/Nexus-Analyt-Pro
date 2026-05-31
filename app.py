@@ -20895,6 +20895,23 @@ def _nexus_score_for_asset(asset: dict) -> dict:
             whale = {"status": "error", "error": str(e), "score_delta": 0}
 
     raw_score = sum(float(v or 0) for v in parts.values())
+
+    # Rotation Strategist bridge: when the frontend sends a ranked Strategist
+    # candidate, keep that signal visible in the rotation preview. This is only
+    # a preview/shadow score hint; the later Vault adapter must still validate
+    # token allowlists, liquidity, slippage and safety on-chain/server-side.
+    hint = _safe_float(
+        asset.get("scoreHint")
+        or asset.get("score_hint")
+        or asset.get("strategistScore")
+        or asset.get("strategist_score")
+        or 0
+    )
+    if hint > 0:
+        # Blend, do not blindly override market/risk scoring.
+        raw_score = (raw_score * 0.55) + (max(0.0, min(100.0, hint)) * 0.45)
+        reasons.append("Strategist candidate score hint")
+
     score = max(0, min(100, round(raw_score, 2)))
     risk = "LOW" if score >= 75 else "MEDIUM" if score >= 50 else "HIGH"
     rating = _nexus_rating(score)
