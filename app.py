@@ -20754,6 +20754,7 @@ def api_nexus_rotation_preview():
         return err("missing assets or symbols", 400)
     budget_usd = _safe_float(body.get("budget_usd") or body.get("budgetUsd") or body.get("budget") or 0)
     chain = _normalize_chain_key(body.get("chain") or "POL")
+    base_asset = str(body.get("baseAsset") or body.get("base_asset") or body.get("payoutAsset") or body.get("payout_asset") or "USDC").strip().upper()
     plan = _nexus_build_rotation_plan(assets, budget_usd)
     previews = []
     for row in plan.get("plan") or []:
@@ -20764,6 +20765,10 @@ def api_nexus_rotation_preview():
                 "symbol": row.get("symbol"),
                 "token": row.get("token") or body.get("token") or body.get("tokenOut") or "",
                 "side": "BUY" if row.get("action") == "INCREASE" else "HOLD",
+                "tokenIn": base_asset,
+                "token_in": base_asset,
+                "tokenOut": row.get("token") or row.get("symbol") or body.get("tokenOut") or "",
+                "token_out": row.get("token") or row.get("symbol") or body.get("tokenOut") or "",
                 "amountUsd": row.get("target_usd"),
             })
             prev = _nexus_order_preview(pb)
@@ -20780,7 +20785,16 @@ def api_nexus_rotation_preview():
                 "blocking_reasons": ["rotation_action_not_increase_or_no_budget"],
                 "ts": now_ts(),
             })
-    return jsonify({"status": "ok", "plan": plan.get("plan") or [], "previews": previews, "ts": now_ts()})
+    return jsonify({
+        "status": "ok",
+        "capitalFlow": "BASE_TO_TARGET_TO_BASE",
+        "baseAsset": base_asset,
+        "shadowOnly": True,
+        "liveVaultReady": False,
+        "plan": plan.get("plan") or [],
+        "previews": previews,
+        "ts": now_ts(),
+    })
 
 
 # -------------------------
