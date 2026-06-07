@@ -11328,6 +11328,15 @@ def _shadow_normalize_queue_item(item, idx=0):
     else:
         confidence = _clamp_float(confidence_raw, 0, 0, 100)
     risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    risk_mode = str(
+        item.get("riskMode") or item.get("risk_mode") or item.get("trading_risk_mode")
+        or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode")
+        or ""
+    ).strip().upper()
+    style = str(
+        item.get("style") or item.get("trading_style") or meta.get("style") or meta.get("trading_style") or ""
+    ).strip().upper()
 
     # Shadow slots often arrive from the prepared UI with a useful priority but
     # without a dedicated confidence score yet. In that case, derive a conservative
@@ -11348,6 +11357,16 @@ def _shadow_normalize_queue_item(item, idx=0):
         "priority": priority,
         "confidence_score": confidence,
         "risk_score": risk_score,
+        "riskMode": risk_mode or item.get("riskMode") or item.get("risk_mode") or "",
+        "risk_mode": risk_mode or item.get("risk_mode") or item.get("riskMode") or "",
+        "trading_risk_mode": risk_mode or item.get("trading_risk_mode") or "",
+        "style": style or item.get("style") or item.get("trading_style") or "",
+        "trading_style": style or item.get("trading_style") or item.get("style") or "",
+        "caution_drawdown_pct": item.get("caution_drawdown_pct", item.get("cautionDrawdownPct", meta.get("caution_drawdown_pct", meta.get("cautionDrawdownPct", None)))),
+        "hard_stop_pct": item.get("hard_stop_pct", item.get("hardStopPct", meta.get("hard_stop_pct", meta.get("hardStopPct", None)))),
+        "profit_lock_pct": item.get("profit_lock_pct", item.get("profitLockPct", meta.get("profit_lock_pct", meta.get("profitLockPct", None)))),
+        "max_slippage_pct": item.get("max_slippage_pct", item.get("maxSlippagePct", meta.get("max_slippage_pct", meta.get("maxSlippagePct", None)))),
+        "max_trades": item.get("max_trades", item.get("maxTrades", meta.get("max_trades", meta.get("maxTrades", None)))),
     }
 
 
@@ -11718,6 +11737,10 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             "collected_profit_usd", "realized_profit_usd",
             "paper_recycled_until_total_usd",
             "paper_quantity", "paper_position_usd", "paper_entry_ts",
+            "riskMode", "risk_mode", "trading_risk_mode", "style", "trading_style",
+            "cautionDrawdownPct", "caution_drawdown_pct", "hardStopPct", "hard_stop_pct",
+            "profitLockPct", "profit_lock_pct", "maxSlippagePct", "max_slippage_pct",
+            "maxTrades", "max_trades",
         ]:
             if item.get(mk) is not None:
                 meta[mk] = item.get(mk)
