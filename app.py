@@ -10928,6 +10928,39 @@ def _nexus_execution_summary(cur, wallet_address):
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
+
+
+def _nexus_confidence_to_score(value, default: float = 55.0) -> float:
+    """Convert frontend labels like MEDIUM/HIGH into numeric Strategist confidence.
+
+    Without this, Number("MEDIUM") on the frontend or float("MEDIUM")
+    collapses to 0 and non-ETH sessions can look like score 0 forever.
+    """
+    try:
+        if value is None:
+            return float(default)
+        raw = str(value).strip().upper()
+        if raw == "":
+            return float(default)
+        try:
+            n = float(raw.replace(",", "."))
+            if math.isfinite(n):
+                return max(0.0, min(100.0, n))
+        except Exception:
+            pass
+        table = {
+            "VERY_HIGH": 90.0, "VERY-HIGH": 90.0, "EXTREME": 90.0,
+            "HIGH": 80.0, "STRONG": 80.0,
+            "MEDIUM_HIGH": 68.0, "MEDIUM-HIGH": 68.0, "MID_HIGH": 68.0, "MID-HIGH": 68.0,
+            "MEDIUM": 58.0, "MID": 58.0, "BALANCED": 58.0,
+            "LOW_MEDIUM": 45.0, "LOW-MEDIUM": 45.0, "LOW_MED": 45.0, "LOW-MED": 45.0,
+            "LOW": 30.0, "WEAK": 30.0,
+            "BLOCKED": 0.0, "FAIL": 0.0, "NONE": 0.0, "NO": 0.0,
+        }
+        return table.get(raw, float(default))
+    except Exception:
+        return float(default)
+
 def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     """Score one prepared slot for Shadow/rotation readiness without live execution.
 
@@ -10941,7 +10974,7 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
 
     raw_confidence = item.get("confidence", item.get("confidence_score", signals.get("confidence", None)))
-    confidence = _clamp_float(raw_confidence, 0, 0, 100) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
+    confidence = _nexus_confidence_to_score(raw_confidence, 0) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
     risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
     priority_raw = item.get("priority", None)
     priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
@@ -11085,8 +11118,6 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         body.get("max_combined_slots", body.get("maxCombinedSlots", body.get("slot_donor_cap", body.get("slotDonorCap", meta.get("max_combined_slots", meta.get("slot_donor_cap", 0)))))),
         0, 0, 3
     ))
-    risk_mode = str(body.get("riskMode") or body.get("risk_mode") or body.get("trading_risk_mode") or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode") or "").strip().upper()
-    style = str(body.get("style") or body.get("trading_style") or meta.get("style") or meta.get("trading_style") or "").strip().upper()
     meta = {
         **meta,
         "reuse_profit_pct": reuse_profit_pct,
@@ -11096,23 +11127,10 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         "slot_donor_cap": max_combined_slots,
         "slotDonorCap": max_combined_slots,
     }
-    if risk_mode:
-        meta.update({"riskMode": risk_mode, "risk_mode": risk_mode, "trading_risk_mode": risk_mode})
-    if style:
-        meta.update({"style": style, "trading_style": style})
-    for camel, snake in (("cautionDrawdownPct", "caution_drawdown_pct"), ("hardStopPct", "hard_stop_pct"), ("profitLockPct", "profit_lock_pct"), ("maxSlippagePct", "max_slippage_pct"), ("maxTrades", "max_trades")):
-        val = body.get(camel, body.get(snake, meta.get(camel, meta.get(snake))))
-        try:
-            if val is not None and str(val).strip() != "":
-                f = float(val)
-                meta[camel] = f
-                meta[snake] = f
-        except Exception:
-            pass
-    confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
+    confidence = _nexus_confidence_to_score(body.get("confidence", body.get("confidence_score", signals.get("confidence", 0))), 55)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
-    decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": risk_mode or "BALANCED"})
+    decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": body.get("risk_mode") or "BALANCED"})
     state = str(decision.get("state") or requested_state).upper()
     if state not in _NEXUS_EXEC_ALLOWED_STATES:
         state = requested_state
@@ -11343,15 +11361,6 @@ def _shadow_normalize_queue_item(item, idx=0):
     else:
         confidence = _clamp_float(confidence_raw, 0, 0, 100)
     risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
-    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    risk_mode = str(
-        item.get("riskMode") or item.get("risk_mode") or item.get("trading_risk_mode")
-        or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode")
-        or ""
-    ).strip().upper()
-    style = str(
-        item.get("style") or item.get("trading_style") or meta.get("style") or meta.get("trading_style") or ""
-    ).strip().upper()
 
     # Shadow slots often arrive from the prepared UI with a useful priority but
     # without a dedicated confidence score yet. In that case, derive a conservative
@@ -11372,16 +11381,6 @@ def _shadow_normalize_queue_item(item, idx=0):
         "priority": priority,
         "confidence_score": confidence,
         "risk_score": risk_score,
-        "riskMode": risk_mode or item.get("riskMode") or item.get("risk_mode") or "",
-        "risk_mode": risk_mode or item.get("risk_mode") or item.get("riskMode") or "",
-        "trading_risk_mode": risk_mode or item.get("trading_risk_mode") or "",
-        "style": style or item.get("style") or item.get("trading_style") or "",
-        "trading_style": style or item.get("trading_style") or item.get("style") or "",
-        "caution_drawdown_pct": item.get("caution_drawdown_pct", item.get("cautionDrawdownPct", meta.get("caution_drawdown_pct", meta.get("cautionDrawdownPct", None)))),
-        "hard_stop_pct": item.get("hard_stop_pct", item.get("hardStopPct", meta.get("hard_stop_pct", meta.get("hardStopPct", None)))),
-        "profit_lock_pct": item.get("profit_lock_pct", item.get("profitLockPct", meta.get("profit_lock_pct", meta.get("profitLockPct", None)))),
-        "max_slippage_pct": item.get("max_slippage_pct", item.get("maxSlippagePct", meta.get("max_slippage_pct", meta.get("maxSlippagePct", None)))),
-        "max_trades": item.get("max_trades", item.get("maxTrades", meta.get("max_trades", meta.get("maxTrades", None)))),
     }
 
 
@@ -11752,10 +11751,6 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             "collected_profit_usd", "realized_profit_usd",
             "paper_recycled_until_total_usd",
             "paper_quantity", "paper_position_usd", "paper_entry_ts",
-            "riskMode", "risk_mode", "trading_risk_mode", "style", "trading_style",
-            "cautionDrawdownPct", "caution_drawdown_pct", "hardStopPct", "hard_stop_pct",
-            "profitLockPct", "profit_lock_pct", "maxSlippagePct", "max_slippage_pct",
-            "maxTrades", "max_trades",
         ]:
             if item.get(mk) is not None:
                 meta[mk] = item.get(mk)
