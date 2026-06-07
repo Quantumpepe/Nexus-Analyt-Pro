@@ -10811,6 +10811,49 @@ def _nexus_queue_row_to_dict(row) -> dict:
         if meta.get(mk) is not None:
             out[mk] = meta.get(mk)
 
+    # Important: Session-specific settings must also be returned top-level.
+    # The UI and Shadow runtime both support mixed old/new key names.
+    # Keeping these aliases synchronized prevents Details cards from showing `—`
+    # and prevents the Strategist from falling back to generic defaults.
+    _session_alias_groups = [
+        ("style", ["style", "trading_style", "strategy"]),
+        ("trading_style", ["trading_style", "style", "strategy"]),
+        ("strategy", ["strategy", "style", "trading_style"]),
+        ("risk_mode", ["risk_mode", "riskMode", "trading_risk_mode"]),
+        ("riskMode", ["riskMode", "risk_mode", "trading_risk_mode"]),
+        ("trading_risk_mode", ["trading_risk_mode", "risk_mode", "riskMode"]),
+        ("max_trades", ["max_trades", "maxTrades"]),
+        ("maxTrades", ["maxTrades", "max_trades"]),
+        ("hard_stop_pct", ["hard_stop_pct", "hardStopPct"]),
+        ("hardStopPct", ["hardStopPct", "hard_stop_pct"]),
+        ("profit_lock_pct", ["profit_lock_pct", "profitLockPct"]),
+        ("profitLockPct", ["profitLockPct", "profit_lock_pct"]),
+        ("max_slippage_pct", ["max_slippage_pct", "maxSlippagePct"]),
+        ("maxSlippagePct", ["maxSlippagePct", "max_slippage_pct"]),
+        ("caution_drawdown_pct", ["caution_drawdown_pct", "cautionDrawdownPct"]),
+        ("cautionDrawdownPct", ["cautionDrawdownPct", "caution_drawdown_pct"]),
+        ("reuse_profit_pct", ["reuse_profit_pct", "reuseProfitPct", "profit_reuse_pct", "profitReusePct"]),
+        ("reuseProfitPct", ["reuseProfitPct", "reuse_profit_pct", "profit_reuse_pct", "profitReusePct"]),
+        ("profit_reuse_pct", ["profit_reuse_pct", "profitReusePct", "reuse_profit_pct", "reuseProfitPct"]),
+        ("profitReusePct", ["profitReusePct", "profit_reuse_pct", "reuse_profit_pct", "reuseProfitPct"]),
+        ("max_combined_slots", ["max_combined_slots", "maxCombinedSlots", "slot_donor_cap", "slotDonorCap"]),
+        ("maxCombinedSlots", ["maxCombinedSlots", "max_combined_slots", "slot_donor_cap", "slotDonorCap"]),
+        ("slot_donor_cap", ["slot_donor_cap", "slotDonorCap", "max_combined_slots", "maxCombinedSlots"]),
+        ("slotDonorCap", ["slotDonorCap", "slot_donor_cap", "max_combined_slots", "maxCombinedSlots"]),
+        ("payout_asset", ["payout_asset", "payoutAsset"]),
+        ("payoutAsset", ["payoutAsset", "payout_asset"]),
+        ("runtime_hours", ["runtime_hours", "runtimeHours"]),
+        ("runtimeHours", ["runtimeHours", "runtime_hours"]),
+        ("session_expires_ts", ["session_expires_ts", "expires_ts"]),
+        ("expires_ts", ["expires_ts", "session_expires_ts"]),
+    ]
+    for out_key, aliases in _session_alias_groups:
+        for k in aliases:
+            val = meta.get(k)
+            if val is not None and str(val).strip() != "":
+                out[out_key] = val
+                break
+
     # Session/UI aggregation must be able to read protected profit without
     # digging through meta_json. Keep top-level aliases in sync.
     collected = _clamp_float(
@@ -10868,6 +10911,9 @@ def _nexus_execution_summary(cur, wallet_address):
             row["session_id"] = sid
             meta["session_id"] = sid
             row["meta"] = meta
+        chain_key = _normalize_chain_key(row.get("chain") or meta.get("chain") or "")
+        if _nexus_shadow_is_session_stopped(cur, wallet_address, sid, chain_key):
+            continue
         active_rows.append(row)
 
     # Dedupe visible cards per budget session. Keep the newest row for the same slot.
@@ -10960,7 +11006,13 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
     security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
 
-    max_slippage = _clamp_float(cfg.get("max_slippage_pct", item.get("maxSlippagePct", 1.2)), 1.2, 0.05, 10)
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    max_slippage_source = cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", None))
+    if max_slippage_source is None:
+        max_slippage_source = item.get("max_slippage_pct", item.get("maxSlippagePct", None))
+    if max_slippage_source is None:
+        max_slippage_source = meta.get("max_slippage_pct", meta.get("maxSlippagePct", 1.2))
+    max_slippage = _clamp_float(max_slippage_source, 1.2, 0.05, 10)
     quality = priority
     if confidence >= 70:
         quality += 10
@@ -11638,11 +11690,31 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
         }
         queue_out.append(out_item)
 
-    safety_score = 100
+    # Do not default every Shadow preview to 100. The score must reflect the
+    # actual per-slot quality/confidence/risk that came from the live prepared queue.
+    quality_values = [
+        _clamp_float((quality_by_idx.get(i) or {}).get("quality"), 0, -100, 100)
+        for i in range(len(normalized))
+        if isinstance(quality_by_idx.get(i), dict)
+    ]
+    confidence_values = [
+        _clamp_float((quality_by_idx.get(i) or {}).get("confidence"), 0, 0, 100)
+        for i in range(len(normalized))
+        if isinstance(quality_by_idx.get(i), dict)
+    ]
+    risk_values = [
+        _clamp_float((quality_by_idx.get(i) or {}).get("risk_score"), 0, 0, 100)
+        for i in range(len(normalized))
+        if isinstance(quality_by_idx.get(i), dict)
+    ]
+    avg_quality = (sum(quality_values) / len(quality_values)) if quality_values else 0.0
+    avg_confidence = (sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0
+    avg_risk = (sum(risk_values) / len(risk_values)) if risk_values else 0.0
+    fill_bonus = min(10.0, virtual_fills * 2.0)
+    safety_score = 50.0 + (avg_quality * 0.35) + ((avg_confidence - 50.0) * 0.25) - (avg_risk * 0.30) + fill_bonus
     safety_score -= min(35, blocked * 8)
     safety_score -= min(24, protect_count * 6)
-    safety_score += min(10, virtual_fills * 2)
-    safety_score = max(0, min(100, int(safety_score)))
+    safety_score = max(0, min(100, int(round(safety_score))))
 
     status = "passed" if safety_score >= 72 and virtual_fills > 0 else "watch" if safety_score >= 45 else "blocked"
     summary = {
@@ -11808,6 +11880,79 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
     return changed
 
 
+
+def _nexus_shadow_ensure_stop_table(cur):
+    """Create the Shadow stop/tombstone table lazily for safe deployments."""
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS nexus_shadow_stopped_sessions (
+            wallet_address TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            chain TEXT DEFAULT '',
+            stopped_ts INTEGER DEFAULT 0,
+            reason TEXT DEFAULT '',
+            PRIMARY KEY (wallet_address, session_key)
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_shadow_stopped_wallet_ts ON nexus_shadow_stopped_sessions(wallet_address, stopped_ts)")
+
+
+def _nexus_shadow_stop_keys(session_id: str = "", chain: str = "") -> set[str]:
+    keys = set()
+    ch = _normalize_chain_key(chain or "")
+    sid_candidates = _nexus_shadow_session_candidates(session_id)
+    if sid_candidates:
+        for sid in sid_candidates:
+            keys.add(f"sid:{sid}")
+            if ch:
+                keys.add(f"sid:{sid}|chain:{ch}")
+    elif ch:
+        # Chain-only tombstone is used only when the UI/backend truly has no
+        # session id. Do not block all future sessions on that chain.
+        keys.add(f"chain:{ch}")
+    return {k for k in keys if k}
+
+
+def _nexus_shadow_mark_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = "", reason: str = "user_stop"):
+    _nexus_shadow_ensure_stop_table(cur)
+    now_i = now_ts()
+    for key in _nexus_shadow_stop_keys(session_id, chain):
+        cur.execute(
+            """
+            INSERT INTO nexus_shadow_stopped_sessions(wallet_address, session_key, session_id, chain, stopped_ts, reason)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(wallet_address, session_key) DO UPDATE SET
+                session_id=excluded.session_id,
+                chain=excluded.chain,
+                stopped_ts=excluded.stopped_ts,
+                reason=excluded.reason
+            """,
+            (wallet_address, key, str(session_id or "")[:100], _normalize_chain_key(chain or "")[:24], now_i, str(reason or "")[:200]),
+        )
+
+
+def _nexus_shadow_clear_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = ""):
+    _nexus_shadow_ensure_stop_table(cur)
+    keys = list(_nexus_shadow_stop_keys(session_id, chain))
+    if not keys:
+        return 0
+    q = ",".join("?" for _ in keys)
+    cur.execute(f"DELETE FROM nexus_shadow_stopped_sessions WHERE wallet_address=? AND session_key IN ({q})", (wallet_address, *keys))
+    return int(cur.rowcount or 0)
+
+
+def _nexus_shadow_is_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = "") -> bool:
+    _nexus_shadow_ensure_stop_table(cur)
+    keys = list(_nexus_shadow_stop_keys(session_id, chain))
+    if not keys:
+        return False
+    q = ",".join("?" for _ in keys)
+    cur.execute(f"SELECT 1 FROM nexus_shadow_stopped_sessions WHERE wallet_address=? AND session_key IN ({q}) LIMIT 1", (wallet_address, *keys))
+    return cur.fetchone() is not None
+
+
 def _nexus_shadow_session_candidates(session_id: str) -> set[str]:
     """Return safe equivalent ids for UI/backend session matching.
 
@@ -11869,6 +12014,9 @@ def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = No
             if has_no_queue and runtime_status in ("idle", "completed", ""):
                 continue
             run_session = str(config.get("session_id") or runtime.get("session_id") or summary.get("session_id") or "").strip()
+            run_chain = _normalize_chain_key(config.get("chain") or config.get("chain_key") or runtime.get("chain") or "")
+            if _nexus_shadow_is_session_stopped(cur, wallet_address, run_session or want_session, run_chain or cfg.get("chain") or cfg.get("chain_key") or ""):
+                continue
             if want_session and run_session and not _nexus_shadow_session_matches(run_session, want_session):
                 continue
             if want_session and not run_session:
@@ -11922,6 +12070,10 @@ def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain:
     ch_filter = _normalize_chain_key(chain or "")
     if not sid and not ch_filter:
         return 0
+
+    # Authoritative backend tombstone. Even if no queue row is currently visible,
+    # older RUNNING run history must not resurrect this session/card on the next GET.
+    _nexus_shadow_mark_session_stopped(cur, wallet_address, sid, ch_filter, "user_stop")
 
     cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=?", (wallet_address,))
     rows = cur.fetchall()
@@ -12109,6 +12261,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     # This prevents a refresh from showing an empty session while avoiding global deletes.
     selected_session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
     selected_chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+    if selected_session_id and action not in ("start", "resume") and _nexus_shadow_is_session_stopped(cur, wallet_address, selected_session_id, selected_chain):
+        return {
+            "runtime_status": "stopped",
+            "events": [{"type": "SHADOW_STOPPED", "message": "Selected Shadow session is stopped and will not auto-restart."}],
+            "queue": [],
+            "changed": [],
+            "strategist": {"status": "stopped", "session_id": selected_session_id},
+        }
+
     if selected_session_id:
         for item in normalized:
             meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
@@ -12754,6 +12915,8 @@ def api_nexus_shadow_executor():
                 if chain:
                     cfg_run["chain"] = chain
                     cfg_run["chain_key"] = chain
+                if _nexus_shadow_is_session_stopped(cur, wa, sid, chain):
+                    continue
                 runtime_key = _nexus_shadow_runtime_key(sid, chain)
                 if runtime_key in seen_runtime_keys:
                     continue
@@ -12858,6 +13021,14 @@ def api_nexus_shadow_executor():
 
         if action in ("start", "tick", "pause", "resume", "stop"):
             if action in ("start", "resume"):
+                # A fresh user start/resume explicitly re-opens the selected permission window.
+                # Clear old stop tombstones only for this selected session/chain.
+                _nexus_shadow_clear_session_stopped(
+                    cur,
+                    wa,
+                    str(cfg.get("session_id") or cfg.get("sessionId") or "").strip(),
+                    _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or ""),
+                )
                 # First run the validator once so sparse frontend queues are persisted before runtime starts.
                 # Scope the seed to the selected session/chain. Never seed the whole wallet into one runtime.
                 seed_queue = _nexus_shadow_filter_queue_for_cfg(queue, cfg) or queue
