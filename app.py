@@ -10928,39 +10928,6 @@ def _nexus_execution_summary(cur, wallet_address):
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
-
-
-def _nexus_confidence_to_score(value, default: float = 55.0) -> float:
-    """Convert frontend labels like MEDIUM/HIGH into numeric Strategist confidence.
-
-    Without this, Number("MEDIUM") on the frontend or float("MEDIUM")
-    collapses to 0 and non-ETH sessions can look like score 0 forever.
-    """
-    try:
-        if value is None:
-            return float(default)
-        raw = str(value).strip().upper()
-        if raw == "":
-            return float(default)
-        try:
-            n = float(raw.replace(",", "."))
-            if math.isfinite(n):
-                return max(0.0, min(100.0, n))
-        except Exception:
-            pass
-        table = {
-            "VERY_HIGH": 90.0, "VERY-HIGH": 90.0, "EXTREME": 90.0,
-            "HIGH": 80.0, "STRONG": 80.0,
-            "MEDIUM_HIGH": 68.0, "MEDIUM-HIGH": 68.0, "MID_HIGH": 68.0, "MID-HIGH": 68.0,
-            "MEDIUM": 58.0, "MID": 58.0, "BALANCED": 58.0,
-            "LOW_MEDIUM": 45.0, "LOW-MEDIUM": 45.0, "LOW_MED": 45.0, "LOW-MED": 45.0,
-            "LOW": 30.0, "WEAK": 30.0,
-            "BLOCKED": 0.0, "FAIL": 0.0, "NONE": 0.0, "NO": 0.0,
-        }
-        return table.get(raw, float(default))
-    except Exception:
-        return float(default)
-
 def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     """Score one prepared slot for Shadow/rotation readiness without live execution.
 
@@ -10974,7 +10941,7 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
 
     raw_confidence = item.get("confidence", item.get("confidence_score", signals.get("confidence", None)))
-    confidence = _nexus_confidence_to_score(raw_confidence, 0) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
+    confidence = _clamp_float(raw_confidence, 0, 0, 100) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
     risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
     priority_raw = item.get("priority", None)
     priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
@@ -11118,6 +11085,21 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         body.get("max_combined_slots", body.get("maxCombinedSlots", body.get("slot_donor_cap", body.get("slotDonorCap", meta.get("max_combined_slots", meta.get("slot_donor_cap", 0)))))),
         0, 0, 3
     ))
+    style = str(
+        body.get("style") or body.get("trading_style") or body.get("strategy")
+        or meta.get("style") or meta.get("trading_style") or meta.get("strategy") or ""
+    ).strip().upper()[:40]
+    risk_mode_meta = str(
+        body.get("riskMode") or body.get("risk_mode") or body.get("trading_risk_mode")
+        or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode") or ""
+    ).strip().upper()[:40]
+    max_trades_meta = int(_clamp_float(body.get("max_trades", body.get("maxTrades", meta.get("max_trades", meta.get("maxTrades", 0)))), 0, 0, 500))
+    hard_stop_meta = _clamp_float(body.get("hard_stop_pct", body.get("hardStopPct", meta.get("hard_stop_pct", meta.get("hardStopPct", 0)))), 0, 0, 100)
+    profit_lock_meta = _clamp_float(body.get("profit_lock_pct", body.get("profitLockPct", meta.get("profit_lock_pct", meta.get("profitLockPct", 0)))), 0, 0, 100)
+    max_slippage_meta = _clamp_float(body.get("max_slippage_pct", body.get("maxSlippagePct", meta.get("max_slippage_pct", meta.get("maxSlippagePct", 0)))), 0, 0, 100)
+    caution_dd_meta = _clamp_float(body.get("caution_drawdown_pct", body.get("cautionDrawdownPct", meta.get("caution_drawdown_pct", meta.get("cautionDrawdownPct", 0)))), 0, 0, 100)
+    payout_asset_meta = str(body.get("payout_asset") or body.get("payoutAsset") or meta.get("payout_asset") or meta.get("payoutAsset") or "USDC").strip().upper()[:24]
+
     meta = {
         **meta,
         "reuse_profit_pct": reuse_profit_pct,
@@ -11126,8 +11108,26 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         "maxCombinedSlots": max_combined_slots,
         "slot_donor_cap": max_combined_slots,
         "slotDonorCap": max_combined_slots,
+        "style": style,
+        "trading_style": style,
+        "strategy": style,
+        "riskMode": risk_mode_meta,
+        "risk_mode": risk_mode_meta,
+        "trading_risk_mode": risk_mode_meta,
+        "maxTrades": max_trades_meta,
+        "max_trades": max_trades_meta,
+        "hardStopPct": hard_stop_meta,
+        "hard_stop_pct": hard_stop_meta,
+        "profitLockPct": profit_lock_meta,
+        "profit_lock_pct": profit_lock_meta,
+        "maxSlippagePct": max_slippage_meta,
+        "max_slippage_pct": max_slippage_meta,
+        "cautionDrawdownPct": caution_dd_meta,
+        "caution_drawdown_pct": caution_dd_meta,
+        "payoutAsset": payout_asset_meta,
+        "payout_asset": payout_asset_meta,
     }
-    confidence = _nexus_confidence_to_score(body.get("confidence", body.get("confidence_score", signals.get("confidence", 0))), 55)
+    confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
     decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": body.get("risk_mode") or "BALANCED"})
@@ -11751,6 +11751,10 @@ def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: 
             "collected_profit_usd", "realized_profit_usd",
             "paper_recycled_until_total_usd",
             "paper_quantity", "paper_position_usd", "paper_entry_ts",
+            "style", "trading_style", "strategy", "riskMode", "risk_mode", "trading_risk_mode",
+            "maxTrades", "max_trades", "hardStopPct", "hard_stop_pct", "profitLockPct", "profit_lock_pct",
+            "maxSlippagePct", "max_slippage_pct", "cautionDrawdownPct", "caution_drawdown_pct",
+            "payoutAsset", "payout_asset",
         ]:
             if item.get(mk) is not None:
                 meta[mk] = item.get(mk)
