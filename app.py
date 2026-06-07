@@ -11085,6 +11085,8 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         body.get("max_combined_slots", body.get("maxCombinedSlots", body.get("slot_donor_cap", body.get("slotDonorCap", meta.get("max_combined_slots", meta.get("slot_donor_cap", 0)))))),
         0, 0, 3
     ))
+    risk_mode = str(body.get("riskMode") or body.get("risk_mode") or body.get("trading_risk_mode") or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode") or "").strip().upper()
+    style = str(body.get("style") or body.get("trading_style") or meta.get("style") or meta.get("trading_style") or "").strip().upper()
     meta = {
         **meta,
         "reuse_profit_pct": reuse_profit_pct,
@@ -11094,10 +11096,23 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         "slot_donor_cap": max_combined_slots,
         "slotDonorCap": max_combined_slots,
     }
+    if risk_mode:
+        meta.update({"riskMode": risk_mode, "risk_mode": risk_mode, "trading_risk_mode": risk_mode})
+    if style:
+        meta.update({"style": style, "trading_style": style})
+    for camel, snake in (("cautionDrawdownPct", "caution_drawdown_pct"), ("hardStopPct", "hard_stop_pct"), ("profitLockPct", "profit_lock_pct"), ("maxSlippagePct", "max_slippage_pct"), ("maxTrades", "max_trades")):
+        val = body.get(camel, body.get(snake, meta.get(camel, meta.get(snake))))
+        try:
+            if val is not None and str(val).strip() != "":
+                f = float(val)
+                meta[camel] = f
+                meta[snake] = f
+        except Exception:
+            pass
     confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
-    decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": body.get("risk_mode") or "BALANCED"})
+    decision = _nexus_trading_decide_slot({"status": requested_state, "symbol": asset, "signals": signals, "confidence": confidence, "risk_score": risk_score}, {"risk_mode": risk_mode or "BALANCED"})
     state = str(decision.get("state") or requested_state).upper()
     if state not in _NEXUS_EXEC_ALLOWED_STATES:
         state = requested_state
