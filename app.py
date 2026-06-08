@@ -11678,26 +11678,14 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
                 "message": transition_reason,
             })
 
-        # Keep slot/user priority stable. The calculated Strategist quality is
-        # stored separately so the next tick cannot feed score back into priority
-        # and push every slot toward 100.
-        stable_priority = _clamp_float(item.get("priority", priority), 0, -100, 100)
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        meta["strategist_score"] = round(quality_score, 4)
-        meta["shadow_quality"] = round(quality_score, 4)
-        meta["shadow_confidence"] = round(confidence, 4)
-        meta["shadow_risk_score"] = round(risk, 4)
         out_item = {
             **item,
             "status": next_state,
             "state": next_state,
-            "priority": stable_priority,
-            "strategist_score": round(quality_score, 4),
-            "shadow_quality": round(quality_score, 4),
+            "priority": quality_score,
             "confidence_score": confidence,
             "confidence": confidence,
             "risk_score": risk,
-            "meta": meta,
             "shadow_transition": {"from": state, "to": next_state, "reason": transition_reason},
         }
         queue_out.append(out_item)
@@ -12252,19 +12240,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     action = str(action or "tick").strip().lower()
     ts = now_ts()
     tick_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
-    # User-defined Max Combined Slots is the hard ceiling for simultaneous paper-active slots.
-    # If the user allows 3 or 5 combined slots and quality/risk are clean, Shadow may use them.
-    max_combined_source = (
-        cfg.get("max_combined_slots")
-        or cfg.get("maxCombinedSlots")
-        or cfg.get("slot_donor_cap")
-        or cfg.get("slotDonorCap")
-        or cfg.get("shadow_active_slots")
-        or cfg.get("active_slots")
-        or os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1")
-    )
-    max_active = int(_clamp_float(max_combined_source, 1, 1, 10))
-    ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max(2, max_active))))), max(2, max_active), 1, 10))
+    max_active = int(_clamp_float(cfg.get("shadow_active_slots", cfg.get("active_slots", os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1"))), 1, 1, 10))
+    ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", "2"))), 2, 1, 10))
 
     execution = _nexus_execution_summary(cur, wallet_address)
     queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
@@ -12480,16 +12457,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         quality = _clamp_float(q.get("quality", item.get("priority", 0)), 0, -100, 100)
         confidence = _clamp_float(q.get("confidence", item.get("confidence", item.get("confidence_score", 0))), 0, 0, 100)
         risk = _clamp_float(q.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
-        # Do not overwrite the stable slot priority with the calculated score.
-        # Priority is a ranking/allocation hint; strategist_score is the live decision quality.
-        meta = get_meta(item)
-        meta["strategist_score"] = round(quality, 4)
-        meta["shadow_quality"] = round(quality, 4)
-        meta["shadow_confidence"] = round(confidence, 4)
-        meta["shadow_risk_score"] = round(risk, 4)
-        set_meta(item, meta)
-        item["strategist_score"] = round(quality, 4)
-        item["shadow_quality"] = round(quality, 4)
+        item["priority"] = quality
         item["confidence"] = item["confidence_score"] = confidence
         item["risk_score"] = risk
         scored.append({"idx": idx, "item": item, "quality": quality, "confidence": confidence, "risk": risk, "hard_block": bool(q.get("hard_block")), "slot_no": slot_no(item, idx)})
@@ -12825,9 +12793,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             continue
         if row["hard_block"] or row["risk"] >= 48:
             continue
-        # Require clean quality/risk, but do not leave good READY capital idle.
-        # Strong markets may activate multiple slots up to max_active/maxCombinedSlots.
-        if row["quality"] >= 30 or row["confidence"] >= 50 or (row["quality"] >= 24 and row["risk"] < 35):
+        # Require enough quality, but allow priority-driven demo/paper execution.
+        if row["quality"] >= 30 or row["confidence"] >= 50:
             candidates.append(row)
     candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
 
@@ -12843,7 +12810,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", "Strategist promoted a clean READY/WAIT slot to paper-active Shadow execution within the user max-combined-slots limit.", "SHADOW_ACTIVE"))
+        events.append(set_state(item, "ACTIVE", "Strategist promoted the best clean slot to paper-active Shadow execution.", "SHADOW_ACTIVE"))
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
