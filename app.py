@@ -247,99 +247,27 @@ _WHALE_SIGNAL_CACHE: dict[str, tuple[float, dict]] = {}
 # CoinGecko proxy (avoid browser CORS + basic throttling)
 # -------------------------
 _CG_CACHE: dict[str, tuple[float, dict]] = {}
-
-# IMPORTANT:
-# CoinGecko market data must not be fetched per UI refresh. The Strategist can
-# still use recent market data, but expensive endpoints are protected by a
-# backend-wide cache, in-flight request dedupe and rate-limit cooldown.
-_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "900"))  # generic/simple endpoints
-_CG_STALE_TTL_SEC = int(os.getenv("COINGECKO_STALE_TTL_SEC", "604800"))  # 7 days fallback
-_CG_RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("COINGECKO_RATE_LIMIT_COOLDOWN_SEC", "300"))
-_CG_COOLDOWN_UNTIL = 0.0
-_CG_LOCK = threading.RLock()
-_CG_INFLIGHT: dict[str, threading.Event] = {}
+_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "20"))
 
 # -------------------------
 # Market Condition (Overextension + RVOL)
 # -------------------------
 _MARKET_CONDITION_CACHE: dict[str, tuple[float, dict]] = {}
-# Market-condition uses 20d daily data. It does NOT need second-by-second refresh.
-_MARKET_CONDITION_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_TTL_SEC", "21600"))  # 6h
-_MARKET_CONDITION_STALE_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_STALE_TTL_SEC", "604800"))
-_MARKET_CONDITION_LOCK = threading.RLock()
-_MARKET_CONDITION_INFLIGHT: dict[str, threading.Event] = {}
+_MARKET_CONDITION_TTL_SEC = int(os.getenv("NEXUS_MARKET_CONDITION_TTL_SEC", "900"))
 
 def _cg_get(url: str) -> dict:
-    """CoinGecko GET with shared cache, stale fallback and in-flight dedupe.
-
-    This protects the monthly CoinGecko credit budget and prevents frontend
-    refresh storms from becoming real upstream API storms.
-    """
-    global _CG_COOLDOWN_UNTIL
     now = time.time()
-
-    # Fast fresh/stale cache checks and in-flight coordination.
-    with _CG_LOCK:
-        hit = _CG_CACHE.get(url)
-        if hit and (now - hit[0]) < _CG_TTL_SEC:
-            return hit[1]
-
-        # During cooldown, never hit CoinGecko again if we have usable stale data.
-        if hit and (now < _CG_COOLDOWN_UNTIL) and (now - hit[0]) < _CG_STALE_TTL_SEC:
-            data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
-            if isinstance(data, dict):
-                data["_stale"] = True
-                data["_stale_reason"] = "coingecko_cooldown"
-            return data
-
-        ev = _CG_INFLIGHT.get(url)
-        if ev is None:
-            ev = threading.Event()
-            _CG_INFLIGHT[url] = ev
-            owner = True
-        else:
-            owner = False
-
-    if not owner:
-        ev.wait(timeout=20)
-        with _CG_LOCK:
-            hit = _CG_CACHE.get(url)
-            if hit and (time.time() - hit[0]) < _CG_STALE_TTL_SEC:
-                data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
-                if isinstance(data, dict) and (time.time() - hit[0]) >= _CG_TTL_SEC:
-                    data["_stale"] = True
-                    data["_stale_reason"] = "waited_for_inflight"
-                return data
-        raise RuntimeError("CoinGecko upstream unavailable and no cache")
-
-    try:
-        headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
-        if COINGECKO_API_KEY:
-            headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
-        r = requests.get(url, headers=headers, timeout=12)
-
-        if r.status_code == 429:
-            with _CG_LOCK:
-                _CG_COOLDOWN_UNTIL = time.time() + _CG_RATE_LIMIT_COOLDOWN_SEC
-                hit = _CG_CACHE.get(url)
-                if hit and (time.time() - hit[0]) < _CG_STALE_TTL_SEC:
-                    data = dict(hit[1]) if isinstance(hit[1], dict) else hit[1]
-                    if isinstance(data, dict):
-                        data["_stale"] = True
-                        data["_stale_reason"] = "coingecko_429"
-                    return data
-            r.raise_for_status()
-
-        r.raise_for_status()
-        data = r.json()
-        with _CG_LOCK:
-            _CG_CACHE[url] = (time.time(), data)
-        return data
-    finally:
-        with _CG_LOCK:
-            ev = _CG_INFLIGHT.pop(url, None)
-            if ev:
-                ev.set()
+    hit = _CG_CACHE.get(url)
+    if hit and (now - hit[0]) < _CG_TTL_SEC:
+        return hit[1]
+    headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
+    if COINGECKO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    r = requests.get(url, headers=headers, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    _CG_CACHE[url] = (now, data)
+    return data
 
 
 def _market_condition_coin_id(raw: str) -> str:
@@ -723,54 +651,6 @@ def _safe_float(v, default: float = 0.0) -> float:
     return float(default)
 
 
-def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | None = None) -> dict:
-    """Estimated Shadow execution costs for a complete paper roundtrip.
-
-    Shadow remains paper-only, but collected profit should behave closer to live:
-    gross PnL - estimated gas - estimated DEX fee - estimated slippage = net PnL.
-    These are conservative estimates and can later be replaced by router quotes.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    amt = max(0.0, _safe_float(amount_usd, 0.0))
-    ck = _normalize_chain_key(chain or cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
-
-    default_gas = {"ETH": 3.00, "BNB": 0.15, "POL": 0.05}
-    gas_usd = _safe_float(
-        cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.50))))),
-        default_gas.get(ck, 0.50),
-    )
-
-    # Roundtrip DEX fee. Default 60 bps = 0.30% entry + 0.30% exit.
-    dex_fee_bps = _safe_float(
-        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "60"))),
-        60.0,
-    )
-
-    # Estimate practical slippage as a fraction of the user's max slippage tolerance.
-    # This keeps the Strategist usable while avoiding unrealistic gross-only results.
-    max_slip_pct = _safe_float(
-        cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", cfg.get("slippage_pct", cfg.get("slippage", 1.2)))),
-        1.2,
-    )
-    slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.35"), 0.35)
-    slippage_bps = max(0.0, min(300.0, max_slip_pct * 100.0 * slip_factor))
-
-    dex_fee_usd = amt * (dex_fee_bps / 10000.0)
-    slippage_usd = amt * (slippage_bps / 10000.0)
-    total = max(0.0, gas_usd + dex_fee_usd + slippage_usd)
-    return {
-        "chain": ck,
-        "notional_usd": round(amt, 4),
-        "gas_usd": round(gas_usd, 4),
-        "dex_fee_bps": round(dex_fee_bps, 4),
-        "dex_fee_usd": round(dex_fee_usd, 4),
-        "slippage_bps": round(slippage_bps, 4),
-        "slippage_usd": round(slippage_usd, 4),
-        "total_cost_usd": round(total, 4),
-        "model": "shadow_estimated_roundtrip_costs_v1",
-    }
-
-
 def _classify_market_condition(oe_pct: float, rvol: float) -> dict:
     """Classify OE + RVOL into an AI-ready market condition state."""
     oe = _safe_float(oe_pct)
@@ -826,41 +706,6 @@ def _classify_market_condition(oe_pct: float, rvol: float) -> dict:
     }
 
 
-def _market_condition_fallback(coin_or_symbol: str, coin_id: str, days_i: int, reason: str = "") -> dict:
-    """Safe degraded market-condition response. Never break Strategist/UI because CoinGecko is rate-limited."""
-    classification = _classify_market_condition(0.0, 0.0)
-    return {
-        "status": "degraded",
-        "coin_id": coin_id,
-        "input": str(coin_or_symbol or "").strip(),
-        "days": days_i,
-        "current_price": 0,
-        "ma20": 0,
-        "current_volume": 0,
-        "avg_volume_20d": 0,
-        "oe_pct": 0,
-        "rvol": 0,
-        "condition": classification,
-        "state": classification.get("state"),
-        "label": "Market condition temporarily cached/unavailable",
-        "level": "neutral",
-        "confidence": "LOW",
-        "score_delta": 0,
-        "ai_context": {
-            "market_condition_state": "DEGRADED",
-            "market_condition_label": "CoinGecko unavailable/rate-limited; using neutral fallback so Strategist is not blocked.",
-            "overextension_pct": 0,
-            "relative_volume": 0,
-            "interpretation": "Market-condition data is temporarily unavailable. Do not treat this as a bullish or bearish signal.",
-        },
-        "cached": False,
-        "stale": True,
-        "stale_reason": "fallback",
-        "error": reason,
-        "ts": now_ts(),
-    }
-
-
 def _market_condition_for_coin(coin_or_symbol: str, days: int = 20) -> dict:
     """Calculate Overextension (OE) and Relative Volume (RVOL) from CoinGecko market_chart."""
     coin_id = _market_condition_coin_id(coin_or_symbol)
@@ -870,55 +715,14 @@ def _market_condition_for_coin(coin_or_symbol: str, days: int = 20) -> dict:
     days_i = max(20, min(90, int(days or 20)))
     cache_key = f"{coin_id}|{days_i}"
     now_f = time.time()
-
-    with _MARKET_CONDITION_LOCK:
-        hit = _MARKET_CONDITION_CACHE.get(cache_key)
-        if hit and (now_f - hit[0]) < _MARKET_CONDITION_TTL_SEC:
-            cached = dict(hit[1])
-            cached["cached"] = True
-            return cached
-
-        ev = _MARKET_CONDITION_INFLIGHT.get(cache_key)
-        if ev is None:
-            ev = threading.Event()
-            _MARKET_CONDITION_INFLIGHT[cache_key] = ev
-            owner = True
-        else:
-            owner = False
-
-    if not owner:
-        ev.wait(timeout=20)
-        with _MARKET_CONDITION_LOCK:
-            hit = _MARKET_CONDITION_CACHE.get(cache_key)
-            if hit and (time.time() - hit[0]) < _MARKET_CONDITION_STALE_TTL_SEC:
-                cached = dict(hit[1])
-                cached["cached"] = True
-                if (time.time() - hit[0]) >= _MARKET_CONDITION_TTL_SEC:
-                    cached["stale"] = True
-                    cached["stale_reason"] = "waited_for_inflight"
-                return cached
-        # Continue with a safe fallback below if the owner did not populate cache.
+    hit = _MARKET_CONDITION_CACHE.get(cache_key)
+    if hit and (now_f - hit[0]) < _MARKET_CONDITION_TTL_SEC:
+        cached = dict(hit[1])
+        cached["cached"] = True
+        return cached
 
     url = f"{COINGECKO_BASE}/coins/{requests.utils.quote(coin_id)}/market_chart?vs_currency=usd&days={days_i}&interval=daily"
-    try:
-        data = _cg_get(url)
-    except Exception as e:
-        with _MARKET_CONDITION_LOCK:
-            hit = _MARKET_CONDITION_CACHE.get(cache_key)
-            if hit and (time.time() - hit[0]) < _MARKET_CONDITION_STALE_TTL_SEC:
-                cached = dict(hit[1])
-                cached["cached"] = True
-                cached["stale"] = True
-                cached["stale_reason"] = "coingecko_unavailable"
-                cached["error"] = str(e)
-                return cached
-        return _market_condition_fallback(coin_or_symbol, coin_id, days_i, str(e))
-    finally:
-        if owner:
-            with _MARKET_CONDITION_LOCK:
-                ev2 = _MARKET_CONDITION_INFLIGHT.pop(cache_key, None)
-                if ev2:
-                    ev2.set()
+    data = _cg_get(url)
 
     prices_raw = data.get("prices") if isinstance(data, dict) else []
     volumes_raw = data.get("total_volumes") if isinstance(data, dict) else []
@@ -999,9 +803,12 @@ def api_market_condition():
     try:
         return jsonify(_market_condition_for_coin(coin, days=days))
     except Exception as e:
-        # Never let CoinGecko/market-condition break the UI or Strategist pipeline.
-        cid = _market_condition_coin_id(coin) or str(coin or "").strip().lower()
-        return jsonify(_market_condition_fallback(coin, cid, max(20, min(90, days)), str(e))), 200
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "input": str(coin or "").strip(),
+            "ts": now_ts(),
+        }), 502
 
 
 @app.route("/api/market-condition/<coin_id>", methods=["GET"])
@@ -1014,8 +821,12 @@ def api_market_condition_by_id(coin_id):
     try:
         return jsonify(_market_condition_for_coin(coin_id, days=days))
     except Exception as e:
-        cid = _market_condition_coin_id(coin_id) or str(coin_id or "").strip().lower()
-        return jsonify(_market_condition_fallback(coin_id, cid, max(20, min(90, days)), str(e))), 200
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "input": str(coin_id or "").strip(),
+            "ts": now_ts(),
+        }), 502
 
 
 @app.route("/api/onchain/whale-signal", methods=["GET"])
@@ -2185,80 +1996,9 @@ def init_db():
             timeframe TEXT DEFAULT '90D',
             index_mode INTEGER DEFAULT 1,
             ai_selected_json TEXT DEFAULT '[]',
-            ui_state_json TEXT DEFAULT '{}',
             updated_ts INTEGER
         )
     """)
-
-
-    # --- Nexus Rotation persistence (wallet-bound, Trading-style lifecycle storage) ---
-    # Rotation runtime state must not live only in ui_state_json. The UI state may keep
-    # display preferences, but the session/event lifecycle is persisted here so refresh,
-    # reconnect and multi-device recovery behave like Nexus Trading/Grid runtime state.
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rotation_sessions (
-            wallet_address TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            status TEXT DEFAULT 'WAITING',
-            chain TEXT DEFAULT '',
-            base_asset TEXT DEFAULT 'USDC',
-            target_symbol TEXT DEFAULT '',
-            budget_usd REAL DEFAULT 0,
-            working_capital_usd REAL DEFAULT 0,
-            collected_profit_usd REAL DEFAULT 0,
-            gross_profit_usd REAL DEFAULT 0,
-            costs_usd REAL DEFAULT 0,
-            net_profit_usd REAL DEFAULT 0,
-            runtime_hours REAL DEFAULT 24,
-            started_ts INTEGER DEFAULT 0,
-            expires_ts INTEGER DEFAULT 0,
-            updated_ts INTEGER DEFAULT 0,
-            session_json TEXT DEFAULT '{}',
-            PRIMARY KEY (wallet_address, session_id)
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_sessions_wallet_updated ON rotation_sessions(wallet_address, updated_ts);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_sessions_wallet_status ON rotation_sessions(wallet_address, status);")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rotation_events (
-            event_id TEXT PRIMARY KEY,
-            wallet_address TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            event_ts INTEGER DEFAULT 0,
-            status TEXT DEFAULT '',
-            chain TEXT DEFAULT '',
-            base_asset TEXT DEFAULT 'USDC',
-            target_asset TEXT DEFAULT '',
-            buy_usd REAL DEFAULT 0,
-            sell_usd REAL DEFAULT 0,
-            gross_usd REAL DEFAULT 0,
-            costs_usd REAL DEFAULT 0,
-            net_usd REAL DEFAULT 0,
-            event_json TEXT DEFAULT '{}'
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_events_wallet_session ON rotation_events(wallet_address, session_id, event_ts);")
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rotation_ui_state (
-            wallet_address TEXT PRIMARY KEY,
-            active_session_id TEXT DEFAULT '',
-            updated_ts INTEGER DEFAULT 0
-        )
-    """)
-
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rotation_deleted_sessions (
-            wallet_address TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            deleted_ts INTEGER DEFAULT 0,
-            reason TEXT DEFAULT '',
-            PRIMARY KEY (wallet_address, session_id)
-        )
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_deleted_wallet_ts ON rotation_deleted_sessions(wallet_address, deleted_ts);")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_coin_ratings (
@@ -2296,61 +2036,7 @@ def init_db():
             "timeframe": "timeframe TEXT DEFAULT '90D'",
             "index_mode": "index_mode INTEGER DEFAULT 1",
             "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
-            "ui_state_json": "ui_state_json TEXT DEFAULT '{}'",
             "updated_ts": "updated_ts INTEGER",
-        })
-
-        _db_ensure_columns(conn, "rotation_sessions", {
-            "status": "status TEXT DEFAULT 'WAITING'",
-            "chain": "chain TEXT DEFAULT ''",
-            "base_asset": "base_asset TEXT DEFAULT 'USDC'",
-            "target_symbol": "target_symbol TEXT DEFAULT ''",
-            "budget_usd": "budget_usd REAL DEFAULT 0",
-            "working_capital_usd": "working_capital_usd REAL DEFAULT 0",
-            "reserved_usd": "reserved_usd REAL DEFAULT 0",
-            "collected_profit_usd": "collected_profit_usd REAL DEFAULT 0",
-            "gross_profit_usd": "gross_profit_usd REAL DEFAULT 0",
-            "costs_usd": "costs_usd REAL DEFAULT 0",
-            "net_profit_usd": "net_profit_usd REAL DEFAULT 0",
-            "runtime_hours": "runtime_hours REAL DEFAULT 24",
-            "risk_limit_pct": "risk_limit_pct REAL DEFAULT 0",
-            "min_net_advantage_pct": "min_net_advantage_pct REAL DEFAULT 0",
-            "max_slippage_pct": "max_slippage_pct REAL DEFAULT 0",
-            "max_active_rotations": "max_active_rotations INTEGER DEFAULT 3",
-            "execution_mode": "execution_mode TEXT DEFAULT 'shadow'",
-            "position_state": "position_state TEXT DEFAULT 'WAITING'",
-            "lifecycle_state": "lifecycle_state TEXT DEFAULT 'WAITING'",
-            "locked_target_symbol": "locked_target_symbol TEXT DEFAULT ''",
-            "locked_chain": "locked_chain TEXT DEFAULT ''",
-            "locked_base_asset": "locked_base_asset TEXT DEFAULT 'USDC'",
-            "deleted_ts": "deleted_ts INTEGER DEFAULT 0",
-            "started_ts": "started_ts INTEGER DEFAULT 0",
-            "expires_ts": "expires_ts INTEGER DEFAULT 0",
-            "updated_ts": "updated_ts INTEGER DEFAULT 0",
-            "session_json": "session_json TEXT DEFAULT '{}'",
-        })
-        _db_ensure_columns(conn, "rotation_events", {
-            "event_ts": "event_ts INTEGER DEFAULT 0",
-            "status": "status TEXT DEFAULT ''",
-            "event_type": "event_type TEXT DEFAULT ''",
-            "execution_mode": "execution_mode TEXT DEFAULT 'shadow'",
-            "chain": "chain TEXT DEFAULT ''",
-            "base_asset": "base_asset TEXT DEFAULT 'USDC'",
-            "target_asset": "target_asset TEXT DEFAULT ''",
-            "buy_usd": "buy_usd REAL DEFAULT 0",
-            "sell_usd": "sell_usd REAL DEFAULT 0",
-            "gross_usd": "gross_usd REAL DEFAULT 0",
-            "costs_usd": "costs_usd REAL DEFAULT 0",
-            "net_usd": "net_usd REAL DEFAULT 0",
-            "event_json": "event_json TEXT DEFAULT '{}'",
-        })
-        _db_ensure_columns(conn, "rotation_ui_state", {
-            "active_session_id": "active_session_id TEXT DEFAULT ''",
-            "updated_ts": "updated_ts INTEGER DEFAULT 0",
-        })
-        _db_ensure_columns(conn, "rotation_deleted_sessions", {
-            "deleted_ts": "deleted_ts INTEGER DEFAULT 0",
-            "reason": "reason TEXT DEFAULT ''",
         })
         _db_ensure_columns(conn, "user_insight_profile", {
             "order_memory_json": "order_memory_json TEXT DEFAULT '{}'",
@@ -3122,22 +2808,7 @@ def _refresh_user_insight_profile(wallet_address: str, conn=None) -> tuple[dict,
             conn.close()
 
 def _norm_addr(addr: str) -> str:
-    """Normalize a wallet/token address.
-
-    Some browsers/proxies merge duplicate case-insensitive wallet headers into
-    a comma-separated value like "0xabc..., 0xabc...". Pick the first real
-    EVM address so backend validation stays robust while still lowercasing
-    ordinary strings.
-    """
-    if addr is None:
-        return ""
-    if isinstance(addr, (list, tuple, set)):
-        addr = next((x for x in addr if x), "")
-    s = str(addr or "").strip()
-    m = re.search(r"0x[a-fA-F0-9]{40}", s)
-    if m:
-        return m.group(0).lower()
-    return s.lower()
+    return (addr or "").strip().lower()
 
 def _looks_like_evm_addr(s: str) -> bool:
     s = (s or "").strip()
@@ -8779,7 +8450,7 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
     if not wa:
         return [], 0
     clean = _watch_items_normalize(items)
-    nowi = int(time.time() * 1000)
+    nowi = int(time.time())
     conn = _db()
     try:
         with DB_WRITE_LOCK:
@@ -8798,14 +8469,14 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
 def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
     conn = _db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
+        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
         row = cur.fetchone()
         if not row:
-            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
+            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
         try:
             compare = json.loads(row["compare_json"] or "[]")
         except Exception:
@@ -8814,18 +8485,11 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
             ai_selected = json.loads(row["ai_selected_json"] or "[]")
         except Exception:
             ai_selected = []
-        try:
-            ui_state = json.loads(row["ui_state_json"] or "{}")
-            if not isinstance(ui_state, dict):
-                ui_state = {}
-        except Exception:
-            ui_state = {}
         return {
             "compare": [str(x).strip().upper() for x in (compare if isinstance(compare, list) else []) if str(x).strip()],
             "timeframe": str(row["timeframe"] or "90D"),
             "indexMode": bool(int(row["index_mode"] or 0)),
             "aiSelected": [str(x).strip().upper() for x in (ai_selected if isinstance(ai_selected, list) else []) if str(x).strip()],
-            "ui": ui_state,
         }, int(row["updated_ts"] or 0)
     finally:
         conn.close()
@@ -8834,13 +8498,12 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
 def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
     base, _ = _db_get_user_app_state(wa)
     compare = payload.get("compare") if isinstance(payload, dict) else None
     timeframe = payload.get("timeframe") if isinstance(payload, dict) else None
     index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
     ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
-    ui_state = payload.get("ui") if isinstance(payload, dict) else None
     if isinstance(compare, list):
         base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:20]
     if isinstance(timeframe, str) and timeframe.strip():
@@ -8849,590 +8512,20 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         base["indexMode"] = bool(index_mode)
     if isinstance(ai_selected, list):
         base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
-    if isinstance(ui_state, dict):
-        allowed = {
-            "watchSortMode", "gridMode", "gridChain", "gridItem",
-            "tradingRuntimeHours", "tradingRuntimeUnit", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
-            "tradingRiskMode", "tradingCautionDrawdownPct", "tradingHardStopPct",
-            "tradingProfitLockPct", "tradingReuseProfitPct", "tradingMaxCombinedSlots",
-            "tradingMaxSlippagePct", "tradingMaxTrades",
-            "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput",
-            "tradingSessions", "activeTradingSessionId",
-            "rotationRuntimeHours", "rotationMaxActiveSessions", "rotationRiskLimit",
-            "rotationMaxSlippage", "rotationMinNetAdvantage", "rotationMode",
-            "rotationNetworkScope"
-        }
-        clean_ui = {}
-        for k, v in ui_state.items():
-            if k not in allowed:
-                continue
-            if isinstance(v, (str, int, float, bool)) or v is None:
-                clean_ui[k] = v
-            elif k in ("tradingSessions",) and isinstance(v, list):
-                clean_ui[k] = [x for x in v[:30] if isinstance(x, dict)]
-        base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
-    nowi = int(time.time() * 1000)
+    nowi = int(time.time())
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts) VALUES(?,?,?,?,?,?,?) "
-                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, ui_state_json=excluded.ui_state_json, updated_ts=excluded.updated_ts",
-                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), json.dumps(base.get("ui") if isinstance(base.get("ui"), dict) else {}, separators=(",", ":")), nowi),
+                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, updated_ts) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), nowi),
             )
             conn.commit()
         return base, nowi
     finally:
         conn.close()
-
-
-def _rotation_session_id(sess: dict) -> str:
-    if not isinstance(sess, dict):
-        return ""
-    sid = (
-        sess.get("id")
-        or sess.get("session_id")
-        or sess.get("rotation_session_id")
-        or sess.get("rotationSessionId")
-        or ""
-    )
-    return str(sid or "").strip()
-
-
-def _rotation_event_id(ev: dict) -> str:
-    if not isinstance(ev, dict):
-        return ""
-    eid = ev.get("id") or ev.get("event_id") or ev.get("rotation_event_id") or ""
-    return str(eid or "").strip()
-
-
-def _rotation_ms(value, default: int = 0) -> int:
-    try:
-        n = int(float(value or 0))
-        return n if n > 0 else int(default or 0)
-    except Exception:
-        return int(default or 0)
-
-
-def _rotation_float(value, default: float = 0.0) -> float:
-    try:
-        n = float(value if value is not None else default)
-        return n if math.isfinite(n) else float(default)
-    except Exception:
-        return float(default)
-
-
-ROTATION_TERMINAL_STATUSES = {"STOPPED", "CLOSED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED", "DELETED", "ARCHIVED"}
-ROTATION_LOCKED_STATUSES = {"WAITING", "SEARCHING", "ACTIVE", "OPEN", "ENTERING", "EXITING", "PAUSED"}
-ROTATION_ALLOWED_BASE_ASSETS = {"USDC", "USDT"}
-
-
-def _rotation_terminal_status(value) -> bool:
-    return str(value or "").strip().upper() in ROTATION_TERMINAL_STATUSES
-
-
-def _rotation_base_asset(value) -> str:
-    base = str(value or "USDC").strip().upper()
-    return base if base in ROTATION_ALLOWED_BASE_ASSETS else "USDC"
-
-
-def _rotation_norm_symbol(value) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper()).strip()
-
-
-def _rotation_position_state(sess: dict, status: str) -> str:
-    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
-    raw = str(sess.get("positionState") or sess.get("position_state") or sess.get("readiness") or meta.get("rotation_action") or "").strip().upper()
-    if status in {"STOPPED", "DELETED", "EXPIRED", "ERROR", "PROTECTED"}:
-        return status
-    if raw in {"WAIT_NET_EDGE", "SEARCHING", "READY", "APPROVED", ""}:
-        return "WAITING" if raw != "SEARCHING" else "SEARCHING"
-    if raw in {"ROTATION_OPEN", "POSITION_OPEN", "OPEN"}:
-        return "OPEN"
-    if raw in {"EXIT_PENDING", "EXITING"}:
-        return "EXITING"
-    if raw in {"SIMULATED_ROTATION_CLOSED", "CLOSED", "COMPLETE", "COMPLETED"}:
-        return "CLOSED"
-    if raw in {"USER_PAUSED", "PAUSED"}:
-        return "PAUSED"
-    return raw or "WAITING"
-
-
-def _rotation_live_normalize_session(sess: dict, existing: dict | None = None, existing_status: str = "") -> dict:
-    """Backend truth for Rotation sessions.
-
-    Live/Vault safety rules enforced here:
-    - STOPPED/DELETED/terminal states cannot be revived by a stale frontend sync.
-    - Existing non-terminal sessions keep their locked target/base/chain until stopped/completed/expired.
-    - Base asset is restricted to USDC/USDT in the current vault-ready flow.
-    - Session JSON carries explicit lifecycle/execution fields so the frontend is only presentation/cache.
-    """
-    src = dict(sess or {})
-    existing = dict(existing or {})
-    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
-    ex_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
-
-    existing_status_u = str(existing_status or existing.get("status") or "").strip().upper()
-    incoming_status = _rotation_status_for_db(src)
-    status = existing_status_u if _rotation_terminal_status(existing_status_u) and not _rotation_terminal_status(incoming_status) else incoming_status
-    if status in ("READY", "APPROVED", "RUNNING"):
-        status = "WAITING" if status != "RUNNING" else "ACTIVE"
-
-    now_ms = int(time.time() * 1000)
-    started_ts = _rotation_ms(src.get("startedAt") or src.get("started_at") or src.get("createdAt") or src.get("created_ts"), _rotation_ms(existing.get("startedAt") or existing.get("started_at") or existing.get("createdAt") or existing.get("created_ts"), now_ms))
-    runtime_hours = _rotation_float(src.get("runtimeHours") or src.get("runtime_hours") or meta.get("runtime_hours") or existing.get("runtimeHours") or existing.get("runtime_hours") or ex_meta.get("runtime_hours"), 24.0)
-    expires_ts = _rotation_ms(src.get("expiresAt") or src.get("expires_at") or meta.get("expires_at") or existing.get("expiresAt") or existing.get("expires_at") or ex_meta.get("expires_at"), started_ts + int(runtime_hours * 3600000))
-    if expires_ts and expires_ts <= now_ms and not _rotation_terminal_status(status):
-        status = "EXPIRED"
-
-    existing_target = _rotation_norm_symbol(existing.get("sourceSymbol") or existing.get("symbol") or existing.get("targetAsset") or ex_meta.get("source_symbol") or ex_meta.get("target_asset"))
-    incoming_target = _rotation_norm_symbol(src.get("sourceSymbol") or src.get("symbol") or src.get("targetAsset") or meta.get("source_symbol") or meta.get("target_asset"))
-    target = existing_target if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_target
-
-    existing_chain = str(existing.get("chain") or ex_meta.get("chain") or "").strip().upper()
-    incoming_chain = str(src.get("chain") or meta.get("chain") or "").strip().upper()
-    chain = existing_chain if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_chain
-
-    existing_base = _rotation_base_asset(existing.get("baseAsset") or existing.get("payoutAsset") or ex_meta.get("base_asset"))
-    incoming_base = _rotation_base_asset(src.get("baseAsset") or src.get("payoutAsset") or meta.get("base_asset"))
-    base_asset = existing_base if existing_target and not _rotation_terminal_status(existing_status_u) else incoming_base
-
-    budget_usd = _rotation_float(src.get("budgetUsd") or src.get("budget_usd") or existing.get("budgetUsd") or existing.get("budget_usd"), 0.0)
-    working_capital = _rotation_float(src.get("workingCapitalUsd") or src.get("sessionCapitalUsd") or src.get("working_capital_usd") or existing.get("workingCapitalUsd") or existing.get("sessionCapitalUsd"), budget_usd)
-    collected = _rotation_float(src.get("collectedProfitUsd") or src.get("rotationProfitUsd") or src.get("profitUsd") or meta.get("collectedProfitUsd") or existing.get("collectedProfitUsd"), 0.0)
-    gross = _rotation_float(src.get("grossProfitUsd") or src.get("gross_usd") or existing.get("grossProfitUsd"), 0.0)
-    costs = _rotation_float(src.get("costsUsd") or src.get("costs_usd") or existing.get("costsUsd"), 0.0)
-    net = _rotation_float(src.get("netProfitUsd") or src.get("net_usd") or src.get("rotationProfitUsd") or existing.get("netProfitUsd"), collected)
-    risk = _rotation_float(src.get("riskLimitPct") or meta.get("risk_limit_pct") or existing.get("riskLimitPct"), 0.0)
-    min_net = _rotation_float(src.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct") or existing.get("minNetAdvantagePct"), 0.0)
-    max_slip = _rotation_float(src.get("maxSlippagePct") or meta.get("max_slippage_pct") or existing.get("maxSlippagePct"), 0.0)
-    max_active = int(max(1, min(12, _rotation_float(src.get("maxActiveRotations") or meta.get("max_active_rotations") or existing.get("maxActiveRotations"), 3))))
-    execution_mode = str(src.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
-    if execution_mode not in {"shadow", "live"}:
-        execution_mode = "shadow"
-    position_state = _rotation_position_state(src, status)
-
-    next_meta = {
-        **ex_meta,
-        **meta,
-        "capital_flow": "BASE_TO_TARGET_TO_BASE",
-        "base_asset": base_asset,
-        "target_asset": target,
-        "locked_target_symbol": target,
-        "locked_chain": chain,
-        "locked_base_asset": base_asset,
-        "execution_mode": execution_mode,
-        "vault_adapter": "rotation_vault_adapter_pending",
-        "live_vault_ready": False,
-        "risk_limit_pct": risk,
-        "min_net_advantage_pct": min_net,
-        "max_slippage_pct": max_slip,
-        "max_active_rotations": max_active,
-        "runtime_hours": runtime_hours,
-        "expires_at": expires_ts,
-    }
-
-    src.update({
-        "status": status,
-        "lifecycleState": status,
-        "positionState": position_state,
-        "executionMode": execution_mode,
-        "engineMode": src.get("engineMode") or "shadow_capital_manager_v1",
-        "liveVaultReady": False,
-        "chain": chain,
-        "symbol": target,
-        "sourceSymbol": target,
-        "targetAsset": target,
-        "baseAsset": base_asset,
-        "payoutAsset": base_asset,
-        "budgetUsd": budget_usd,
-        "workingCapitalUsd": working_capital,
-        "sessionCapitalUsd": working_capital,
-        "reservedUsd": 0.0 if _rotation_terminal_status(status) else budget_usd,
-        "collectedProfitUsd": collected,
-        "rotationProfitUsd": collected,
-        "grossProfitUsd": gross,
-        "costsUsd": costs,
-        "netProfitUsd": net,
-        "runtimeHours": runtime_hours,
-        "startedAt": started_ts,
-        "expiresAt": expires_ts,
-        "riskLimitPct": risk,
-        "minNetAdvantagePct": min_net,
-        "maxSlippagePct": max_slip,
-        "maxActiveRotations": max_active,
-        "active": not _rotation_terminal_status(status),
-        "updatedAt": _rotation_ms(src.get("updatedAt") or src.get("updated_ts"), now_ms),
-        "meta": next_meta,
-    })
-    return src
-
-
-def _rotation_status_for_db(sess: dict) -> str:
-    raw = str((sess or {}).get("status") or (sess or {}).get("runtimeStatus") or "WAITING").strip().upper()
-    if raw in ("READY", "APPROVED"):
-        return "WAITING"
-    if raw in ("RUNNING", "ACTIVE"):
-        # Session is active, but the card/runtime status should remain tied to the shadow action.
-        action = str(((sess or {}).get("meta") or {}).get("rotation_action") or (sess or {}).get("readiness") or "").upper()
-        if action in ("WAIT_NET_EDGE", "SEARCHING"):
-            return "WAITING"
-        return "ACTIVE"
-    return raw or "WAITING"
-
-
-def _rotation_session_to_db_tuple(wa: str, sess: dict, nowi: int):
-    sid = _rotation_session_id(sess)
-    if not sid:
-        sid = f"ROT-{uuid.uuid4().hex[:12].upper()}"
-        sess["id"] = sid
-    sess = _rotation_live_normalize_session(sess)
-    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
-    status = _rotation_status_for_db(sess)
-    chain = str(sess.get("chain") or meta.get("chain") or "").strip().upper()
-    base_asset = _rotation_base_asset(sess.get("baseAsset") or sess.get("payoutAsset") or meta.get("base_asset"))
-    target_symbol = _rotation_norm_symbol(sess.get("sourceSymbol") or sess.get("symbol") or sess.get("targetAsset") or meta.get("target_asset"))
-    budget_usd = _rotation_float(sess.get("budgetUsd") or sess.get("budget_usd"), 0.0)
-    working_capital_usd = _rotation_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("working_capital_usd"), budget_usd)
-    reserved_usd = 0.0 if _rotation_terminal_status(status) else _rotation_float(sess.get("reservedUsd") or sess.get("reserved_usd"), budget_usd)
-    collected_profit_usd = _rotation_float(sess.get("collectedProfitUsd") or sess.get("rotationProfitUsd") or sess.get("profitUsd") or meta.get("collectedProfitUsd"), 0.0)
-    gross_profit_usd = _rotation_float(sess.get("grossProfitUsd") or sess.get("gross_usd"), 0.0)
-    costs_usd = _rotation_float(sess.get("costsUsd") or sess.get("costs_usd"), 0.0)
-    net_profit_usd = _rotation_float(sess.get("netProfitUsd") or sess.get("net_usd"), collected_profit_usd)
-    runtime_hours = _rotation_float(sess.get("runtimeHours") or sess.get("runtime_hours") or meta.get("runtime_hours"), 24.0)
-    risk_limit_pct = _rotation_float(sess.get("riskLimitPct") or meta.get("risk_limit_pct"), 0.0)
-    min_net_advantage_pct = _rotation_float(sess.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct"), 0.0)
-    max_slippage_pct = _rotation_float(sess.get("maxSlippagePct") or meta.get("max_slippage_pct"), 0.0)
-    max_active_rotations = int(max(1, min(12, _rotation_float(sess.get("maxActiveRotations") or meta.get("max_active_rotations"), 3))))
-    execution_mode = str(sess.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
-    position_state = str(sess.get("positionState") or sess.get("position_state") or "WAITING").strip().upper()
-    lifecycle_state = str(sess.get("lifecycleState") or status or "WAITING").strip().upper()
-    locked_target_symbol = target_symbol
-    locked_chain = chain
-    locked_base_asset = base_asset
-    deleted_ts = _rotation_ms(sess.get("deletedAt") or sess.get("deleted_ts"), 0)
-    started_ts = _rotation_ms(sess.get("startedAt") or sess.get("started_at") or sess.get("createdAt") or sess.get("created_ts"), nowi)
-    expires_ts = _rotation_ms(sess.get("expiresAt") or sess.get("expires_at") or meta.get("expires_at"), 0)
-    updated_ts = _rotation_ms(sess.get("updatedAt") or sess.get("updated_ts"), nowi)
-    sess_json = json.dumps(sess if isinstance(sess, dict) else {}, separators=(",", ":"), ensure_ascii=False)
-    return (
-        wa, sid, status, chain, base_asset, target_symbol,
-        budget_usd, working_capital_usd, reserved_usd, collected_profit_usd,
-        gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
-        risk_limit_pct, min_net_advantage_pct, max_slippage_pct, max_active_rotations,
-        execution_mode, position_state, lifecycle_state,
-        locked_target_symbol, locked_chain, locked_base_asset, deleted_ts,
-        started_ts, expires_ts, updated_ts, sess_json,
-    )
-
-
-def _rotation_event_to_db_tuple(wa: str, sid: str, ev: dict):
-    eid = _rotation_event_id(ev)
-    if not eid:
-        eid = f"ROT-EVT-{uuid.uuid4().hex[:12].upper()}"
-        ev["id"] = eid
-    event_ts = _rotation_ms(ev.get("ts") or ev.get("event_ts") or ev.get("createdAt"), now_ts() * 1000)
-    status = str(ev.get("status") or "").strip().upper()
-    chain = str(ev.get("chain") or "").strip().upper()
-    base_asset = str(ev.get("baseAsset") or ev.get("fromAsset") or "USDC").strip().upper()
-    target_asset = str(ev.get("targetAsset") or ev.get("symbol") or "").strip().upper()
-    return (
-        eid, wa, sid, event_ts, status, chain, base_asset, target_asset,
-        _rotation_float(ev.get("buyUsd") or ev.get("buy_usd"), 0.0),
-        _rotation_float(ev.get("sellUsd") or ev.get("sell_usd"), 0.0),
-        _rotation_float(ev.get("grossUsd") or ev.get("gross_usd"), 0.0),
-        _rotation_float(ev.get("costsUsd") or ev.get("costs_usd"), 0.0),
-        _rotation_float(ev.get("netUsd") or ev.get("net_usd"), 0.0),
-        json.dumps(ev if isinstance(ev, dict) else {}, separators=(",", ":"), ensure_ascii=False),
-    )
-
-
-def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int]:
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return [], "", 0
-    conn = _db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT active_session_id, updated_ts FROM rotation_ui_state WHERE wallet_address=?", (wa,))
-        ui_row = cur.fetchone()
-        active_id = str(ui_row["active_session_id"] or "") if ui_row else ""
-        updated_ts = int(ui_row["updated_ts"] or 0) if ui_row else 0
-        cur.execute(
-            """
-            SELECT s.session_id, s.session_json, s.status, s.updated_ts
-            FROM rotation_sessions s
-            LEFT JOIN rotation_deleted_sessions d
-              ON d.wallet_address=s.wallet_address AND d.session_id=s.session_id
-            WHERE s.wallet_address=?
-              AND d.session_id IS NULL
-              AND COALESCE(s.status,'') <> 'DELETED'
-            ORDER BY s.updated_ts DESC LIMIT 30
-            """,
-            (wa,),
-        )
-        rows = cur.fetchall()
-        sessions = []
-        for row in rows:
-            try:
-                sess = json.loads(row["session_json"] or "{}")
-                if not isinstance(sess, dict):
-                    sess = {}
-            except Exception:
-                sess = {}
-            sess.setdefault("id", row["session_id"])
-            # DB scalar status is canonical if the JSON was stale or said READY.
-            db_status = str(row["status"] or "").strip().upper()
-            if db_status:
-                sess["status"] = db_status
-            sessions.append(sess)
-            updated_ts = max(updated_ts, int(row["updated_ts"] or 0))
-        return sessions, active_id, updated_ts
-    finally:
-        conn.close()
-
-
-def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_session_id: str = "", replace_missing: bool = True) -> tuple[list[dict], str, int]:
-    wa = _norm_addr(wallet_address or "")
-    if not wa:
-        return [], "", 0
-    clean = [dict(x) for x in (sessions if isinstance(sessions, list) else []) if isinstance(x, dict)][:30]
-    nowi = int(time.time() * 1000)
-    conn = _db()
-    try:
-        with DB_WRITE_LOCK:
-            cur = conn.cursor()
-            cur.execute("SELECT session_id, status, session_json FROM rotation_sessions WHERE wallet_address=?", (wa,))
-            existing_by_id = {}
-            existing_status_by_id = {}
-            for row in cur.fetchall():
-                sid_existing = str(row["session_id"] or "")
-                existing_status_by_id[sid_existing] = str(row["status"] or "").strip().upper()
-                try:
-                    existing_by_id[sid_existing] = json.loads(row["session_json"] or "{}") or {}
-                except Exception:
-                    existing_by_id[sid_existing] = {}
-            cur.execute("SELECT session_id FROM rotation_deleted_sessions WHERE wallet_address=?", (wa,))
-            deleted_ids = {str(r["session_id"] or "") for r in cur.fetchall()}
-            incoming_ids = set()
-            normalized_clean = []
-            for raw_sess in clean:
-                sid_preview = _rotation_session_id(raw_sess)
-                if sid_preview and sid_preview in deleted_ids:
-                    continue
-                norm_sess = _rotation_live_normalize_session(raw_sess, existing_by_id.get(sid_preview), existing_status_by_id.get(sid_preview, ""))
-                if _rotation_session_id(norm_sess) in deleted_ids:
-                    continue
-                normalized_clean.append(norm_sess)
-            clean = normalized_clean
-            for sess in clean:
-                sid_preview = _rotation_session_id(sess)
-                if sid_preview:
-                    incoming_ids.add(sid_preview)
-            # Frontend sends the full wallet-bound Rotation session list.
-            # If a stopped session was deleted in the UI, it must be removed from DB too;
-            # otherwise the next GET resurrects it. Keep compatibility for partial updates.
-            if replace_missing:
-                if incoming_ids:
-                    placeholders = ",".join(["?"] * len(incoming_ids))
-                    params = [wa, *sorted(incoming_ids)]
-                    cur.execute(f"DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id NOT IN ({placeholders})", params)
-                    cur.execute(f"DELETE FROM rotation_events WHERE wallet_address=? AND session_id NOT IN ({placeholders})", params)
-                else:
-                    cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=?", (wa,))
-                    cur.execute("DELETE FROM rotation_events WHERE wallet_address=?", (wa,))
-            for sess in clean:
-                vals = _rotation_session_to_db_tuple(wa, sess, nowi)
-                sid = vals[1]
-                cur.execute(
-                    """
-                    INSERT INTO rotation_sessions(
-                        wallet_address, session_id, status, chain, base_asset, target_symbol,
-                        budget_usd, working_capital_usd, reserved_usd, collected_profit_usd,
-                        gross_profit_usd, costs_usd, net_profit_usd, runtime_hours,
-                        risk_limit_pct, min_net_advantage_pct, max_slippage_pct, max_active_rotations,
-                        execution_mode, position_state, lifecycle_state,
-                        locked_target_symbol, locked_chain, locked_base_asset, deleted_ts,
-                        started_ts, expires_ts, updated_ts, session_json
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(wallet_address, session_id) DO UPDATE SET
-                        status=excluded.status,
-                        chain=CASE WHEN rotation_sessions.locked_chain <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_chain ELSE excluded.chain END,
-                        base_asset=CASE WHEN rotation_sessions.locked_base_asset <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_base_asset ELSE excluded.base_asset END,
-                        target_symbol=CASE WHEN rotation_sessions.locked_target_symbol <> '' AND rotation_sessions.status NOT IN ('STOPPED','CLOSED','COMPLETE','COMPLETED','EXPIRED','ERROR','PROTECTED','DELETED','ARCHIVED') THEN rotation_sessions.locked_target_symbol ELSE excluded.target_symbol END,
-                        budget_usd=excluded.budget_usd,
-                        working_capital_usd=excluded.working_capital_usd,
-                        reserved_usd=excluded.reserved_usd,
-                        collected_profit_usd=excluded.collected_profit_usd,
-                        gross_profit_usd=excluded.gross_profit_usd,
-                        costs_usd=excluded.costs_usd,
-                        net_profit_usd=excluded.net_profit_usd,
-                        runtime_hours=excluded.runtime_hours,
-                        risk_limit_pct=excluded.risk_limit_pct,
-                        min_net_advantage_pct=excluded.min_net_advantage_pct,
-                        max_slippage_pct=excluded.max_slippage_pct,
-                        max_active_rotations=excluded.max_active_rotations,
-                        execution_mode=excluded.execution_mode,
-                        position_state=excluded.position_state,
-                        lifecycle_state=excluded.lifecycle_state,
-                        locked_target_symbol=COALESCE(NULLIF(rotation_sessions.locked_target_symbol,''), excluded.locked_target_symbol),
-                        locked_chain=COALESCE(NULLIF(rotation_sessions.locked_chain,''), excluded.locked_chain),
-                        locked_base_asset=COALESCE(NULLIF(rotation_sessions.locked_base_asset,''), excluded.locked_base_asset),
-                        deleted_ts=excluded.deleted_ts,
-                        started_ts=excluded.started_ts,
-                        expires_ts=excluded.expires_ts,
-                        updated_ts=excluded.updated_ts,
-                        session_json=excluded.session_json
-                    """,
-                    vals,
-                )
-                for ev in (sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else [])[:50]:
-                    if not isinstance(ev, dict):
-                        continue
-                    ev_vals = _rotation_event_to_db_tuple(wa, sid, dict(ev))
-                    cur.execute(
-                        """
-                        INSERT INTO rotation_events(
-                            event_id, wallet_address, session_id, event_ts, status, chain, base_asset, target_asset,
-                            buy_usd, sell_usd, gross_usd, costs_usd, net_usd, event_json
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(event_id) DO UPDATE SET
-                            status=excluded.status,
-                            event_ts=excluded.event_ts,
-                            chain=excluded.chain,
-                            base_asset=excluded.base_asset,
-                            target_asset=excluded.target_asset,
-                            buy_usd=excluded.buy_usd,
-                            sell_usd=excluded.sell_usd,
-                            gross_usd=excluded.gross_usd,
-                            costs_usd=excluded.costs_usd,
-                            net_usd=excluded.net_usd,
-                            event_json=excluded.event_json
-                        """,
-                        ev_vals,
-                    )
-            active_clean = str(active_session_id or "").strip()
-            if not active_clean and clean:
-                active_clean = _rotation_session_id(clean[0])
-            cur.execute(
-                "INSERT INTO rotation_ui_state(wallet_address, active_session_id, updated_ts) VALUES(?,?,?) "
-                "ON CONFLICT(wallet_address) DO UPDATE SET active_session_id=excluded.active_session_id, updated_ts=excluded.updated_ts",
-                (wa, active_clean, nowi),
-            )
-            conn.commit()
-        saved, active, updated_ts = _db_get_rotation_sessions(wa)
-        return saved, active, updated_ts or nowi
-    finally:
-        conn.close()
-
-
-
-
-@app.route("/api/rotation-sessions/<session_id>", methods=["DELETE"])
-def api_rotation_session_delete(session_id):
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return err("wallet required", 401)
-    sid = str(session_id or "").strip()
-    if not sid:
-        return err("session_id required", 400)
-    wa_norm = _norm_addr(wa)
-    nowi = int(time.time() * 1000)
-    conn = _db()
-    try:
-        with DB_WRITE_LOCK:
-            cur = conn.cursor()
-            # Safety: do not delete an open/live-running position by accident.
-            cur.execute("SELECT status, session_json FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
-            row = cur.fetchone()
-            if row:
-                st = str(row["status"] or "").strip().upper()
-                try:
-                    sess = json.loads(row["session_json"] or "{}") or {}
-                except Exception:
-                    sess = {}
-                position_state = str(sess.get("positionState") or sess.get("position_state") or sess.get("readiness") or "").strip().upper()
-                hard_delete_ok = st in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"} or position_state in {"STOPPED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED"}
-                if not hard_delete_ok:
-                    return err("rotation session can only be deleted after STOPPED/COMPLETE/EXPIRED/ERROR/PROTECTED", 409)
-            cur.execute(
-                "INSERT INTO rotation_deleted_sessions(wallet_address, session_id, deleted_ts, reason) VALUES(?,?,?,?) "
-                "ON CONFLICT(wallet_address, session_id) DO UPDATE SET deleted_ts=excluded.deleted_ts, reason=excluded.reason",
-                (wa_norm, sid, nowi, "user_delete"),
-            )
-            cur.execute("DELETE FROM rotation_events WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
-            cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (wa_norm, sid))
-            cur.execute("SELECT active_session_id FROM rotation_ui_state WHERE wallet_address=?", (wa_norm,))
-            ui_row = cur.fetchone()
-            if ui_row and str(ui_row["active_session_id"] or "") == sid:
-                cur.execute("SELECT session_id FROM rotation_sessions WHERE wallet_address=? ORDER BY updated_ts DESC LIMIT 1", (wa_norm,))
-                next_row = cur.fetchone()
-                next_active = str(next_row["session_id"] or "") if next_row else ""
-                cur.execute("INSERT INTO rotation_ui_state(wallet_address, active_session_id, updated_ts) VALUES(?,?,?) ON CONFLICT(wallet_address) DO UPDATE SET active_session_id=excluded.active_session_id, updated_ts=excluded.updated_ts", (wa_norm, next_active, nowi))
-            conn.commit()
-        sessions, active, updated_ts = _db_get_rotation_sessions(wa_norm)
-        out = jsonify({"status": "ok", "wallet": wa_norm, "deleted": sid, "sessions": sessions, "activeRotationSessionId": active, "updated_ts": updated_ts or nowi, "ts": now_ts()})
-        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return out
-    finally:
-        conn.close()
-
-
-@app.route("/api/rotation-sessions", methods=["GET", "POST"])
-def api_rotation_sessions():
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return err("wallet required", 401)
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        sessions = body.get("sessions") if isinstance(body, dict) else []
-        # Compatibility: allow posting a single updated session as {session: {...}}.
-        # Single-session updates must not delete the other wallet sessions.
-        replace_missing = isinstance(sessions, list)
-        if not isinstance(sessions, list):
-            session = body.get("session") if isinstance(body, dict) else None
-            sessions = [session] if isinstance(session, dict) else []
-            replace_missing = False
-        active_id = str((body.get("activeRotationSessionId") or body.get("active_session_id") or "") if isinstance(body, dict) else "").strip()
-        saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id, replace_missing=replace_missing)
-        active_rows = [x for x in saved if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
-        out = jsonify({
-            "status": "ok",
-            "wallet": wa,
-            "sessions": saved,
-            "activeRotationSessionId": active,
-            "summary": {
-                "active_count": len(active_rows),
-                "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
-                "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in saved), 6),
-                "execution_mode": "shadow",
-                "vault_ready": False,
-            },
-            "updated_ts": updated_ts,
-            "ts": now_ts(),
-        })
-        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return out
-    sessions, active, updated_ts = _db_get_rotation_sessions(wa)
-    active_rows = [x for x in sessions if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
-    out = jsonify({
-        "status": "ok",
-        "wallet": wa,
-        "sessions": sessions,
-        "activeRotationSessionId": active,
-        "summary": {
-            "active_count": len(active_rows),
-            "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
-            "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in sessions), 6),
-            "execution_mode": "shadow",
-            "vault_ready": False,
-        },
-        "updated_ts": updated_ts,
-        "ts": now_ts(),
-    })
-    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    return out
 
 
 @app.route("/api/watchlist", methods=["GET", "POST"])
@@ -10661,29 +9754,6 @@ def api_nexus_trading_hold_state():
                 _nexus_risk_state_save(cur, wa, _nexus_risk_state_build([], hold_snapshot, _nexus_risk_state_load(cur, wa), {}))
                 conn.commit()
 
-        elif action == "stop":
-            session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
-            chain = _normalize_chain_key(body.get("chain") or body.get("chain_key") or "")
-            with DB_WRITE_LOCK:
-                deleted = _nexus_shadow_stop_session(cur, wa, session_id, chain) if session_id else 0
-                cur.execute(
-                    """
-                    INSERT INTO nexus_trading_hold_state(wallet_address, status, hold_hours, observe_max_hours, release_required, queue_json, reason, updated_ts)
-                    VALUES (?, 'PREPARED', 1, 12, 0, '[]', 'stopped_by_user', ?)
-                    ON CONFLICT(wallet_address) DO UPDATE SET
-                        status='PREPARED', release_required=0, queue_json='[]', reason='stopped_by_user', updated_ts=excluded.updated_ts
-                    """,
-                    (wa, now_i),
-                )
-                _nexus_risk_state_save(cur, wa, {
-                    **_nexus_risk_state_default(),
-                    "global_status": "ACTIVE_OK",
-                    "last_action": "STOP",
-                    "blocked_reason": f"Trading session stopped by user. Archived {deleted} queue rows.",
-                    "updated_ts": now_i,
-                })
-                conn.commit()
-
         elif action == "release":
             with DB_WRITE_LOCK:
                 cur.execute(
@@ -10757,7 +9827,7 @@ def api_nexus_trading_hold_state():
 # -------------------------
 # Nexus Execution Preparation Layer
 # -------------------------
-_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PAUSED","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
+_NEXUS_EXEC_ALLOWED_STATES = {"WAIT","READY","ACTIVE","PROTECT","EXIT_RISK","HOLD","OBSERVE","BLOCKED","RELEASE_REQUIRED","SIMULATED_EXIT"}
 
 def _nexus_json_load(value, fallback):
     try:
@@ -10768,16 +9838,7 @@ def _nexus_json_load(value, fallback):
 
 def _nexus_wallet_from_request():
     body = request.get_json(silent=True) or {}
-    wallet = (
-        request.args.get("wallet")
-        or request.args.get("wallet_address")
-        or request.headers.get("X-Wallet-Address")
-        or request.headers.get("x-wallet-address")
-        or body.get("wallet")
-        or body.get("wallet_address")
-        or body.get("walletAddress")
-        or ""
-    )
+    wallet = request.args.get("wallet") or request.args.get("wallet_address") or request.headers.get("X-Wallet-Address") or body.get("wallet") or body.get("wallet_address") or ""
     wa = _norm_addr(wallet)
     if not wa or not _looks_like_evm_addr(wa):
         return "", (jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400)
@@ -10786,85 +9847,15 @@ def _nexus_wallet_from_request():
 def _nexus_queue_row_to_dict(row) -> dict:
     meta = _nexus_json_load(row["meta_json"], {})
     session_id = str(meta.get("session_id") or meta.get("trade_session_id") or meta.get("rotation_session_id") or "")
-    reserved_usd = float(row["reserved_capital_usd"] or 0)
-    out = {
-        "id": row["id"], "slot_id": row["slot_id"] or "", "slot": row["slot_id"] or "", "asset": row["asset"] or "", "symbol": row["asset"] or "", "chain": row["chain"] or "",
-        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "status": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
-        "reserved_capital_usd": reserved_usd, "amountUsd": reserved_usd, "amount_usd": reserved_usd, "confidence": float(row["confidence"] or 0),
+    return {
+        "id": row["id"], "slot_id": row["slot_id"] or "", "asset": row["asset"] or "", "chain": row["chain"] or "",
+        "action": row["action"] or "OBSERVE", "state": row["state"] or "WAIT", "priority": float(row["priority"] or 0),
+        "reserved_capital_usd": float(row["reserved_capital_usd"] or 0), "confidence": float(row["confidence"] or 0),
         "risk_score": float(row["risk_score"] or 0), "reason": row["reason"] or "",
         "signals": _nexus_json_load(row["signals_json"], {}), "meta": meta, "session_id": session_id,
         "recheck_after_ts": row["recheck_after_ts"], "expires_ts": row["expires_ts"],
         "created_ts": row["created_ts"], "updated_ts": row["updated_ts"],
     }
-    for mk in [
-        "paper_entry_price", "paper_mark_price", "paper_exit_price",
-        "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd",
-        "paper_gross_pnl_usd", "paper_net_pnl_usd",
-        "paper_estimated_costs_usd", "paper_estimated_gas_usd",
-        "paper_estimated_dex_fee_usd", "paper_estimated_slippage_usd",
-        "paper_cycle_realized_usd",
-        "paper_realized_total_usd", "paper_collected_profit_usd",
-        "collected_profit_usd", "realized_profit_usd",
-        "paper_recycled_until_total_usd",
-        "paper_quantity", "paper_position_usd",
-    ]:
-        if meta.get(mk) is not None:
-            out[mk] = meta.get(mk)
-
-    # Important: Session-specific settings must also be returned top-level.
-    # The UI and Shadow runtime both support mixed old/new key names.
-    # Keeping these aliases synchronized prevents Details cards from showing `—`
-    # and prevents the Strategist from falling back to generic defaults.
-    _session_alias_groups = [
-        ("style", ["style", "trading_style", "strategy"]),
-        ("trading_style", ["trading_style", "style", "strategy"]),
-        ("strategy", ["strategy", "style", "trading_style"]),
-        ("risk_mode", ["risk_mode", "riskMode", "trading_risk_mode"]),
-        ("riskMode", ["riskMode", "risk_mode", "trading_risk_mode"]),
-        ("trading_risk_mode", ["trading_risk_mode", "risk_mode", "riskMode"]),
-        ("max_trades", ["max_trades", "maxTrades"]),
-        ("maxTrades", ["maxTrades", "max_trades"]),
-        ("hard_stop_pct", ["hard_stop_pct", "hardStopPct"]),
-        ("hardStopPct", ["hardStopPct", "hard_stop_pct"]),
-        ("profit_lock_pct", ["profit_lock_pct", "profitLockPct"]),
-        ("profitLockPct", ["profitLockPct", "profit_lock_pct"]),
-        ("max_slippage_pct", ["max_slippage_pct", "maxSlippagePct"]),
-        ("maxSlippagePct", ["maxSlippagePct", "max_slippage_pct"]),
-        ("caution_drawdown_pct", ["caution_drawdown_pct", "cautionDrawdownPct"]),
-        ("cautionDrawdownPct", ["cautionDrawdownPct", "caution_drawdown_pct"]),
-        ("reuse_profit_pct", ["reuse_profit_pct", "reuseProfitPct", "profit_reuse_pct", "profitReusePct"]),
-        ("reuseProfitPct", ["reuseProfitPct", "reuse_profit_pct", "profit_reuse_pct", "profitReusePct"]),
-        ("profit_reuse_pct", ["profit_reuse_pct", "profitReusePct", "reuse_profit_pct", "reuseProfitPct"]),
-        ("profitReusePct", ["profitReusePct", "profit_reuse_pct", "reuse_profit_pct", "reuseProfitPct"]),
-        ("max_combined_slots", ["max_combined_slots", "maxCombinedSlots", "slot_donor_cap", "slotDonorCap"]),
-        ("maxCombinedSlots", ["maxCombinedSlots", "max_combined_slots", "slot_donor_cap", "slotDonorCap"]),
-        ("slot_donor_cap", ["slot_donor_cap", "slotDonorCap", "max_combined_slots", "maxCombinedSlots"]),
-        ("slotDonorCap", ["slotDonorCap", "slot_donor_cap", "max_combined_slots", "maxCombinedSlots"]),
-        ("payout_asset", ["payout_asset", "payoutAsset"]),
-        ("payoutAsset", ["payoutAsset", "payout_asset"]),
-        ("runtime_hours", ["runtime_hours", "runtimeHours"]),
-        ("runtimeHours", ["runtimeHours", "runtime_hours"]),
-        ("session_expires_ts", ["session_expires_ts", "expires_ts"]),
-        ("expires_ts", ["expires_ts", "session_expires_ts"]),
-    ]
-    for out_key, aliases in _session_alias_groups:
-        for k in aliases:
-            val = meta.get(k)
-            if val is not None and str(val).strip() != "":
-                out[out_key] = val
-                break
-
-    # Session/UI aggregation must be able to read protected profit without
-    # digging through meta_json. Keep top-level aliases in sync.
-    collected = _clamp_float(
-        meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd", meta.get("collected_profit_usd", 0))),
-        0, -1_000_000_000, 1_000_000_000
-    )
-    out["paper_collected_profit_usd"] = collected
-    out["paper_realized_total_usd"] = _clamp_float(meta.get("paper_realized_total_usd", collected), 0, -1_000_000_000, 1_000_000_000)
-    out["collected_profit_usd"] = collected
-    out["realized_profit_usd"] = collected
-    return out
 
 def _nexus_reservation_row_to_dict(row) -> dict:
     return {
@@ -10881,236 +9872,38 @@ def _nexus_log_sim_event(cur, wallet_address, slot_id, asset, event_type, state_
     )
 
 def _nexus_execution_summary(cur, wallet_address):
-    """Backend-first execution summary with safe multi-session isolation.
-
-    Important: the DB table stores session_id inside meta_json. Older code sorted the
-    whole wallet queue by priority and returned rows from different sessions together.
-    That made the frontend show duplicated slots and made old stopped/runtime rows come
-    back after refresh. Here we load enough recent rows, discard stopped/archived rows,
-    and dedupe by session+chain+slot so every budget session keeps its own queue.
-    """
-    cur.execute(
-        "SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY updated_ts DESC, created_ts DESC LIMIT 300",
-        (wallet_address,),
-    )
-    raw_rows = [_nexus_queue_row_to_dict(r) for r in cur.fetchall()]
-
-    active_rows = []
-    stopped_states = {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "RELEASED"}
-    for row in raw_rows:
-        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-        st = str(row.get("state") or "").upper()
-        meta_status = str(meta.get("session_status") or meta.get("runtime_status") or meta.get("status") or "").upper()
-        if st in stopped_states or meta_status in stopped_states:
-            continue
-        if meta.get("session_stopped") or meta.get("archived") or meta.get("deleted"):
-            continue
-        # Normalize session id from any legacy location, but don't invent one.
-        sid = str(row.get("session_id") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-        if sid:
-            row["session_id"] = sid
-            meta["session_id"] = sid
-            row["meta"] = meta
-        chain_key = _normalize_chain_key(row.get("chain") or meta.get("chain") or "")
-        if _nexus_shadow_is_session_stopped(cur, wallet_address, sid, chain_key):
-            continue
-        active_rows.append(row)
-
-    # Dedupe visible cards per budget session. Keep the newest row for the same slot.
-    by_key = {}
-    order = []
-    for idx, row in enumerate(active_rows):
-        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-        sid = str(row.get("session_id") or meta.get("session_id") or "NO_SESSION").strip() or "NO_SESSION"
-        chain = _normalize_chain_key(row.get("chain") or meta.get("chain") or "") or "NO_CHAIN"
-        slot_raw = str(row.get("slot_id") or meta.get("slot") or idx + 1).strip()
-        m = re.search(r"\d+", slot_raw)
-        slot_no = m.group(0) if m else slot_raw or str(idx + 1)
-        asset = str(row.get("asset") or meta.get("asset") or "").upper()
-        key = f"{sid}|{chain}|{slot_no}"
-        if key not in by_key:
-            order.append(key)
-            by_key[key] = row
-        else:
-            prev = by_key[key]
-            if int(row.get("updated_ts") or 0) >= int(prev.get("updated_ts") or 0):
-                by_key[key] = row
-
-    queue = list(by_key.values())
-    queue.sort(key=lambda q: (
-        str(q.get("session_id") or (q.get("meta") or {}).get("session_id") or ""),
-        _normalize_chain_key(q.get("chain") or ""),
-        int(re.search(r"\d+", str(q.get("slot_id") or "0")).group(0)) if re.search(r"\d+", str(q.get("slot_id") or "0")) else 0,
-    ))
-
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY priority DESC, updated_ts DESC LIMIT 25", (wallet_address,))
+    queue = [_nexus_queue_row_to_dict(r) for r in cur.fetchall()]
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE wallet_address=? AND state IN ('RESERVED','HOLD','OBSERVE','RELEASE_REQUIRED') ORDER BY updated_ts DESC", (wallet_address,))
     reservations = [_nexus_reservation_row_to_dict(r) for r in cur.fetchall()]
     due_count = len([q for q in queue if not q.get("recheck_after_ts") or int(q.get("recheck_after_ts") or 0) <= now_ts()])
-
-    # Aggregate protected/collected profit per session and globally for the UI.
-    # Important: this is read-only aggregation; it does not change runtime logic.
-    session_profit = {}
-    for q in queue:
-        meta = q.get("meta") if isinstance(q.get("meta"), dict) else {}
-        sid = str(q.get("session_id") or meta.get("session_id") or meta.get("trade_session_id") or "NO_SESSION").strip() or "NO_SESSION"
-        chain = _normalize_chain_key(q.get("chain") or meta.get("chain") or "")
-        asset = str(q.get("asset") or q.get("symbol") or meta.get("asset") or chain or "ASSET").upper()
-        key = f"{sid}::{asset or chain or 'ASSET'}"
-        profit = _clamp_float(
-            q.get("paper_collected_profit_usd", meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd", 0))),
-            0, -1_000_000_000, 1_000_000_000
-        )
-        session_profit[key] = round(session_profit.get(key, 0.0) + profit, 4)
-
-    total_collected_profit = round(sum(session_profit.values()), 4)
-
     return {
         "queue": queue, "reservations": reservations,
         "reserved_capital_usd": round(sum(float(r.get("amount_usd") or 0) for r in reservations), 2),
-        "collected_profit_usd": total_collected_profit,
-        "paper_collected_profit_usd": total_collected_profit,
-        "session_collected_profit_usd": session_profit,
         "recheck_due_count": due_count, "queue_count": len(queue),
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
-
-def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
-    """Score one prepared slot for Shadow/rotation readiness without live execution.
-
-    This is intentionally deterministic and local to the queue row. It does not call
-    external services and it never triggers Vault execution. The goal is to make
-    Shadow behave like a realistic prepared/live preview: good WAIT slots can move
-    to READY, weak slots stay WAIT, and risky slots move to PROTECT/BLOCKED.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
-
-    raw_confidence = item.get("confidence", item.get("confidence_score", signals.get("confidence", None)))
-    confidence = _clamp_float(raw_confidence, 0, 0, 100) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
-    risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
-    priority_raw = item.get("priority", None)
-    priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
-
-    # If Strategist/Frontend provides priority but not confidence, do not treat the
-    # slot as untradeable in Shadow. Priority is already a prepared signal, so convert
-    # it into a conservative Shadow confidence for simulation visibility only.
-    confidence_missing = raw_confidence is None or str(raw_confidence).strip() in ("", "0", "0.0")
-    if confidence_missing and priority > 0 and risk < 48:
-        confidence = min(82, max(45, priority + 12))
-
-    liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=70)
-    rvol = _nexus_trading_signal_value(item, signals, "rvol", "relative_volume", default=1.0)
-    slippage = _nexus_trading_signal_value(item, signals, "slippage_pct", "slippagePct", default=0)
-    overextension = _nexus_trading_signal_value(item, signals, "overextension_pct", "overextension", default=0)
-    structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
-    security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
-
-    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    max_slippage_source = cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", None))
-    if max_slippage_source is None:
-        max_slippage_source = item.get("max_slippage_pct", item.get("maxSlippagePct", None))
-    if max_slippage_source is None:
-        max_slippage_source = meta.get("max_slippage_pct", meta.get("maxSlippagePct", 1.2))
-    max_slippage = _clamp_float(max_slippage_source, 1.2, 0.05, 10)
-    quality = priority
-    if confidence >= 70:
-        quality += 10
-    elif confidence >= 55:
-        quality += 5
-    if liquidity >= 60:
-        quality += 5
-    elif liquidity < 35:
-        quality -= 12
-    if rvol >= 1.2:
-        quality += 4
-    elif rvol < 0.7:
-        quality -= 5
-    if structure in ("BREAKOUT", "ACCUMULATION", "INTACT", "STRONG", "UPTREND"):
-        quality += 6
-    if structure in ("WEAK", "UNSTABLE", "DISTRIBUTION"):
-        quality -= 8
-    if overextension >= 60 and rvol < 1.2:
-        quality -= 10
-    if slippage and slippage > max_slippage:
-        quality -= 14
-
-    hard_block = security in ("FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED") or liquidity <= 10 or (slippage and slippage >= max_slippage * 2.5)
-    return {
-        "confidence": max(0, min(100, confidence)),
-        "risk_score": max(0, min(100, risk)),
-        "priority": max(-100, min(100, priority)),
-        "quality": max(-100, min(100, quality)),
-        "hard_block": bool(hard_block),
-    }
-
 
 def _nexus_recheck_apply(cur, wallet_address):
     ts = now_ts()
     cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 20", (wallet_address, ts))
     changed = []
-    active_like = 0
-    max_shadow_ready = int(os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6"))
-
     for row in cur.fetchall():
         item = _nexus_queue_row_to_dict(row)
         old_state = str(item.get("state") or "WAIT").upper()
-        quality = _nexus_shadow_slot_quality(item, {"risk_mode": "BALANCED"})
-        decision = _nexus_trading_decide_slot({
-            "status": old_state,
-            "symbol": item.get("asset"),
-            "signals": item.get("signals") or {},
-            "confidence": quality.get("confidence"),
-            "risk_score": quality.get("risk_score"),
-            "priority": quality.get("priority"),
-        }, {"risk_mode": "BALANCED"})
-
-        new_state = str(decision.get("next_status") or decision.get("state") or old_state).upper()
-        reason = "; ".join(decision.get("reasons") or []) or item.get("reason") or "Scheduled Strategist recheck"
-
-        if old_state == "PAUSED":
-            # Expired/user-paused sessions are authoritative. Recheck must not revive them.
-            continue
-        if quality.get("hard_block"):
-            new_state = "BLOCKED"
-            reason = "Shadow recheck blocked this slot because security/liquidity/slippage rules failed."
-        elif quality.get("risk_score", 0) >= 70:
-            new_state = "HOLD"
-            reason = "Shadow recheck detected high risk; slot is protected in HOLD."
-        elif quality.get("risk_score", 0) >= 48:
-            new_state = "PROTECT"
-            reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
-        elif old_state in ("WAIT", "OBSERVE", "READY"):
-            # Recheck should mirror Shadow behavior: a clean prepared slot may become
-            # READY even when explicit confidence is missing, as long as priority/quality
-            # and risk are acceptable. This is still preparation-only, no Vault execution.
-            if (
-                (quality.get("confidence", 0) >= 50 and quality.get("quality", 0) >= 30)
-                or quality.get("quality", 0) >= 38
-            ) and active_like < max_shadow_ready:
-                new_state = "READY"
-                active_like += 1
-                reason = "Shadow recheck promoted this slot to READY based on priority, quality and controlled risk."
-            else:
-                new_state = "WAIT"
-                reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
-        elif old_state == "PROTECT" and quality.get("risk_score", 0) < 35 and quality.get("quality", 0) >= 35:
+        decision = _nexus_trading_decide_slot({"status": old_state, "symbol": item.get("asset"), "signals": item.get("signals") or {}, "confidence": item.get("confidence"), "risk_score": item.get("risk_score")}, {"risk_mode": "BALANCED"})
+        new_state = str(decision.get("state") or old_state).upper()
+        reason = str(decision.get("reason") or item.get("reason") or "Scheduled Strategist recheck").strip()
+        if old_state in ("WAIT","OBSERVE") and new_state == "ACTIVE":
             new_state = "READY"
-            active_like += 1
-            reason = "Risk normalized; Shadow recheck returned this slot to READY."
-        elif old_state == "ACTIVE":
-            active_like += 1
-
+            reason = "Recheck confirmed readiness, but Vault execution is not enabled yet."
         if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
             new_state = old_state
         next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
-        cur.execute(
-            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
-            (new_state, quality.get("quality", item.get("priority") or 0), quality.get("confidence", item.get("confidence") or 0), quality.get("risk_score", item.get("risk_score") or 0), reason[:500], next_recheck, ts, item["id"], wallet_address),
-        )
+        cur.execute("UPDATE nexus_execution_queue SET state=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?", (new_state, reason[:500], next_recheck, ts, item["id"], wallet_address))
         if new_state != old_state:
-            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision, "quality": quality})
-            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason, "quality": quality})
+            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision})
+            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason})
     return changed
 
 def _nexus_upsert_queue_item(cur, wallet_address, body):
@@ -11127,58 +9920,6 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
     session_id = str(body.get("session_id") or body.get("trade_session_id") or body.get("rotation_session_id") or meta.get("session_id") or "").strip()[:80]
     if session_id:
         meta = {**meta, "session_id": session_id}
-    # User-controlled profit reuse permission (0-100%). Default 0 protects all realized profit.
-    reuse_profit_pct = _clamp_float(
-        body.get("reuse_profit_pct", body.get("profit_reuse_pct", body.get("reuseProfitPct", body.get("profitReusePct", meta.get("reuse_profit_pct", meta.get("profit_reuse_pct", 0)))))),
-        0, 0, 100
-    )
-    # User-controlled slot capital rotation cap. Default 0 means no slot combination.
-    max_combined_slots = int(_clamp_float(
-        body.get("max_combined_slots", body.get("maxCombinedSlots", body.get("slot_donor_cap", body.get("slotDonorCap", meta.get("max_combined_slots", meta.get("slot_donor_cap", 0)))))),
-        0, 0, 3
-    ))
-    style = str(
-        body.get("style") or body.get("trading_style") or body.get("strategy")
-        or meta.get("style") or meta.get("trading_style") or meta.get("strategy") or ""
-    ).strip().upper()[:40]
-    risk_mode_meta = str(
-        body.get("riskMode") or body.get("risk_mode") or body.get("trading_risk_mode")
-        or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode") or ""
-    ).strip().upper()[:40]
-    max_trades_meta = int(_clamp_float(body.get("max_trades", body.get("maxTrades", meta.get("max_trades", meta.get("maxTrades", 0)))), 0, 0, 500))
-    hard_stop_meta = _clamp_float(body.get("hard_stop_pct", body.get("hardStopPct", meta.get("hard_stop_pct", meta.get("hardStopPct", 0)))), 0, 0, 100)
-    profit_lock_meta = _clamp_float(body.get("profit_lock_pct", body.get("profitLockPct", meta.get("profit_lock_pct", meta.get("profitLockPct", 0)))), 0, 0, 100)
-    max_slippage_meta = _clamp_float(body.get("max_slippage_pct", body.get("maxSlippagePct", meta.get("max_slippage_pct", meta.get("maxSlippagePct", 0)))), 0, 0, 100)
-    caution_dd_meta = _clamp_float(body.get("caution_drawdown_pct", body.get("cautionDrawdownPct", meta.get("caution_drawdown_pct", meta.get("cautionDrawdownPct", 0)))), 0, 0, 100)
-    payout_asset_meta = str(body.get("payout_asset") or body.get("payoutAsset") or meta.get("payout_asset") or meta.get("payoutAsset") or "USDC").strip().upper()[:24]
-
-    meta = {
-        **meta,
-        "reuse_profit_pct": reuse_profit_pct,
-        "profit_reuse_pct": reuse_profit_pct,
-        "max_combined_slots": max_combined_slots,
-        "maxCombinedSlots": max_combined_slots,
-        "slot_donor_cap": max_combined_slots,
-        "slotDonorCap": max_combined_slots,
-        "style": style,
-        "trading_style": style,
-        "strategy": style,
-        "riskMode": risk_mode_meta,
-        "risk_mode": risk_mode_meta,
-        "trading_risk_mode": risk_mode_meta,
-        "maxTrades": max_trades_meta,
-        "max_trades": max_trades_meta,
-        "hardStopPct": hard_stop_meta,
-        "hard_stop_pct": hard_stop_meta,
-        "profitLockPct": profit_lock_meta,
-        "profit_lock_pct": profit_lock_meta,
-        "maxSlippagePct": max_slippage_meta,
-        "max_slippage_pct": max_slippage_meta,
-        "cautionDrawdownPct": caution_dd_meta,
-        "caution_drawdown_pct": caution_dd_meta,
-        "payoutAsset": payout_asset_meta,
-        "payout_asset": payout_asset_meta,
-    }
     confidence = _clamp_float(body.get("confidence", signals.get("confidence", 0)), 0, 0, 100)
     risk_score = _clamp_float(body.get("risk_score", signals.get("risk_score", 0)), 0, 0, 100)
     priority = _clamp_float(body.get("priority", confidence - risk_score), 0, -100, 100)
@@ -11405,145 +10146,43 @@ def _shadow_normalize_queue_item(item, idx=0):
     state = str(item.get("status") or item.get("state") or "WAIT").strip().upper()
     amount = _clamp_float(item.get("amountUsd", item.get("reserved_capital_usd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
     priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
-    confidence_raw = item.get("confidence", item.get("confidence_score", None))
+    confidence_raw = item.get("confidence", item.get("confidence_score", 0))
     if isinstance(confidence_raw, str):
         confidence = {"LOW": 35, "MEDIUM": 62, "HIGH": 82}.get(confidence_raw.upper(), 50)
-    elif confidence_raw is None or str(confidence_raw).strip() == "":
-        confidence = 0
     else:
         confidence = _clamp_float(confidence_raw, 0, 0, 100)
     risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
-
-    # Shadow slots often arrive from the prepared UI with a useful priority but
-    # without a dedicated confidence score yet. In that case, derive a conservative
-    # Shadow-only confidence from priority so the simulator can visibly test rotation
-    # instead of leaving every non-slot-1 row in WAIT forever. This never affects
-    # live/Vault execution.
-    confidence_missing = confidence_raw is None or str(confidence_raw).strip() in ("", "0", "0.0")
-    if confidence_missing and priority > 0 and risk_score < 48:
-        confidence = max(confidence, min(82, max(45, priority + 12)))
     return {
         **item,
         "slot": slot,
         "symbol": symbol,
         "status": state,
         "amountUsd": amount,
-        "amount_usd": amount,
-        "reserved_capital_usd": amount,
         "priority": priority,
         "confidence_score": confidence,
         "risk_score": risk_score,
     }
 
 
-def _nexus_shadow_item_blocked_by_hold(item: dict, hold: dict) -> bool:
-    """Return True only when HOLD/OBSERVE applies to this slot/session.
-
-    Older Shadow logic used the wallet-level HOLD status as a global blocker. That made
-    every slot look frozen although only protected capital/slots should be blocked.
-    """
-    status = str((hold or {}).get("status") or "").upper()
-    if status not in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
-        return False
-
-    hold_queue = (hold or {}).get("queue") if isinstance((hold or {}).get("queue"), list) else []
-    if not hold_queue:
-        # Keep backward compatibility: if backend has no slot list, block only slots already
-        # explicitly in a protected state, not every WAIT/READY candidate.
-        return str((item or {}).get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
-
-    slot = str((item or {}).get("slot") or (item or {}).get("slot_id") or "").strip().upper()
-    symbol = str((item or {}).get("symbol") or (item or {}).get("asset") or "").strip().upper()
-    session_id = str((item or {}).get("session_id") or ((item or {}).get("meta") or {}).get("session_id") or "").strip().upper()
-
-    for q in hold_queue:
-        if not isinstance(q, dict):
-            continue
-        qslot = str(q.get("slot") or q.get("slot_id") or q.get("id") or "").strip().upper()
-        qsymbol = str(q.get("symbol") or q.get("asset") or "").strip().upper()
-        qsession = str(q.get("session_id") or (q.get("meta") or {}).get("session_id") or "").strip().upper()
-        if slot and qslot and slot == qslot:
-            return True
-        if session_id and qsession and session_id == qsession:
-            return True
-        if symbol and qsymbol and symbol == qsymbol:
-            return True
-    return False
-
-
 def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     """Run an off-chain shadow execution validation pass.
 
     This function never creates transactions, never calls Vault execution routes, and never
-    mutates live Grid orders. It produces a realistic Shadow rotation preview: WAIT slots
-    can become READY, READY/ACTIVE slots can produce virtual fills, risky slots move to
-    PROTECT/HOLD, and protected slots stay blocked only when the hold applies to them.
+    mutates live Grid orders. It only produces validation events and a safety summary.
     """
     cfg = config if isinstance(config, dict) else {}
     hold = hold_state if isinstance(hold_state, dict) else {}
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 1, 1, 168)
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 6)), 1, 1, 200))
-    max_ready_slots = int(_clamp_float(cfg.get("max_ready_slots", os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6")), 6, 1, 50))
-    min_ready_slots = int(_clamp_float(cfg.get("min_ready_slots", cfg.get("minReadySlots", os.getenv("NEXUS_SHADOW_MIN_READY_SLOTS", "3"))), 3, 0, 50))
-    # In Shadow mode the user must be able to see whether the rotation engine can move
-    # more than the first slot. These are still conservative: risky/protected/hard-blocked
-    # slots are never forced ready, but clean WAIT slots can be promoted into a visible
-    # READY preview even when their raw confidence is incomplete or stale.
-    shadow_ready_confidence_floor = _clamp_float(
-        cfg.get("shadow_ready_confidence_floor", cfg.get("shadowReadyConfidenceFloor", os.getenv("NEXUS_SHADOW_READY_CONFIDENCE_FLOOR", "45"))),
-        50,
-        0,
-        100,
-    )
-    shadow_ready_quality_floor = _clamp_float(
-        cfg.get("shadow_ready_quality_floor", cfg.get("shadowReadyQualityFloor", os.getenv("NEXUS_SHADOW_READY_QUALITY_FLOOR", "20"))),
-        25,
-        -100,
-        100,
-    )
-    persist_state = str(cfg.get("persist_state", cfg.get("persistState", os.getenv("NEXUS_SHADOW_PERSIST_QUEUE", "1")))).strip().lower() in ("1", "true", "yes", "on")
-
+    reentry_blocked = str(hold.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
     events = []
     virtual_fills = 0
-    virtual_waits = 0
     blocked = 0
     protect_count = 0
-    ready_count = 0
     reallocation_tests = 0
     stop_tests = 0
-    queue_out = []
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue if isinstance(queue, list) else [])]
-    quality_by_idx = {}
-    forced_ready_indices = set()
-
-    if normalized:
-        candidates = []
-        for i, candidate in enumerate(normalized):
-            candidate_state = str(candidate.get("status") or "WAIT").upper()
-            q = _nexus_shadow_slot_quality(candidate, cfg)
-            quality_by_idx[i] = q
-            candidate_risk = _clamp_float(q.get("risk_score", candidate.get("risk_score", 0)), 0, 0, 100)
-            candidate_quality = _clamp_float(q.get("quality", q.get("priority", 0)), 0, -100, 100)
-            candidate_confidence = _clamp_float(q.get("confidence", candidate.get("confidence_score", 0)), 0, 0, 100)
-
-            # Only clean, currently waiting/ready/active slots can be included in the
-            # visible Shadow rotation preview. Protected states remain protected.
-            if candidate_state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
-                continue
-            if _nexus_shadow_item_blocked_by_hold(candidate, hold):
-                continue
-            if q.get("hard_block") or candidate_risk >= 48:
-                continue
-
-            # If external signals are sparse, use quality + priority ranking so Shadow can
-            # still demonstrate slot rotation instead of leaving every non-slot-1 card WAIT.
-            candidates.append((candidate_quality, candidate_confidence, _clamp_float(candidate.get("priority", 0), 0, -100, 100), i))
-
-        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-        target_ready = max(0, min(max_ready_slots, min_ready_slots, len(candidates)))
-        forced_ready_indices = {i for *_rest, i in candidates[:target_ready]}
-
     if not normalized:
         events.append({
             "type": "NO_QUEUE",
@@ -11553,182 +10192,94 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
 
     for idx, item in enumerate(normalized):
         state = str(item.get("status") or "WAIT").upper()
-        quality = quality_by_idx.get(idx) or _nexus_shadow_slot_quality(item, cfg)
-        risk = _clamp_float(quality.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
-        confidence = _clamp_float(quality.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
-        priority = _clamp_float(quality.get("priority", item.get("priority", 0)), 0, -100, 100)
-        quality_score = _clamp_float(quality.get("quality", priority), 0, -100, 100)
+        risk = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
+        confidence = _clamp_float(item.get("confidence_score", 0), 0, 0, 100)
+        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
         symbol = item.get("symbol") or "ASSET"
         slot = item.get("slot") or f"S{idx + 1}"
-        next_state = state
-        transition_reason = ""
 
-        if _nexus_shadow_item_blocked_by_hold(item, hold):
+        if reentry_blocked:
             blocked += 1
-            next_state = "RELEASE_REQUIRED" if str(hold.get("status") or "").upper() == "RELEASE_REQUIRED" else state if state in ("HOLD", "OBSERVE") else "OBSERVE"
-            transition_reason = "Protected HOLD/OBSERVE applies to this slot; Shadow blocks blind re-entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "REENTRY_BLOCKED",
                 "severity": "high",
-                "from": state,
-                "to": next_state,
-                "message": transition_reason,
+                "message": "HOLD/OBSERVE state blocks blind re-entry in shadow validation.",
             })
-        elif state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+            continue
+
+        if state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
             blocked += 1
-            next_state = state
-            transition_reason = f"Slot state {state} is protected and not executable in shadow mode."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "STATE_BLOCKED",
                 "severity": "medium",
-                "from": state,
-                "to": next_state,
-                "message": transition_reason,
+                "message": f"Slot state {state} is not executable in shadow mode.",
             })
-        elif quality.get("hard_block") or risk >= 70:
+            continue
+
+        if risk >= 70:
             blocked += 1
             stop_tests += 1
-            next_state = "HOLD"
-            transition_reason = "Virtual execution blocked because risk/security/liquidity rules are too high."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_STOP_BLOCK",
                 "severity": "high",
-                "from": state,
-                "to": next_state,
                 "risk_score": risk,
-                "message": transition_reason,
+                "message": "Virtual execution blocked because risk score is too high.",
             })
-        elif risk >= 48:
+            continue
+
+        if risk >= 48:
             protect_count += 1
             stop_tests += 1
-            next_state = "PROTECT"
-            transition_reason = "Shadow executor would reduce/protect before any live entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_PROTECT",
                 "severity": "medium_high",
-                "from": state,
-                "to": next_state,
                 "risk_score": risk,
-                "message": transition_reason,
+                "message": "Shadow executor would reduce/protect before any live entry.",
             })
-        elif (
-            (confidence >= 50 and quality_score >= 30)
-            or (idx in forced_ready_indices and quality_score >= shadow_ready_quality_floor)
-            or quality_score >= 38
-        ) and ready_count < max_ready_slots:
-            ready_count += 1
-            if virtual_fills < max_trades:
-                virtual_fills += 1
-                reallocation_tests += 1
-                # Shadow must demonstrate the future Live scheduler more realistically:
-                # multiple clean slots can become active in the preview. This is not
-                # on-chain execution and does not touch Vault/Grid routes.
-                next_state = "ACTIVE" if (state == "ACTIVE" or idx in forced_ready_indices) else "READY"
-                transition_reason = "Virtual fill accepted for simulation only. Slot is active/ready in Shadow rotation preview."
-                events.append({
-                    "slot": slot,
-                    "symbol": symbol,
-                    "type": "VIRTUAL_FILL",
-                    "severity": "normal",
-                    "from": state,
-                    "to": next_state,
-                    "confidence": confidence,
-                    "priority": priority,
-                    "quality": quality_score,
-                    "message": transition_reason,
-                })
-            else:
-                virtual_waits += 1
-                next_state = "READY"
-                transition_reason = "Slot is ready, but max virtual trade count is reached for this Shadow pass."
-                events.append({
-                    "slot": slot,
-                    "symbol": symbol,
-                    "type": "VIRTUAL_READY_WAIT",
-                    "severity": "info",
-                    "from": state,
-                    "to": next_state,
-                    "confidence": confidence,
-                    "priority": priority,
-                    "quality": quality_score,
-                    "message": transition_reason,
-                })
+            continue
+
+        if confidence >= 55 and priority >= 35 and virtual_fills < max_trades:
+            virtual_fills += 1
+            reallocation_tests += 1
+            events.append({
+                "slot": slot,
+                "symbol": symbol,
+                "type": "VIRTUAL_FILL",
+                "severity": "normal",
+                "confidence": confidence,
+                "priority": priority,
+                "message": "Virtual fill accepted for simulation only. No Vault execution triggered.",
+            })
         else:
-            virtual_waits += 1
-            next_state = "WAIT"
-            transition_reason = "Setup remains in WAIT; quality is not clean enough yet."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_WAIT",
                 "severity": "info",
-                "from": state,
-                "to": next_state,
                 "confidence": confidence,
                 "priority": priority,
-                "quality": quality_score,
-                "message": transition_reason,
+                "message": "Setup remains in WAIT during shadow validation.",
             })
 
-        # Keep slot/user priority stable. The calculated Strategist quality is
-        # stored separately so the next tick cannot feed score back into priority
-        # and push every slot toward 100.
-        stable_priority = _clamp_float(item.get("priority", priority), 0, -100, 100)
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        meta["strategist_score"] = round(quality_score, 4)
-        meta["shadow_quality"] = round(quality_score, 4)
-        meta["shadow_confidence"] = round(confidence, 4)
-        meta["shadow_risk_score"] = round(risk, 4)
-        out_item = {
-            **item,
-            "status": next_state,
-            "state": next_state,
-            "priority": stable_priority,
-            "strategist_score": round(quality_score, 4),
-            "shadow_quality": round(quality_score, 4),
-            "confidence_score": confidence,
-            "confidence": confidence,
-            "risk_score": risk,
-            "meta": meta,
-            "shadow_transition": {"from": state, "to": next_state, "reason": transition_reason},
-        }
-        queue_out.append(out_item)
-
-    # Do not default every Shadow preview to 100. The score must reflect the
-    # actual per-slot quality/confidence/risk that came from the live prepared queue.
-    quality_values = [
-        _clamp_float((quality_by_idx.get(i) or {}).get("quality"), 0, -100, 100)
-        for i in range(len(normalized))
-        if isinstance(quality_by_idx.get(i), dict)
-    ]
-    confidence_values = [
-        _clamp_float((quality_by_idx.get(i) or {}).get("confidence"), 0, 0, 100)
-        for i in range(len(normalized))
-        if isinstance(quality_by_idx.get(i), dict)
-    ]
-    risk_values = [
-        _clamp_float((quality_by_idx.get(i) or {}).get("risk_score"), 0, 0, 100)
-        for i in range(len(normalized))
-        if isinstance(quality_by_idx.get(i), dict)
-    ]
-    avg_quality = (sum(quality_values) / len(quality_values)) if quality_values else 0.0
-    avg_confidence = (sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0
-    avg_risk = (sum(risk_values) / len(risk_values)) if risk_values else 0.0
-    fill_bonus = min(10.0, virtual_fills * 2.0)
-    safety_score = 50.0 + (avg_quality * 0.35) + ((avg_confidence - 50.0) * 0.25) - (avg_risk * 0.30) + fill_bonus
+    total = max(1, len(normalized))
+    safety_score = 100
     safety_score -= min(35, blocked * 8)
     safety_score -= min(24, protect_count * 6)
-    safety_score = max(0, min(100, int(round(safety_score))))
+    safety_score += min(10, virtual_fills * 2)
+    safety_score = max(0, min(100, int(safety_score)))
 
-    status = "passed" if safety_score >= 72 and virtual_fills > 0 else "watch" if safety_score >= 45 else "blocked"
+    status = "passed" if safety_score >= 72 and not reentry_blocked else "watch" if safety_score >= 45 else "blocked"
+    if reentry_blocked:
+        status = "blocked"
+
     summary = {
         "shadow_only": True,
         "live_execution_triggered": False,
@@ -11736,1182 +10287,16 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
         "safety_score": safety_score,
         "runtime_hours": runtime_hours,
         "slots_tested": len(normalized),
-        "ready_slots": ready_count,
-        "min_ready_slots": min_ready_slots,
-        "forced_ready_slots": len(forced_ready_indices),
         "virtual_fills": virtual_fills,
-        "virtual_waits": virtual_waits,
         "virtual_blocks": blocked,
         "protect_tests": protect_count,
         "reallocation_tests": reallocation_tests,
         "stop_reentry_tests": stop_tests,
-        "reentry_allowed": status == "passed",
+        "reentry_allowed": not reentry_blocked and status == "passed",
         "readiness": "VAULT_READY_CANDIDATE" if status == "passed" else "NEEDS_OBSERVATION" if status == "watch" else "NOT_READY_FOR_VAULT",
-        "persist_state": persist_state,
-        "message": "Shadow Executor completed a realistic slot rotation preview without live Vault execution.",
+        "message": "Shadow Executor completed without live Vault execution.",
     }
-    return {"summary": summary, "events": events[:200], "queue": queue_out}
-
-
-def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: list) -> list:
-    """Persist one Shadow/Strategist queue safely.
-
-    The identity of a slot is session_id + chain + slot number. Never match only by
-    slot_id or asset, because different budget sessions all have Slot 1/2/3 and the
-    same asset. This was the source of duplicated/mixed cards after refresh.
-    """
-    ts = now_ts()
-    changed = []
-
-    def _slot_no(value, fallback=""):
-        raw = str(value or fallback or "").strip()
-        m = re.search(r"\d+", raw)
-        return m.group(0) if m else raw
-
-    def _item_identity(item: dict, idx: int = 0):
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        session_id = str(
-            item.get("session_id") or item.get("sessionId") or item.get("trade_session_id")
-            or meta.get("session_id") or meta.get("trade_session_id") or ""
-        ).strip()[:80]
-        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or meta.get("chain") or "")
-        slot_id = _slot_no(item.get("slot_id") or item.get("slot") or meta.get("slot"), idx + 1)[:80]
-        asset = str(item.get("asset") or item.get("symbol") or meta.get("asset") or "").strip().upper()[:24]
-        return session_id, chain, slot_id, asset, meta
-
-    # Preload wallet rows so we can match meta_json without relying on SQLite JSON1.
-    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? ORDER BY updated_ts DESC, created_ts DESC LIMIT 500", (wallet_address,))
-    existing_rows = cur.fetchall()
-
-    def _find_existing(queue_id: str, session_id: str, chain: str, slot_id: str, asset: str):
-        if queue_id:
-            for r in existing_rows:
-                if str(r["id"] or "") == queue_id:
-                    return r
-        # Strict match by session+chain+slot first.
-        if session_id and slot_id:
-            for r in existing_rows:
-                meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {})
-                rsid = str(meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-                rchain = _normalize_chain_key(r["chain"] or meta.get("chain") or "")
-                rslot = _slot_no(r["slot_id"] or meta.get("slot"), "")
-                if rsid == session_id and rchain == chain and rslot == slot_id:
-                    return r
-        return None
-
-    for idx, item in enumerate(shadow_queue if isinstance(shadow_queue, list) else []):
-        if not isinstance(item, dict):
-            continue
-        new_state = str(item.get("state") or item.get("status") or "WAIT").upper()
-        if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
-            continue
-        queue_id = str(item.get("id") or item.get("queue_id") or "").strip()
-        session_id, chain, slot_id, asset, item_meta = _item_identity(item, idx)
-        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
-        confidence = _clamp_float(item.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
-        risk_score = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
-        transition = item.get("shadow_transition") if isinstance(item.get("shadow_transition"), dict) else {}
-        reason = str(transition.get("reason") or item.get("condition") or item.get("reason") or "Shadow runtime updated this slot.")[:500]
-        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
-        row = _find_existing(queue_id, session_id, chain, slot_id, asset)
-
-        meta = dict(item_meta if isinstance(item_meta, dict) else {})
-        if session_id:
-            meta["session_id"] = session_id
-            meta["trade_session_id"] = session_id
-        if chain:
-            meta["chain"] = chain
-        if slot_id:
-            meta["slot"] = slot_id
-        if asset:
-            meta["asset"] = asset
-        # Persist runtime/paper fields whether they arrive top-level or in meta.
-        for mk in [
-            "shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts",
-            "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy",
-            "paper_entry_price", "paper_mark_price", "paper_exit_price", "paper_pnl_pct",
-            "paper_pnl_usd", "paper_pnl_total_usd", "paper_cycle_realized_usd",
-            "paper_realized_total_usd", "paper_collected_profit_usd",
-            "collected_profit_usd", "realized_profit_usd",
-            "paper_recycled_until_total_usd",
-            "paper_quantity", "paper_position_usd", "paper_entry_ts",
-            "style", "trading_style", "strategy", "riskMode", "risk_mode", "trading_risk_mode",
-            "maxTrades", "max_trades", "hardStopPct", "hard_stop_pct", "profitLockPct", "profit_lock_pct",
-            "maxSlippagePct", "max_slippage_pct", "cautionDrawdownPct", "caution_drawdown_pct",
-            "payoutAsset", "payout_asset",
-        ]:
-            if item.get(mk) is not None:
-                meta[mk] = item.get(mk)
-
-        signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
-        reserved_capital_usd = _clamp_float(item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
-        action = str(item.get("action") or "OBSERVE").upper()[:40]
-
-        if row is None:
-            # Deterministic id per session/chain/slot prevents duplicates across refresh/ticks.
-            stable_key = f"{wallet_address}|{session_id or 'NO_SESSION'}|{chain or 'NO_CHAIN'}|{slot_id or idx+1}|{asset}"
-            rid = queue_id or ("NQ-" + uuid.uuid5(uuid.NAMESPACE_URL, stable_key).hex[:12].upper())
-            cur.execute(
-                """
-                INSERT INTO nexus_execution_queue(
-                    id,wallet_address,slot_id,asset,chain,action,state,priority,
-                    reserved_capital_usd,confidence,risk_score,reason,signals_json,meta_json,
-                    recheck_after_ts,expires_ts,created_ts,updated_ts
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET
-                    slot_id=excluded.slot_id,asset=excluded.asset,chain=excluded.chain,
-                    action=excluded.action,state=excluded.state,priority=excluded.priority,
-                    reserved_capital_usd=excluded.reserved_capital_usd,confidence=excluded.confidence,
-                    risk_score=excluded.risk_score,reason=excluded.reason,signals_json=excluded.signals_json,
-                    meta_json=excluded.meta_json,recheck_after_ts=excluded.recheck_after_ts,
-                    expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts
-                """,
-                (rid, wallet_address, slot_id, asset, chain, action, new_state, priority,
-                 reserved_capital_usd, confidence, risk_score, reason,
-                 json.dumps(signals, ensure_ascii=False), json.dumps(meta, ensure_ascii=False),
-                 next_recheck, None, ts, ts),
-            )
-            _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "SHADOW_QUEUE_CREATED", "", new_state, reason, {"queue_id": rid, "session_id": session_id, "shadow": transition})
-            changed.append({"id": rid, "from": "", "to": new_state, "reason": reason, "created": True})
-            continue
-
-        old_state = str(row["state"] or "WAIT").upper()
-        rid = row["id"]
-        existing_meta = _nexus_json_load(row["meta_json"] if "meta_json" in row.keys() else "{}", {})
-        merged_meta = {**(existing_meta if isinstance(existing_meta, dict) else {}), **meta}
-        cur.execute(
-            "UPDATE nexus_execution_queue SET slot_id=?,asset=?,chain=?,action=?,state=?,priority=?,reserved_capital_usd=?,confidence=?,risk_score=?,reason=?,signals_json=?,meta_json=?,recheck_after_ts=?,updated_ts=? WHERE id=? AND wallet_address=?",
-            (slot_id or row["slot_id"], asset or row["asset"], chain or row["chain"], action, new_state, priority,
-             reserved_capital_usd if reserved_capital_usd > 0 else float(row["reserved_capital_usd"] or 0),
-             confidence, risk_score, reason, json.dumps(signals, ensure_ascii=False), json.dumps(merged_meta, ensure_ascii=False),
-             next_recheck, ts, rid, wallet_address),
-        )
-        if new_state != old_state:
-            _nexus_log_sim_event(cur, wallet_address, slot_id or row["slot_id"], asset or row["asset"], "SHADOW_ROTATION", old_state, new_state, reason, {"queue_id": rid, "session_id": session_id, "shadow": transition})
-            changed.append({"id": rid, "from": old_state, "to": new_state, "reason": reason})
-    return changed
-
-
-
-def _nexus_shadow_ensure_stop_table(cur):
-    """Create the Shadow stop/tombstone table lazily for safe deployments."""
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS nexus_shadow_stopped_sessions (
-            wallet_address TEXT NOT NULL,
-            session_key TEXT NOT NULL,
-            session_id TEXT DEFAULT '',
-            chain TEXT DEFAULT '',
-            stopped_ts INTEGER DEFAULT 0,
-            reason TEXT DEFAULT '',
-            PRIMARY KEY (wallet_address, session_key)
-        )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_shadow_stopped_wallet_ts ON nexus_shadow_stopped_sessions(wallet_address, stopped_ts)")
-
-
-def _nexus_shadow_stop_keys(session_id: str = "", chain: str = "") -> set[str]:
-    keys = set()
-    ch = _normalize_chain_key(chain or "")
-    sid_candidates = _nexus_shadow_session_candidates(session_id)
-    if sid_candidates:
-        for sid in sid_candidates:
-            keys.add(f"sid:{sid}")
-            if ch:
-                keys.add(f"sid:{sid}|chain:{ch}")
-    elif ch:
-        # Chain-only tombstone is used only when the UI/backend truly has no
-        # session id. Do not block all future sessions on that chain.
-        keys.add(f"chain:{ch}")
-    return {k for k in keys if k}
-
-
-def _nexus_shadow_mark_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = "", reason: str = "user_stop"):
-    _nexus_shadow_ensure_stop_table(cur)
-    now_i = now_ts()
-    for key in _nexus_shadow_stop_keys(session_id, chain):
-        cur.execute(
-            """
-            INSERT INTO nexus_shadow_stopped_sessions(wallet_address, session_key, session_id, chain, stopped_ts, reason)
-            VALUES (?,?,?,?,?,?)
-            ON CONFLICT(wallet_address, session_key) DO UPDATE SET
-                session_id=excluded.session_id,
-                chain=excluded.chain,
-                stopped_ts=excluded.stopped_ts,
-                reason=excluded.reason
-            """,
-            (wallet_address, key, str(session_id or "")[:100], _normalize_chain_key(chain or "")[:24], now_i, str(reason or "")[:200]),
-        )
-
-
-def _nexus_shadow_clear_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = ""):
-    _nexus_shadow_ensure_stop_table(cur)
-    keys = list(_nexus_shadow_stop_keys(session_id, chain))
-    if not keys:
-        return 0
-    q = ",".join("?" for _ in keys)
-    cur.execute(f"DELETE FROM nexus_shadow_stopped_sessions WHERE wallet_address=? AND session_key IN ({q})", (wallet_address, *keys))
-    return int(cur.rowcount or 0)
-
-
-def _nexus_shadow_is_session_stopped(cur, wallet_address: str, session_id: str = "", chain: str = "") -> bool:
-    _nexus_shadow_ensure_stop_table(cur)
-    keys = list(_nexus_shadow_stop_keys(session_id, chain))
-    if not keys:
-        return False
-    q = ",".join("?" for _ in keys)
-    cur.execute(f"SELECT 1 FROM nexus_shadow_stopped_sessions WHERE wallet_address=? AND session_key IN ({q}) LIMIT 1", (wallet_address, *keys))
-    return cur.fetchone() is not None
-
-
-def _nexus_shadow_session_candidates(session_id: str) -> set[str]:
-    """Return safe equivalent ids for UI/backend session matching.
-
-    The React UI may split one backend session into per-asset display ids like
-    TRD-123::POL. Backend rows normally store only TRD-123. Stop/Recovery must
-    treat those as the same selected budget session, otherwise a stopped POL
-    session is deleted locally but restored from the DB after refresh.
-    """
-    raw = str(session_id or "").strip()
-    out = set()
-    if raw:
-        out.add(raw)
-        if "::" in raw:
-            base = raw.split("::", 1)[0].strip()
-            if base:
-                out.add(base)
-    return out
-
-
-def _nexus_shadow_session_matches(row_session_id: str, selected_session_id: str) -> bool:
-    row = str(row_session_id or "").strip()
-    selected = str(selected_session_id or "").strip()
-    if not row or not selected:
-        return False
-    candidates = _nexus_shadow_session_candidates(selected)
-    if row in candidates:
-        return True
-    # Defensive compatibility for the reverse case.
-    if selected in _nexus_shadow_session_candidates(row):
-        return True
-    return False
-
-
-def _nexus_shadow_runtime_key(session_id: str = "", chain: str = "") -> str:
-    cands = _nexus_shadow_session_candidates(session_id)
-    base = sorted(cands, key=len)[0] if cands else "legacy"
-    ch = _normalize_chain_key(chain or "")
-    return f"{base or 'legacy'}|{ch or ''}"
-
-def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = None) -> dict:
-    """Read latest Shadow runtime metadata, optionally scoped to one budget session."""
-    cfg = cfg if isinstance(cfg, dict) else {}
-    want_session = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
-    try:
-        cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 40", (wallet_address,))
-        rows = cur.fetchall()
-        for row in rows:
-            run = _shadow_row_to_dict(row)
-            if not run:
-                continue
-            config = run.get("config") if isinstance(run.get("config"), dict) else {}
-            summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
-            runtime = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
-            events = run.get("events") if isinstance(run.get("events"), list) else []
-            has_no_queue = any(isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events)
-            runtime_status = str(runtime.get("status") or summary.get("runtime_status") or run.get("status") or "idle").lower()
-            # IMPORTANT: NO_QUEUE is a transient tick result, not an authoritative runtime state.
-            # Older deployments stored NO_QUEUE as the latest run, which made valid sessions appear IDLE forever.
-            if has_no_queue and runtime_status in ("idle", "completed", ""):
-                continue
-            run_session = str(config.get("session_id") or runtime.get("session_id") or summary.get("session_id") or "").strip()
-            run_chain = _normalize_chain_key(config.get("chain") or config.get("chain_key") or runtime.get("chain") or "")
-            if _nexus_shadow_is_session_stopped(cur, wallet_address, run_session or want_session, run_chain or cfg.get("chain") or cfg.get("chain_key") or ""):
-                continue
-            if want_session and run_session and not _nexus_shadow_session_matches(run_session, want_session):
-                continue
-            if want_session and not run_session:
-                # Legacy/global run should not pause/stop a specific newer session.
-                continue
-            return {"status": runtime_status, "run": run, "runtime": runtime}
-        return {"status": "idle", "run": None}
-    except Exception:
-        return {"status": "idle", "run": None}
-
-
-def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
-    """Filter queue by selected budget session/chain without mixing legacy rows."""
-    if not isinstance(queue, list):
-        return []
-    session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
-    chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
-
-    strict = []
-    legacy = []
-    for item in queue:
-        if not isinstance(item, dict):
-            continue
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-        ch = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or meta.get("chain") or "")
-        if chain and ch and ch != chain:
-            continue
-        if session_id:
-            if _nexus_shadow_session_matches(sid, session_id):
-                strict.append(item)
-            elif not sid:
-                legacy.append(item)
-            continue
-        strict.append(item)
-    # For a selected session, use exact session rows if they exist. If the session was
-    # created before every row carried a session_id, fall back to legacy rows instead
-    # of returning an empty queue. The runtime tick will stamp those rows with the
-    # selected session_id before persisting them, so refresh hydration stays intact.
-    return strict if strict else (legacy if session_id else strict)
-
-
-def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain: str = "") -> int:
-    """Authoritatively stop one selected Shadow/Trading session.
-
-    This must survive browser refresh. The frontend can only hide rows locally; the
-    backend must remove the active queue rows and prevent older RUNNING shadow runs
-    for the same session/chain from being auto-ticked back to life.
-    """
-    sid = str(session_id or "").strip()
-    ch_filter = _normalize_chain_key(chain or "")
-    if not sid and not ch_filter:
-        return 0
-
-    # Authoritative backend tombstone. Even if no queue row is currently visible,
-    # older RUNNING run history must not resurrect this session/card on the next GET.
-    _nexus_shadow_mark_session_stopped(cur, wallet_address, sid, ch_filter, "user_stop")
-
-    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=?", (wallet_address,))
-    rows = cur.fetchall()
-    ids = []
-    legacy_ids = []
-    for r in rows:
-        meta = _nexus_json_load(r["meta_json"] if "meta_json" in r.keys() else "{}", {})
-        rsid = str(meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-        rchain = _normalize_chain_key(r["chain"] or meta.get("chain") or "")
-        if ch_filter and rchain and rchain != ch_filter:
-            continue
-        if sid and _nexus_shadow_session_matches(rsid, sid):
-            ids.append(r["id"])
-        elif not rsid:
-            legacy_ids.append(r["id"])
-
-    # Legacy fallback only if no exact/base session rows exist. This is needed for
-    # old POL rows that were created before session_id was stamped into meta_json.
-    if not ids and legacy_ids:
-        ids = legacy_ids
-
-    for rid in ids:
-        cur.execute("DELETE FROM nexus_execution_queue WHERE wallet_address=? AND id=?", (wallet_address, rid))
-
-    # Mark matching active Shadow runs as stopped. Otherwise GET recovery can see an
-    # older `running` run after refresh and tick the old queue back into the UI.
-    try:
-        cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 120", (wallet_address,))
-        run_rows = cur.fetchall()
-        for rr in run_rows:
-            run = _shadow_row_to_dict(rr)
-            config = run.get("config") if isinstance(run.get("config"), dict) else {}
-            summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
-            runtime = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
-            run_sid = str(config.get("session_id") or runtime.get("session_id") or summary.get("session_id") or "").strip()
-            run_chain = _normalize_chain_key(config.get("chain") or config.get("chain_key") or runtime.get("chain") or "")
-            if ch_filter and run_chain and run_chain != ch_filter:
-                continue
-            if sid and run_sid and not _nexus_shadow_session_matches(run_sid, sid):
-                continue
-            if sid and not run_sid:
-                # Do not rewrite unrelated legacy/global history unless this was a chain-only stop.
-                continue
-            runtime["status"] = "stopped"
-            runtime["action"] = "stop"
-            runtime["stopped_ts"] = now_ts()
-            summary["status"] = "stopped"
-            summary["runtime_status"] = "stopped"
-            summary["runtime"] = runtime
-            summary["message"] = "Shadow runtime stopped by user; older running recovery is blocked."
-            cur.execute(
-                "UPDATE nexus_shadow_executor_runs SET status=?, summary_json=?, updated_ts=? WHERE run_id=? AND wallet_address=?",
-                ("stopped", json.dumps(summary, ensure_ascii=False), now_ts(), rr["run_id"], wallet_address),
-            )
-    except Exception:
-        pass
-
-    if ids:
-        _nexus_log_sim_event(cur, wallet_address, sid or ch_filter, ch_filter, "SESSION_STOPPED", "ACTIVE", "STOPPED", "User stopped selected Trading/Shadow session; active queue rows removed and runtime recovery blocked.", {"session_id": sid, "chain": ch_filter, "deleted_queue_rows": len(ids)})
-    return len(ids)
-
-
-def _nexus_session_expiry_ts_from_queue(queue: list, cfg: dict, now_i: int) -> int | None:
-    """Return the authoritative session expiry timestamp (seconds) for a Shadow session.
-
-    Priority:
-      1) explicit queue expires_ts / meta session_expires_ts
-      2) config expires_ts / session_expires_ts
-      3) earliest slot/session start + runtime_hours
-
-    This keeps the user-defined runtime as the hard autonomy window.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    candidates = []
-
-    def _to_sec(v):
-        try:
-            if v is None or str(v).strip() == "":
-                return None
-            n = float(v)
-            if not math.isfinite(n) or n <= 0:
-                return None
-            # frontend Date.now() values may arrive in ms
-            if n > 10_000_000_000:
-                n = n / 1000.0
-            return int(n)
-        except Exception:
-            return None
-
-    for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
-        vv = _to_sec(cfg.get(k))
-        if vv:
-            candidates.append(vv)
-
-    starts = []
-    for item in queue if isinstance(queue, list) else []:
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
-            vv = _to_sec(item.get(k) if k in item else meta.get(k))
-            if vv:
-                candidates.append(vv)
-        for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts", "createdAt", "startedAt"):
-            vv = _to_sec(item.get(k) if k in item else meta.get(k))
-            if vv:
-                starts.append(vv)
-
-    if candidates:
-        # All slots in one selected session should share the same expiry. Use the earliest
-        # valid expiry as the safety boundary.
-        return min(candidates)
-
-    runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
-    if starts:
-        return int(min(starts) + runtime_hours * 3600)
-    return None
-
-
-def _nexus_shadow_expire_selected_session(cur, wallet_address: str, normalized: list, cfg: dict, expires_ts: int, now_i: int) -> list:
-    """Pause all slots of the selected expired session and persist the decision.
-
-    Expiry is not deletion. The session stays visible, collected profit stays visible,
-    but the Strategist cannot create new ACTIVE/READY entries until the user starts or
-    extends a new permission window.
-    """
-    changed = []
-    for item in normalized if isinstance(normalized, list) else []:
-        old = str(item.get("status") or item.get("state") or "WAIT").upper()
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        item["status"] = item["state"] = "PAUSED"
-        item["reason"] = "Session runtime expired; Strategist paused and cannot open new trades until user extends/starts a new session."
-        item["session_expired"] = True
-        item["session_expires_ts"] = int(expires_ts or 0)
-        meta["session_status"] = "PAUSED"
-        meta["runtime_status"] = "PAUSED"
-        meta["session_expired"] = True
-        meta["session_expired_ts"] = int(now_i)
-        meta["session_expires_ts"] = int(expires_ts or 0)
-        meta["pause_reason"] = "SESSION_EXPIRED"
-        meta["shadow_runtime_status"] = "paused"
-        item["meta"] = meta
-        item["shadow_transition"] = {"from": old, "to": "PAUSED", "reason": item["reason"]}
-        changed.append({"slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": "PAUSED", "reason": item["reason"]})
-
-    _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
-    try:
-        sid = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
-        chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
-        _nexus_log_sim_event(cur, wallet_address, sid or chain, chain, "SESSION_EXPIRED_PAUSED", "RUNNING", "PAUSED", "Session runtime expired; Strategist paused automatically.", {"session_id": sid, "chain": chain, "expires_ts": expires_ts, "changed": len(changed)})
-    except Exception:
-        pass
-    return changed
-
-def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
-    """Backend-first Strategist-controlled Shadow runtime.
-
-    Shadow must behave like future Live execution without touching Vault/routes:
-      Market/Strategist-style decision -> queue state -> paper executor -> persisted events.
-
-    The runtime is intentionally deterministic and stateful in SQLite. It stores its
-    per-slot timing in meta_json so a browser refresh, mobile sleep or another device
-    cannot reset the paper lifecycle.
-    """
-    cfg = cfg if isinstance(cfg, dict) else {}
-    action = str(action or "tick").strip().lower()
-    ts = now_ts()
-    tick_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
-    # User-defined Max Combined Slots is the hard ceiling for simultaneous paper-active slots.
-    # If the user allows 3 or 5 combined slots and quality/risk are clean, Shadow may use them.
-    max_combined_source = (
-        cfg.get("max_combined_slots")
-        or cfg.get("maxCombinedSlots")
-        or cfg.get("slot_donor_cap")
-        or cfg.get("slotDonorCap")
-        or cfg.get("shadow_active_slots")
-        or cfg.get("active_slots")
-        or os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1")
-    )
-    max_active = int(_clamp_float(max_combined_source, 1, 1, 10))
-    ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max(2, max_active))))), max(2, max_active), 1, 10))
-
-    execution = _nexus_execution_summary(cur, wallet_address)
-    queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
-    if not queue:
-        return {
-            "runtime_status": "idle",
-            "events": [{"type": "NO_QUEUE", "message": "No queue available for Shadow runtime."}],
-            "queue": [],
-            "changed": [],
-            "strategist": {"status": "idle", "reason": "No queue available."},
-        }
-
-    normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue)]
-
-    # Legacy migration: if frontend/backend selected a budget session but older queue
-    # rows have no session id, stamp the in-memory runtime rows before persisting.
-    # This prevents a refresh from showing an empty session while avoiding global deletes.
-    selected_session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
-    selected_chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
-    if selected_session_id and action not in ("start", "resume") and _nexus_shadow_is_session_stopped(cur, wallet_address, selected_session_id, selected_chain):
-        return {
-            "runtime_status": "stopped",
-            "events": [{"type": "SHADOW_STOPPED", "message": "Selected Shadow session is stopped and will not auto-restart."}],
-            "queue": [],
-            "changed": [],
-            "strategist": {"status": "stopped", "session_id": selected_session_id},
-        }
-
-    if selected_session_id:
-        for item in normalized:
-            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-            sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
-            if not sid:
-                item["session_id"] = selected_session_id
-                item["sessionId"] = selected_session_id
-                item["trade_session_id"] = selected_session_id
-                meta["session_id"] = selected_session_id
-                meta["trade_session_id"] = selected_session_id
-            if selected_chain and not _normalize_chain_key(item.get("chain") or item.get("chain_key") or meta.get("chain") or ""):
-                item["chain"] = selected_chain
-                item["chain_key"] = selected_chain
-                meta["chain"] = selected_chain
-            item["meta"] = meta
-
-    def slot_no(item, idx):
-        raw = str(item.get("slot") or item.get("slot_id") or idx + 1)
-        m = re.search(r"\d+", raw)
-        return int(m.group(0)) if m else idx + 1
-
-    def get_meta(item):
-        return dict(item.get("meta") if isinstance(item.get("meta"), dict) else {})
-
-    def set_meta(item, meta):
-        item["meta"] = meta if isinstance(meta, dict) else {}
-        return item
-
-    def _paper_base_price(item, meta):
-        for value in [
-            item.get("current_price"), item.get("price"), item.get("priceUsd"), item.get("mark_price"),
-            meta.get("paper_mark_price"), meta.get("paper_entry_price"), cfg.get("current_price"), cfg.get("price"), cfg.get("mark_price"), 1,
-        ]:
-            try:
-                n = float(value)
-                if math.isfinite(n) and n > 0:
-                    return n
-            except Exception:
-                continue
-        return 1.0
-
-    def update_paper_accounting(item, quality=0, force_exit=False):
-        meta = get_meta(item)
-        amount = _clamp_float(item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))), 0, 0, 1_000_000_000)
-        if amount <= 0:
-            amount = _clamp_float(meta.get("paper_position_usd", 0), 0, 0, 1_000_000_000)
-        if amount <= 0:
-            return item
-        entry = _clamp_float(meta.get("paper_entry_price", 0), 0, 0, 1_000_000_000)
-        if entry <= 0:
-            entry = _paper_base_price(item, meta)
-            meta["paper_entry_price"] = round(entry, 10)
-            meta["paper_entry_ts"] = ts
-        entered = int(meta.get("paper_entry_ts") or meta.get("shadow_active_started_ts") or meta.get("shadow_state_entered_ts") or ts)
-        elapsed_min = max(0, (ts - entered) / 60.0)
-        q = _clamp_float(quality, 0, -100, 100)
-        # Deterministic paper drift: strong slots drift slightly positive, weak/risky slots negative.
-        slot_seed = slot_no(item, 1)
-        drift_pct = max(-4.5, min(4.5, ((q - 50.0) / 50.0) * 1.15 + min(1.8, elapsed_min / 60.0 * 0.35) + ((slot_seed % 3) - 1) * 0.18))
-        if force_exit:
-            drift_pct = max(-8.0, min(8.0, drift_pct))
-        mark = entry * (1 + drift_pct / 100.0)
-        qty = amount / entry if entry > 0 else 0
-        pnl_usd = amount * (drift_pct / 100.0)
-        # Cumulative realized profit is the protected/collected account.
-        # paper_pnl_total_usd must stay cycle-local for the UI; otherwise old
-        # profits keep appearing inside the next run after a restart.
-        realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_collected_profit_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
-        cycle_realized = _clamp_float(meta.get("paper_cycle_realized_usd", 0), 0, -1_000_000_000, 1_000_000_000)
-        meta["paper_position_usd"] = round(amount, 2)
-        meta["paper_quantity"] = round(qty, 10)
-        meta["paper_mark_price"] = round(mark, 10)
-        meta["paper_pnl_pct"] = round(drift_pct, 4)
-        meta["paper_pnl_usd"] = round(pnl_usd, 4)
-        if force_exit:
-            meta["paper_exit_price"] = round(mark, 10)
-            cost = _nexus_shadow_cost_model(amount, item.get("chain") or meta.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
-            total_cost = _clamp_float(cost.get("total_cost_usd"), 0, 0, 1_000_000_000)
-            gross_pnl_usd = round(pnl_usd, 4)
-            net_pnl_usd = round(pnl_usd - total_cost, 4)
-
-            realized_total = round(realized_total + net_pnl_usd, 4)
-            cycle_realized = round(cycle_realized + net_pnl_usd, 4)
-
-            meta["paper_gross_pnl_usd"] = gross_pnl_usd
-            meta["paper_net_pnl_usd"] = net_pnl_usd
-            meta["paper_estimated_costs_usd"] = round(total_cost, 4)
-            meta["paper_estimated_gas_usd"] = cost.get("gas_usd", 0)
-            meta["paper_estimated_dex_fee_usd"] = cost.get("dex_fee_usd", 0)
-            meta["paper_estimated_slippage_usd"] = cost.get("slippage_usd", 0)
-            meta["paper_cost_model"] = cost
-
-            # Collected Profit is net profit after estimated live-like costs.
-            meta["paper_realized_total_usd"] = realized_total
-            meta["paper_collected_profit_usd"] = realized_total
-            meta["collected_profit_usd"] = realized_total
-            meta["realized_profit_usd"] = realized_total
-            meta["paper_cycle_realized_usd"] = cycle_realized
-            meta["paper_pnl_total_usd"] = cycle_realized
-        else:
-            # During an open paper position, show gross unrealized PnL only.
-            # Costs are applied once on SIMULATED_EXIT to avoid double counting.
-            meta["paper_gross_pnl_usd"] = round(pnl_usd, 4)
-            meta["paper_net_pnl_usd"] = None
-            meta["paper_estimated_costs_usd"] = 0
-            meta["paper_pnl_total_usd"] = round(cycle_realized + pnl_usd, 4)
-        item["amountUsd"] = amount
-        item["amount_usd"] = amount
-        item["reserved_capital_usd"] = amount
-        item["paper_entry_price"] = meta.get("paper_entry_price")
-        item["paper_mark_price"] = meta.get("paper_mark_price")
-        item["paper_exit_price"] = meta.get("paper_exit_price")
-        item["paper_pnl_pct"] = meta.get("paper_pnl_pct")
-        item["paper_pnl_usd"] = meta.get("paper_pnl_usd")
-        item["paper_pnl_total_usd"] = meta.get("paper_pnl_total_usd")
-        item["paper_cycle_realized_usd"] = meta.get("paper_cycle_realized_usd")
-        item["paper_gross_pnl_usd"] = meta.get("paper_gross_pnl_usd")
-        item["paper_net_pnl_usd"] = meta.get("paper_net_pnl_usd")
-        item["paper_estimated_costs_usd"] = meta.get("paper_estimated_costs_usd")
-        item["paper_estimated_gas_usd"] = meta.get("paper_estimated_gas_usd")
-        item["paper_estimated_dex_fee_usd"] = meta.get("paper_estimated_dex_fee_usd")
-        item["paper_estimated_slippage_usd"] = meta.get("paper_estimated_slippage_usd")
-        item["paper_realized_total_usd"] = meta.get("paper_realized_total_usd")
-        item["paper_collected_profit_usd"] = meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd"))
-        item["collected_profit_usd"] = meta.get("collected_profit_usd", meta.get("paper_collected_profit_usd", meta.get("paper_realized_total_usd")))
-        item["realized_profit_usd"] = meta.get("realized_profit_usd", meta.get("paper_realized_total_usd"))
-        item["paper_quantity"] = meta.get("paper_quantity")
-        item["paper_position_usd"] = meta.get("paper_position_usd")
-        set_meta(item, meta)
-        return item
-
-    def set_state(item, new_state, reason, event_type="SHADOW_STATE"):
-        old = str(item.get("status") or item.get("state") or "WAIT").upper()
-        ns = str(new_state or old).upper()
-        item["status"] = item["state"] = ns
-        meta = get_meta(item)
-        if old != ns:
-            meta["shadow_state_entered_ts"] = ts
-            meta["shadow_last_transition_ts"] = ts
-        meta["shadow_last_decision_ts"] = ts
-        meta["shadow_runtime_status"] = "running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running")
-        set_meta(item, meta)
-        item["shadow_transition"] = {"from": old, "to": ns, "reason": reason}
-        return {"type": event_type, "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
-
-    # User controls must be immediate and authoritative.
-    if action == "pause":
-        events = []
-        for item in normalized:
-            st = str(item.get("status") or item.get("state") or "WAIT").upper()
-            if st == "ACTIVE":
-                events.append(set_state(item, "READY", "Shadow paused by user; paper-active slot returned to READY.", "SHADOW_PAUSED_SLOT"))
-        changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
-        return {"runtime_status": "paused", "events": events or [{"type": "SHADOW_PAUSED", "message": "Shadow runtime paused."}], "queue": normalized, "changed": changed, "strategist": {"status": "paused"}}
-
-    if action == "stop":
-        session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
-        chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
-        deleted = _nexus_shadow_stop_session(cur, wallet_address, session_id, chain)
-        events = [{"type": "SHADOW_STOPPED", "message": f"Shadow runtime stopped for selected session; {deleted} queue row(s) archived."}]
-        return {"runtime_status": "stopped", "events": events, "queue": [], "changed": [], "strategist": {"status": "stopped", "session_id": session_id, "deleted_rows": deleted}}
-
-    latest = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
-    if action == "tick" and latest.get("status") == "paused":
-        return {"runtime_status": "paused", "events": [{"type": "SHADOW_PAUSED", "message": "Shadow runtime is paused."}], "queue": normalized, "changed": [], "strategist": {"status": "paused"}}
-
-    # Hard session-autonomy window: after expiry, the Strategist must not open new
-    # trades, re-enter slots, recycle cycles, or rebalance. It pauses the selected
-    # session visibly instead of deleting it.
-    expires_ts = _nexus_session_expiry_ts_from_queue(normalized, cfg, ts)
-    if expires_ts and ts >= int(expires_ts) and action not in ("stop", "pause"):
-        changed = _nexus_shadow_expire_selected_session(cur, wallet_address, normalized, cfg, int(expires_ts), ts)
-        return {
-            "runtime_status": "expired_paused",
-            "events": [{"type": "SESSION_EXPIRED_PAUSED", "message": "Session runtime expired; Strategist paused automatically. No new trades/re-entries/rebalancing until user starts or extends a new session."}],
-            "queue": normalized,
-            "changed": changed,
-            "strategist": {"status": "expired_paused", "expires_ts": int(expires_ts), "now_ts": ts},
-        }
-
-    # Strategist scoring: quality is the brain input. Runtime only executes paper decisions.
-    scored = []
-    for idx, item in enumerate(normalized):
-        q = _nexus_shadow_slot_quality(item, cfg)
-        quality = _clamp_float(q.get("quality", item.get("priority", 0)), 0, -100, 100)
-        confidence = _clamp_float(q.get("confidence", item.get("confidence", item.get("confidence_score", 0))), 0, 0, 100)
-        risk = _clamp_float(q.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
-        # Do not overwrite the stable slot priority with the calculated score.
-        # Priority is a ranking/allocation hint; strategist_score is the live decision quality.
-        meta = get_meta(item)
-        meta["strategist_score"] = round(quality, 4)
-        meta["shadow_quality"] = round(quality, 4)
-        meta["shadow_confidence"] = round(confidence, 4)
-        meta["shadow_risk_score"] = round(risk, 4)
-        set_meta(item, meta)
-        item["strategist_score"] = round(quality, 4)
-        item["shadow_quality"] = round(quality, 4)
-        item["confidence"] = item["confidence_score"] = confidence
-        item["risk_score"] = risk
-        scored.append({"idx": idx, "item": item, "quality": quality, "confidence": confidence, "risk": risk, "hard_block": bool(q.get("hard_block")), "slot_no": slot_no(item, idx)})
-
-    events = []
-    strategist_reason = []
-
-    def recycle_completed_shadow_cycle():
-        """Recycle paper capital when a running session has completed all slots.
-
-        A professional Shadow session must not stop at SIMULATED_EXIT. Once every
-        slot is exited, only the originally released capital is recycled into the
-        next paper cycle. Realized profit is collected separately and must not be
-        auto-compounded. The cumulative realized PnL stays visible in meta while
-        per-cycle PnL is reset to zero for the new paper positions.
-        """
-        if not normalized:
-            return False
-
-        terminal_states = {"SIMULATED_EXIT"}
-        blocking_states = {"HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT"}
-        states = [str(x.get("status") or x.get("state") or "WAIT").upper() for x in normalized]
-        if any(st in blocking_states for st in states):
-            return False
-        if not states or not all(st in terminal_states for st in states):
-            return False
-
-        base_total = 0.0
-        fresh_realized_delta = 0.0
-        for item in normalized:
-            meta = get_meta(item)
-            amount = _clamp_float(
-                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))),
-                0, 0, 1_000_000_000
-            )
-            base_total += amount
-
-            realized_total = _clamp_float(
-                meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)),
-                0, -1_000_000_000, 1_000_000_000
-            )
-            already_recycled = _clamp_float(
-                meta.get("paper_recycled_until_total_usd", 0),
-                0, -1_000_000_000, 1_000_000_000
-            )
-            delta = realized_total - already_recycled
-            if math.isfinite(delta):
-                fresh_realized_delta += delta
-
-        if base_total <= 0:
-            # Fallback for older sessions with missing slot amounts.
-            cfg_budget = _clamp_float(cfg.get("budgetUsd", cfg.get("budget_usd", cfg.get("approvedBudgetUsd", 0))), 0, 0, 1_000_000_000)
-            base_total = cfg_budget if cfg_budget > 0 else float(len(normalized) * 100)
-
-        # Controlled compounding: by default only the user-released capital is reused.
-        # The user can explicitly allow a percentage of fresh collected profit to be reused.
-        reuse_profit_pct = _clamp_float(
-            cfg.get("reuse_profit_pct", cfg.get("profit_reuse_pct", cfg.get("reuseProfitPct", cfg.get("profitReusePct", 0)))),
-            0, 0, 100
-        )
-        if reuse_profit_pct <= 0:
-            for _it in normalized:
-                _m = get_meta(_it)
-                reuse_profit_pct = max(reuse_profit_pct, _clamp_float(_m.get("reuse_profit_pct", _m.get("profit_reuse_pct", 0)), 0, 0, 100))
-        reusable_profit = max(0.0, fresh_realized_delta) * (reuse_profit_pct / 100.0)
-        next_total = max(0.01, base_total + reusable_profit)
-
-        sorted_rows = sorted(scored, key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
-        active_idx = {r["idx"] for r in sorted_rows[:max_active]}
-        ready_idx = {r["idx"] for r in sorted_rows[max_active:max_active + max(0, ready_slots_target)]}
-
-        # Intra-session capital rotation:
-        # The user-approved session budget remains the hard ceiling. The Strategist may
-        # redistribute that budget between slots at cycle restart when some slots show
-        # stronger quality/performance. This is NOT Vault rebalancing and does not move
-        # capital between chains/sessions. Safety rule: one slot can only receive the
-        # equivalent of a limited number of other slots, so no single slot can absorb
-        # the whole session budget.
-        base_amounts = []
-        for item in normalized:
-            meta = get_meta(item)
-            amount = _clamp_float(
-                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))),
-                0, 0, 1_000_000_000
-            )
-            base_amounts.append(amount if amount > 0 else 1.0)
-
-        def _shadow_dynamic_slot_weights():
-            n = len(normalized)
-            if n <= 1:
-                return list(base_amounts), "single_slot_no_rotation", 0
-
-            risk_mode_raw = str(
-                cfg.get("risk_mode")
-                or cfg.get("riskMode")
-                or cfg.get("mode")
-                or cfg.get("runtime_mode")
-                or "BALANCED"
-            ).upper()
-            # User-controlled safety: this is the maximum donor count a single
-            # target slot can effectively receive. Risk mode may suggest a UI default,
-            # but the backend must respect the user/session permission first.
-            suggested_donor_slots = 3 if "DYNAMIC" in risk_mode_raw else 1 if "DEFENSIVE" in risk_mode_raw else 2
-            max_donor_slots = int(_clamp_float(
-                cfg.get("max_combined_slots", cfg.get("maxCombinedSlots", cfg.get("slot_donor_cap", cfg.get("slotDonorCap", suggested_donor_slots)))),
-                suggested_donor_slots, 0, 3
-            ))
-
-            # Only rotate capital when there is a real quality edge. Otherwise keep the
-            # user's original slot split intact.
-            top_quality = max((_clamp_float(r.get("quality"), 0, -100, 100) for r in scored), default=0.0)
-            avg_quality = sum(_clamp_float(r.get("quality"), 0, -100, 100) for r in scored) / max(1, len(scored))
-            quality_spread = top_quality - avg_quality
-            if top_quality < 42 or quality_spread < 6:
-                return list(base_amounts), "flat_split_no_clear_edge", max_donor_slots
-
-            score_by_idx = {int(r["idx"]): r for r in scored}
-            raw_weights = []
-            for idx, item in enumerate(normalized):
-                meta = get_meta(item)
-                row = score_by_idx.get(idx, {})
-                q = _clamp_float(row.get("quality"), 0, -100, 100)
-                conf = _clamp_float(row.get("confidence"), 0, 0, 100)
-                risk = _clamp_float(row.get("risk"), 0, 0, 100)
-                cycle_profit = _clamp_float(meta.get("paper_cycle_realized_usd", meta.get("paper_pnl_total_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
-                base_amt = max(0.01, float(base_amounts[idx]))
-                perf_pct = (cycle_profit / base_amt) * 100.0 if base_amt > 0 else 0.0
-
-                # Positive quality/confidence and recent slot performance increase allocation;
-                # risk decreases it. Keep the multiplier bounded to avoid hidden leverage.
-                quality_boost = max(0.0, (q - 40.0) / 60.0)
-                confidence_boost = max(0.0, (conf - 45.0) / 55.0) * 0.35
-                perf_boost = max(0.0, min(2.5, perf_pct)) * 0.18
-                risk_penalty = max(0.0, (risk - 25.0) / 75.0) * 0.65
-                multiplier = 1.0 + quality_boost + confidence_boost + perf_boost - risk_penalty
-                raw_weights.append(max(0.10, min(3.0 + max_donor_slots * 0.15, multiplier)) * base_amt)
-
-            # Cap: own base + at most N donor slots. This implements the safety idea
-            # that one slot may combine with only 2-3 other slots, never the full session.
-            sorted_base_desc = sorted([max(0.0, x) for x in base_amounts], reverse=True)
-            caps = []
-            for idx, own in enumerate(base_amounts):
-                donors = []
-                own_consumed = False
-                for val in sorted_base_desc:
-                    if not own_consumed and abs(val - own) <= 1e-9:
-                        own_consumed = True
-                        continue
-                    donors.append(val)
-                    if len(donors) >= max_donor_slots:
-                        break
-                caps.append(max(0.01, own + sum(donors)))
-
-            # Keep a small floor per slot so WAIT/READY candidates do not disappear.
-            floors = [max(1.0, amt * 0.12) for amt in base_amounts]
-
-            def _fit_allocations(raw, total, caps_, floors_):
-                alloc = [max(floors_[i], min(caps_[i], raw[i])) for i in range(len(raw))]
-                if sum(alloc) <= 0:
-                    return list(base_amounts)
-                # Iteratively scale the uncapped part to match the total while respecting floors/caps.
-                for _ in range(12):
-                    current = sum(alloc)
-                    if abs(current - total) <= 0.01:
-                        break
-                    if current < total:
-                        room_idx = [i for i in range(len(alloc)) if alloc[i] < caps_[i] - 0.01]
-                        room = sum(max(0.0, caps_[i] - alloc[i]) for i in room_idx)
-                        if room <= 0:
-                            break
-                        add = min(total - current, room)
-                        raw_room = sum(max(0.01, raw[i]) for i in room_idx)
-                        for i in room_idx:
-                            share = max(0.01, raw[i]) / raw_room if raw_room > 0 else 1.0 / len(room_idx)
-                            alloc[i] = min(caps_[i], alloc[i] + add * share)
-                    else:
-                        reducible_idx = [i for i in range(len(alloc)) if alloc[i] > floors_[i] + 0.01]
-                        reducible = sum(max(0.0, alloc[i] - floors_[i]) for i in reducible_idx)
-                        if reducible <= 0:
-                            break
-                        cut = min(current - total, reducible)
-                        for i in reducible_idx:
-                            share = max(0.0, alloc[i] - floors_[i]) / reducible if reducible > 0 else 1.0 / len(reducible_idx)
-                            alloc[i] = max(floors_[i], alloc[i] - cut * share)
-                # Final tiny rounding adjustment to keep total stable.
-                diff = total - sum(alloc)
-                if abs(diff) > 0.01 and alloc:
-                    best = max(range(len(alloc)), key=lambda i: caps_[i] - alloc[i] if diff > 0 else alloc[i] - floors_[i])
-                    alloc[best] = max(floors_[best], min(caps_[best], alloc[best] + diff))
-                return [round(max(0.01, x), 2) for x in alloc]
-
-            fitted = _fit_allocations(raw_weights, next_total, caps, floors)
-            changed = any(abs(float(fitted[i]) - float(base_amounts[i])) >= 0.50 for i in range(n))
-            return fitted if changed else list(base_amounts), "dynamic_slot_capital_rotation" if changed else "flat_split_rotation_not_needed", max_donor_slots
-
-        next_amounts, rotation_mode, rotation_donor_cap = _shadow_dynamic_slot_weights()
-        weight_sum = sum(next_amounts) if sum(next_amounts) > 0 else float(len(normalized) or 1)
-
-        for idx, item in enumerate(normalized):
-            meta = get_meta(item)
-            realized_total = _clamp_float(
-                meta.get("paper_realized_total_usd", meta.get("paper_pnl_total_usd", 0)),
-                0, -1_000_000_000, 1_000_000_000
-            )
-            next_amount = round(float(next_amounts[idx]) if idx < len(next_amounts) else next_total * (1.0 / max(1, len(normalized))), 2)
-            item["amountUsd"] = next_amount
-            item["amount_usd"] = next_amount
-            item["reserved_capital_usd"] = next_amount
-
-            # Start a clean paper position for the new cycle, while preserving cumulative realized PnL.
-            base_price = _paper_base_price(item, meta)
-            meta["paper_position_usd"] = next_amount
-            meta["paper_quantity"] = round(next_amount / base_price, 10) if base_price > 0 else 0
-            meta["paper_entry_price"] = round(base_price, 10)
-            meta["paper_mark_price"] = round(base_price, 10)
-            meta.pop("paper_exit_price", None)
-            meta["paper_pnl_pct"] = 0
-            meta["paper_pnl_usd"] = 0
-            # New cycle starts visually at zero. The protected cumulative profit
-            # stays in paper_realized_total_usd / paper_collected_profit_usd.
-            meta["paper_cycle_realized_usd"] = 0
-            meta["paper_pnl_total_usd"] = 0
-            meta["paper_gross_pnl_usd"] = 0
-            meta["paper_net_pnl_usd"] = 0
-            meta["paper_estimated_costs_usd"] = 0
-            meta["paper_estimated_gas_usd"] = 0
-            meta["paper_estimated_dex_fee_usd"] = 0
-            meta["paper_estimated_slippage_usd"] = 0
-            meta["paper_realized_total_usd"] = round(realized_total, 4)
-            meta["paper_collected_profit_usd"] = round(realized_total, 4)
-            meta["collected_profit_usd"] = round(realized_total, 4)
-            meta["realized_profit_usd"] = round(realized_total, 4)
-            meta["paper_recycled_until_total_usd"] = round(realized_total, 4)
-            meta["paper_entry_ts"] = ts
-            meta["shadow_cycle_recycled_ts"] = ts
-            meta["shadow_runtime_status"] = "running"
-            meta["reuse_profit_pct"] = round(reuse_profit_pct, 4)
-            meta["profit_reuse_pct"] = round(reuse_profit_pct, 4)
-            meta["paper_reused_profit_usd"] = round(reusable_profit * (next_amount / max(0.01, next_total)), 4) if next_total > 0 else 0
-            meta["shadow_slot_allocation_mode"] = rotation_mode
-            meta["shadow_slot_rotation_donor_cap"] = int(rotation_donor_cap)
-            meta["shadow_strategy"] = "controlled_profit_reuse_with_slot_rotation" if reuse_profit_pct > 0 else "fixed_released_capital_with_slot_rotation"
-            item["paper_entry_price"] = meta["paper_entry_price"]
-            item["paper_mark_price"] = meta["paper_mark_price"]
-            item["paper_exit_price"] = None
-            item["paper_pnl_pct"] = 0
-            item["paper_pnl_usd"] = 0
-            item["paper_pnl_total_usd"] = meta["paper_pnl_total_usd"]
-            item["paper_cycle_realized_usd"] = meta["paper_cycle_realized_usd"]
-            item["paper_gross_pnl_usd"] = meta["paper_gross_pnl_usd"]
-            item["paper_net_pnl_usd"] = meta["paper_net_pnl_usd"]
-            item["paper_estimated_costs_usd"] = meta["paper_estimated_costs_usd"]
-            item["paper_estimated_gas_usd"] = meta["paper_estimated_gas_usd"]
-            item["paper_estimated_dex_fee_usd"] = meta["paper_estimated_dex_fee_usd"]
-            item["paper_estimated_slippage_usd"] = meta["paper_estimated_slippage_usd"]
-            item["paper_realized_total_usd"] = meta["paper_realized_total_usd"]
-            item["paper_collected_profit_usd"] = meta["paper_collected_profit_usd"]
-            item["collected_profit_usd"] = meta["collected_profit_usd"]
-            item["realized_profit_usd"] = meta["realized_profit_usd"]
-            item["reuse_profit_pct"] = meta["reuse_profit_pct"]
-            item["profit_reuse_pct"] = meta["profit_reuse_pct"]
-            item["paper_reused_profit_usd"] = meta["paper_reused_profit_usd"]
-            item["shadow_slot_allocation_mode"] = meta["shadow_slot_allocation_mode"]
-            item["shadow_slot_rotation_donor_cap"] = meta["shadow_slot_rotation_donor_cap"]
-            item["paper_position_usd"] = next_amount
-            item["paper_quantity"] = meta["paper_quantity"]
-            set_meta(item, meta)
-
-            if idx in active_idx:
-                events.append(set_state(item, "ACTIVE", "Shadow restarted with released capital only; realized profit stays collected separately.", "SHADOW_CAPITAL_RECYCLED"))
-            elif idx in ready_idx:
-                events.append(set_state(item, "READY", "Shadow restarted with released capital only; slot is ready for the next paper entry.", "SHADOW_CAPITAL_RECYCLED"))
-            else:
-                events.append(set_state(item, "WAIT", "Shadow restarted with released capital only; slot waits for a cleaner edge.", "SHADOW_CAPITAL_RECYCLED"))
-
-        strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total). Slot allocation: {rotation_mode}, donor cap {rotation_donor_cap}.")
-        return True
-
-    cycle_recycled = recycle_completed_shadow_cycle()
-
-    # 1) Protect/block risky slots immediately.
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
-            continue
-        if row["hard_block"] or row["risk"] >= 70:
-            events.append(set_state(item, "HOLD", "Strategist detected hard risk/security/liquidity block; paper slot moves to HOLD.", "STRATEGIST_HOLD"))
-        elif row["risk"] >= 48:
-            events.append(set_state(item, "PROTECT", "Strategist detected elevated risk; paper slot moves to PROTECT.", "STRATEGIST_PROTECT"))
-
-    # 2) Close active paper slots after one runtime cycle or if quality deteriorates.
-    active_rows = []
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st != "ACTIVE":
-            continue
-        meta = get_meta(item)
-        entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
-        elapsed = max(0, ts - entered)
-        if elapsed >= tick_sec or row["quality"] < 28 or row["risk"] >= 40:
-            update_paper_accounting(item, row["quality"], force_exit=True)
-            meta = get_meta(item)
-            meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
-            meta["shadow_last_exit_ts"] = ts
-            set_meta(item, meta)
-            pnl_msg = ""
-            try:
-                pnl_msg = f" Paper PnL: {float(meta.get('paper_pnl_usd') or 0):+.2f} USD ({float(meta.get('paper_pnl_pct') or 0):+.2f}%)."
-            except Exception:
-                pnl_msg = ""
-            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate." + pnl_msg, "SHADOW_PAPER_EXIT"))
-        else:
-            update_paper_accounting(item, row["quality"], force_exit=False)
-            active_rows.append(row)
-
-    # 3) Keep only max_active active slots; demote extras by quality.
-    active_rows = [r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"]
-    if len(active_rows) > max_active:
-        active_rows.sort(key=lambda r: (r["quality"], r["confidence"]), reverse=True)
-        keep = {r["idx"] for r in active_rows[:max_active]}
-        for row in active_rows[max_active:]:
-            events.append(set_state(row["item"], "READY", "Strategist limited simultaneous paper-active slots; extra slot stays READY.", "STRATEGIST_READY"))
-
-    # 4) Promote best clean candidate if active capacity exists.
-    active_count = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
-    candidates = []
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st not in ("READY", "WAIT"):
-            continue
-        if row["hard_block"] or row["risk"] >= 48:
-            continue
-        # Require clean quality/risk, but do not leave good READY capital idle.
-        # Strong markets may activate multiple slots up to max_active/maxCombinedSlots.
-        if row["quality"] >= 30 or row["confidence"] >= 50 or (row["quality"] >= 24 and row["risk"] < 35):
-            candidates.append(row)
-    candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
-
-    promoted = 0
-    for row in candidates:
-        if active_count >= max_active:
-            break
-        item = row["item"]
-        old = str(item.get("status") or item.get("state") or "WAIT").upper()
-        meta = get_meta(item)
-        meta["shadow_active_started_ts"] = ts
-        meta["shadow_state_entered_ts"] = ts
-        meta["shadow_runtime_status"] = "running"
-        meta["shadow_strategy"] = "quality_priority_rotation"
-        set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", "Strategist promoted a clean READY/WAIT slot to paper-active Shadow execution within the user max-combined-slots limit.", "SHADOW_ACTIVE"))
-        update_paper_accounting(item, row["quality"], force_exit=False)
-        active_count += 1
-        promoted += 1
-
-    # 5) Mark next clean candidates READY and others WAIT. Avoid immediate re-entry for SIMULATED_EXIT in same tick.
-    active_ids = {id(r["item"]) for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"}
-    ready_candidates = []
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if id(item) in active_ids or st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT"):
-            continue
-        if st == "SIMULATED_EXIT":
-            # Show completed exit for one tick, then it can become WAIT/READY on next tick.
-            continue
-        if not row["hard_block"] and row["risk"] < 48 and (row["quality"] >= 25 or row["confidence"] >= 45):
-            ready_candidates.append(row)
-    ready_candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
-    ready_keep = {r["idx"] for r in ready_candidates[:max(0, ready_slots_target - active_count)]}
-
-    for row in scored:
-        item = row["item"]
-        st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st in ("ACTIVE", "HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT", "SIMULATED_EXIT"):
-            continue
-        if row["idx"] in ready_keep:
-            if st != "READY":
-                events.append(set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY"))
-            else:
-                set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY")
-        else:
-            if st != "WAIT":
-                events.append(set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT"))
-            else:
-                set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT")
-
-    # Sort by slot number for stable UI, not by updated_ts/priority.
-    normalized.sort(key=lambda item: slot_no(item, 0))
-
-    changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
-    if not events:
-        events.append({"type": "STRATEGIST_HOLD_DECISION", "message": "Strategist tick completed; current paper allocation remains valid."})
-
-    active_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "ACTIVE"])
-    ready_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "READY"])
-    exit_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "SIMULATED_EXIT"])
-    strategist = {
-        "status": "ok",
-        "driver": "shadow_strategist_runtime_v1",
-        "active_slots": active_count,
-        "ready_slots": ready_count,
-        "simulated_exits": exit_count,
-        "promoted": promoted,
-        "tick_sec": tick_sec,
-        "reason": "; ".join(strategist_reason) or "Strategist evaluated priority, confidence, risk and slot lifecycle.",
-    }
-    return {
-        "runtime_status": "running" if action in ("start", "resume", "tick") else action,
-        "events": events[:80],
-        "queue": normalized,
-        "changed": changed,
-        "active_count": active_count,
-        "ready_count": ready_count,
-        "simulated_exits": exit_count,
-        "promoted": promoted,
-        "tick_sec": tick_sec,
-        "strategist": strategist,
-    }
+    return {"summary": summary, "events": events[:200], "queue": normalized}
 
 
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
@@ -12921,113 +10306,22 @@ def api_nexus_shadow_executor():
         return error_resp
 
     if request.method == "GET":
-        with DB_WRITE_LOCK:
-            conn = _db()
-            cur = conn.cursor()
-            now_i = now_ts()
-
-            # Safe auto-tick: continue already-running sessions only.
-            # It must never create a new session, never persist NO_QUEUE, and never delete/cleanup queues.
-            cur.execute(
-                "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 80",
-                (wa,),
-            )
-            recent_runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
-            seen_runtime_keys = set()
-            for rr in recent_runs:
-                summary = rr.get("summary") if isinstance(rr.get("summary"), dict) else {}
-                runtime_meta = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
-                config = rr.get("config") if isinstance(rr.get("config"), dict) else {}
-                status_raw = str(runtime_meta.get("status") or summary.get("runtime_status") or rr.get("status") or "").lower()
-                cfg_run = dict(config)
-                sid = str(cfg_run.get("session_id") or cfg_run.get("sessionId") or runtime_meta.get("session_id") or summary.get("session_id") or "").strip()
-                chain = _normalize_chain_key(cfg_run.get("chain") or cfg_run.get("chain_key") or cfg_run.get("network") or runtime_meta.get("chain") or "")
-                if sid:
-                    cfg_run["session_id"] = sid
-                    cfg_run["sessionId"] = sid
-                if chain:
-                    cfg_run["chain"] = chain
-                    cfg_run["chain_key"] = chain
-                if _nexus_shadow_is_session_stopped(cur, wa, sid, chain):
-                    continue
-                runtime_key = _nexus_shadow_runtime_key(sid, chain)
-                if runtime_key in seen_runtime_keys:
-                    continue
-                # Important: the newest row for a runtime key is authoritative even when it is stopped/paused.
-                # Otherwise older RUNNING rows can resurrect after refresh.
-                seen_runtime_keys.add(runtime_key)
-                if status_raw != "running":
-                    continue
-                tick_sec = int(_clamp_float(cfg_run.get("tick_sec", cfg_run.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
-                updated_ts = int(runtime_meta.get("updated_ts") or rr.get("updated_ts") or rr.get("created_ts") or 0)
-                if updated_ts and (now_i - updated_ts) < tick_sec:
-                    continue
-                tick_result = _nexus_shadow_runtime_tick(cur, wa, cfg_run, action="tick")
-                events_tick = tick_result.get("events") if isinstance(tick_result.get("events"), list) else []
-                is_no_queue = str(tick_result.get("runtime_status") or "").lower() == "idle" and any(
-                    isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events_tick
-                )
-                if is_no_queue:
-                    # NO_QUEUE is transient: do not persist it as latest runtime and do not create Ghost sessions.
-                    continue
-                run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
-                result_summary = {
-                    "shadow_only": True,
-                    "live_execution_triggered": False,
-                    "status": "running",
-                    "runtime_status": tick_result.get("runtime_status"),
-                    "runtime": {
-                        "status": tick_result.get("runtime_status"),
-                        "action": "tick",
-                        "tick_sec": tick_result.get("tick_sec"),
-                        "active_count": tick_result.get("active_count", 0),
-                        "ready_count": tick_result.get("ready_count", 0),
-                        "simulated_exits": tick_result.get("simulated_exits", 0),
-                        "promoted": tick_result.get("promoted", 0),
-                        "strategist": tick_result.get("strategist") or {},
-                        "updated_ts": now_i,
-                    },
-                    "readiness": "SHADOW_RUNTIME_ACTIVE" if tick_result.get("runtime_status") == "running" else str(tick_result.get("runtime_status") or "idle").upper(),
-                    "message": "Shadow runtime auto-ticked by backend GET polling. No Vault execution was triggered.",
-                }
-                cur.execute(
-                    """
-                    INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        run_id,
-                        wa,
-                        "SHADOW",
-                        "auto_get_tick",
-                        "running",
-                        json.dumps(result_summary, ensure_ascii=False),
-                        json.dumps(events_tick, ensure_ascii=False),
-                        json.dumps(tick_result.get("queue") or [], ensure_ascii=False),
-                        json.dumps({**cfg_run, "action": "tick"}, ensure_ascii=False),
-                        now_i,
-                        now_i,
-                    ),
-                )
-            conn.commit()
-
-            cur.execute(
-                "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
-                (wa,),
-            )
-            runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
-            execution = _nexus_execution_summary(cur, wa)
-            cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
-            hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-            runtime = _nexus_shadow_latest_runtime(cur, wa)
-            conn.close()
+        conn = _db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 5",
+            (wa,),
+        )
+        runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+        execution = _nexus_execution_summary(cur, wa)
+        cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
+        hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        conn.close()
         return jsonify({
             "status": "ok",
             "wallet": wa,
             "mode": "SHADOW_ONLY",
             "live_execution_triggered": False,
-            "runtime_status": runtime.get("status") or "idle",
-            "runtime": runtime.get("runtime") or {},
             "last_run": runs[0] if runs else None,
             "runs": runs,
             "execution": execution,
@@ -13037,7 +10331,6 @@ def api_nexus_shadow_executor():
 
     body = request.get_json(silent=True) or {}
     cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
-    action = str(body.get("action") or cfg.get("action") or "validate").strip().lower()
     source = str(body.get("source") or "manual").strip()[:80]
 
     with DB_WRITE_LOCK:
@@ -13046,105 +10339,43 @@ def api_nexus_shadow_executor():
         execution = _nexus_execution_summary(cur, wa)
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-        body_queue = body.get("queue") if isinstance(body.get("queue"), list) else None
-        # Backend-first: an empty frontend queue must not override the persisted
-        # wallet/session queue. Otherwise Shadow buttons look broken and Test can
-        # clear/replace visible slots with an empty preview.
-        queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
-
-        if action in ("start", "tick", "pause", "resume", "stop"):
-            if action in ("start", "resume"):
-                # A fresh user start/resume explicitly re-opens the selected permission window.
-                # Clear old stop tombstones only for this selected session/chain.
-                _nexus_shadow_clear_session_stopped(
-                    cur,
-                    wa,
-                    str(cfg.get("session_id") or cfg.get("sessionId") or "").strip(),
-                    _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or ""),
-                )
-                # First run the validator once so sparse frontend queues are persisted before runtime starts.
-                # Scope the seed to the selected session/chain. Never seed the whole wallet into one runtime.
-                seed_queue = _nexus_shadow_filter_queue_for_cfg(queue, cfg) or queue
-                seed = _nexus_shadow_executor_simulate(seed_queue, {**cfg, "persist_state": True}, hold_state)
-                _nexus_shadow_persist_queue_preview(cur, wa, seed.get("queue") or [])
-            runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
-            result = {
-                "summary": {
-                    "shadow_only": True,
-                    "live_execution_triggered": False,
-                    "status": "paused" if action == "pause" else "stopped" if action == "stop" else "running",
-                    "runtime_status": runtime_result.get("runtime_status"),
-                    "runtime": {
-                        "status": runtime_result.get("runtime_status"),
-                        "action": action,
-                        "tick_sec": runtime_result.get("tick_sec"),
-                        "active_count": runtime_result.get("active_count", 0),
-                        "ready_count": runtime_result.get("ready_count", 0),
-                        "simulated_exits": runtime_result.get("simulated_exits", 0),
-                        "promoted": runtime_result.get("promoted", 0),
-                        "strategist": runtime_result.get("strategist") or {},
-                        "updated_ts": now_ts(),
-                    },
-                    "readiness": "SHADOW_RUNTIME_ACTIVE" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle").upper(),
-                    "message": "Shadow runtime updated paper execution state only. No Vault execution was triggered.",
-                },
-                "events": runtime_result.get("events") or [],
-                "queue": runtime_result.get("queue") or [],
-            }
-            shadow_state_changes = runtime_result.get("changed") or []
-            events_for_persist = result.get("events") if isinstance(result.get("events"), list) else []
-            skip_shadow_run_persist = str(runtime_result.get("runtime_status") or "").lower() == "idle" and any(
-                isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events_for_persist
-            )
-        else:
-            skip_shadow_run_persist = False
-            result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
-            # One-shot validation/test must be read-only by default. It should show
-            # whether Shadow would work, but it must not rewrite the live-like paper
-            # runtime queue unless the caller explicitly asks for persist_state.
-            persist_shadow_state = bool(cfg.get("persist_state") is True)
-            if isinstance(result.get("summary"), dict):
-                result["summary"]["persist_state"] = persist_shadow_state
-            shadow_state_changes = _nexus_shadow_persist_queue_preview(cur, wa, result.get("queue") or []) if persist_shadow_state else []
-
+        queue = body.get("queue") if isinstance(body.get("queue"), list) else execution.get("queue", [])
+        result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
         run_id = str(body.get("run_id") or ("NSH-" + uuid.uuid4().hex[:12].upper()))
         now_i = now_ts()
-        run = None
-        if not skip_shadow_run_persist:
-            cur.execute(
-                """
-                INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    run_id,
-                    wa,
-                    "SHADOW",
-                    source,
-                    result["summary"].get("status") or "completed",
-                    json.dumps(result["summary"], ensure_ascii=False),
-                    json.dumps(result["events"], ensure_ascii=False),
-                    json.dumps(result["queue"], ensure_ascii=False),
-                    json.dumps({**cfg, "action": action}, ensure_ascii=False),
-                    now_i,
-                    now_i,
-                ),
-            )
-            _nexus_log_sim_event(
-                cur,
+        cur.execute(
+            """
+            INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                run_id,
                 wa,
-                "shadow_executor",
                 "SHADOW",
-                "SHADOW_RUNTIME" if action in ("start", "tick", "pause", "resume", "stop") else "SHADOW_EXECUTOR_RUN",
-                "",
+                source,
                 result["summary"].get("status") or "completed",
-                "Shadow paper runtime updated. No live Vault execution was triggered.",
-                {"run_id": run_id, "summary": result["summary"], "shadow_state_changes": shadow_state_changes},
-            )
+                json.dumps(result["summary"], ensure_ascii=False),
+                json.dumps(result["events"], ensure_ascii=False),
+                json.dumps(result["queue"], ensure_ascii=False),
+                json.dumps(cfg, ensure_ascii=False),
+                now_i,
+                now_i,
+            ),
+        )
+        _nexus_log_sim_event(
+            cur,
+            wa,
+            "shadow_executor",
+            "SHADOW",
+            "SHADOW_EXECUTOR_RUN",
+            "",
+            result["summary"].get("status") or "completed",
+            "Shadow Executor validation completed. No live Vault execution was triggered.",
+            {"run_id": run_id, "summary": result["summary"]},
+        )
         conn.commit()
-        if not skip_shadow_run_persist:
-            cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wa))
-            run = _shadow_row_to_dict(cur.fetchone())
+        cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wa))
+        run = _shadow_row_to_dict(cur.fetchone())
         execution = _nexus_execution_summary(cur, wa)
         conn.close()
 
@@ -13153,9 +10384,7 @@ def api_nexus_shadow_executor():
         "wallet": wa,
         "run": run,
         "execution": execution,
-        "shadow_state_changes": shadow_state_changes,
-        "runtime_status": (result.get("summary") or {}).get("runtime_status"),
-        "message": "Shadow runtime/paper execution updated. No Vault execution was triggered.",
+        "message": "Shadow Executor simulated virtual fills/reallocation/stop-reentry only. No Vault execution was triggered.",
         "ts": now_ts(),
     })
 
@@ -14554,7 +11783,6 @@ def api_grid_budgets_by_chain():
 
 
 @app.route("/api/grid/order/stop", methods=["POST"])
-@app.route("/api/grid/order/pause", methods=["POST"])
 def api_grid_order_stop():
     """Fast-path stop/cancel for a single visible SQLite order.
 
@@ -21463,23 +18691,6 @@ def _nexus_score_for_asset(asset: dict) -> dict:
             whale = {"status": "error", "error": str(e), "score_delta": 0}
 
     raw_score = sum(float(v or 0) for v in parts.values())
-
-    # Rotation Strategist bridge: when the frontend sends a ranked Strategist
-    # candidate, keep that signal visible in the rotation preview. This is only
-    # a preview/shadow score hint; the later Vault adapter must still validate
-    # token allowlists, liquidity, slippage and safety on-chain/server-side.
-    hint = _safe_float(
-        asset.get("scoreHint")
-        or asset.get("score_hint")
-        or asset.get("strategistScore")
-        or asset.get("strategist_score")
-        or 0
-    )
-    if hint > 0:
-        # Blend, do not blindly override market/risk scoring.
-        raw_score = (raw_score * 0.55) + (max(0.0, min(100.0, hint)) * 0.45)
-        reasons.append("Strategist candidate score hint")
-
     score = max(0, min(100, round(raw_score, 2)))
     risk = "LOW" if score >= 75 else "MEDIUM" if score >= 50 else "HIGH"
     rating = _nexus_rating(score)
@@ -21684,7 +18895,6 @@ def api_nexus_rotation_preview():
         return err("missing assets or symbols", 400)
     budget_usd = _safe_float(body.get("budget_usd") or body.get("budgetUsd") or body.get("budget") or 0)
     chain = _normalize_chain_key(body.get("chain") or "POL")
-    base_asset = str(body.get("baseAsset") or body.get("base_asset") or body.get("payoutAsset") or body.get("payout_asset") or "USDC").strip().upper()
     plan = _nexus_build_rotation_plan(assets, budget_usd)
     previews = []
     for row in plan.get("plan") or []:
@@ -21695,10 +18905,6 @@ def api_nexus_rotation_preview():
                 "symbol": row.get("symbol"),
                 "token": row.get("token") or body.get("token") or body.get("tokenOut") or "",
                 "side": "BUY" if row.get("action") == "INCREASE" else "HOLD",
-                "tokenIn": base_asset,
-                "token_in": base_asset,
-                "tokenOut": row.get("token") or row.get("symbol") or body.get("tokenOut") or "",
-                "token_out": row.get("token") or row.get("symbol") or body.get("tokenOut") or "",
                 "amountUsd": row.get("target_usd"),
             })
             prev = _nexus_order_preview(pb)
@@ -21715,16 +18921,7 @@ def api_nexus_rotation_preview():
                 "blocking_reasons": ["rotation_action_not_increase_or_no_budget"],
                 "ts": now_ts(),
             })
-    return jsonify({
-        "status": "ok",
-        "capitalFlow": "BASE_TO_TARGET_TO_BASE",
-        "baseAsset": base_asset,
-        "shadowOnly": True,
-        "liveVaultReady": False,
-        "plan": plan.get("plan") or [],
-        "previews": previews,
-        "ts": now_ts(),
-    })
+    return jsonify({"status": "ok", "plan": plan.get("plan") or [], "previews": previews, "ts": now_ts()})
 
 
 # -------------------------
