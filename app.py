@@ -1996,6 +1996,7 @@ def init_db():
             timeframe TEXT DEFAULT '90D',
             index_mode INTEGER DEFAULT 1,
             ai_selected_json TEXT DEFAULT '[]',
+            ui_state_json TEXT DEFAULT '{}',
             updated_ts INTEGER
         )
     """)
@@ -2036,6 +2037,7 @@ def init_db():
             "timeframe": "timeframe TEXT DEFAULT '90D'",
             "index_mode": "index_mode INTEGER DEFAULT 1",
             "ai_selected_json": "ai_selected_json TEXT DEFAULT '[]'",
+            "ui_state_json": "ui_state_json TEXT DEFAULT '{}'",
             "updated_ts": "updated_ts INTEGER",
         })
         _db_ensure_columns(conn, "user_insight_profile", {
@@ -2808,7 +2810,22 @@ def _refresh_user_insight_profile(wallet_address: str, conn=None) -> tuple[dict,
             conn.close()
 
 def _norm_addr(addr: str) -> str:
-    return (addr or "").strip().lower()
+    """Normalize a wallet/token address.
+
+    Some browsers/proxies merge duplicate case-insensitive wallet headers into
+    a comma-separated value like "0xabc..., 0xabc...". Pick the first real
+    EVM address so backend validation stays robust while still lowercasing
+    ordinary strings.
+    """
+    if addr is None:
+        return ""
+    if isinstance(addr, (list, tuple, set)):
+        addr = next((x for x in addr if x), "")
+    s = str(addr or "").strip()
+    m = re.search(r"0x[a-fA-F0-9]{40}", s)
+    if m:
+        return m.group(0).lower()
+    return s.lower()
 
 def _looks_like_evm_addr(s: str) -> bool:
     s = (s or "").strip()
@@ -8450,7 +8467,7 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
     if not wa:
         return [], 0
     clean = _watch_items_normalize(items)
-    nowi = int(time.time())
+    nowi = int(time.time() * 1000)
     conn = _db()
     try:
         with DB_WRITE_LOCK:
@@ -8469,14 +8486,14 @@ def _db_set_user_watchlist(wallet_address: str, items: list) -> tuple[list, int]
 def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
     conn = _db()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
+        cur.execute("SELECT compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts FROM user_app_state WHERE wallet_address=?", (wa,))
         row = cur.fetchone()
         if not row:
-            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+            return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
         try:
             compare = json.loads(row["compare_json"] or "[]")
         except Exception:
@@ -8485,11 +8502,18 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
             ai_selected = json.loads(row["ai_selected_json"] or "[]")
         except Exception:
             ai_selected = []
+        try:
+            ui_state = json.loads(row["ui_state_json"] or "{}")
+            if not isinstance(ui_state, dict):
+                ui_state = {}
+        except Exception:
+            ui_state = {}
         return {
             "compare": [str(x).strip().upper() for x in (compare if isinstance(compare, list) else []) if str(x).strip()],
             "timeframe": str(row["timeframe"] or "90D"),
             "indexMode": bool(int(row["index_mode"] or 0)),
             "aiSelected": [str(x).strip().upper() for x in (ai_selected if isinstance(ai_selected, list) else []) if str(x).strip()],
+            "ui": ui_state,
         }, int(row["updated_ts"] or 0)
     finally:
         conn.close()
@@ -8498,12 +8522,13 @@ def _db_get_user_app_state(wallet_address: str) -> tuple[dict, int]:
 def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": []}, 0
+        return {"compare": [], "timeframe": "90D", "indexMode": True, "aiSelected": [], "ui": {}}, 0
     base, _ = _db_get_user_app_state(wa)
     compare = payload.get("compare") if isinstance(payload, dict) else None
     timeframe = payload.get("timeframe") if isinstance(payload, dict) else None
     index_mode = payload.get("indexMode") if isinstance(payload, dict) else None
     ai_selected = payload.get("aiSelected") if isinstance(payload, dict) else None
+    ui_state = payload.get("ui") if isinstance(payload, dict) else None
     if isinstance(compare, list):
         base["compare"] = [str(x).strip().upper() for x in compare if str(x).strip()][:20]
     if isinstance(timeframe, str) and timeframe.strip():
@@ -8512,15 +8537,30 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         base["indexMode"] = bool(index_mode)
     if isinstance(ai_selected, list):
         base["aiSelected"] = [str(x).strip().upper() for x in ai_selected if str(x).strip()][:6]
-    nowi = int(time.time())
+    if isinstance(ui_state, dict):
+        allowed = {
+            "watchSortMode", "gridMode", "gridChain", "gridItem",
+            "tradingRuntimeHours", "tradingHoldHours", "tradingAllowedAssets", "tradingAllowedChains",
+            "tradingRiskMode", "tradingCautionDrawdownPct", "tradingHardStopPct",
+            "tradingProfitLockPct", "tradingMaxSlippagePct", "tradingMaxTrades",
+            "tradingConfidenceMin", "tradingStyle", "tradingBudgetUsd", "tradingBudgetSplitInput"
+        }
+        clean_ui = {}
+        for k, v in ui_state.items():
+            if k not in allowed:
+                continue
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                clean_ui[k] = v
+        base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
+    nowi = int(time.time() * 1000)
     conn = _db()
     try:
         with DB_WRITE_LOCK:
             cur = conn.cursor()
             cur.execute(
-                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, updated_ts) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, updated_ts=excluded.updated_ts",
-                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), nowi),
+                "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(wallet_address) DO UPDATE SET compare_json=excluded.compare_json, timeframe=excluded.timeframe, index_mode=excluded.index_mode, ai_selected_json=excluded.ai_selected_json, ui_state_json=excluded.ui_state_json, updated_ts=excluded.updated_ts",
+                (wa, json.dumps(base["compare"], separators=(",", ":")), base["timeframe"], 1 if base["indexMode"] else 0, json.dumps(base["aiSelected"], separators=(",", ":")), json.dumps(base.get("ui") if isinstance(base.get("ui"), dict) else {}, separators=(",", ":")), nowi),
             )
             conn.commit()
         return base, nowi
@@ -9838,7 +9878,16 @@ def _nexus_json_load(value, fallback):
 
 def _nexus_wallet_from_request():
     body = request.get_json(silent=True) or {}
-    wallet = request.args.get("wallet") or request.args.get("wallet_address") or request.headers.get("X-Wallet-Address") or body.get("wallet") or body.get("wallet_address") or ""
+    wallet = (
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or request.headers.get("x-wallet-address")
+        or body.get("wallet")
+        or body.get("wallet_address")
+        or body.get("walletAddress")
+        or ""
+    )
     wa = _norm_addr(wallet)
     if not wa or not _looks_like_evm_addr(wa):
         return "", (jsonify({"status": "error", "error": "invalid wallet", "wallet": wa, "ts": now_ts()}), 400)
@@ -9884,26 +9933,134 @@ def _nexus_execution_summary(cur, wallet_address):
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
+def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
+    """Score one prepared slot for Shadow/rotation readiness without live execution.
+
+    This is intentionally deterministic and local to the queue row. It does not call
+    external services and it never triggers Vault execution. The goal is to make
+    Shadow behave like a realistic prepared/live preview: good WAIT slots can move
+    to READY, weak slots stay WAIT, and risky slots move to PROTECT/BLOCKED.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    item = item if isinstance(item, dict) else {}
+    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+
+    raw_confidence = item.get("confidence", item.get("confidence_score", signals.get("confidence", None)))
+    confidence = _clamp_float(raw_confidence, 0, 0, 100) if raw_confidence is not None and str(raw_confidence).strip() != "" else 0
+    risk = _clamp_float(item.get("risk_score", item.get("riskScore", signals.get("risk_score", 0))), 0, 0, 100)
+    priority_raw = item.get("priority", None)
+    priority = _clamp_float(priority_raw, confidence - risk, -100, 100)
+
+    # If Strategist/Frontend provides priority but not confidence, do not treat the
+    # slot as untradeable in Shadow. Priority is already a prepared signal, so convert
+    # it into a conservative Shadow confidence for simulation visibility only.
+    confidence_missing = raw_confidence is None or str(raw_confidence).strip() in ("", "0", "0.0")
+    if confidence_missing and priority > 0 and risk < 48:
+        confidence = min(82, max(45, priority + 12))
+
+    liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=70)
+    rvol = _nexus_trading_signal_value(item, signals, "rvol", "relative_volume", default=1.0)
+    slippage = _nexus_trading_signal_value(item, signals, "slippage_pct", "slippagePct", default=0)
+    overextension = _nexus_trading_signal_value(item, signals, "overextension_pct", "overextension", default=0)
+    structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
+    security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
+
+    max_slippage = _clamp_float(cfg.get("max_slippage_pct", item.get("maxSlippagePct", 1.2)), 1.2, 0.05, 10)
+    quality = priority
+    if confidence >= 70:
+        quality += 10
+    elif confidence >= 55:
+        quality += 5
+    if liquidity >= 60:
+        quality += 5
+    elif liquidity < 35:
+        quality -= 12
+    if rvol >= 1.2:
+        quality += 4
+    elif rvol < 0.7:
+        quality -= 5
+    if structure in ("BREAKOUT", "ACCUMULATION", "INTACT", "STRONG", "UPTREND"):
+        quality += 6
+    if structure in ("WEAK", "UNSTABLE", "DISTRIBUTION"):
+        quality -= 8
+    if overextension >= 60 and rvol < 1.2:
+        quality -= 10
+    if slippage and slippage > max_slippage:
+        quality -= 14
+
+    hard_block = security in ("FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED") or liquidity <= 10 or (slippage and slippage >= max_slippage * 2.5)
+    return {
+        "confidence": max(0, min(100, confidence)),
+        "risk_score": max(0, min(100, risk)),
+        "priority": max(-100, min(100, priority)),
+        "quality": max(-100, min(100, quality)),
+        "hard_block": bool(hard_block),
+    }
+
+
 def _nexus_recheck_apply(cur, wallet_address):
     ts = now_ts()
     cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 20", (wallet_address, ts))
     changed = []
+    active_like = 0
+    max_shadow_ready = int(os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6"))
+
     for row in cur.fetchall():
         item = _nexus_queue_row_to_dict(row)
         old_state = str(item.get("state") or "WAIT").upper()
-        decision = _nexus_trading_decide_slot({"status": old_state, "symbol": item.get("asset"), "signals": item.get("signals") or {}, "confidence": item.get("confidence"), "risk_score": item.get("risk_score")}, {"risk_mode": "BALANCED"})
-        new_state = str(decision.get("state") or old_state).upper()
-        reason = str(decision.get("reason") or item.get("reason") or "Scheduled Strategist recheck").strip()
-        if old_state in ("WAIT","OBSERVE") and new_state == "ACTIVE":
+        quality = _nexus_shadow_slot_quality(item, {"risk_mode": "BALANCED"})
+        decision = _nexus_trading_decide_slot({
+            "status": old_state,
+            "symbol": item.get("asset"),
+            "signals": item.get("signals") or {},
+            "confidence": quality.get("confidence"),
+            "risk_score": quality.get("risk_score"),
+            "priority": quality.get("priority"),
+        }, {"risk_mode": "BALANCED"})
+
+        new_state = str(decision.get("next_status") or decision.get("state") or old_state).upper()
+        reason = "; ".join(decision.get("reasons") or []) or item.get("reason") or "Scheduled Strategist recheck"
+
+        if quality.get("hard_block"):
+            new_state = "BLOCKED"
+            reason = "Shadow recheck blocked this slot because security/liquidity/slippage rules failed."
+        elif quality.get("risk_score", 0) >= 70:
+            new_state = "HOLD"
+            reason = "Shadow recheck detected high risk; slot is protected in HOLD."
+        elif quality.get("risk_score", 0) >= 48:
+            new_state = "PROTECT"
+            reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
+        elif old_state in ("WAIT", "OBSERVE", "READY"):
+            # Recheck should mirror Shadow behavior: a clean prepared slot may become
+            # READY even when explicit confidence is missing, as long as priority/quality
+            # and risk are acceptable. This is still preparation-only, no Vault execution.
+            if (
+                (quality.get("confidence", 0) >= 50 and quality.get("quality", 0) >= 30)
+                or quality.get("quality", 0) >= 38
+            ) and active_like < max_shadow_ready:
+                new_state = "READY"
+                active_like += 1
+                reason = "Shadow recheck promoted this slot to READY based on priority, quality and controlled risk."
+            else:
+                new_state = "WAIT"
+                reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
+        elif old_state == "PROTECT" and quality.get("risk_score", 0) < 35 and quality.get("quality", 0) >= 35:
             new_state = "READY"
-            reason = "Recheck confirmed readiness, but Vault execution is not enabled yet."
+            active_like += 1
+            reason = "Risk normalized; Shadow recheck returned this slot to READY."
+        elif old_state == "ACTIVE":
+            active_like += 1
+
         if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
             new_state = old_state
         next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
-        cur.execute("UPDATE nexus_execution_queue SET state=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?", (new_state, reason[:500], next_recheck, ts, item["id"], wallet_address))
+        cur.execute(
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, quality.get("quality", item.get("priority") or 0), quality.get("confidence", item.get("confidence") or 0), quality.get("risk_score", item.get("risk_score") or 0), reason[:500], next_recheck, ts, item["id"], wallet_address),
+        )
         if new_state != old_state:
-            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision})
-            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason})
+            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision, "quality": quality})
+            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason, "quality": quality})
     return changed
 
 def _nexus_upsert_queue_item(cur, wallet_address, body):
@@ -10146,12 +10303,23 @@ def _shadow_normalize_queue_item(item, idx=0):
     state = str(item.get("status") or item.get("state") or "WAIT").strip().upper()
     amount = _clamp_float(item.get("amountUsd", item.get("reserved_capital_usd", item.get("amount_usd", 0))), 0, 0, 1_000_000_000)
     priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
-    confidence_raw = item.get("confidence", item.get("confidence_score", 0))
+    confidence_raw = item.get("confidence", item.get("confidence_score", None))
     if isinstance(confidence_raw, str):
         confidence = {"LOW": 35, "MEDIUM": 62, "HIGH": 82}.get(confidence_raw.upper(), 50)
+    elif confidence_raw is None or str(confidence_raw).strip() == "":
+        confidence = 0
     else:
         confidence = _clamp_float(confidence_raw, 0, 0, 100)
     risk_score = _clamp_float(item.get("risk_score", item.get("riskScore", 0)), 0, 0, 100)
+
+    # Shadow slots often arrive from the prepared UI with a useful priority but
+    # without a dedicated confidence score yet. In that case, derive a conservative
+    # Shadow-only confidence from priority so the simulator can visibly test rotation
+    # instead of leaving every non-slot-1 row in WAIT forever. This never affects
+    # live/Vault execution.
+    confidence_missing = confidence_raw is None or str(confidence_raw).strip() in ("", "0", "0.0")
+    if confidence_missing and priority > 0 and risk_score < 48:
+        confidence = max(confidence, min(82, max(45, priority + 12)))
     return {
         **item,
         "slot": slot,
@@ -10164,25 +10332,114 @@ def _shadow_normalize_queue_item(item, idx=0):
     }
 
 
+def _nexus_shadow_item_blocked_by_hold(item: dict, hold: dict) -> bool:
+    """Return True only when HOLD/OBSERVE applies to this slot/session.
+
+    Older Shadow logic used the wallet-level HOLD status as a global blocker. That made
+    every slot look frozen although only protected capital/slots should be blocked.
+    """
+    status = str((hold or {}).get("status") or "").upper()
+    if status not in ("HOLD", "OBSERVE", "RELEASE_REQUIRED"):
+        return False
+
+    hold_queue = (hold or {}).get("queue") if isinstance((hold or {}).get("queue"), list) else []
+    if not hold_queue:
+        # Keep backward compatibility: if backend has no slot list, block only slots already
+        # explicitly in a protected state, not every WAIT/READY candidate.
+        return str((item or {}).get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
+
+    slot = str((item or {}).get("slot") or (item or {}).get("slot_id") or "").strip().upper()
+    symbol = str((item or {}).get("symbol") or (item or {}).get("asset") or "").strip().upper()
+    session_id = str((item or {}).get("session_id") or ((item or {}).get("meta") or {}).get("session_id") or "").strip().upper()
+
+    for q in hold_queue:
+        if not isinstance(q, dict):
+            continue
+        qslot = str(q.get("slot") or q.get("slot_id") or q.get("id") or "").strip().upper()
+        qsymbol = str(q.get("symbol") or q.get("asset") or "").strip().upper()
+        qsession = str(q.get("session_id") or (q.get("meta") or {}).get("session_id") or "").strip().upper()
+        if slot and qslot and slot == qslot:
+            return True
+        if session_id and qsession and session_id == qsession:
+            return True
+        if symbol and qsymbol and symbol == qsymbol:
+            return True
+    return False
+
+
 def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
     """Run an off-chain shadow execution validation pass.
 
     This function never creates transactions, never calls Vault execution routes, and never
-    mutates live Grid orders. It only produces validation events and a safety summary.
+    mutates live Grid orders. It produces a realistic Shadow rotation preview: WAIT slots
+    can become READY, READY/ACTIVE slots can produce virtual fills, risky slots move to
+    PROTECT/HOLD, and protected slots stay blocked only when the hold applies to them.
     """
     cfg = config if isinstance(config, dict) else {}
     hold = hold_state if isinstance(hold_state, dict) else {}
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 1, 1, 168)
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 6)), 1, 1, 200))
-    reentry_blocked = str(hold.get("status") or "").upper() in ("HOLD", "OBSERVE", "RELEASE_REQUIRED")
+    max_ready_slots = int(_clamp_float(cfg.get("max_ready_slots", os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6")), 6, 1, 50))
+    min_ready_slots = int(_clamp_float(cfg.get("min_ready_slots", cfg.get("minReadySlots", os.getenv("NEXUS_SHADOW_MIN_READY_SLOTS", "3"))), 3, 0, 50))
+    # In Shadow mode the user must be able to see whether the rotation engine can move
+    # more than the first slot. These are still conservative: risky/protected/hard-blocked
+    # slots are never forced ready, but clean WAIT slots can be promoted into a visible
+    # READY preview even when their raw confidence is incomplete or stale.
+    shadow_ready_confidence_floor = _clamp_float(
+        cfg.get("shadow_ready_confidence_floor", cfg.get("shadowReadyConfidenceFloor", os.getenv("NEXUS_SHADOW_READY_CONFIDENCE_FLOOR", "45"))),
+        50,
+        0,
+        100,
+    )
+    shadow_ready_quality_floor = _clamp_float(
+        cfg.get("shadow_ready_quality_floor", cfg.get("shadowReadyQualityFloor", os.getenv("NEXUS_SHADOW_READY_QUALITY_FLOOR", "20"))),
+        25,
+        -100,
+        100,
+    )
+    persist_state = str(cfg.get("persist_state", cfg.get("persistState", os.getenv("NEXUS_SHADOW_PERSIST_QUEUE", "1")))).strip().lower() in ("1", "true", "yes", "on")
+
     events = []
     virtual_fills = 0
+    virtual_waits = 0
     blocked = 0
     protect_count = 0
+    ready_count = 0
     reallocation_tests = 0
     stop_tests = 0
+    queue_out = []
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue if isinstance(queue, list) else [])]
+    quality_by_idx = {}
+    forced_ready_indices = set()
+
+    if normalized:
+        candidates = []
+        for i, candidate in enumerate(normalized):
+            candidate_state = str(candidate.get("status") or "WAIT").upper()
+            q = _nexus_shadow_slot_quality(candidate, cfg)
+            quality_by_idx[i] = q
+            candidate_risk = _clamp_float(q.get("risk_score", candidate.get("risk_score", 0)), 0, 0, 100)
+            candidate_quality = _clamp_float(q.get("quality", q.get("priority", 0)), 0, -100, 100)
+            candidate_confidence = _clamp_float(q.get("confidence", candidate.get("confidence_score", 0)), 0, 0, 100)
+
+            # Only clean, currently waiting/ready/active slots can be included in the
+            # visible Shadow rotation preview. Protected states remain protected.
+            if candidate_state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+                continue
+            if _nexus_shadow_item_blocked_by_hold(candidate, hold):
+                continue
+            if q.get("hard_block") or candidate_risk >= 48:
+                continue
+
+            # If external signals are sparse, use quality + priority ranking so Shadow can
+            # still demonstrate slot rotation instead of leaving every non-slot-1 card WAIT.
+            candidates.append((candidate_quality, candidate_confidence, _clamp_float(candidate.get("priority", 0), 0, -100, 100), i))
+
+        candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        target_ready = max(0, min(max_ready_slots, min_ready_slots, len(candidates)))
+        forced_ready_indices = {i for *_rest, i in candidates[:target_ready]}
+
     if not normalized:
         events.append({
             "type": "NO_QUEUE",
@@ -10192,94 +10449,150 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
 
     for idx, item in enumerate(normalized):
         state = str(item.get("status") or "WAIT").upper()
-        risk = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
-        confidence = _clamp_float(item.get("confidence_score", 0), 0, 0, 100)
-        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+        quality = quality_by_idx.get(idx) or _nexus_shadow_slot_quality(item, cfg)
+        risk = _clamp_float(quality.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
+        confidence = _clamp_float(quality.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
+        priority = _clamp_float(quality.get("priority", item.get("priority", 0)), 0, -100, 100)
+        quality_score = _clamp_float(quality.get("quality", priority), 0, -100, 100)
         symbol = item.get("symbol") or "ASSET"
         slot = item.get("slot") or f"S{idx + 1}"
+        next_state = state
+        transition_reason = ""
 
-        if reentry_blocked:
+        if _nexus_shadow_item_blocked_by_hold(item, hold):
             blocked += 1
+            next_state = "RELEASE_REQUIRED" if str(hold.get("status") or "").upper() == "RELEASE_REQUIRED" else state if state in ("HOLD", "OBSERVE") else "OBSERVE"
+            transition_reason = "Protected HOLD/OBSERVE applies to this slot; Shadow blocks blind re-entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "REENTRY_BLOCKED",
                 "severity": "high",
-                "message": "HOLD/OBSERVE state blocks blind re-entry in shadow validation.",
+                "from": state,
+                "to": next_state,
+                "message": transition_reason,
             })
-            continue
-
-        if state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+        elif state in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
             blocked += 1
+            next_state = state
+            transition_reason = f"Slot state {state} is protected and not executable in shadow mode."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "STATE_BLOCKED",
                 "severity": "medium",
-                "message": f"Slot state {state} is not executable in shadow mode.",
+                "from": state,
+                "to": next_state,
+                "message": transition_reason,
             })
-            continue
-
-        if risk >= 70:
+        elif quality.get("hard_block") or risk >= 70:
             blocked += 1
             stop_tests += 1
+            next_state = "HOLD"
+            transition_reason = "Virtual execution blocked because risk/security/liquidity rules are too high."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_STOP_BLOCK",
                 "severity": "high",
+                "from": state,
+                "to": next_state,
                 "risk_score": risk,
-                "message": "Virtual execution blocked because risk score is too high.",
+                "message": transition_reason,
             })
-            continue
-
-        if risk >= 48:
+        elif risk >= 48:
             protect_count += 1
             stop_tests += 1
+            next_state = "PROTECT"
+            transition_reason = "Shadow executor would reduce/protect before any live entry."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_PROTECT",
                 "severity": "medium_high",
+                "from": state,
+                "to": next_state,
                 "risk_score": risk,
-                "message": "Shadow executor would reduce/protect before any live entry.",
+                "message": transition_reason,
             })
-            continue
-
-        if confidence >= 55 and priority >= 35 and virtual_fills < max_trades:
-            virtual_fills += 1
-            reallocation_tests += 1
-            events.append({
-                "slot": slot,
-                "symbol": symbol,
-                "type": "VIRTUAL_FILL",
-                "severity": "normal",
-                "confidence": confidence,
-                "priority": priority,
-                "message": "Virtual fill accepted for simulation only. No Vault execution triggered.",
-            })
+        elif (
+            (confidence >= 50 and quality_score >= 30)
+            or (idx in forced_ready_indices and quality_score >= shadow_ready_quality_floor)
+            or quality_score >= 38
+        ) and ready_count < max_ready_slots:
+            ready_count += 1
+            if virtual_fills < max_trades:
+                virtual_fills += 1
+                reallocation_tests += 1
+                # Shadow must demonstrate the future Live scheduler more realistically:
+                # multiple clean slots can become active in the preview. This is not
+                # on-chain execution and does not touch Vault/Grid routes.
+                next_state = "ACTIVE" if (state == "ACTIVE" or idx in forced_ready_indices) else "READY"
+                transition_reason = "Virtual fill accepted for simulation only. Slot is active/ready in Shadow rotation preview."
+                events.append({
+                    "slot": slot,
+                    "symbol": symbol,
+                    "type": "VIRTUAL_FILL",
+                    "severity": "normal",
+                    "from": state,
+                    "to": next_state,
+                    "confidence": confidence,
+                    "priority": priority,
+                    "quality": quality_score,
+                    "message": transition_reason,
+                })
+            else:
+                virtual_waits += 1
+                next_state = "READY"
+                transition_reason = "Slot is ready, but max virtual trade count is reached for this Shadow pass."
+                events.append({
+                    "slot": slot,
+                    "symbol": symbol,
+                    "type": "VIRTUAL_READY_WAIT",
+                    "severity": "info",
+                    "from": state,
+                    "to": next_state,
+                    "confidence": confidence,
+                    "priority": priority,
+                    "quality": quality_score,
+                    "message": transition_reason,
+                })
         else:
+            virtual_waits += 1
+            next_state = "WAIT"
+            transition_reason = "Setup remains in WAIT; quality is not clean enough yet."
             events.append({
                 "slot": slot,
                 "symbol": symbol,
                 "type": "VIRTUAL_WAIT",
                 "severity": "info",
+                "from": state,
+                "to": next_state,
                 "confidence": confidence,
                 "priority": priority,
-                "message": "Setup remains in WAIT during shadow validation.",
+                "quality": quality_score,
+                "message": transition_reason,
             })
 
-    total = max(1, len(normalized))
+        out_item = {
+            **item,
+            "status": next_state,
+            "state": next_state,
+            "priority": quality_score,
+            "confidence_score": confidence,
+            "confidence": confidence,
+            "risk_score": risk,
+            "shadow_transition": {"from": state, "to": next_state, "reason": transition_reason},
+        }
+        queue_out.append(out_item)
+
     safety_score = 100
     safety_score -= min(35, blocked * 8)
     safety_score -= min(24, protect_count * 6)
     safety_score += min(10, virtual_fills * 2)
     safety_score = max(0, min(100, int(safety_score)))
 
-    status = "passed" if safety_score >= 72 and not reentry_blocked else "watch" if safety_score >= 45 else "blocked"
-    if reentry_blocked:
-        status = "blocked"
-
+    status = "passed" if safety_score >= 72 and virtual_fills > 0 else "watch" if safety_score >= 45 else "blocked"
     summary = {
         "shadow_only": True,
         "live_execution_triggered": False,
@@ -10287,16 +10600,391 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
         "safety_score": safety_score,
         "runtime_hours": runtime_hours,
         "slots_tested": len(normalized),
+        "ready_slots": ready_count,
+        "min_ready_slots": min_ready_slots,
+        "forced_ready_slots": len(forced_ready_indices),
         "virtual_fills": virtual_fills,
+        "virtual_waits": virtual_waits,
         "virtual_blocks": blocked,
         "protect_tests": protect_count,
         "reallocation_tests": reallocation_tests,
         "stop_reentry_tests": stop_tests,
-        "reentry_allowed": not reentry_blocked and status == "passed",
+        "reentry_allowed": status == "passed",
         "readiness": "VAULT_READY_CANDIDATE" if status == "passed" else "NEEDS_OBSERVATION" if status == "watch" else "NOT_READY_FOR_VAULT",
-        "message": "Shadow Executor completed without live Vault execution.",
+        "persist_state": persist_state,
+        "message": "Shadow Executor completed a realistic slot rotation preview without live Vault execution.",
     }
-    return {"summary": summary, "events": events[:200], "queue": normalized}
+    return {"summary": summary, "events": events[:200], "queue": queue_out}
+
+
+def _nexus_shadow_persist_queue_preview(cur, wallet_address: str, shadow_queue: list) -> list:
+    """Persist Shadow slot preview back into nexus_execution_queue.
+
+    Only prepared/simulation queue state is updated. This never touches Grid orders,
+    Vault balances, routers or live execution paths.
+    """
+    ts = now_ts()
+    changed = []
+    for item in shadow_queue if isinstance(shadow_queue, list) else []:
+        if not isinstance(item, dict):
+            continue
+        new_state = str(item.get("state") or item.get("status") or "WAIT").upper()
+        if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
+            continue
+        queue_id = str(item.get("id") or item.get("queue_id") or "").strip()
+        slot_id = str(item.get("slot_id") or item.get("slot") or "").strip()
+        asset = str(item.get("asset") or item.get("symbol") or "").strip().upper()
+        priority = _clamp_float(item.get("priority", 0), 0, -100, 100)
+        confidence = _clamp_float(item.get("confidence", item.get("confidence_score", 0)), 0, 0, 100)
+        risk_score = _clamp_float(item.get("risk_score", 0), 0, 0, 100)
+        transition = item.get("shadow_transition") if isinstance(item.get("shadow_transition"), dict) else {}
+        reason = str(transition.get("reason") or item.get("reason") or "Shadow rotation preview updated this slot.")[:500]
+        old_state = None
+        row = None
+        if queue_id:
+            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE id=? AND wallet_address=?", (queue_id, wallet_address))
+            row = cur.fetchone()
+        if row is None and slot_id:
+            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND slot_id=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, slot_id))
+            row = cur.fetchone()
+        if row is None and asset:
+            cur.execute("SELECT id,state,slot_id,asset,meta_json FROM nexus_execution_queue WHERE wallet_address=? AND asset=? ORDER BY updated_ts DESC LIMIT 1", (wallet_address, asset))
+            row = cur.fetchone()
+        next_recheck = ts + int(os.getenv("NEXUS_STRATEGIST_RECHECK_SEC", "900"))
+
+        # Backend-first rule: if a Shadow-visible slot does not yet exist in
+        # nexus_execution_queue, create it instead of skipping it. Older sessions
+        # could exist only in frontend/app-state, which made Shadow look unchanged
+        # on every device after refresh.
+        if row is None:
+            rid = queue_id or ("NQ-" + uuid.uuid4().hex[:12].upper())
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            session_id = str(
+                item.get("session_id")
+                or item.get("sessionId")
+                or item.get("trade_session_id")
+                or meta.get("session_id")
+                or ""
+            ).strip()[:80]
+            if session_id:
+                meta = {**meta, "session_id": session_id}
+            chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+            action = str(item.get("action") or "OBSERVE").upper()[:40]
+            reserved_capital_usd = _clamp_float(
+                item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", 0))),
+                0, 0, 1_000_000_000,
+            )
+            cur.execute(
+                """
+                INSERT INTO nexus_execution_queue(
+                    id,wallet_address,slot_id,asset,chain,action,state,priority,
+                    reserved_capital_usd,confidence,risk_score,reason,signals_json,meta_json,
+                    recheck_after_ts,expires_ts,created_ts,updated_ts
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    slot_id=excluded.slot_id,asset=excluded.asset,chain=excluded.chain,
+                    action=excluded.action,state=excluded.state,priority=excluded.priority,
+                    reserved_capital_usd=excluded.reserved_capital_usd,confidence=excluded.confidence,
+                    risk_score=excluded.risk_score,reason=excluded.reason,signals_json=excluded.signals_json,
+                    meta_json=excluded.meta_json,recheck_after_ts=excluded.recheck_after_ts,
+                    expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts
+                """,
+                (
+                    rid, wallet_address, slot_id or str(item.get("slot") or ""), asset, chain,
+                    action, new_state, priority, reserved_capital_usd, confidence, risk_score,
+                    reason,
+                    json.dumps(item.get("signals") if isinstance(item.get("signals"), dict) else {}, ensure_ascii=False),
+                    json.dumps(meta, ensure_ascii=False), next_recheck, None, ts, ts,
+                ),
+            )
+            _nexus_log_sim_event(
+                cur, wallet_address, slot_id, asset, "SHADOW_QUEUE_CREATED", "", new_state,
+                reason, {"queue_id": rid, "shadow": transition},
+            )
+            changed.append({"id": rid, "from": "", "to": new_state, "reason": reason, "created": True})
+            continue
+
+        old_state = str(row["state"] or "WAIT").upper()
+        rid = row["id"]
+        existing_meta = _nexus_json_load(row["meta_json"] if "meta_json" in row.keys() else "{}", {}) if hasattr(row, "keys") else {}
+        item_meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        merged_meta = {**(existing_meta if isinstance(existing_meta, dict) else {}), **item_meta}
+        # Persist Shadow runtime timing fields even when they are top-level in the preview item.
+        for mk in ["shadow_active_started_ts", "shadow_state_entered_ts", "shadow_closed_ts", "shadow_last_exit_ts", "shadow_cycles", "shadow_runtime_status", "shadow_strategy"]:
+            if item.get(mk) is not None:
+                merged_meta[mk] = item.get(mk)
+        item_signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+        cur.execute(
+            "UPDATE nexus_execution_queue SET state=?, priority=?, confidence=?, risk_score=?, reason=?, signals_json=?, meta_json=?, recheck_after_ts=?, updated_ts=? WHERE id=? AND wallet_address=?",
+            (new_state, priority, confidence, risk_score, reason, json.dumps(item_signals, ensure_ascii=False), json.dumps(merged_meta, ensure_ascii=False), next_recheck, ts, rid, wallet_address),
+        )
+        if new_state != old_state:
+            _nexus_log_sim_event(cur, wallet_address, row["slot_id"], row["asset"], "SHADOW_ROTATION", old_state, new_state, reason, {"queue_id": rid, "shadow": transition})
+            changed.append({"id": rid, "from": old_state, "to": new_state, "reason": reason})
+    return changed
+
+
+def _nexus_shadow_latest_runtime(cur, wallet_address: str) -> dict:
+    """Read latest Shadow runtime metadata. No live/Vault execution involved."""
+    try:
+        cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 1", (wallet_address,))
+        run = _shadow_row_to_dict(cur.fetchone())
+        if not run:
+            return {"status": "idle", "run": None}
+        summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+        runtime = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
+        return {"status": str(runtime.get("status") or summary.get("runtime_status") or run.get("status") or "idle").lower(), "run": run, "runtime": runtime}
+    except Exception:
+        return {"status": "idle", "run": None}
+
+
+def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
+    """Filter queue by selected session/chain so Shadow does not mix devices/chains."""
+    if not isinstance(queue, list):
+        return []
+    session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
+    chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+    out = []
+    for item in queue:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        sid = str(item.get("session_id") or item.get("sessionId") or meta.get("session_id") or "").strip()
+        ch = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or "")
+        if session_id and sid and sid != session_id:
+            continue
+        if chain and ch and ch != chain:
+            continue
+        out.append(item)
+    return out
+
+
+def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
+    """Backend-first Strategist-controlled Shadow runtime.
+
+    Shadow must behave like future Live execution without touching Vault/routes:
+      Market/Strategist-style decision -> queue state -> paper executor -> persisted events.
+
+    The runtime is intentionally deterministic and stateful in SQLite. It stores its
+    per-slot timing in meta_json so a browser refresh, mobile sleep or another device
+    cannot reset the paper lifecycle.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    action = str(action or "tick").strip().lower()
+    ts = now_ts()
+    tick_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
+    max_active = int(_clamp_float(cfg.get("shadow_active_slots", cfg.get("active_slots", os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1"))), 1, 1, 10))
+    ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", "2"))), 2, 1, 10))
+
+    execution = _nexus_execution_summary(cur, wallet_address)
+    queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
+    if not queue:
+        return {
+            "runtime_status": "idle",
+            "events": [{"type": "NO_QUEUE", "message": "No queue available for Shadow runtime."}],
+            "queue": [],
+            "changed": [],
+            "strategist": {"status": "idle", "reason": "No queue available."},
+        }
+
+    normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue)]
+
+    def slot_no(item, idx):
+        raw = str(item.get("slot") or item.get("slot_id") or idx + 1)
+        m = re.search(r"\d+", raw)
+        return int(m.group(0)) if m else idx + 1
+
+    def get_meta(item):
+        return dict(item.get("meta") if isinstance(item.get("meta"), dict) else {})
+
+    def set_meta(item, meta):
+        item["meta"] = meta if isinstance(meta, dict) else {}
+        return item
+
+    def set_state(item, new_state, reason, event_type="SHADOW_STATE"):
+        old = str(item.get("status") or item.get("state") or "WAIT").upper()
+        ns = str(new_state or old).upper()
+        item["status"] = item["state"] = ns
+        meta = get_meta(item)
+        if old != ns:
+            meta["shadow_state_entered_ts"] = ts
+            meta["shadow_last_transition_ts"] = ts
+        meta["shadow_last_decision_ts"] = ts
+        meta["shadow_runtime_status"] = "running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running")
+        set_meta(item, meta)
+        item["shadow_transition"] = {"from": old, "to": ns, "reason": reason}
+        return {"type": event_type, "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
+
+    # User controls must be immediate and authoritative.
+    if action == "pause":
+        events = []
+        for item in normalized:
+            st = str(item.get("status") or item.get("state") or "WAIT").upper()
+            if st == "ACTIVE":
+                events.append(set_state(item, "READY", "Shadow paused by user; paper-active slot returned to READY.", "SHADOW_PAUSED_SLOT"))
+        changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+        return {"runtime_status": "paused", "events": events or [{"type": "SHADOW_PAUSED", "message": "Shadow runtime paused."}], "queue": normalized, "changed": changed, "strategist": {"status": "paused"}}
+
+    if action == "stop":
+        events = []
+        for item in normalized:
+            st = str(item.get("status") or item.get("state") or "WAIT").upper()
+            if st in ("ACTIVE", "READY", "PROTECT", "SIMULATED_EXIT"):
+                events.append(set_state(item, "WAIT", "Shadow stopped by user; paper slot returned to WAIT.", "SHADOW_STOPPED_SLOT"))
+        changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+        return {"runtime_status": "stopped", "events": events or [{"type": "SHADOW_STOPPED", "message": "Shadow runtime stopped."}], "queue": normalized, "changed": changed, "strategist": {"status": "stopped"}}
+
+    latest = _nexus_shadow_latest_runtime(cur, wallet_address)
+    if action == "tick" and latest.get("status") == "paused":
+        return {"runtime_status": "paused", "events": [{"type": "SHADOW_PAUSED", "message": "Shadow runtime is paused."}], "queue": normalized, "changed": [], "strategist": {"status": "paused"}}
+
+    # Strategist scoring: quality is the brain input. Runtime only executes paper decisions.
+    scored = []
+    for idx, item in enumerate(normalized):
+        q = _nexus_shadow_slot_quality(item, cfg)
+        quality = _clamp_float(q.get("quality", item.get("priority", 0)), 0, -100, 100)
+        confidence = _clamp_float(q.get("confidence", item.get("confidence", item.get("confidence_score", 0))), 0, 0, 100)
+        risk = _clamp_float(q.get("risk_score", item.get("risk_score", 0)), 0, 0, 100)
+        item["priority"] = quality
+        item["confidence"] = item["confidence_score"] = confidence
+        item["risk_score"] = risk
+        scored.append({"idx": idx, "item": item, "quality": quality, "confidence": confidence, "risk": risk, "hard_block": bool(q.get("hard_block")), "slot_no": slot_no(item, idx)})
+
+    events = []
+    strategist_reason = []
+
+    # 1) Protect/block risky slots immediately.
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
+            continue
+        if row["hard_block"] or row["risk"] >= 70:
+            events.append(set_state(item, "HOLD", "Strategist detected hard risk/security/liquidity block; paper slot moves to HOLD.", "STRATEGIST_HOLD"))
+        elif row["risk"] >= 48:
+            events.append(set_state(item, "PROTECT", "Strategist detected elevated risk; paper slot moves to PROTECT.", "STRATEGIST_PROTECT"))
+
+    # 2) Close active paper slots after one runtime cycle or if quality deteriorates.
+    active_rows = []
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st != "ACTIVE":
+            continue
+        meta = get_meta(item)
+        entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
+        elapsed = max(0, ts - entered)
+        if elapsed >= tick_sec or row["quality"] < 28 or row["risk"] >= 40:
+            meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
+            meta["shadow_last_exit_ts"] = ts
+            set_meta(item, meta)
+            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate.", "SHADOW_PAPER_EXIT"))
+        else:
+            active_rows.append(row)
+
+    # 3) Keep only max_active active slots; demote extras by quality.
+    active_rows = [r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"]
+    if len(active_rows) > max_active:
+        active_rows.sort(key=lambda r: (r["quality"], r["confidence"]), reverse=True)
+        keep = {r["idx"] for r in active_rows[:max_active]}
+        for row in active_rows[max_active:]:
+            events.append(set_state(row["item"], "READY", "Strategist limited simultaneous paper-active slots; extra slot stays READY.", "STRATEGIST_READY"))
+
+    # 4) Promote best clean candidate if active capacity exists.
+    active_count = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
+    candidates = []
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st not in ("READY", "WAIT"):
+            continue
+        if row["hard_block"] or row["risk"] >= 48:
+            continue
+        # Require enough quality, but allow priority-driven demo/paper execution.
+        if row["quality"] >= 30 or row["confidence"] >= 50:
+            candidates.append(row)
+    candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
+
+    promoted = 0
+    for row in candidates:
+        if active_count >= max_active:
+            break
+        item = row["item"]
+        old = str(item.get("status") or item.get("state") or "WAIT").upper()
+        meta = get_meta(item)
+        meta["shadow_active_started_ts"] = ts
+        meta["shadow_state_entered_ts"] = ts
+        meta["shadow_runtime_status"] = "running"
+        meta["shadow_strategy"] = "quality_priority_rotation"
+        set_meta(item, meta)
+        events.append(set_state(item, "ACTIVE", "Strategist promoted the best clean slot to paper-active Shadow execution.", "SHADOW_ACTIVE"))
+        active_count += 1
+        promoted += 1
+
+    # 5) Mark next clean candidates READY and others WAIT. Avoid immediate re-entry for SIMULATED_EXIT in same tick.
+    active_ids = {id(r["item"]) for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"}
+    ready_candidates = []
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if id(item) in active_ids or st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT"):
+            continue
+        if st == "SIMULATED_EXIT":
+            # Show completed exit for one tick, then it can become WAIT/READY on next tick.
+            continue
+        if not row["hard_block"] and row["risk"] < 48 and (row["quality"] >= 25 or row["confidence"] >= 45):
+            ready_candidates.append(row)
+    ready_candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
+    ready_keep = {r["idx"] for r in ready_candidates[:max(0, ready_slots_target - active_count)]}
+
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st in ("ACTIVE", "HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT", "SIMULATED_EXIT"):
+            continue
+        if row["idx"] in ready_keep:
+            if st != "READY":
+                events.append(set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY"))
+            else:
+                set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY")
+        else:
+            if st != "WAIT":
+                events.append(set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT"))
+            else:
+                set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT")
+
+    # Sort by slot number for stable UI, not by updated_ts/priority.
+    normalized.sort(key=lambda item: slot_no(item, 0))
+
+    changed = _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+    if not events:
+        events.append({"type": "STRATEGIST_HOLD_DECISION", "message": "Strategist tick completed; current paper allocation remains valid."})
+
+    active_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "ACTIVE"])
+    ready_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "READY"])
+    exit_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "SIMULATED_EXIT"])
+    strategist = {
+        "status": "ok",
+        "driver": "shadow_strategist_runtime_v1",
+        "active_slots": active_count,
+        "ready_slots": ready_count,
+        "simulated_exits": exit_count,
+        "promoted": promoted,
+        "tick_sec": tick_sec,
+        "reason": "; ".join(strategist_reason) or "Strategist evaluated priority, confidence, risk and slot lifecycle.",
+    }
+    return {
+        "runtime_status": "running" if action in ("start", "resume", "tick") else action,
+        "events": events[:80],
+        "queue": normalized,
+        "changed": changed,
+        "active_count": active_count,
+        "ready_count": ready_count,
+        "simulated_exits": exit_count,
+        "promoted": promoted,
+        "tick_sec": tick_sec,
+        "strategist": strategist,
+    }
 
 
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
@@ -10316,12 +11004,15 @@ def api_nexus_shadow_executor():
         execution = _nexus_execution_summary(cur, wa)
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
+        runtime = _nexus_shadow_latest_runtime(cur, wa)
         conn.close()
         return jsonify({
             "status": "ok",
             "wallet": wa,
             "mode": "SHADOW_ONLY",
             "live_execution_triggered": False,
+            "runtime_status": runtime.get("status") or "idle",
+            "runtime": runtime.get("runtime") or {},
             "last_run": runs[0] if runs else None,
             "runs": runs,
             "execution": execution,
@@ -10331,6 +11022,7 @@ def api_nexus_shadow_executor():
 
     body = request.get_json(silent=True) or {}
     cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+    action = str(body.get("action") or cfg.get("action") or "validate").strip().lower()
     source = str(body.get("source") or "manual").strip()[:80]
 
     with DB_WRITE_LOCK:
@@ -10339,8 +11031,52 @@ def api_nexus_shadow_executor():
         execution = _nexus_execution_summary(cur, wa)
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
-        queue = body.get("queue") if isinstance(body.get("queue"), list) else execution.get("queue", [])
-        result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
+        body_queue = body.get("queue") if isinstance(body.get("queue"), list) else None
+        # Backend-first: an empty frontend queue must not override the persisted
+        # wallet/session queue. Otherwise Shadow buttons look broken and Test can
+        # clear/replace visible slots with an empty preview.
+        queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
+
+        if action in ("start", "tick", "pause", "resume", "stop"):
+            if action in ("start", "resume"):
+                # First run the validator once so sparse frontend queues are persisted before runtime starts.
+                seed = _nexus_shadow_executor_simulate(queue, {**cfg, "persist_state": True}, hold_state)
+                _nexus_shadow_persist_queue_preview(cur, wa, seed.get("queue") or [])
+            runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
+            result = {
+                "summary": {
+                    "shadow_only": True,
+                    "live_execution_triggered": False,
+                    "status": "paused" if action == "pause" else "stopped" if action == "stop" else "running",
+                    "runtime_status": runtime_result.get("runtime_status"),
+                    "runtime": {
+                        "status": runtime_result.get("runtime_status"),
+                        "action": action,
+                        "tick_sec": runtime_result.get("tick_sec"),
+                        "active_count": runtime_result.get("active_count", 0),
+                        "ready_count": runtime_result.get("ready_count", 0),
+                        "simulated_exits": runtime_result.get("simulated_exits", 0),
+                        "promoted": runtime_result.get("promoted", 0),
+                        "strategist": runtime_result.get("strategist") or {},
+                        "updated_ts": now_ts(),
+                    },
+                    "readiness": "SHADOW_RUNTIME_ACTIVE" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle").upper(),
+                    "message": "Shadow runtime updated paper execution state only. No Vault execution was triggered.",
+                },
+                "events": runtime_result.get("events") or [],
+                "queue": runtime_result.get("queue") or [],
+            }
+            shadow_state_changes = runtime_result.get("changed") or []
+        else:
+            result = _nexus_shadow_executor_simulate(queue, cfg, hold_state)
+            # One-shot validation/test must be read-only by default. It should show
+            # whether Shadow would work, but it must not rewrite the live-like paper
+            # runtime queue unless the caller explicitly asks for persist_state.
+            persist_shadow_state = bool(cfg.get("persist_state") is True)
+            if isinstance(result.get("summary"), dict):
+                result["summary"]["persist_state"] = persist_shadow_state
+            shadow_state_changes = _nexus_shadow_persist_queue_preview(cur, wa, result.get("queue") or []) if persist_shadow_state else []
+
         run_id = str(body.get("run_id") or ("NSH-" + uuid.uuid4().hex[:12].upper()))
         now_i = now_ts()
         cur.execute(
@@ -10357,7 +11093,7 @@ def api_nexus_shadow_executor():
                 json.dumps(result["summary"], ensure_ascii=False),
                 json.dumps(result["events"], ensure_ascii=False),
                 json.dumps(result["queue"], ensure_ascii=False),
-                json.dumps(cfg, ensure_ascii=False),
+                json.dumps({**cfg, "action": action}, ensure_ascii=False),
                 now_i,
                 now_i,
             ),
@@ -10367,11 +11103,11 @@ def api_nexus_shadow_executor():
             wa,
             "shadow_executor",
             "SHADOW",
-            "SHADOW_EXECUTOR_RUN",
+            "SHADOW_RUNTIME" if action in ("start", "tick", "pause", "resume", "stop") else "SHADOW_EXECUTOR_RUN",
             "",
             result["summary"].get("status") or "completed",
-            "Shadow Executor validation completed. No live Vault execution was triggered.",
-            {"run_id": run_id, "summary": result["summary"]},
+            "Shadow paper runtime updated. No live Vault execution was triggered.",
+            {"run_id": run_id, "summary": result["summary"], "shadow_state_changes": shadow_state_changes},
         )
         conn.commit()
         cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE run_id=? AND wallet_address=?", (run_id, wa))
@@ -10384,7 +11120,9 @@ def api_nexus_shadow_executor():
         "wallet": wa,
         "run": run,
         "execution": execution,
-        "message": "Shadow Executor simulated virtual fills/reallocation/stop-reentry only. No Vault execution was triggered.",
+        "shadow_state_changes": shadow_state_changes,
+        "runtime_status": (result.get("summary") or {}).get("runtime_status"),
+        "message": "Shadow runtime/paper execution updated. No Vault execution was triggered.",
         "ts": now_ts(),
     })
 
