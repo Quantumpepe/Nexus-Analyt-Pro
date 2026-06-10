@@ -12928,7 +12928,41 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         set_meta(item, meta)
         return ok_edge
 
-    # 4) Promote best clean candidate if active capacity exists.
+    # 4) Enforce Strategist allocation gate on already-active slots before any new promotion.
+    # This is the important fine-tuning: maxCombinedSlots is only an upper limit. In RED/Risk-Off,
+    # mediocre ACTIVE slots must be demoted instead of keeping 3 slots active just because the UI
+    # allowed combining up to 3. ACTIVE now means: still passes regime + edge + risk + cost gate.
+    active_rows_now = [r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"]
+    active_rows_now.sort(key=lambda r: (r["quality"], r["confidence"], -r["risk"]), reverse=True)
+    keep_active = set()
+    for r in active_rows_now:
+        if len(keep_active) >= max_active:
+            continue
+        if _shadow_cost_gate(r):
+            keep_active.add(r["idx"])
+    for r in active_rows_now:
+        if r["idx"] not in keep_active:
+            item = r["item"]
+            meta = get_meta(item)
+            meta["strategist_entry_allowed"] = False
+            meta["strategist_entry_reason"] = f"demoted_by_{regime.lower()}_regime_or_edge_cost_gate"
+            meta["strategist_market_regime"] = regime
+            set_meta(item, meta)
+            events.append(set_state(item, "READY", f"Strategist demoted ACTIVE slot: Market Regime={regime}, quality={r['quality']:.1f}, confidence={r['confidence']:.1f}, risk={r['risk']:.1f}; entry no longer clears edge/cost/risk gate.", "STRATEGIST_ACTIVE_DEMOTED"))
+
+    # Global wallet exposure guard. Each selected asset/session is evaluated locally, but in RED/Risk-Off
+    # Nexus must not let ETH+POL+BNB all run 3 ACTIVE slots at the same time. Other sessions will be
+    # demoted on their next tick; this guard also prevents this session from adding exposure while the
+    # wallet-level active count is already too high.
+    global_active_cap = int(_clamp_float(cfg.get("global_active_cap", cfg.get("globalActiveCap", os.getenv(f"NEXUS_SHADOW_GLOBAL_ACTIVE_CAP_{regime}", {"RED": "2", "NEUTRAL": "4", "GREEN": "7", "STRONG_GREEN": "10"}.get(regime, "4")))), 4, 1, 50))
+    try:
+        _execution_all = _nexus_execution_summary(cur, wallet_address)
+        _wallet_queue_all = _execution_all.get("queue", []) if isinstance(_execution_all, dict) else []
+        wallet_active_slots = len([_x for _x in (_wallet_queue_all if isinstance(_wallet_queue_all, list) else []) if str((_x or {}).get("status") or (_x or {}).get("state") or "WAIT").upper() == "ACTIVE"])
+    except Exception:
+        wallet_active_slots = len(keep_active)
+
+    # Promote best clean candidate if active capacity exists.
     active_count = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
     candidates = []
     for row in scored:
@@ -12946,6 +12980,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     promoted = 0
     for row in candidates:
         if active_count >= max_active:
+            break
+        if wallet_active_slots + promoted >= global_active_cap:
+            strategist_reason.append(f"Global exposure cap holds entries in {regime}: wallet active {wallet_active_slots + promoted}/{global_active_cap}.")
             break
         if used_trade_slots + promoted >= hard_trade_limit:
             strategist_reason.append(f"Hard trade limit reached: {used_trade_slots + promoted}/{hard_trade_limit}.")
@@ -13023,6 +13060,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "hard_trade_limit": hard_trade_limit,
         "paced_soft_allowed": paced_soft_allowed,
         "used_trade_slots": used_trade_slots,
+        "global_active_cap": global_active_cap,
+        "wallet_active_slots": wallet_active_slots,
         "elapsed_ratio": round(elapsed_ratio, 4),
         "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
@@ -13194,6 +13233,17 @@ def api_nexus_shadow_executor():
                 seed_queue = _nexus_shadow_filter_queue_for_cfg(queue, cfg) or queue
                 if seed_queue:
                     normalized_seed = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(seed_queue)]
+                    # User Start/Resume must not inherit old ACTIVE preview state.
+                    # The Strategist runtime gate below is the only place that may
+                    # promote slots into ACTIVE after regime/edge/cost/pacing checks.
+                    for _seed_item in normalized_seed:
+                        _st = str(_seed_item.get("status") or _seed_item.get("state") or "WAIT").upper()
+                        if _st == "ACTIVE":
+                            _seed_item["status"] = _seed_item["state"] = "READY"
+                            _meta = _seed_item.get("meta") if isinstance(_seed_item.get("meta"), dict) else {}
+                            _meta["shadow_transition"] = {"from": "ACTIVE", "to": "READY", "reason": "Start reset: Strategist must re-approve ACTIVE state."}
+                            _meta["strategist_entry_reason"] = "start_requires_regime_edge_cost_gate"
+                            _seed_item["meta"] = _meta
                     _nexus_shadow_persist_queue_preview(cur, wa, normalized_seed)
             runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
             result = {
