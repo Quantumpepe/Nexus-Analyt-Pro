@@ -734,7 +734,7 @@ def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | Non
     amt = max(0.0, _safe_float(amount_usd, 0.0))
     ck = _normalize_chain_key(chain or cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
 
-    default_gas = {"ETH": 3.00, "BNB": 0.15, "POL": 0.05}
+    default_gas = {"ETH": 1.50, "BNB": 1.00, "POL": 0.50}
     gas_usd = _safe_float(
         cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.50))))),
         default_gas.get(ck, 0.50),
@@ -11227,10 +11227,7 @@ def _nexus_reserve_capital(cur, wallet_address, body):
     )
     _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "CAPITAL_RESERVED", "", "RESERVED", reason, {"reservation_id": reservation_id, "amount_usd": amount})
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE reservation_id=? AND wallet_address=?", (reservation_id, wallet_address))
-    return _nexus_reservation_row_to_dict(cur.fetchone())
-
-
-@app.route("/api/nexus/trading/state", methods=["GET"])
+    return _nexus_reservation_row_to_dict(cur.fetchone())@app.route("/api/nexus/trading/state", methods=["GET"])
 def api_nexus_trading_state():
     wallet = (
         request.args.get("wallet")
@@ -12768,7 +12765,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total). Slot allocation: {rotation_mode}, donor cap {rotation_donor_cap}.")
         return True
 
-    cycle_recycled = recycle_completed_shadow_cycle()
+    allow_auto_recycle = str(cfg.get("auto_recycle", cfg.get("autoRecycle", os.getenv("NEXUS_SHADOW_AUTO_RECYCLE", "0")))).strip().lower() in ("1", "true", "yes", "on")
+    cycle_recycled = recycle_completed_shadow_cycle() if allow_auto_recycle else False
+    if not allow_auto_recycle:
+        strategist_reason.append("Auto-recycle disabled: completed paper cycles stay exited until a new Strategist entry decision is allowed.")
 
     # 1) Protect/block risky slots immediately.
     for row in scored:
@@ -12791,7 +12791,16 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta = get_meta(item)
         entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
         elapsed = max(0, ts - entered)
-        if elapsed >= tick_sec or row["quality"] < 28 or row["risk"] >= 40:
+        # Runtime time alone must never close a trade. Exit requires a Strategist risk/quality decision.
+        exit_due_to_quality = row["quality"] < 28
+        exit_due_to_risk = row["risk"] >= 40
+        meta_now = get_meta(item)
+        hard_stop_pct = abs(_clamp_float(cfg.get("hard_stop_pct", cfg.get("hardStopPct", meta_now.get("hard_stop_pct", meta_now.get("hardStopPct", 0)))), 0, 0, 100))
+        profit_lock_pct = abs(_clamp_float(cfg.get("profit_lock_pct", cfg.get("profitLockPct", meta_now.get("profit_lock_pct", meta_now.get("profitLockPct", 0)))), 0, 0, 100))
+        current_pnl_pct = _clamp_float(meta_now.get("paper_pnl_pct", 0), 0, -100, 100)
+        exit_due_to_hard_stop = hard_stop_pct > 0 and current_pnl_pct <= -hard_stop_pct
+        exit_due_to_profit_lock = profit_lock_pct > 0 and current_pnl_pct >= profit_lock_pct and row["quality"] < 45
+        if exit_due_to_quality or exit_due_to_risk or exit_due_to_hard_stop or exit_due_to_profit_lock:
             update_paper_accounting(item, row["quality"], force_exit=True)
             meta = get_meta(item)
             meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
@@ -12815,6 +12824,110 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         for row in active_rows[max_active:]:
             events.append(set_state(row["item"], "READY", "Strategist limited simultaneous paper-active slots; extra slot stays READY.", "STRATEGIST_READY"))
 
+    # Strategist capital-allocation gate: market regime, costs, trade pacing and slot combine rules.
+    def _shadow_session_started_ts():
+        vals = []
+        for it in normalized:
+            m = get_meta(it)
+            for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts", "shadow_active_started_ts", "paper_entry_ts"):
+                try:
+                    v = float(it.get(k) if it.get(k) is not None else m.get(k))
+                    if v > 10_000_000_000:
+                        v = v / 1000.0
+                    if v > 0:
+                        vals.append(int(v))
+                except Exception:
+                    pass
+        for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts"):
+            try:
+                v = float(cfg.get(k))
+                if v > 10_000_000_000:
+                    v = v / 1000.0
+                if v > 0:
+                    vals.append(int(v))
+            except Exception:
+                pass
+        return min(vals) if vals else ts
+
+    def _shadow_market_regime():
+        raw = str(
+            cfg.get("market_regime") or cfg.get("marketRegime") or cfg.get("regime") or
+            cfg.get("market_mode") or cfg.get("marketMode") or ""
+        ).strip().upper().replace("-", "_").replace(" ", "_")
+        alias = {
+            "RISK_OFF": "RED", "BEAR": "RED", "BEARISH": "RED", "RED_MARKET": "RED",
+            "RISK_ON": "GREEN", "BULL": "GREEN", "BULLISH": "GREEN", "GREEN_MARKET": "GREEN",
+            "STRONG_BULL": "STRONG_GREEN", "VERY_GREEN": "STRONG_GREEN", "STRONG_GREEN_MARKET": "STRONG_GREEN",
+        }
+        raw = alias.get(raw, raw)
+        if raw in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
+            return raw
+        avg_q = sum(r["quality"] for r in scored) / max(1, len(scored))
+        avg_r = sum(r["risk"] for r in scored) / max(1, len(scored))
+        if avg_r >= 48 or avg_q < 45:
+            return "RED"
+        if avg_q >= 82 and avg_r < 30:
+            return "STRONG_GREEN"
+        if avg_q >= 65 and avg_r < 40:
+            return "GREEN"
+        return "NEUTRAL"
+
+    regime = _shadow_market_regime()
+    regime_params = {
+        "RED": {"min_edge": 80, "risk_max": 28, "pace": 0.50, "active_cap": 1},
+        "NEUTRAL": {"min_edge": 70, "risk_max": 38, "pace": 1.00, "active_cap": min(max_active, 2)},
+        "GREEN": {"min_edge": 62, "risk_max": 45, "pace": 1.30, "active_cap": min(max_active, 3)},
+        "STRONG_GREEN": {"min_edge": 55, "risk_max": 48, "pace": 1.50, "active_cap": max_active},
+    }.get(regime, {"min_edge": 70, "risk_max": 38, "pace": 1.00, "active_cap": min(max_active, 2)})
+    max_active = min(max_active, int(regime_params.get("active_cap") or max_active))
+
+    max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
+    hard_trade_limit = int(_clamp_float(cfg.get("hard_trade_limit", cfg.get("hardTradeLimit", max_trades + 5)), max_trades + 5, max_trades, max_trades + 50))
+    runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
+    started_ts = _shadow_session_started_ts()
+    elapsed_ratio = max(0.0, min(1.0, (ts - started_ts) / max(1.0, runtime_hours * 3600.0)))
+    completed_trades = 0
+    for it in normalized:
+        m = get_meta(it)
+        completed_trades += int(_clamp_float(m.get("shadow_cycles", 0), 0, 0, 100000))
+    currently_active = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
+    used_trade_slots = completed_trades + currently_active
+    paced_soft_allowed = max(1, int(math.floor(elapsed_ratio * max_trades * float(regime_params.get("pace", 1.0)))))
+    best_quality = max([r["quality"] for r in scored], default=0)
+    if best_quality >= 85 and regime in ("GREEN", "STRONG_GREEN"):
+        # Strong early opportunity may start multiple slots, but never above max combined slots.
+        paced_soft_allowed = max(paced_soft_allowed, min(max_active, 3))
+    paced_hard_allowed = max(paced_soft_allowed, int(math.floor(elapsed_ratio * hard_trade_limit * float(regime_params.get("pace", 1.0)))))
+    if best_quality >= 90 and regime == "STRONG_GREEN":
+        paced_hard_allowed = max(paced_hard_allowed, min(hard_trade_limit, max_active))
+    remaining_soft_entries = max(0, paced_soft_allowed - used_trade_slots)
+    remaining_hard_entries = max(0, hard_trade_limit - used_trade_slots)
+
+    def _shadow_cost_gate(row):
+        item = row["item"]
+        meta = get_meta(item)
+        amount = _clamp_float(item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta.get("paper_position_usd", 0)))), 0, 0, 1_000_000_000)
+        cost = _nexus_shadow_cost_model(amount, item.get("chain") or meta.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
+        total_cost = _clamp_float(cost.get("total_cost_usd"), 0, 0, 1_000_000_000)
+        q = _clamp_float(row["quality"], 0, -100, 100)
+        risk = _clamp_float(row["risk"], 0, 0, 100)
+        confidence = _clamp_float(row["confidence"], 0, 0, 100)
+        min_edge = float(regime_params.get("min_edge", 70))
+        risk_max = float(regime_params.get("risk_max", 38))
+        expected_pct = max(0.0, ((q - 50.0) * 0.055) + ((confidence - 50.0) * 0.018) - (risk * 0.012))
+        expected_usd = amount * (expected_pct / 100.0)
+        cost_buffer = total_cost * (1.20 if regime in ("RED", "NEUTRAL") else 1.05)
+        ok_edge = q >= min_edge and risk <= risk_max and expected_usd > cost_buffer
+        meta["strategist_market_regime"] = regime
+        meta["strategist_expected_pct"] = round(expected_pct, 4)
+        meta["strategist_expected_usd"] = round(expected_usd, 4)
+        meta["strategist_cost_gate_usd"] = round(cost_buffer, 4)
+        meta["strategist_cost_model"] = cost
+        meta["strategist_entry_allowed"] = bool(ok_edge)
+        meta["strategist_entry_reason"] = "edge_after_cost_positive" if ok_edge else "wait_edge_after_cost_not_enough"
+        set_meta(item, meta)
+        return ok_edge
+
     # 4) Promote best clean candidate if active capacity exists.
     active_count = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
     candidates = []
@@ -12825,9 +12938,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             continue
         if row["hard_block"] or row["risk"] >= 48:
             continue
-        # Require clean quality/risk, but do not leave good READY capital idle.
-        # Strong markets may activate multiple slots up to max_active/maxCombinedSlots.
-        if row["quality"] >= 30 or row["confidence"] >= 50 or (row["quality"] >= 24 and row["risk"] < 35):
+        # Require positive net edge after estimated costs. Market regime controls aggressiveness.
+        if _shadow_cost_gate(row):
             candidates.append(row)
     candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
 
@@ -12835,6 +12947,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     for row in candidates:
         if active_count >= max_active:
             break
+        if used_trade_slots + promoted >= hard_trade_limit:
+            strategist_reason.append(f"Hard trade limit reached: {used_trade_slots + promoted}/{hard_trade_limit}.")
+            break
+        if promoted >= remaining_soft_entries:
+            # Tolerance entries are only allowed for very high quality in green regimes.
+            if not (remaining_hard_entries > promoted and regime in ("GREEN", "STRONG_GREEN") and row["quality"] >= 85 and row["confidence"] >= 75 and row["risk"] < 35):
+                strategist_reason.append(f"Trade pacing holds entries: elapsed {elapsed_ratio*100:.1f}%, allowed {paced_soft_allowed}/{max_trades}, used {used_trade_slots}.")
+                break
         item = row["item"]
         old = str(item.get("status") or item.get("state") or "WAIT").upper()
         meta = get_meta(item)
@@ -12843,7 +12963,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", "Strategist promoted a clean READY/WAIT slot to paper-active Shadow execution within the user max-combined-slots limit.", "SHADOW_ACTIVE"))
+        events.append(set_state(item, "ACTIVE", f"Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard.", "SHADOW_ACTIVE"))
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
@@ -12898,7 +13018,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "simulated_exits": exit_count,
         "promoted": promoted,
         "tick_sec": tick_sec,
-        "reason": "; ".join(strategist_reason) or "Strategist evaluated priority, confidence, risk and slot lifecycle.",
+        "market_regime": regime,
+        "max_trades": max_trades,
+        "hard_trade_limit": hard_trade_limit,
+        "paced_soft_allowed": paced_soft_allowed,
+        "used_trade_slots": used_trade_slots,
+        "elapsed_ratio": round(elapsed_ratio, 4),
+        "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
     return {
         "runtime_status": "running" if action in ("start", "resume", "tick") else action,
@@ -12926,6 +13052,7 @@ def api_nexus_shadow_executor():
             cur = conn.cursor()
             now_i = now_ts()
 
+            get_autotick_enabled = str(os.getenv("NEXUS_SHADOW_GET_AUTOTICK", "0")).strip().lower() in ("1", "true", "yes", "on")
             # Safe auto-tick: continue already-running sessions only.
             # It must never create a new session, never persist NO_QUEUE, and never delete/cleanup queues.
             cur.execute(
@@ -12934,7 +13061,7 @@ def api_nexus_shadow_executor():
             )
             recent_runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
             seen_runtime_keys = set()
-            for rr in recent_runs:
+            for rr in (recent_runs if get_autotick_enabled else []):
                 summary = rr.get("summary") if isinstance(rr.get("summary"), dict) else {}
                 runtime_meta = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
                 config = rr.get("config") if isinstance(rr.get("config"), dict) else {}
@@ -13062,11 +13189,12 @@ def api_nexus_shadow_executor():
                     str(cfg.get("session_id") or cfg.get("sessionId") or "").strip(),
                     _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or ""),
                 )
-                # First run the validator once so sparse frontend queues are persisted before runtime starts.
-                # Scope the seed to the selected session/chain. Never seed the whole wallet into one runtime.
+                # Start/resume must not create virtual fills before the Strategist gate.
+                # Persist only the existing selected queue shape; entries are opened by _nexus_shadow_runtime_tick() after edge/cost/pacing checks.
                 seed_queue = _nexus_shadow_filter_queue_for_cfg(queue, cfg) or queue
-                seed = _nexus_shadow_executor_simulate(seed_queue, {**cfg, "persist_state": True}, hold_state)
-                _nexus_shadow_persist_queue_preview(cur, wa, seed.get("queue") or [])
+                if seed_queue:
+                    normalized_seed = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(seed_queue)]
+                    _nexus_shadow_persist_queue_preview(cur, wa, normalized_seed)
             runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
             result = {
                 "summary": {
