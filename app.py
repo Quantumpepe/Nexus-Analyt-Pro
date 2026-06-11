@@ -12311,7 +12311,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     # all 5 slots to work when the Strategist sees enough edge, while still limiting
     # any single combined position to max_combined_slots.
     total_session_slots = max(1, len(normalized))
-    max_active_slot_units_source = (
+    # IMPORTANT: do not use legacy/combined-slot fields as an active-slot cap.
+    # Older runs may have persisted max_active_slot_units=3 because maxCombinedSlots was
+    # mistakenly treated as “max active slots”. For Nexus Trading this is wrong:
+    # all slot-units in the selected session may work independently; max_combined_slots
+    # only limits how many slot-units may be bundled into ONE position.
+    raw_max_active_slot_units_source = (
         cfg.get("max_active_slot_units")
         or cfg.get("maxActiveSlotUnits")
         or cfg.get("max_slots")
@@ -12321,17 +12326,32 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         or cfg.get("slotCount")
         or total_session_slots
     )
-    max_active = int(_clamp_float(max_active_slot_units_source, total_session_slots, 1, total_session_slots))
+    max_active = int(_clamp_float(raw_max_active_slot_units_source, total_session_slots, 1, total_session_slots))
+    legacy_combined_cap_leak = False
+    try:
+        raw_src_num = float(raw_max_active_slot_units_source)
+        legacy_combined_cap_leak = total_session_slots > max_combined_slots and int(raw_src_num) <= int(max_combined_slots)
+    except Exception:
+        legacy_combined_cap_leak = False
+    if legacy_combined_cap_leak:
+        # Treat stale/misused 3 as the old maxCombinedSlots leak, not as a true active-unit cap.
+        max_active = total_session_slots
+
     ready_slots_target = int(_clamp_float(
         cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max_active)))),
         max_active,
         0,
         total_session_slots,
     ))
+    if ready_slots_target <= max_combined_slots and total_session_slots > max_combined_slots:
+        # Same legacy leak protection for ready target. A 5-slot session should be able
+        # to keep all 5 candidates READY/ACTIVE; combined size is a different concept.
+        ready_slots_target = total_session_slots
 
     # Keep the raw values visible in downstream summaries/debugging.
     cfg["max_combined_slots"] = max_combined_slots
     cfg["max_active_slot_units"] = max_active
+    cfg["max_active_slot_units_scope"] = "session_slot_units_not_combined_cap"
 
     # Legacy migration: if frontend/backend selected a budget session but older queue
     # rows have no session id, stamp the in-memory runtime rows before persisting.
@@ -13039,12 +13059,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     # even after the time-pacing budget allowed entries and the market recovered.
     # RED/Risk-Off is not a trading ban; it requires smaller, cleaner rebound-style entries.
     regime_params = {
-        "RED": {"min_edge": 58, "risk_max": 42, "pace": 0.75, "active_cap": 1},
-        "NEUTRAL": {"min_edge": 52, "risk_max": 45, "pace": 1.00, "active_cap": min(max_active, 2)},
-        "GREEN": {"min_edge": 48, "risk_max": 50, "pace": 1.30, "active_cap": min(max_active, 3)},
-        "STRONG_GREEN": {"min_edge": 45, "risk_max": 55, "pace": 1.50, "active_cap": max_active},
-    }.get(regime, {"min_edge": 52, "risk_max": 45, "pace": 1.00, "active_cap": min(max_active, 2)})
-    max_active = min(max_active, int(regime_params.get("active_cap") or max_active))
+        # Regime controls edge/risk thresholds and pacing only. It must NOT turn
+        # max_combined_slots into a hard active-slot limit. A RED market can make
+        # entries rarer/cleaner, but active capacity remains the selected session's
+        # slot-unit capacity.
+        "RED": {"min_edge": 58, "risk_max": 42, "pace": 0.75},
+        "NEUTRAL": {"min_edge": 52, "risk_max": 45, "pace": 1.00},
+        "GREEN": {"min_edge": 48, "risk_max": 50, "pace": 1.30},
+        "STRONG_GREEN": {"min_edge": 45, "risk_max": 55, "pace": 1.50},
+    }.get(regime, {"min_edge": 52, "risk_max": 45, "pace": 1.00})
 
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
     hard_trade_limit = int(_clamp_float(cfg.get("hard_trade_limit", cfg.get("hardTradeLimit", max_trades + 5)), max_trades + 5, max_trades, max_trades + 50))
@@ -13060,8 +13083,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     paced_soft_allowed = max(1, int(math.floor(elapsed_ratio * max_trades * float(regime_params.get("pace", 1.0)))))
     best_quality = max([r["quality"] for r in scored], default=0)
     if best_quality >= 85 and regime in ("GREEN", "STRONG_GREEN"):
-        # Strong early opportunity may start multiple slots, but never above max combined slots.
-        paced_soft_allowed = max(paced_soft_allowed, min(max_active, 3))
+        # Strong early opportunity may start multiple slot-units, but never above
+        # the session's active slot-unit capacity. max_combined_slots is only the
+        # maximum bundle size of one position and must not cap active entries.
+        paced_soft_allowed = max(paced_soft_allowed, max_active)
     paced_hard_allowed = max(paced_soft_allowed, int(math.floor(elapsed_ratio * hard_trade_limit * float(regime_params.get("pace", 1.0)))))
     if best_quality >= 90 and regime == "STRONG_GREEN":
         paced_hard_allowed = max(paced_hard_allowed, min(hard_trade_limit, max_active))
@@ -13084,7 +13109,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # - READY slots around q=52-58 should be able to start when risk is controlled
         #   and time-pacing allows it; otherwise the Strategist can stay stuck forever.
         # - RED/Risk-Off adds a small rebound opportunity bonus for clean, oversold-style
-        #   slots, but still keeps only one active slot by regime active_cap.
+        #   slots. Regime does not cap active slot-units; pacing and edge/risk do.
         base_expected_pct = ((q - 45.0) * 0.11) + ((confidence - 45.0) * 0.035) - (risk * 0.010)
         rebound_bonus_pct = 0.0
         if regime == "RED" and q >= 55 and confidence >= 45 and risk <= risk_max:
