@@ -12873,12 +12873,16 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         return "NEUTRAL"
 
     regime = _shadow_market_regime()
+    # Entry thresholds are intentionally realistic for Shadow trading.
+    # The previous values were too strict: slots became READY, but almost never ACTIVE,
+    # even after the time-pacing budget allowed entries and the market recovered.
+    # RED/Risk-Off is not a trading ban; it requires smaller, cleaner rebound-style entries.
     regime_params = {
-        "RED": {"min_edge": 80, "risk_max": 28, "pace": 0.50, "active_cap": 1},
-        "NEUTRAL": {"min_edge": 70, "risk_max": 38, "pace": 1.00, "active_cap": min(max_active, 2)},
-        "GREEN": {"min_edge": 62, "risk_max": 45, "pace": 1.30, "active_cap": min(max_active, 3)},
-        "STRONG_GREEN": {"min_edge": 55, "risk_max": 48, "pace": 1.50, "active_cap": max_active},
-    }.get(regime, {"min_edge": 70, "risk_max": 38, "pace": 1.00, "active_cap": min(max_active, 2)})
+        "RED": {"min_edge": 58, "risk_max": 42, "pace": 0.75, "active_cap": 1},
+        "NEUTRAL": {"min_edge": 52, "risk_max": 45, "pace": 1.00, "active_cap": min(max_active, 2)},
+        "GREEN": {"min_edge": 48, "risk_max": 50, "pace": 1.30, "active_cap": min(max_active, 3)},
+        "STRONG_GREEN": {"min_edge": 45, "risk_max": 55, "pace": 1.50, "active_cap": max_active},
+    }.get(regime, {"min_edge": 52, "risk_max": 45, "pace": 1.00, "active_cap": min(max_active, 2)})
     max_active = min(max_active, int(regime_params.get("active_cap") or max_active))
 
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
@@ -12914,17 +12918,55 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         confidence = _clamp_float(row["confidence"], 0, 0, 100)
         min_edge = float(regime_params.get("min_edge", 70))
         risk_max = float(regime_params.get("risk_max", 38))
-        expected_pct = max(0.0, ((q - 50.0) * 0.055) + ((confidence - 50.0) * 0.018) - (risk * 0.012))
+        # Expected move model:
+        # - Use a more realistic paper expectation for short-term opportunities.
+        # - READY slots around q=52-58 should be able to start when risk is controlled
+        #   and time-pacing allows it; otherwise the Strategist can stay stuck forever.
+        # - RED/Risk-Off adds a small rebound opportunity bonus for clean, oversold-style
+        #   slots, but still keeps only one active slot by regime active_cap.
+        base_expected_pct = ((q - 45.0) * 0.11) + ((confidence - 45.0) * 0.035) - (risk * 0.010)
+        rebound_bonus_pct = 0.0
+        if regime == "RED" and q >= 55 and confidence >= 45 and risk <= risk_max:
+            rebound_bonus_pct = 0.35
+        elif regime == "NEUTRAL" and q >= 52 and confidence >= 45 and risk <= risk_max:
+            rebound_bonus_pct = 0.20
+        expected_pct = max(0.0, base_expected_pct + rebound_bonus_pct)
         expected_usd = amount * (expected_pct / 100.0)
-        cost_buffer = total_cost * (1.20 if regime in ("RED", "NEUTRAL") else 1.05)
-        ok_edge = q >= min_edge and risk <= risk_max and expected_usd > cost_buffer
+
+        # Shadow cost gate should protect against noise, not block every small setup.
+        # Use a lighter buffer for RED/NEUTRAL so controlled rebound entries can start.
+        cost_buffer = total_cost * (1.05 if regime in ("RED", "NEUTRAL") else 1.00)
+
+        edge_ok = q >= min_edge
+        risk_ok = risk <= risk_max
+        cost_ok = expected_usd > cost_buffer
+
+        # Safety fallback: if costs are zero/missing in Shadow and the score/risk gate is clean,
+        # do not require a synthetic cost advantage that cannot be calculated.
+        if total_cost <= 0 and edge_ok and risk_ok and expected_pct >= 0.25:
+            cost_ok = True
+
+        ok_edge = edge_ok and risk_ok and cost_ok
+        if ok_edge:
+            reason = "edge_after_cost_positive"
+        elif not edge_ok:
+            reason = f"wait_edge_below_{min_edge:g}"
+        elif not risk_ok:
+            reason = f"wait_risk_above_{risk_max:g}"
+        else:
+            reason = "wait_expected_move_below_cost_buffer"
+
         meta["strategist_market_regime"] = regime
+        meta["strategist_min_edge"] = round(min_edge, 4)
+        meta["strategist_risk_max"] = round(risk_max, 4)
+        meta["strategist_base_expected_pct"] = round(base_expected_pct, 4)
+        meta["strategist_rebound_bonus_pct"] = round(rebound_bonus_pct, 4)
         meta["strategist_expected_pct"] = round(expected_pct, 4)
         meta["strategist_expected_usd"] = round(expected_usd, 4)
         meta["strategist_cost_gate_usd"] = round(cost_buffer, 4)
         meta["strategist_cost_model"] = cost
         meta["strategist_entry_allowed"] = bool(ok_edge)
-        meta["strategist_entry_reason"] = "edge_after_cost_positive" if ok_edge else "wait_edge_after_cost_not_enough"
+        meta["strategist_entry_reason"] = reason
         set_meta(item, meta)
         return ok_edge
 
