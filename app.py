@@ -1,4 +1,4 @@
-# backend1/app.py
+# backend/app.py
 from __future__ import annotations
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
@@ -11227,7 +11227,9 @@ def _nexus_reserve_capital(cur, wallet_address, body):
     )
     _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "CAPITAL_RESERVED", "", "RESERVED", reason, {"reservation_id": reservation_id, "amount_usd": amount})
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE reservation_id=? AND wallet_address=?", (reservation_id, wallet_address))
-    return _nexus_reservation_row_to_dict(cur.fetchone())@app.route("/api/nexus/trading/state", methods=["GET"])
+    return _nexus_reservation_row_to_dict(cur.fetchone())
+
+@app.route("/api/nexus/trading/state", methods=["GET"])
 def api_nexus_trading_state():
     wallet = (
         request.args.get("wallet")
