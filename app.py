@@ -12880,26 +12880,128 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         return min(vals) if vals else ts
 
     def _shadow_market_regime():
-        raw = str(
-            cfg.get("market_regime") or cfg.get("marketRegime") or cfg.get("regime") or
-            cfg.get("market_mode") or cfg.get("marketMode") or ""
-        ).strip().upper().replace("-", "_").replace(" ", "_")
+        """Classify global market regime from market-wide context only.
+
+        Do not infer STRONG_GREEN from per-slot quality. Slot scores are entry
+        inputs; they are not the market regime. This prevents feedback loops where
+        good ETH/BNB/POL slots make the whole market look aggressively green even
+        when dashboard context is only neutral, e.g. Market Risk 56/100, Breadth 38%,
+        MCap +0.60%.
+        """
         alias = {
             "RISK_OFF": "RED", "BEAR": "RED", "BEARISH": "RED", "RED_MARKET": "RED",
             "RISK_ON": "GREEN", "BULL": "GREEN", "BULLISH": "GREEN", "GREEN_MARKET": "GREEN",
             "STRONG_BULL": "STRONG_GREEN", "VERY_GREEN": "STRONG_GREEN", "STRONG_GREEN_MARKET": "STRONG_GREEN",
         }
-        raw = alias.get(raw, raw)
-        if raw in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
-            return raw
-        avg_q = sum(r["quality"] for r in scored) / max(1, len(scored))
-        avg_r = sum(r["risk"] for r in scored) / max(1, len(scored))
-        if avg_r >= 48 or avg_q < 45:
+
+        def _norm_regime(v):
+            r = str(v or "").strip().upper().replace("-", "_").replace(" ", "_")
+            return alias.get(r, r)
+
+        def _iter_contexts():
+            if isinstance(cfg, dict):
+                yield cfg
+                for key in (
+                    "market", "market_context", "marketContext", "global_market", "globalMarket",
+                    "market_risk", "marketRisk", "market_state", "marketState",
+                ):
+                    obj = cfg.get(key)
+                    if isinstance(obj, dict):
+                        yield obj
+            for it in normalized if isinstance(normalized, list) else []:
+                if not isinstance(it, dict):
+                    continue
+                yield it
+                m = get_meta(it)
+                if isinstance(m, dict):
+                    yield m
+                    for key in (
+                        "market", "market_context", "marketContext", "global_market", "globalMarket",
+                        "market_risk", "marketRisk", "market_state", "marketState",
+                    ):
+                        obj = m.get(key)
+                        if isinstance(obj, dict):
+                            yield obj
+
+        def _first_number(keys):
+            for obj in _iter_contexts():
+                if not isinstance(obj, dict):
+                    continue
+                for k in keys:
+                    if k not in obj:
+                        continue
+                    try:
+                        n = float(obj.get(k))
+                        if math.isfinite(n):
+                            return n
+                    except Exception:
+                        pass
+            return None
+
+        def _first_regime():
+            for obj in _iter_contexts():
+                if not isinstance(obj, dict):
+                    continue
+                for k in ("market_regime", "marketRegime", "regime", "market_mode", "marketMode", "phase"):
+                    r = _norm_regime(obj.get(k))
+                    if r in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
+                        return r
+            return ""
+
+        explicit = _first_regime()
+        market_score = _first_number([
+            "market_score", "marketScore", "risk_on_score", "riskOnScore",
+            "market_risk_score", "marketRiskScore", "market_risk", "marketRisk",
+            "risk_score", "riskScore",
+        ])
+        breadth = _first_number([
+            "breadth", "breadth_pct", "breadthPct", "market_breadth", "marketBreadth",
+            "green_breadth", "greenBreadth", "positive_breadth", "positiveBreadth",
+        ])
+        mcap = _first_number([
+            "mcap_change_pct", "mcapChangePct", "market_cap_change_pct", "marketCapChangePct",
+            "global_mcap_change_pct", "globalMcapChangePct", "mcap_pct", "mcapPct",
+            "total_market_cap_change_pct", "totalMarketCapChangePct", "market_change_pct", "marketChangePct",
+            "change24h", "change_24h", "market_change_24h", "marketChange24h",
+        ])
+        liq = _first_number([
+            "vol_cap", "volCap", "volume_cap", "volumeCap", "volume_to_mcap", "volumeToMcap",
+            "liquidity_score", "liquidityScore",
+        ])
+
+        has_market_inputs = any(v is not None for v in (market_score, breadth, mcap, liq))
+        if not has_market_inputs:
+            return explicit if explicit in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN") else "NEUTRAL"
+
+        score = float(market_score) if market_score is not None else 50.0
+        br = float(breadth) if breadth is not None else 50.0
+        mc = float(mcap) if mcap is not None else 0.0
+        liquidity = float(liq) if liq is not None else 50.0
+
+        # Normalize values that may arrive as fractions instead of percentages.
+        if 0 <= br <= 1:
+            br *= 100.0
+        if -1 <= mc <= 1 and abs(mc) < 0.20:
+            mc *= 100.0
+
+        if score < 35 or mc <= -1.0 or br <= 30:
             return "RED"
-        if avg_q >= 82 and avg_r < 30:
+
+        # Strong green must be broad and confirmed. Example: score 56, breadth 38,
+        # mcap +0.60 is NOT strong green; it is neutral / mild-green at most.
+        if score >= 75 and br >= 60 and mc >= 1.5 and liquidity >= 45:
             return "STRONG_GREEN"
-        if avg_q >= 65 and avg_r < 40:
+
+        if score >= 60 and br >= 45 and mc >= 0.3:
             return "GREEN"
+
+        # Explicit external regime can only upgrade to GREEN if metrics do not contradict it.
+        # It cannot force STRONG_GREEN without breadth/MCap confirmation.
+        if explicit == "GREEN" and br >= 40 and mc >= 0:
+            return "GREEN"
+        if explicit == "RED" and (score < 50 or mc < 0 or br < 45):
+            return "RED"
+
         return "NEUTRAL"
 
     regime = _shadow_market_regime()
