@@ -12279,19 +12279,19 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     action = str(action or "tick").strip().lower()
     ts = now_ts()
     tick_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
-    # User-defined Max Combined Slots is the hard ceiling for simultaneous paper-active slots.
-    # If the user allows 3 or 5 combined slots and quality/risk are clean, Shadow may use them.
+    # IMPORTANT: Max Combined Slots is NOT the same as max active slots.
+    # max_combined_slots means: how many slot-units may be bundled into ONE position.
+    # It must not cap the number of active slot-units in this session.
+    # Example with 5 slots and max_combined_slots=3:
+    #   Position A may use Slot 1+2+3, while Slot 4 and Slot 5 may still run separately.
     max_combined_source = (
         cfg.get("max_combined_slots")
         or cfg.get("maxCombinedSlots")
         or cfg.get("slot_donor_cap")
         or cfg.get("slotDonorCap")
-        or cfg.get("shadow_active_slots")
-        or cfg.get("active_slots")
-        or os.getenv("NEXUS_SHADOW_ACTIVE_SLOTS", "1")
+        or 3
     )
-    max_active = int(_clamp_float(max_combined_source, 1, 1, 10))
-    ready_slots_target = int(_clamp_float(cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max(2, max_active))))), max(2, max_active), 1, 10))
+    max_combined_slots = int(_clamp_float(max_combined_source, 3, 1, 10))
 
     execution = _nexus_execution_summary(cur, wallet_address)
     queue = _nexus_shadow_filter_queue_for_cfg(execution.get("queue", []), cfg)
@@ -12305,6 +12305,33 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         }
 
     normalized = [_shadow_normalize_queue_item(x, i) for i, x in enumerate(queue)]
+
+    # Session active slot-units are capped by the available slots (or explicit override),
+    # not by max_combined_slots. This keeps every EVM session independent and allows
+    # all 5 slots to work when the Strategist sees enough edge, while still limiting
+    # any single combined position to max_combined_slots.
+    total_session_slots = max(1, len(normalized))
+    max_active_slot_units_source = (
+        cfg.get("max_active_slot_units")
+        or cfg.get("maxActiveSlotUnits")
+        or cfg.get("max_slots")
+        or cfg.get("maxSlots")
+        or cfg.get("slots")
+        or cfg.get("slot_count")
+        or cfg.get("slotCount")
+        or total_session_slots
+    )
+    max_active = int(_clamp_float(max_active_slot_units_source, total_session_slots, 1, total_session_slots))
+    ready_slots_target = int(_clamp_float(
+        cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max_active)))),
+        max_active,
+        0,
+        total_session_slots,
+    ))
+
+    # Keep the raw values visible in downstream summaries/debugging.
+    cfg["max_combined_slots"] = max_combined_slots
+    cfg["max_active_slot_units"] = max_active
 
     # Legacy migration: if frontend/backend selected a budget session but older queue
     # rows have no session id, stamp the in-memory runtime rows before persisting.
@@ -13126,13 +13153,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             set_meta(item, meta)
             events.append(set_state(item, "READY", f"Strategist demoted ACTIVE slot: Market Regime={regime}, quality={r['quality']:.1f}, confidence={r['confidence']:.1f}, risk={r['risk']:.1f}; entry no longer clears edge/cost/risk gate.", "STRATEGIST_ACTIVE_DEMOTED"))
 
-    # Session-local slot guard.
-    # IMPORTANT: maxCombinedSlots/max_active belongs to the selected Trading session
-    # (for example ETH 5 slots, BNB 5 slots, POL 5 slots), not to the whole wallet.
-    # Older fine-tuning used a wallet-level global_active_cap. That made ETH's 3 ACTIVE
-    # slots block BNB/POL even when those sessions had their own independent budget and
-    # clean READY slots. Cross-chain capital allocation belongs to the later NKR layer;
-    # this Shadow runtime must only enforce the selected session's own max_active limit.
+    # Session-local slot-unit guard.
+    # IMPORTANT: max_combined_slots only limits how many slot-units may be bundled
+    # into one combined position. It does NOT limit total active slot-units.
+    # Total active slot-units are capped by max_active_slot_units / total session slots.
+    # Cross-chain/global capital allocation belongs to the later NKR layer.
     global_active_cap = None
     wallet_active_slots = len(keep_active)
 
@@ -13235,7 +13260,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "used_trade_slots": used_trade_slots,
         "global_active_cap": global_active_cap,
         "wallet_active_slots": wallet_active_slots,
-        "slot_scope": "session_local",
+        "max_combined_slots": max_combined_slots,
+        "max_active_slot_units": max_active,
+        "total_session_slots": total_session_slots,
+        "slot_scope": "session_local_slot_units",
         "elapsed_ratio": round(elapsed_ratio, 4),
         "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
