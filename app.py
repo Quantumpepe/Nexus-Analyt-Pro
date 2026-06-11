@@ -12994,17 +12994,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             set_meta(item, meta)
             events.append(set_state(item, "READY", f"Strategist demoted ACTIVE slot: Market Regime={regime}, quality={r['quality']:.1f}, confidence={r['confidence']:.1f}, risk={r['risk']:.1f}; entry no longer clears edge/cost/risk gate.", "STRATEGIST_ACTIVE_DEMOTED"))
 
-    # Global wallet exposure guard. Each selected asset/session is evaluated locally, but in RED/Risk-Off
-    # Nexus must not let ETH+POL+BNB all run 3 ACTIVE slots at the same time. Other sessions will be
-    # demoted on their next tick; this guard also prevents this session from adding exposure while the
-    # wallet-level active count is already too high.
-    global_active_cap = int(_clamp_float(cfg.get("global_active_cap", cfg.get("globalActiveCap", os.getenv(f"NEXUS_SHADOW_GLOBAL_ACTIVE_CAP_{regime}", {"RED": "2", "NEUTRAL": "4", "GREEN": "7", "STRONG_GREEN": "10"}.get(regime, "4")))), 4, 1, 50))
-    try:
-        _execution_all = _nexus_execution_summary(cur, wallet_address)
-        _wallet_queue_all = _execution_all.get("queue", []) if isinstance(_execution_all, dict) else []
-        wallet_active_slots = len([_x for _x in (_wallet_queue_all if isinstance(_wallet_queue_all, list) else []) if str((_x or {}).get("status") or (_x or {}).get("state") or "WAIT").upper() == "ACTIVE"])
-    except Exception:
-        wallet_active_slots = len(keep_active)
+    # Session-local slot guard.
+    # IMPORTANT: maxCombinedSlots/max_active belongs to the selected Trading session
+    # (for example ETH 5 slots, BNB 5 slots, POL 5 slots), not to the whole wallet.
+    # Older fine-tuning used a wallet-level global_active_cap. That made ETH's 3 ACTIVE
+    # slots block BNB/POL even when those sessions had their own independent budget and
+    # clean READY slots. Cross-chain capital allocation belongs to the later NKR layer;
+    # this Shadow runtime must only enforce the selected session's own max_active limit.
+    global_active_cap = None
+    wallet_active_slots = len(keep_active)
 
     # Promote best clean candidate if active capacity exists.
     active_count = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
@@ -13025,9 +13023,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     for row in candidates:
         if active_count >= max_active:
             break
-        if wallet_active_slots + promoted >= global_active_cap:
-            strategist_reason.append(f"Global exposure cap holds entries in {regime}: wallet active {wallet_active_slots + promoted}/{global_active_cap}.")
-            break
+        # Do not block this session because another ETH/BNB/POL session is already active.
+        # Per-session capacity is enforced by active_count >= max_active above.
         if used_trade_slots + promoted >= hard_trade_limit:
             strategist_reason.append(f"Hard trade limit reached: {used_trade_slots + promoted}/{hard_trade_limit}.")
             break
@@ -13106,6 +13103,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "used_trade_slots": used_trade_slots,
         "global_active_cap": global_active_cap,
         "wallet_active_slots": wallet_active_slots,
+        "slot_scope": "session_local",
         "elapsed_ratio": round(elapsed_ratio, 4),
         "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
