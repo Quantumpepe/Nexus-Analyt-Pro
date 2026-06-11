@@ -12899,29 +12899,22 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             return alias.get(r, r)
 
         def _iter_contexts():
+            # IMPORTANT: market regime must come only from real market-wide context.
+            # Do NOT inspect normalized slot rows or per-slot meta here. Those rows
+            # contain fields like priority/risk_score/market_regime copied from old
+            # Shadow decisions. Reading them here creates feedback loops where good
+            # slot scores or a stale STRONG_GREEN meta value become the global market.
             if isinstance(cfg, dict):
                 yield cfg
                 for key in (
                     "market", "market_context", "marketContext", "global_market", "globalMarket",
                     "market_risk", "marketRisk", "market_state", "marketState",
+                    "volatility_pulse", "volatilityPulse", "liquidity", "liquidity_context",
+                    "liquidityContext", "dominance", "dominance_context", "dominanceContext",
                 ):
                     obj = cfg.get(key)
                     if isinstance(obj, dict):
                         yield obj
-            for it in normalized if isinstance(normalized, list) else []:
-                if not isinstance(it, dict):
-                    continue
-                yield it
-                m = get_meta(it)
-                if isinstance(m, dict):
-                    yield m
-                    for key in (
-                        "market", "market_context", "marketContext", "global_market", "globalMarket",
-                        "market_risk", "marketRisk", "market_state", "marketState",
-                    ):
-                        obj = m.get(key)
-                        if isinstance(obj, dict):
-                            yield obj
 
         def _first_number(keys):
             for obj in _iter_contexts():
@@ -12971,7 +12964,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
         has_market_inputs = any(v is not None for v in (market_score, breadth, mcap, liq))
         if not has_market_inputs:
-            return explicit if explicit in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN") else "NEUTRAL"
+            # Never trust a stale explicit STRONG_GREEN without fresh market metrics.
+            if explicit in ("RED", "NEUTRAL", "GREEN"):
+                return explicit
+            if explicit == "STRONG_GREEN":
+                return "GREEN"
+            return "NEUTRAL"
 
         score = float(market_score) if market_score is not None else 50.0
         br = float(breadth) if breadth is not None else 50.0
@@ -12999,6 +12997,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # It cannot force STRONG_GREEN without breadth/MCap confirmation.
         if explicit == "GREEN" and br >= 40 and mc >= 0:
             return "GREEN"
+        if explicit == "STRONG_GREEN":
+            # Explicit STRONG_GREEN may only downgrade to GREEN unless the hard
+            # strong-green confirmation above is actually met.
+            return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
         if explicit == "RED" and (score < 50 or mc < 0 or br < 45):
             return "RED"
 
