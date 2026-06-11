@@ -11047,14 +11047,37 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
 
 def _nexus_recheck_apply(cur, wallet_address):
     ts = now_ts()
-    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 20", (wallet_address, ts))
+    cur.execute("SELECT * FROM nexus_execution_queue WHERE wallet_address=? AND state IN ('WAIT','READY','ACTIVE','PROTECT','EXIT_RISK','HOLD','OBSERVE') AND (recheck_after_ts IS NULL OR recheck_after_ts <= ?) ORDER BY priority DESC, updated_ts ASC LIMIT 80", (wallet_address, ts))
     changed = []
-    active_like = 0
+
+    # IMPORTANT: READY/ACTIVE caps must be scoped per independent Trading session/chain.
+    # The old implementation used one wallet-global counter (`active_like`). That meant
+    # ETH/BNB/POL could block each other during scheduled rechecks: after a few high-priority
+    # rows were marked READY/ACTIVE, later EVM sessions were forced back to WAIT even with
+    # score/quality 90-100. Max ready/combined rules are session-local; cross-chain allocation
+    # belongs to the later NKR layer.
     max_shadow_ready = int(os.getenv("NEXUS_SHADOW_MAX_READY_SLOTS", "6"))
+    ready_like_by_scope = {}
+
+    def _recheck_scope_key(item: dict) -> str:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        session_id = str(
+            item.get("session_id") or item.get("sessionId") or item.get("trade_session_id")
+            or meta.get("session_id") or meta.get("trade_session_id") or ""
+        ).strip()
+        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or meta.get("chain") or "")
+        asset = str(item.get("asset") or item.get("symbol") or meta.get("asset") or "").strip().upper()
+        # Prefer explicit session+chain. Asset fallback keeps legacy rows from different EVMs separate.
+        if session_id:
+            return f"sid:{session_id}|chain:{chain or 'NO_CHAIN'}"
+        return f"legacy|chain:{chain or 'NO_CHAIN'}|asset:{asset or 'NO_ASSET'}"
 
     for row in cur.fetchall():
         item = _nexus_queue_row_to_dict(row)
         old_state = str(item.get("state") or "WAIT").upper()
+        scope_key = _recheck_scope_key(item)
+        scope_count = int(ready_like_by_scope.get(scope_key, 0))
+
         quality = _nexus_shadow_slot_quality(item, {"risk_mode": "BALANCED"})
         decision = _nexus_trading_decide_slot({
             "status": old_state,
@@ -11081,25 +11104,30 @@ def _nexus_recheck_apply(cur, wallet_address):
             new_state = "PROTECT"
             reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
         elif old_state in ("WAIT", "OBSERVE", "READY"):
-            # Recheck should mirror Shadow behavior: a clean prepared slot may become
-            # READY even when explicit confidence is missing, as long as priority/quality
-            # and risk are acceptable. This is still preparation-only, no Vault execution.
-            if (
+            clean_enough = (
                 (quality.get("confidence", 0) >= 50 and quality.get("quality", 0) >= 30)
                 or quality.get("quality", 0) >= 38
-            ) and active_like < max_shadow_ready:
+            )
+            if clean_enough and scope_count < max_shadow_ready:
                 new_state = "READY"
-                active_like += 1
-                reason = "Shadow recheck promoted this slot to READY based on priority, quality and controlled risk."
+                ready_like_by_scope[scope_key] = scope_count + 1
+                reason = "Shadow recheck promoted this slot to READY within its own session based on priority, quality and controlled risk."
             else:
                 new_state = "WAIT"
-                reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
+                if clean_enough:
+                    reason = f"Shadow recheck kept this slot in WAIT because this session already has {scope_count}/{max_shadow_ready} ready/active candidates."
+                else:
+                    reason = "Shadow recheck kept this slot in WAIT; quality is not clean enough yet."
         elif old_state == "PROTECT" and quality.get("risk_score", 0) < 35 and quality.get("quality", 0) >= 35:
-            new_state = "READY"
-            active_like += 1
-            reason = "Risk normalized; Shadow recheck returned this slot to READY."
+            if scope_count < max_shadow_ready:
+                new_state = "READY"
+                ready_like_by_scope[scope_key] = scope_count + 1
+                reason = "Risk normalized; Shadow recheck returned this slot to READY within its own session."
+            else:
+                new_state = "WAIT"
+                reason = f"Risk normalized, but this session already has {scope_count}/{max_shadow_ready} ready/active candidates."
         elif old_state == "ACTIVE":
-            active_like += 1
+            ready_like_by_scope[scope_key] = scope_count + 1
 
         if new_state not in _NEXUS_EXEC_ALLOWED_STATES:
             new_state = old_state
@@ -11109,8 +11137,8 @@ def _nexus_recheck_apply(cur, wallet_address):
             (new_state, quality.get("quality", item.get("priority") or 0), quality.get("confidence", item.get("confidence") or 0), quality.get("risk_score", item.get("risk_score") or 0), reason[:500], next_recheck, ts, item["id"], wallet_address),
         )
         if new_state != old_state:
-            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision, "quality": quality})
-            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason, "quality": quality})
+            _nexus_log_sim_event(cur, wallet_address, item.get("slot_id"), item.get("asset"), "RECHECK", old_state, new_state, reason, {"decision": decision, "quality": quality, "scope_key": scope_key})
+            changed.append({"id": item["id"], "from": old_state, "to": new_state, "reason": reason, "quality": quality, "scope_key": scope_key})
     return changed
 
 def _nexus_upsert_queue_item(cur, wallet_address, body):
