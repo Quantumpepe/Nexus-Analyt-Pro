@@ -13080,6 +13080,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         completed_trades += int(_clamp_float(m.get("shadow_cycles", 0), 0, 0, 100000))
     currently_active = len([r for r in scored if str(r["item"].get("status") or r["item"].get("state") or "WAIT").upper() == "ACTIVE"])
     used_trade_slots = completed_trades + currently_active
+    # Trade-pacing must not deadlock fresh sessions.
+    # The old UI fallback used floor(elapsed_ratio * max_trades), which stays 0
+    # for the first part of a 24h session. When slots are READY and the runtime
+    # is already started, allow one controlled entry window instead of holding
+    # all candidates at READY forever.
     paced_soft_allowed = max(1, int(math.floor(elapsed_ratio * max_trades * float(regime_params.get("pace", 1.0)))))
     best_quality = max([r["quality"] for r in scored], default=0)
     if best_quality >= 85 and regime in ("GREEN", "STRONG_GREEN"):
@@ -13282,6 +13287,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "max_trades": max_trades,
         "hard_trade_limit": hard_trade_limit,
         "paced_soft_allowed": paced_soft_allowed,
+        "paced_hard_allowed": paced_hard_allowed,
+        "allowed_by_time": paced_soft_allowed,
+        "allowed_trades_now": paced_soft_allowed,
+        "allowed_by_time_hard": paced_hard_allowed,
         "used_trade_slots": used_trade_slots,
         "global_active_cap": global_active_cap,
         "wallet_active_slots": wallet_active_slots,
