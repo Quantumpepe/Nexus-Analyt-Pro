@@ -13262,6 +13262,34 @@ def api_nexus_shadow_executor():
         # clear/replace visible slots with an empty preview.
         queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
 
+        if action == "start":
+            # Idempotency guard: pressing Start Shadow while the selected runtime is
+            # already RUNNING must be read-only. It must not tick, reset ACTIVE slots,
+            # recalculate paper PnL, or create another run row.
+            selected_session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
+            selected_chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+            latest_runtime = _nexus_shadow_latest_runtime(cur, wa, cfg)
+            latest_status = str(latest_runtime.get("status") or "").lower()
+            if latest_status == "running" and not _nexus_shadow_is_session_stopped(cur, wa, selected_session_id, selected_chain):
+                runtime_meta = latest_runtime.get("runtime") if isinstance(latest_runtime.get("runtime"), dict) else {}
+                conn.commit()
+                conn.close()
+                return jsonify({
+                    "status": "ok",
+                    "wallet": wa,
+                    "run": latest_runtime.get("run"),
+                    "execution": execution,
+                    "shadow_state_changes": [],
+                    "runtime_status": "running",
+                    "message": "Shadow runtime already running; Start Shadow ignored without ticking or changing paper state.",
+                    "event": {
+                        "type": "SHADOW_START_IGNORED",
+                        "message": "Start Shadow was pressed while runtime was already running. No tick, no slot reset, no PnL recalculation.",
+                    },
+                    "runtime": runtime_meta,
+                    "ts": now_ts(),
+                })
+
         if action in ("start", "tick", "pause", "resume", "stop"):
             if action in ("start", "resume"):
                 # A fresh user start/resume explicitly re-opens the selected permission window.
