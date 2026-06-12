@@ -12868,29 +12868,92 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta = get_meta(item)
         entered = int(meta.get("shadow_state_entered_ts") or meta.get("shadow_active_started_ts") or item.get("updated_ts") or ts)
         elapsed = max(0, ts - entered)
-        # Runtime time alone must never close a trade. Exit requires a Strategist risk/quality decision.
+        # Update open PnL first, then let the Strategist decide whether this paper
+        # position should close. The old code only closed on quality collapse/risk/hard
+        # stop or a very high user profit_lock_pct. In normal green/neutral markets an
+        # ACTIVE slot could therefore stay open for the full 24h, showing unrealized
+        # gross/net while Closed trades and Cycle stayed at 0.
+        update_paper_accounting(item, row["quality"], force_exit=False)
+        meta_now = get_meta(item)
+
+        # Runtime time alone must never close a trade. Time is only used together with
+        # realized paper edge, late-session protection, or stale-profit harvesting.
         exit_due_to_quality = row["quality"] < 28
         exit_due_to_risk = row["risk"] >= 40
-        meta_now = get_meta(item)
         hard_stop_pct = abs(_clamp_float(cfg.get("hard_stop_pct", cfg.get("hardStopPct", meta_now.get("hard_stop_pct", meta_now.get("hardStopPct", 0)))), 0, 0, 100))
         profit_lock_pct = abs(_clamp_float(cfg.get("profit_lock_pct", cfg.get("profitLockPct", meta_now.get("profit_lock_pct", meta_now.get("profitLockPct", 0)))), 0, 0, 100))
         current_pnl_pct = _clamp_float(meta_now.get("paper_pnl_pct", 0), 0, -100, 100)
+        current_pnl_usd = _clamp_float(meta_now.get("paper_pnl_usd", 0), 0, -1_000_000_000, 1_000_000_000)
         exit_due_to_hard_stop = hard_stop_pct > 0 and current_pnl_pct <= -hard_stop_pct
-        exit_due_to_profit_lock = profit_lock_pct > 0 and current_pnl_pct >= profit_lock_pct and row["quality"] < 45
-        if exit_due_to_quality or exit_due_to_risk or exit_due_to_hard_stop or exit_due_to_profit_lock:
+
+        # Shadow tactical take-profit: separate from the user's large Profit Lock UI
+        # value. The UI value may be 20%, which is a strategic lock and far too high
+        # for paper cycle harvesting. Shadow needs small, repeatable cycle exits.
+        style_key = str(cfg.get("style") or cfg.get("strategy") or "TACTICAL").upper()
+        if style_key == "SCALP":
+            default_tp = 0.22
+            default_min_hold = 6
+        elif style_key == "SWING":
+            default_tp = 0.75
+            default_min_hold = 20
+        else:
+            default_tp = 0.38
+            default_min_hold = 8
+        if regime == "RED":
+            default_tp = max(0.18, default_tp * 0.75)
+        elif regime == "STRONG_GREEN":
+            default_tp = max(0.25, default_tp * 0.85)
+
+        shadow_take_profit_pct = abs(_clamp_float(
+            cfg.get("shadow_take_profit_pct", cfg.get("shadowTakeProfitPct", meta_now.get("shadow_take_profit_pct", default_tp))),
+            default_tp, 0.05, 5.0
+        ))
+        min_hold_min = _clamp_float(
+            cfg.get("shadow_min_hold_minutes", cfg.get("shadowMinHoldMinutes", meta_now.get("shadow_min_hold_minutes", default_min_hold))),
+            default_min_hold, 0, 240
+        )
+        stale_profit_min = _clamp_float(
+            cfg.get("shadow_stale_profit_minutes", cfg.get("shadowStaleProfitMinutes", meta_now.get("shadow_stale_profit_minutes", 45))),
+            45, 5, 720
+        )
+
+        exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and current_pnl_pct >= shadow_take_profit_pct
+        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and current_pnl_pct >= max(0.10, shadow_take_profit_pct * 0.45)
+        exit_due_to_late_session_profit = elapsed_ratio >= 0.90 and current_pnl_usd > 0 and current_pnl_pct >= 0.03
+        exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct
+
+        exit_reason = None
+        if exit_due_to_quality:
+            exit_reason = "quality_deteriorated"
+        elif exit_due_to_risk:
+            exit_reason = "risk_exceeded"
+        elif exit_due_to_hard_stop:
+            exit_reason = "hard_stop"
+        elif exit_due_to_profit_lock:
+            exit_reason = "user_profit_lock"
+        elif exit_due_to_shadow_take_profit:
+            exit_reason = "shadow_tactical_take_profit"
+        elif exit_due_to_stale_profit:
+            exit_reason = "shadow_stale_profit_harvest"
+        elif exit_due_to_late_session_profit:
+            exit_reason = "late_session_profit_protection"
+
+        if exit_reason:
             update_paper_accounting(item, row["quality"], force_exit=True)
             meta = get_meta(item)
             meta["shadow_cycles"] = int(meta.get("shadow_cycles") or 0) + 1
             meta["shadow_last_exit_ts"] = ts
+            meta["shadow_exit_reason"] = exit_reason
+            meta["shadow_take_profit_pct"] = round(shadow_take_profit_pct, 4)
+            meta["shadow_min_hold_minutes"] = round(min_hold_min, 4)
             set_meta(item, meta)
             pnl_msg = ""
             try:
                 pnl_msg = f" Paper PnL: {float(meta.get('paper_pnl_usd') or 0):+.2f} USD ({float(meta.get('paper_pnl_pct') or 0):+.2f}%)."
             except Exception:
                 pnl_msg = ""
-            events.append(set_state(item, "SIMULATED_EXIT", "Strategist completed one paper cycle; slot exits and capital can rotate." + pnl_msg, "SHADOW_PAPER_EXIT"))
+            events.append(set_state(item, "SIMULATED_EXIT", f"Strategist completed one paper cycle ({exit_reason}); slot exits and capital can rotate." + pnl_msg, "SHADOW_PAPER_EXIT"))
         else:
-            update_paper_accounting(item, row["quality"], force_exit=False)
             active_rows.append(row)
 
     # 3) Keep only max_active active slots; demote extras by quality.
@@ -13275,6 +13338,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     active_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "ACTIVE"])
     ready_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "READY"])
     exit_count = len([x for x in normalized if str(x.get("status") or x.get("state") or "WAIT").upper() == "SIMULATED_EXIT"])
+    # Recompute displayed usage after promotions/exits in this tick. Previously the
+    # UI could show active slots but used 0 because used_trade_slots was calculated
+    # before the current tick promoted slots.
+    completed_trades_after = 0
+    for it in normalized:
+        m = get_meta(it)
+        completed_trades_after += int(_clamp_float(m.get("shadow_cycles", 0), 0, 0, 100000))
+    used_trade_slots_after = completed_trades_after + active_count
     strategist = {
         "status": "ok",
         "driver": "shadow_strategist_runtime_v1",
@@ -13291,7 +13362,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "allowed_by_time": paced_soft_allowed,
         "allowed_trades_now": paced_soft_allowed,
         "allowed_by_time_hard": paced_hard_allowed,
-        "used_trade_slots": used_trade_slots,
+        "used_trade_slots": used_trade_slots_after,
         "global_active_cap": global_active_cap,
         "wallet_active_slots": wallet_active_slots,
         "max_combined_slots": max_combined_slots,
