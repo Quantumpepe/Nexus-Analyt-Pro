@@ -13117,6 +13117,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         exit_due_to_late_session_profit = elapsed_ratio >= 0.90 and current_pnl_usd > 0 and current_pnl_pct >= 0.03
         exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct
 
+        # RESTORED LIFECYCLE RULE:
+        # The older working Shadow runtime completed one paper cycle after tick_sec
+        # or when quality/risk broke. Later changes made exits depend mostly on
+        # profit-lock/tactical TP, which left ACTIVE slots open for hours and kept
+        # Closed trades/Cycle at 0. Use real market-price PnL, but restore the
+        # deterministic tick lifecycle so ACTIVE -> SIMULATED_EXIT -> READY can run.
+        exit_due_to_runtime_tick = elapsed >= tick_sec
+
         exit_reason = None
         if exit_due_to_quality:
             exit_reason = "quality_deteriorated"
@@ -13132,6 +13140,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             exit_reason = "shadow_stale_profit_harvest"
         elif exit_due_to_late_session_profit:
             exit_reason = "late_session_profit_protection"
+        elif exit_due_to_runtime_tick:
+            exit_reason = "runtime_tick_cycle"
 
         if exit_reason:
             update_paper_accounting(item, row["quality"], force_exit=True)
