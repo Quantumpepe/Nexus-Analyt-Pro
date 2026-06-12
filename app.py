@@ -13071,59 +13071,62 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         update_paper_accounting(item, row["quality"], force_exit=False)
         meta_now = get_meta(item)
 
-        # Runtime time alone must never close a trade. Time is only used together with
-        # realized paper edge, late-session protection, or stale-profit harvesting.
-        exit_due_to_quality = row["quality"] < 28
-        exit_due_to_risk = row["risk"] >= 40
+        # Looser Shadow lifecycle: keep the Strategist safeguards, but do not freeze
+        # profitable ACTIVE slots for hours. A slot may close a paper cycle when it has
+        # a small positive real-price PnL and either the tactical TP, one runtime tick,
+        # or stale-profit timer is reached. This restores movement without bringing back
+        # blind refresh/start profits: Start/GET still do not force a cycle.
+        exit_due_to_quality = row["quality"] < 24
+        exit_due_to_risk = row["risk"] >= 48
         hard_stop_pct = abs(_clamp_float(cfg.get("hard_stop_pct", cfg.get("hardStopPct", meta_now.get("hard_stop_pct", meta_now.get("hardStopPct", 0)))), 0, 0, 100))
         profit_lock_pct = abs(_clamp_float(cfg.get("profit_lock_pct", cfg.get("profitLockPct", meta_now.get("profit_lock_pct", meta_now.get("profitLockPct", 0)))), 0, 0, 100))
         current_pnl_pct = _clamp_float(meta_now.get("paper_pnl_pct", 0), 0, -100, 100)
         current_pnl_usd = _clamp_float(meta_now.get("paper_pnl_usd", 0), 0, -1_000_000_000, 1_000_000_000)
+        has_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0
         exit_due_to_hard_stop = hard_stop_pct > 0 and current_pnl_pct <= -hard_stop_pct
 
-        # Shadow tactical take-profit: separate from the user's large Profit Lock UI
-        # value. The UI value may be 20%, which is a strategic lock and far too high
-        # for paper cycle harvesting. Shadow needs small, repeatable cycle exits.
         style_key = str(cfg.get("style") or cfg.get("strategy") or "TACTICAL").upper()
         if style_key == "SCALP":
-            default_tp = 0.22
-            default_min_hold = 6
+            default_tp = 0.10
+            default_min_hold = 2
         elif style_key == "SWING":
-            default_tp = 0.75
-            default_min_hold = 20
+            default_tp = 0.28
+            default_min_hold = 6
         else:
-            default_tp = 0.38
-            default_min_hold = 8
+            default_tp = 0.16
+            default_min_hold = 3
         if regime == "RED":
-            default_tp = max(0.18, default_tp * 0.75)
+            default_tp = max(0.07, default_tp * 0.70)
+            default_min_hold = min(default_min_hold, 2)
+        elif regime == "GREEN":
+            default_tp = max(0.10, default_tp * 0.90)
         elif regime == "STRONG_GREEN":
-            default_tp = max(0.25, default_tp * 0.85)
+            # Strong green may run a little longer, but still harvest cycles.
+            default_tp = max(0.12, default_tp * 1.05)
+            default_min_hold = min(max(default_min_hold, 3), 6)
 
         shadow_take_profit_pct = abs(_clamp_float(
             cfg.get("shadow_take_profit_pct", cfg.get("shadowTakeProfitPct", meta_now.get("shadow_take_profit_pct", default_tp))),
-            default_tp, 0.05, 5.0
+            default_tp, 0.03, 5.0
         ))
         min_hold_min = _clamp_float(
             cfg.get("shadow_min_hold_minutes", cfg.get("shadowMinHoldMinutes", meta_now.get("shadow_min_hold_minutes", default_min_hold))),
             default_min_hold, 0, 240
         )
         stale_profit_min = _clamp_float(
-            cfg.get("shadow_stale_profit_minutes", cfg.get("shadowStaleProfitMinutes", meta_now.get("shadow_stale_profit_minutes", 45))),
-            45, 5, 720
+            cfg.get("shadow_stale_profit_minutes", cfg.get("shadowStaleProfitMinutes", meta_now.get("shadow_stale_profit_minutes", 12))),
+            12, 3, 720
         )
 
         exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and current_pnl_pct >= shadow_take_profit_pct
-        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and current_pnl_pct >= max(0.10, shadow_take_profit_pct * 0.45)
-        exit_due_to_late_session_profit = elapsed_ratio >= 0.90 and current_pnl_usd > 0 and current_pnl_pct >= 0.03
+        # Main liveness rule: after one runtime tick, a positive real-price PnL can be harvested.
+        exit_due_to_tick_profit = elapsed >= tick_sec and has_positive_edge and current_pnl_pct >= max(0.03, shadow_take_profit_pct * 0.25)
+        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and has_positive_edge and current_pnl_pct >= max(0.03, shadow_take_profit_pct * 0.20)
+        exit_due_to_late_session_profit = elapsed_ratio >= 0.85 and has_positive_edge and current_pnl_pct >= 0.02
+        # Respect user profit-lock when it is a practical Shadow lock, but do not require it.
         exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct
-
-        # RESTORED LIFECYCLE RULE:
-        # The older working Shadow runtime completed one paper cycle after tick_sec
-        # or when quality/risk broke. Later changes made exits depend mostly on
-        # profit-lock/tactical TP, which left ACTIVE slots open for hours and kept
-        # Closed trades/Cycle at 0. Use real market-price PnL, but restore the
-        # deterministic tick lifecycle so ACTIVE -> SIMULATED_EXIT -> READY can run.
-        exit_due_to_runtime_tick = elapsed >= tick_sec
+        # If a slot is old and slightly negative, allow a controlled defensive close only when quality/risk weakens.
+        exit_due_to_stale_weak_trade = elapsed >= max(tick_sec * 3, 900) and current_pnl_pct >= -0.12 and (row["quality"] < 36 or row["risk"] >= 36)
 
         exit_reason = None
         if exit_due_to_quality:
@@ -13136,12 +13139,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             exit_reason = "user_profit_lock"
         elif exit_due_to_shadow_take_profit:
             exit_reason = "shadow_tactical_take_profit"
+        elif exit_due_to_tick_profit:
+            exit_reason = "shadow_tick_profit_harvest"
         elif exit_due_to_stale_profit:
             exit_reason = "shadow_stale_profit_harvest"
         elif exit_due_to_late_session_profit:
             exit_reason = "late_session_profit_protection"
-        elif exit_due_to_runtime_tick:
-            exit_reason = "runtime_tick_cycle"
+        elif exit_due_to_stale_weak_trade:
+            exit_reason = "stale_weak_trade_rotation"
 
         if exit_reason:
             update_paper_accounting(item, row["quality"], force_exit=True)
