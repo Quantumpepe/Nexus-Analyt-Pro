@@ -12395,18 +12395,62 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["meta"] = meta if isinstance(meta, dict) else {}
         return item
 
-    def _paper_base_price(item, meta):
+    def _paper_asset_symbol(item, meta):
+        candidates = [
+            item.get("asset"), item.get("symbol"), item.get("coin"), item.get("token"),
+            item.get("chain"), item.get("chain_key"), item.get("network"),
+            meta.get("asset"), meta.get("symbol"), meta.get("coin"), meta.get("token"),
+            meta.get("chain"), cfg.get("asset"), cfg.get("symbol"), cfg.get("coin"),
+            cfg.get("chain"), cfg.get("chain_key"), cfg.get("network"),
+        ]
+        for value in candidates:
+            s = str(value or "").strip().upper()
+            if not s:
+                continue
+            if ":" in s:
+                s = s.split(":")[-1].strip().upper()
+            s = re.sub(r"[^A-Z0-9]", "", s)
+            if s in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON"):
+                return "POL" if s == "MATIC" else s
+        sid = str(item.get("session_id") or item.get("sessionId") or item.get("trade_session_id") or meta.get("session_id") or "").upper()
+        for sym in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON"):
+            if re.search(rf"(^|[^A-Z0-9]){sym}([^A-Z0-9]|$)", sid):
+                return "POL" if sym == "MATIC" else sym
+        return ""
+
+    def _paper_live_price(item, meta, allow_network=True):
+        # Truth source for paper PnL: real market price only.
+        # Never use paper_mark_price, paper_entry_price, or a hardcoded 1.0 as a current mark.
         for value in [
             item.get("current_price"), item.get("price"), item.get("priceUsd"), item.get("mark_price"),
-            meta.get("paper_mark_price"), meta.get("paper_entry_price"), cfg.get("current_price"), cfg.get("price"), cfg.get("mark_price"), 1,
+            cfg.get("current_price"), cfg.get("price"), cfg.get("priceUsd"), cfg.get("mark_price"),
         ]:
             try:
                 n = float(value)
                 if math.isfinite(n) and n > 0:
-                    return n
+                    return n, "provided"
             except Exception:
                 continue
-        return 1.0
+        if allow_network:
+            sym = _paper_asset_symbol(item, meta)
+            if sym:
+                try:
+                    if "_price_multi" in globals() and callable(globals().get("_price_multi")):
+                        px = _price_multi(sym) or {}
+                        n = float(px.get("price") or 0)
+                        if math.isfinite(n) and n > 0:
+                            return n, str(px.get("source") or "market")
+                except Exception:
+                    pass
+        return None, "unavailable"
+
+    def _paper_base_price(item, meta):
+        price, source = _paper_live_price(item, meta, allow_network=True)
+        if price and price > 0:
+            meta["paper_price_source"] = source
+            return price
+        meta["paper_price_source"] = "unavailable"
+        return 0.0
 
     def update_paper_accounting(item, quality=0, force_exit=False):
         meta = get_meta(item)
@@ -12416,21 +12460,38 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if amount <= 0:
             return item
         entry = _clamp_float(meta.get("paper_entry_price", 0), 0, 0, 1_000_000_000)
+        live_mark, price_source = _paper_live_price(item, meta, allow_network=True)
         if entry <= 0:
-            entry = _paper_base_price(item, meta)
+            if not live_mark or live_mark <= 0:
+                # No real price means no paper trade and no artificial PnL.
+                meta["paper_price_source"] = "unavailable"
+                meta["paper_price_missing"] = True
+                meta["paper_pnl_pct"] = 0
+                meta["paper_pnl_usd"] = 0
+                meta["paper_pnl_total_usd"] = _clamp_float(meta.get("paper_cycle_realized_usd", 0), 0, -1_000_000_000, 1_000_000_000)
+                item["paper_pnl_pct"] = 0
+                item["paper_pnl_usd"] = 0
+                item["paper_pnl_total_usd"] = meta["paper_pnl_total_usd"]
+                set_meta(item, meta)
+                return item
+            entry = float(live_mark)
             meta["paper_entry_price"] = round(entry, 10)
             meta["paper_entry_ts"] = ts
         entered = int(meta.get("paper_entry_ts") or meta.get("shadow_active_started_ts") or meta.get("shadow_state_entered_ts") or ts)
         elapsed_min = max(0, (ts - entered) / 60.0)
-        q = _clamp_float(quality, 0, -100, 100)
-        # Deterministic paper drift: strong slots drift slightly positive, weak/risky slots negative.
-        slot_seed = slot_no(item, 1)
-        drift_pct = max(-4.5, min(4.5, ((q - 50.0) / 50.0) * 1.15 + min(1.8, elapsed_min / 60.0 * 0.35) + ((slot_seed % 3) - 1) * 0.18))
-        if force_exit:
-            drift_pct = max(-8.0, min(8.0, drift_pct))
-        mark = entry * (1 + drift_pct / 100.0)
+        # Current mark is real market price only. If a later tick cannot fetch price,
+        # hold mark at entry and do not fabricate movement.
+        if not live_mark or live_mark <= 0:
+            mark = entry
+            meta["paper_price_missing"] = True
+            meta["paper_price_source"] = "unavailable"
+        else:
+            mark = float(live_mark)
+            meta["paper_price_missing"] = False
+            meta["paper_price_source"] = price_source
         qty = amount / entry if entry > 0 else 0
-        pnl_usd = amount * (drift_pct / 100.0)
+        drift_pct = ((mark - entry) / entry * 100.0) if entry > 0 else 0.0
+        pnl_usd = (mark - entry) * qty if qty > 0 else 0.0
         # Cumulative realized profit is the protected/collected account.
         # paper_pnl_total_usd must stay cycle-local for the UI; otherwise old
         # profits keep appearing inside the next run after a restart.
@@ -12777,8 +12838,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             base_price = _paper_base_price(item, meta)
             meta["paper_position_usd"] = next_amount
             meta["paper_quantity"] = round(next_amount / base_price, 10) if base_price > 0 else 0
-            meta["paper_entry_price"] = round(base_price, 10)
-            meta["paper_mark_price"] = round(base_price, 10)
+            meta["paper_entry_price"] = round(base_price, 10) if base_price > 0 else 0
+            meta["paper_mark_price"] = round(base_price, 10) if base_price > 0 else 0
+            meta["paper_price_missing"] = False if base_price > 0 else True
             meta.pop("paper_exit_price", None)
             meta["paper_pnl_pct"] = 0
             meta["paper_pnl_usd"] = 0
