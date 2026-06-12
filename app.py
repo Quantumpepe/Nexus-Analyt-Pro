@@ -12842,6 +12842,139 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         strategist_reason.append(f"Restarted completed paper cycle with released capital {base_total:.2f} USD. Collected profit delta {fresh_realized_delta:+.2f} USD; reuse permission {reuse_profit_pct:.1f}% adds {reusable_profit:.2f} USD to next cycle ({next_total:.2f} USD total). Slot allocation: {rotation_mode}, donor cap {rotation_donor_cap}.")
         return True
 
+
+    # ---- Precompute market regime and runtime progress before ACTIVE exit checks ----
+    # The exit lifecycle uses regime and elapsed_ratio. In previous builds these values
+    # were assigned only later in the entry-promotion block, so ACTIVE slots could keep
+    # showing unrealized Gross/Net without ever reaching SIMULATED_EXIT/Cycle.
+    def _shadow_session_started_ts():
+        vals = []
+        for it in normalized:
+            m = get_meta(it)
+            for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts", "shadow_active_started_ts", "paper_entry_ts"):
+                try:
+                    v = float(it.get(k) if it.get(k) is not None else m.get(k))
+                    if v > 10_000_000_000:
+                        v = v / 1000.0
+                    if v > 0:
+                        vals.append(int(v))
+                except Exception:
+                    pass
+        for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts"):
+            try:
+                v = float(cfg.get(k))
+                if v > 10_000_000_000:
+                    v = v / 1000.0
+                if v > 0:
+                    vals.append(int(v))
+            except Exception:
+                pass
+        return min(vals) if vals else ts
+
+    def _shadow_market_regime():
+        """Classify global market regime from market-wide context only.
+
+        Slot scores are entry inputs, not global market context. Do not read slot
+        meta here, because old STRONG_GREEN values inside slots can feed back into
+        the global regime.
+        """
+        alias = {
+            "RISK_OFF": "RED", "BEAR": "RED", "BEARISH": "RED", "RED_MARKET": "RED",
+            "RISK_ON": "GREEN", "BULL": "GREEN", "BULLISH": "GREEN", "GREEN_MARKET": "GREEN",
+            "STRONG_BULL": "STRONG_GREEN", "VERY_GREEN": "STRONG_GREEN", "STRONG_GREEN_MARKET": "STRONG_GREEN",
+        }
+        def _norm_regime(v):
+            r = str(v or "").strip().upper().replace("-", "_").replace(" ", "_")
+            return alias.get(r, r)
+        def _iter_contexts():
+            if isinstance(cfg, dict):
+                yield cfg
+                for key in (
+                    "market", "market_context", "marketContext", "global_market", "globalMarket",
+                    "market_risk", "marketRisk", "market_state", "marketState",
+                    "volatility_pulse", "volatilityPulse", "liquidity", "liquidity_context",
+                    "liquidityContext", "dominance", "dominance_context", "dominanceContext",
+                ):
+                    obj = cfg.get(key)
+                    if isinstance(obj, dict):
+                        yield obj
+        def _first_number(keys):
+            for obj in _iter_contexts():
+                if not isinstance(obj, dict):
+                    continue
+                for k in keys:
+                    if k not in obj:
+                        continue
+                    try:
+                        n = float(obj.get(k))
+                        if math.isfinite(n):
+                            return n
+                    except Exception:
+                        pass
+            return None
+        def _first_regime():
+            for obj in _iter_contexts():
+                if not isinstance(obj, dict):
+                    continue
+                for k in ("market_regime", "marketRegime", "regime", "market_mode", "marketMode", "phase"):
+                    r = _norm_regime(obj.get(k))
+                    if r in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
+                        return r
+            return ""
+        explicit = _first_regime()
+        market_score = _first_number([
+            "market_score", "marketScore", "risk_on_score", "riskOnScore",
+            "market_risk_score", "marketRiskScore", "market_risk", "marketRisk",
+            "risk_score", "riskScore",
+        ])
+        breadth = _first_number([
+            "breadth", "breadth_pct", "breadthPct", "market_breadth", "marketBreadth",
+            "green_breadth", "greenBreadth", "positive_breadth", "positiveBreadth",
+        ])
+        mcap = _first_number([
+            "mcap_change_pct", "mcapChangePct", "market_cap_change_pct", "marketCapChangePct",
+            "global_mcap_change_pct", "globalMcapChangePct", "mcap_pct", "mcapPct",
+            "total_market_cap_change_pct", "totalMarketCapChangePct", "market_change_pct", "marketChangePct",
+            "change24h", "change_24h", "market_change_24h", "marketChange24h",
+        ])
+        liq = _first_number([
+            "vol_cap", "volCap", "volume_cap", "volumeCap", "volume_to_mcap", "volumeToMcap",
+            "liquidity_score", "liquidityScore",
+        ])
+        has_market_inputs = any(v is not None for v in (market_score, breadth, mcap, liq))
+        if not has_market_inputs:
+            if explicit in ("RED", "NEUTRAL", "GREEN"):
+                return explicit
+            if explicit == "STRONG_GREEN":
+                return "GREEN"
+            return "NEUTRAL"
+        score = float(market_score) if market_score is not None else 50.0
+        br = float(breadth) if breadth is not None else 50.0
+        mc = float(mcap) if mcap is not None else 0.0
+        liquidity = float(liq) if liq is not None else 50.0
+        if 0 <= br <= 1:
+            br *= 100.0
+        if -1 <= mc <= 1 and abs(mc) < 0.20:
+            mc *= 100.0
+        if score < 35 or mc <= -1.0 or br <= 30:
+            return "RED"
+        if score >= 75 and br >= 60 and mc >= 1.5 and liquidity >= 45:
+            return "STRONG_GREEN"
+        if score >= 60 and br >= 45 and mc >= 0.3:
+            return "GREEN"
+        if explicit == "GREEN" and br >= 40 and mc >= 0:
+            return "GREEN"
+        if explicit == "STRONG_GREEN":
+            return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
+        if explicit == "RED" and (score < 50 or mc < 0 or br < 45):
+            return "RED"
+        return "NEUTRAL"
+
+    regime = _shadow_market_regime()
+    runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
+    started_ts = _shadow_session_started_ts()
+    elapsed_ratio = max(0.0, min(1.0, (ts - started_ts) / max(1.0, runtime_hours * 3600.0)))
+
     allow_auto_recycle = str(cfg.get("auto_recycle", cfg.get("autoRecycle", os.getenv("NEXUS_SHADOW_AUTO_RECYCLE", "0")))).strip().lower() in ("1", "true", "yes", "on")
     cycle_recycled = recycle_completed_shadow_cycle() if allow_auto_recycle else False
     if not allow_auto_recycle:
@@ -13260,7 +13393,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     for row in scored:
         item = row["item"]
         st = str(item.get("status") or item.get("state") or "WAIT").upper()
-        if st not in ("READY", "WAIT"):
+        if st == "SIMULATED_EXIT":
+            m = get_meta(item)
+            last_exit = int(m.get("shadow_last_exit_ts") or m.get("shadow_state_entered_ts") or 0)
+            # Completed cycles should be visible for a short moment, then the slot can
+            # be considered again by the Strategist. Without this, every profitable
+            # cycle becomes a dead end unless auto_recycle is enabled.
+            if not last_exit or ts - last_exit < min(120, max(30, tick_sec)):
+                continue
+        elif st not in ("READY", "WAIT"):
             continue
         if row["hard_block"] or row["risk"] >= 48:
             continue
@@ -13286,6 +13427,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item = row["item"]
         old = str(item.get("status") or item.get("state") or "WAIT").upper()
         meta = get_meta(item)
+        if old == "SIMULATED_EXIT":
+            # Start a fresh paper position while keeping cumulative collected profit.
+            realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_collected_profit_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
+            for k in ("paper_entry_price", "paper_entry_ts", "paper_mark_price", "paper_exit_price", "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd", "paper_cycle_realized_usd", "paper_gross_pnl_usd", "paper_net_pnl_usd"):
+                meta.pop(k, None)
+            meta["paper_realized_total_usd"] = realized_total
+            meta["paper_collected_profit_usd"] = realized_total
+            meta["collected_profit_usd"] = realized_total
+            meta["realized_profit_usd"] = realized_total
         meta["shadow_active_started_ts"] = ts
         meta["shadow_state_entered_ts"] = ts
         meta["shadow_runtime_status"] = "running"
@@ -13305,8 +13455,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if id(item) in active_ids or st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED", "PROTECT"):
             continue
         if st == "SIMULATED_EXIT":
-            # Show completed exit for one tick, then it can become WAIT/READY on next tick.
-            continue
+            m = get_meta(item)
+            last_exit = int(m.get("shadow_last_exit_ts") or m.get("shadow_state_entered_ts") or 0)
+            if not last_exit or ts - last_exit < min(120, max(30, tick_sec)):
+                # Show completed exit briefly before allowing the next Strategist entry decision.
+                continue
         if not row["hard_block"] and row["risk"] < 48 and (row["quality"] >= 25 or row["confidence"] >= 45):
             ready_candidates.append(row)
     ready_candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
