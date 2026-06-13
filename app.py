@@ -183,13 +183,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-006"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-007"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-006"
-SHADOW_BUILD_ID = "SH-ENGINE-006"
-SHADOW_ENTRY_MODE = "BACKEND_PRICE_TICK_OR_EXISTING_MARK"
+STRATEGIST_BUILD_ID = "S-ENGINE-007"
+SHADOW_BUILD_ID = "SH-ENGINE-007"
+SHADOW_ENTRY_MODE = "AUTO_STATE_TICK_PRICE_MARK"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "GROSS_POSITIVE_HARVEST_SOFT_COST_GUARD"
+SHADOW_EXIT_MODE = "AUTO_TICK_GROSS_HARVEST"
 
 @app.get("/api/build-info")
 def api_build_info():
@@ -11326,6 +11326,12 @@ def api_nexus_trading_state():
             conn = _db()
             cur = conn.cursor()
             recheck_changes = _nexus_recheck_apply(cur, wa)
+            # ENGINE-007 watchdog: normal UI state polling must advance running Shadow sessions.
+            # Previously only pressing Start Shadow reliably woke a stale ACTIVE position.
+            try:
+                _nexus_shadow_autotick_running_sessions(cur, wa, source="trading_state_autotick", min_interval_sec=60)
+            except Exception:
+                pass
             execution = _nexus_execution_summary(cur, wa)
             try:
                 cur.execute("SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 1", (wa,))
@@ -13733,6 +13739,109 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     }
 
 
+
+def _nexus_shadow_autotick_running_sessions(cur, wallet_address: str, source: str = "state_autotick", min_interval_sec: int = 60) -> list:
+    """Tick running Shadow sessions from state polling, not only from Start Shadow.
+
+    User observation: pressing Start Shadow again woke ETH after ~30 minutes. That means
+    the runtime logic itself works, but normal polling can leave ACTIVE slots stale. This
+    helper makes every backend state refresh act as a safe watchdog tick for already
+    RUNNING sessions. It never creates new sessions, never clears stop tombstones and
+    never touches stopped/paused runtimes.
+    """
+    events_out = []
+    try:
+        now_i = now_ts()
+        cur.execute(
+            "SELECT * FROM nexus_shadow_executor_runs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 120",
+            (wallet_address,),
+        )
+        recent_runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+        seen_runtime_keys = set()
+        for rr in recent_runs:
+            summary = rr.get("summary") if isinstance(rr.get("summary"), dict) else {}
+            runtime_meta = summary.get("runtime") if isinstance(summary.get("runtime"), dict) else {}
+            config = rr.get("config") if isinstance(rr.get("config"), dict) else {}
+            status_raw = str(runtime_meta.get("status") or summary.get("runtime_status") or rr.get("status") or "").lower()
+            cfg_run = dict(config)
+            sid = str(cfg_run.get("session_id") or cfg_run.get("sessionId") or runtime_meta.get("session_id") or summary.get("session_id") or "").strip()
+            chain = _normalize_chain_key(cfg_run.get("chain") or cfg_run.get("chain_key") or cfg_run.get("network") or runtime_meta.get("chain") or "")
+            if sid:
+                cfg_run["session_id"] = sid
+                cfg_run["sessionId"] = sid
+            if chain:
+                cfg_run["chain"] = chain
+                cfg_run["chain_key"] = chain
+            runtime_key = _nexus_shadow_runtime_key(sid, chain)
+            if runtime_key in seen_runtime_keys:
+                continue
+            # Newest row for a runtime key is authoritative, even if paused/stopped.
+            seen_runtime_keys.add(runtime_key)
+            if status_raw != "running":
+                continue
+            if _nexus_shadow_is_session_stopped(cur, wallet_address, sid, chain):
+                continue
+            tick_sec = int(_clamp_float(cfg_run.get("tick_sec", cfg_run.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
+            stale_after = int(max(20, min(int(min_interval_sec or 60), tick_sec)))
+            updated_ts = int(runtime_meta.get("last_tick_ts") or runtime_meta.get("updated_ts") or rr.get("updated_ts") or rr.get("created_ts") or 0)
+            if updated_ts and (now_i - updated_ts) < stale_after:
+                continue
+            tick_result = _nexus_shadow_runtime_tick(cur, wallet_address, cfg_run, action="tick")
+            events_tick = tick_result.get("events") if isinstance(tick_result.get("events"), list) else []
+            is_no_queue = str(tick_result.get("runtime_status") or "").lower() == "idle" and any(
+                isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events_tick
+            )
+            if is_no_queue:
+                continue
+            run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+            result_summary = {
+                "shadow_only": True,
+                "live_execution_triggered": False,
+                "status": "running",
+                "runtime_status": tick_result.get("runtime_status"),
+                "runtime": {
+                    "status": tick_result.get("runtime_status"),
+                    "action": "tick",
+                    "source": source,
+                    "tick_sec": tick_result.get("tick_sec"),
+                    "last_tick_ts": now_i,
+                    "active_count": tick_result.get("active_count", 0),
+                    "ready_count": tick_result.get("ready_count", 0),
+                    "simulated_exits": tick_result.get("simulated_exits", 0),
+                    "promoted": tick_result.get("promoted", 0),
+                    "strategist": tick_result.get("strategist") or {},
+                    "updated_ts": now_i,
+                },
+                "readiness": "SHADOW_RUNTIME_ACTIVE" if tick_result.get("runtime_status") == "running" else str(tick_result.get("runtime_status") or "idle").upper(),
+                "message": "Shadow runtime auto-ticked by backend state watchdog. No Vault execution was triggered.",
+            }
+            cur.execute(
+                """
+                INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    run_id,
+                    wallet_address,
+                    "SHADOW",
+                    source,
+                    "running",
+                    json.dumps(result_summary, ensure_ascii=False),
+                    json.dumps(events_tick, ensure_ascii=False),
+                    json.dumps(tick_result.get("queue") or [], ensure_ascii=False),
+                    json.dumps({**cfg_run, "action": "tick", "autotick_source": source}, ensure_ascii=False),
+                    now_i,
+                    now_i,
+                ),
+            )
+            events_out.extend(events_tick)
+    except Exception as e:
+        try:
+            events_out.append({"type": "AUTOTICK_ERROR", "message": str(e)[:180]})
+        except Exception:
+            pass
+    return events_out
+
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
 def api_nexus_shadow_executor():
     wa, error_resp = _nexus_wallet_from_request()
@@ -13962,6 +14071,7 @@ def api_nexus_shadow_executor():
                         "simulated_exits": runtime_result.get("simulated_exits", 0),
                         "promoted": runtime_result.get("promoted", 0),
                         "strategist": runtime_result.get("strategist") or {},
+                        "last_tick_ts": now_ts(),
                         "updated_ts": now_ts(),
                     },
                     "readiness": "SHADOW_RUNTIME_ACTIVE" if runtime_result.get("runtime_status") == "running" else str(runtime_result.get("runtime_status") or "idle").upper(),
