@@ -183,13 +183,28 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-009"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-010"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-009"
-SHADOW_BUILD_ID = "SH-ENGINE-009"
-SHADOW_ENTRY_MODE = "FRESH_BACKEND_PRICE_TICK_NO_WATCHLIST"
+STRATEGIST_BUILD_ID = "S-ENGINE-010"
+SHADOW_BUILD_ID = "SH-ENGINE-010"
+SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_MONITOR"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_TICK_PROOF"
+
+# ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
+# these globals are a fallback and a fast proof that a runtime cycle touched this worker.
+SHADOW_LAST_TICK_TS = 0
+SHADOW_TICK_COUNT = 0
+SHADOW_LAST_TICK_SOURCE = "boot"
+
+def _shadow_mark_tick(source: str = "runtime"):
+    global SHADOW_LAST_TICK_TS, SHADOW_TICK_COUNT, SHADOW_LAST_TICK_SOURCE
+    try:
+        SHADOW_LAST_TICK_TS = int(time.time())
+        SHADOW_TICK_COUNT = int(SHADOW_TICK_COUNT or 0) + 1
+        SHADOW_LAST_TICK_SOURCE = str(source or "runtime")[:80]
+    except Exception:
+        pass
 
 @app.get("/api/build-info")
 def api_build_info():
@@ -12107,6 +12122,84 @@ def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = No
         return {"status": "idle", "run": None}
 
 
+def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None = None) -> dict:
+    """ENGINE-010 health proof for the Shadow runtime.
+
+    This is DB-derived so it survives refreshes/redeploys and proves whether the
+    engine is really ticking without relying on the Start Shadow button.
+    """
+    now_i = now_ts()
+    cfg = cfg if isinstance(cfg, dict) else {}
+    latest = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
+    runtime = latest.get("runtime") if isinstance(latest.get("runtime"), dict) else {}
+    run = latest.get("run") if isinstance(latest.get("run"), dict) else {}
+    status = str(latest.get("status") or runtime.get("status") or run.get("status") or "idle").lower()
+
+    last_tick = int(
+        runtime.get("last_tick_ts")
+        or runtime.get("updated_ts")
+        or run.get("updated_ts")
+        or run.get("created_ts")
+        or 0
+    )
+    seconds_since_tick = (now_i - last_tick) if last_tick else None
+
+    try:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM nexus_shadow_executor_runs
+            WHERE wallet_address=?
+              AND (source IN ('auto_get_tick','state_autotick') OR config_json LIKE '%"action": "tick"%' OR config_json LIKE '%"action":"tick"%')
+            """,
+            (wallet_address,),
+        )
+        row = cur.fetchone()
+        db_tick_count = int((row["c"] if row and "c" in row.keys() else row[0]) or 0)
+    except Exception:
+        db_tick_count = 0
+
+    # A tick older than 2 minutes is suspicious for this debugging phase.
+    stalled = bool(status == "running" and (seconds_since_tick is None or seconds_since_tick > 120))
+
+    return {
+        "status": "ok",
+        "running": status == "running",
+        "runtime_status": status,
+        "last_tick": last_tick,
+        "last_tick_ts": last_tick,
+        "last_tick_iso": datetime.utcfromtimestamp(last_tick).isoformat() + "Z" if last_tick else None,
+        "seconds_since_tick": seconds_since_tick,
+        "tick_count": db_tick_count,
+        "process_last_tick": int(SHADOW_LAST_TICK_TS or 0),
+        "process_tick_count": int(SHADOW_TICK_COUNT or 0),
+        "process_tick_source": SHADOW_LAST_TICK_SOURCE,
+        "stalled": stalled,
+        "stalled_after_sec": 120,
+        "latest_run_id": run.get("run_id") if isinstance(run, dict) else None,
+        "source": "ENGINE-010_DB_RUNTIME_HEALTH",
+        "ts": now_i,
+    }
+
+
+@app.get("/api/shadow/health")
+def api_shadow_health():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        health = _nexus_shadow_health_for_wallet(cur, wa)
+        conn.close()
+    return jsonify(health)
+
+
+@app.get("/api/nexus/shadow/health")
+def api_nexus_shadow_health():
+    return api_shadow_health()
+
+
 def _nexus_shadow_filter_queue_for_cfg(queue: list, cfg: dict) -> list:
     """Filter queue by selected budget session/chain without mixing legacy rows."""
     if not isinstance(queue, list):
@@ -13748,6 +13841,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         ],
         "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
+    _shadow_mark_tick(f"runtime_{action}")
     return {
         "runtime_status": "running" if action in ("start", "resume", "tick") else action,
         "events": events[:80],
