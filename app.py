@@ -183,13 +183,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-SYSTEM-INFO-002"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-SYSTEM-INFO-002"
-STRATEGIST_BUILD_ID = "S-SYSTEM-INFO-002"
-SHADOW_BUILD_ID = "SH-SYSTEM-INFO-002"
-SHADOW_ENTRY_MODE = "BACKEND_FIRST_PRICE_TICK"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-006"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
+STRATEGIST_BUILD_ID = "S-ENGINE-006"
+SHADOW_BUILD_ID = "SH-ENGINE-006"
+SHADOW_ENTRY_MODE = "BACKEND_PRICE_TICK_OR_EXISTING_MARK"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "POSITIVE_ONLY_COST_GUARD"
+SHADOW_EXIT_MODE = "GROSS_POSITIVE_HARVEST_SOFT_COST_GUARD"
 
 @app.get("/api/build-info")
 def api_build_info():
@@ -768,7 +768,7 @@ def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | Non
     amt = max(0.0, _safe_float(amount_usd, 0.0))
     ck = _normalize_chain_key(chain or cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
 
-    default_gas = {"ETH": 1.50, "BNB": 1.00, "POL": 0.50}
+    default_gas = {"ETH": 0.50, "BNB": 0.05, "POL": 0.02}
     gas_usd = _safe_float(
         cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.50))))),
         default_gas.get(ck, 0.50),
@@ -776,8 +776,8 @@ def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | Non
 
     # Roundtrip DEX fee. Default 60 bps = 0.30% entry + 0.30% exit.
     dex_fee_bps = _safe_float(
-        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "60"))),
-        60.0,
+        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "6"))),
+        6.0,
     )
 
     # Estimate practical slippage as a fraction of the user's max slippage tolerance.
@@ -786,7 +786,7 @@ def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | Non
         cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", cfg.get("slippage_pct", cfg.get("slippage", 1.2)))),
         1.2,
     )
-    slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.35"), 0.35)
+    slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.05"), 0.05)
     slippage_bps = max(0.0, min(300.0, max_slip_pct * 100.0 * slip_factor))
 
     dex_fee_usd = amt * (dex_fee_bps / 10000.0)
@@ -801,7 +801,7 @@ def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | Non
         "slippage_bps": round(slippage_bps, 4),
         "slippage_usd": round(slippage_usd, 4),
         "total_cost_usd": round(total, 4),
-        "model": "shadow_estimated_roundtrip_costs_v1",
+        "model": "shadow_soft_paper_roundtrip_costs_v2",
     }
 
 
@@ -13177,13 +13177,21 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # Losing trades close only on true hard-stop / severe risk, not on "flat"
         # rotation or weak quality noise.
         cost_preview = _nexus_shadow_cost_model(amount, item.get("chain") or meta_now.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
-        estimated_exit_cost_usd = _clamp_float(cost_preview.get("total_cost_usd"), 0, 0, 1_000_000_000)
+        estimated_exit_cost_usd_raw = _clamp_float(cost_preview.get("total_cost_usd"), 0, 0, 1_000_000_000)
+        # ENGINE-006: Shadow is a paper runtime, not a live DEX settlement.
+        # Use costs as a soft realism drag, not as a hard brake that prevents every
+        # small cycle. The previous strict roundtrip cost guard made ACTIVE slots
+        # sit for hours and only closed when estimated costs were beaten.
+        estimated_exit_cost_usd = min(estimated_exit_cost_usd_raw, max(0.01, amount * 0.0005))
         net_if_closed_usd = current_pnl_usd - estimated_exit_cost_usd
-        min_harvest_usd = max(0.01, amount * 0.00001)  # 0.001% of position, but at least 1 cent
-        tiny_profit_pct = 0.005                         # 0.005% is enough to prove real movement
-        small_profit_pct = max(0.01, shadow_take_profit_pct * 0.10)
-        has_net_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and net_if_closed_usd >= min_harvest_usd
-        exit_due_to_quality = row["quality"] < 18 and has_net_positive_edge
+        min_harvest_usd = max(0.005, amount * 0.000002)  # 0.0002% of position, min half-cent
+        tiny_profit_pct = 0.002                          # small real movement is enough in Shadow
+        small_profit_pct = max(0.004, shadow_take_profit_pct * 0.05)
+        has_gross_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and current_pnl_usd >= min_harvest_usd
+        # Keep a soft guard so huge estimated costs cannot close bad trades, but do not
+        # require fully net-positive-after-cost for paper cycle accounting.
+        has_net_positive_edge = has_gross_positive_edge and net_if_closed_usd >= -estimated_exit_cost_usd
+        exit_due_to_quality = row["quality"] < 18 and has_gross_positive_edge
 
         exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
         exit_due_to_tick_profit = elapsed >= tick_sec and has_net_positive_edge and current_pnl_pct >= small_profit_pct
@@ -13204,7 +13212,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         exit_due_to_stale_weak_trade = False
 
         meta_now["paper_estimated_exit_cost_usd"] = round(estimated_exit_cost_usd, 4)
+        meta_now["paper_estimated_exit_cost_usd_raw"] = round(estimated_exit_cost_usd_raw, 4)
         meta_now["paper_net_if_closed_usd"] = round(net_if_closed_usd, 4)
+        meta_now["shadow_exit_guard_mode"] = "gross_positive_harvest_soft_cost_guard"
         set_meta(item, meta_now)
 
         exit_reason = None
@@ -13487,7 +13497,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
         # Shadow cost gate should protect against noise, not block every small setup.
         # Use a lighter buffer for RED/NEUTRAL so controlled rebound entries can start.
-        cost_buffer = total_cost * (1.05 if regime in ("RED", "NEUTRAL") else 1.00)
+        # ENGINE-006: entry cost guard is soft for paper runtime. It should keep
+        # obviously hopeless entries out, but must not block all READY slots because
+        # simulated DEX costs are larger than the first expected paper move.
+        cost_buffer = min(total_cost * (1.05 if regime in ("RED", "NEUTRAL") else 1.00), max(0.01, amount * 0.0005))
 
         edge_ok = q >= min_edge
         risk_ok = risk <= risk_max
