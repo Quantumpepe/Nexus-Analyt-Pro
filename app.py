@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-013"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-014"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-013"
-SHADOW_BUILD_ID = "SH-ENGINE-013"
-SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_WORKER_BOOT_RECOVERY"
+STRATEGIST_BUILD_ID = "S-ENGINE-014"
+SHADOW_BUILD_ID = "SH-ENGINE-014"
+SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_WORKER_BOOT_RECOVERY"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_RECOVERY_AMOUNT_FIX"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -12124,7 +12124,7 @@ def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = No
 
 
 def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None = None) -> dict:
-    """ENGINE-013 health proof and boot recovery for the Shadow runtime.
+    """ENGINE-014 health proof, boot recovery, and active amount fix for the Shadow runtime.
 
     Key diagnosis from live screenshots:
     - DB tick_count/last_tick existed, but process_tick_count stayed 0 / boot.
@@ -12273,7 +12273,7 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
         "recovery_error": recovery_error,
         "recovery_source": recovery_source,
         "recovery_event_count": len(recovery_events),
-        "source": "ENGINE-013_DB_RUNTIME_HEALTH_BOOT_RECOVERY",
+        "source": "ENGINE-014_DB_RUNTIME_HEALTH_BOOT_RECOVERY_AMOUNT_FIX",
         "ts": now_i,
     }
 
@@ -13332,6 +13332,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # gross/net while Closed trades and Cycle stayed at 0.
         update_paper_accounting(item, row["quality"], force_exit=False)
         meta_now = get_meta(item)
+        # ENGINE-014: active exit/recovery code needs the current position size.
+        # ENGINE-013 crashed during health boot recovery with: name 'amount' is not defined.
+        # Define it locally from the slot/meta before cost previews and harvest checks.
+        amount = _clamp_float(
+            item.get("reserved_capital_usd", item.get("amountUsd", item.get("amount_usd", meta_now.get("paper_position_usd", 0)))),
+            0, 0, 1_000_000_000
+        )
+        if amount <= 0:
+            amount = _clamp_float(meta_now.get("paper_position_usd", 0), 0, 0, 1_000_000_000)
 
         # Looser Shadow lifecycle: keep the Strategist safeguards, but do not freeze
         # profitable ACTIVE slots for hours. A slot may close a paper cycle when it has
