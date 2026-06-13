@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-012"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-013"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-012"
-SHADOW_BUILD_ID = "SH-ENGINE-012"
-SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_AUTORECOVERY"
+STRATEGIST_BUILD_ID = "S-ENGINE-013"
+SHADOW_BUILD_ID = "SH-ENGINE-013"
+SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_WORKER_BOOT_RECOVERY"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_HEALTH_AUTORECOVERY"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_WORKER_BOOT_RECOVERY"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -12124,34 +12124,117 @@ def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = No
 
 
 def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None = None) -> dict:
-    """ENGINE-011 health proof for the Shadow runtime.
+    """ENGINE-013 health proof and boot recovery for the Shadow runtime.
 
-    This is DB-derived so it survives refreshes/redeploys and proves whether the
-    engine is really ticking without relying on the Start Shadow button.
+    Key diagnosis from live screenshots:
+    - DB tick_count/last_tick existed, but process_tick_count stayed 0 / boot.
+    - This means Render/Flask can boot while the Shadow runtime loop is not alive.
+    - Health therefore must be able to wake a stale RUNNING runtime in this process.
+
+    The recovery is conservative: it only ticks already RUNNING runtimes, never creates
+    new budget sessions and never clears stop tombstones.
     """
     now_i = now_ts()
     cfg = cfg if isinstance(cfg, dict) else {}
-    # ENGINE-012: health is not only a display endpoint. If the runtime is RUNNING
-    # but stale, the health request performs one safe watchdog tick. This is
-    # request-driven, session-local, and does not create new sessions. It fixes the
-    # observed case where Start Shadow woke the engine but normal polling did not.
-    try:
-        _nexus_shadow_autotick_running_sessions(cur, wallet_address, source="health_autorecover_tick", min_interval_sec=60)
-    except Exception:
-        pass
-    latest = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
-    runtime = latest.get("runtime") if isinstance(latest.get("runtime"), dict) else {}
-    run = latest.get("run") if isinstance(latest.get("run"), dict) else {}
-    status = str(latest.get("status") or runtime.get("status") or run.get("status") or "idle").lower()
+    recovery_attempted = False
+    recovery_success = False
+    recovery_error = None
+    recovery_source = None
+    recovery_events = []
 
-    last_tick = int(
-        runtime.get("last_tick_ts")
-        or runtime.get("updated_ts")
-        or run.get("updated_ts")
-        or run.get("created_ts")
-        or 0
-    )
-    seconds_since_tick = (now_i - last_tick) if last_tick else None
+    def _read_latest():
+        latest_local = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
+        runtime_local = latest_local.get("runtime") if isinstance(latest_local.get("runtime"), dict) else {}
+        run_local = latest_local.get("run") if isinstance(latest_local.get("run"), dict) else {}
+        status_local = str(latest_local.get("status") or runtime_local.get("status") or run_local.get("status") or "idle").lower()
+        last_local = int(
+            runtime_local.get("last_tick_ts")
+            or runtime_local.get("updated_ts")
+            or run_local.get("updated_ts")
+            or run_local.get("created_ts")
+            or 0
+        )
+        age_local = (now_ts() - last_local) if last_local else None
+        return latest_local, runtime_local, run_local, status_local, last_local, age_local
+
+    latest, runtime, run, status, last_tick, seconds_since_tick = _read_latest()
+    stale_before_recovery = bool(status == "running" and (seconds_since_tick is None or seconds_since_tick > 120))
+
+    if stale_before_recovery:
+        recovery_attempted = True
+        recovery_source = "health_boot_recovery_tick"
+        try:
+            # First use the multi-runtime watchdog. This handles wallet-level runs.
+            evs = _nexus_shadow_autotick_running_sessions(cur, wallet_address, source=recovery_source, min_interval_sec=1)
+            recovery_events.extend(evs if isinstance(evs, list) else [])
+
+            # If this process still did not tick, directly wake the newest RUNNING runtime.
+            # This is the important boot-recovery path: Start Shadow should not be needed
+            # after a Render restart.
+            if int(SHADOW_TICK_COUNT or 0) <= 0:
+                latest2, runtime2, run2, status2, last2, age2 = _read_latest()
+                if status2 == "running":
+                    cfg_run = {}
+                    if isinstance(run2, dict) and isinstance(run2.get("config"), dict):
+                        cfg_run.update(run2.get("config") or {})
+                    if isinstance(runtime2, dict):
+                        sid = str(runtime2.get("session_id") or cfg_run.get("session_id") or cfg_run.get("sessionId") or "").strip()
+                        chain = _normalize_chain_key(runtime2.get("chain") or cfg_run.get("chain") or cfg_run.get("chain_key") or "")
+                        if sid:
+                            cfg_run["session_id"] = sid
+                            cfg_run["sessionId"] = sid
+                        if chain:
+                            cfg_run["chain"] = chain
+                            cfg_run["chain_key"] = chain
+                    tick_result = _nexus_shadow_runtime_tick(cur, wallet_address, cfg_run, action="tick")
+                    events_tick = tick_result.get("events") if isinstance(tick_result.get("events"), list) else []
+                    recovery_events.extend(events_tick)
+                    run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+                    now_j = now_ts()
+                    result_summary = {
+                        "shadow_only": True,
+                        "live_execution_triggered": False,
+                        "status": "running",
+                        "runtime_status": tick_result.get("runtime_status"),
+                        "runtime": {
+                            "status": tick_result.get("runtime_status"),
+                            "action": "tick",
+                            "source": recovery_source,
+                            "tick_sec": tick_result.get("tick_sec"),
+                            "last_tick_ts": now_j,
+                            "active_count": tick_result.get("active_count", 0),
+                            "ready_count": tick_result.get("ready_count", 0),
+                            "simulated_exits": tick_result.get("simulated_exits", 0),
+                            "promoted": tick_result.get("promoted", 0),
+                            "strategist": tick_result.get("strategist") or {},
+                            "updated_ts": now_j,
+                        },
+                        "readiness": "SHADOW_RUNTIME_ACTIVE" if tick_result.get("runtime_status") == "running" else str(tick_result.get("runtime_status") or "idle").upper(),
+                        "message": "Shadow runtime recovered after stale health/boot detection. No Vault execution was triggered.",
+                    }
+                    cur.execute(
+                        """
+                        INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            run_id,
+                            wallet_address,
+                            "SHADOW",
+                            recovery_source,
+                            "running",
+                            json.dumps(result_summary, ensure_ascii=False),
+                            json.dumps(events_tick, ensure_ascii=False),
+                            json.dumps(tick_result.get("queue") or [], ensure_ascii=False),
+                            json.dumps({**cfg_run, "action": "tick", "autotick_source": recovery_source}, ensure_ascii=False),
+                            now_j,
+                            now_j,
+                        ),
+                    )
+            latest, runtime, run, status, last_tick, seconds_since_tick = _read_latest()
+            recovery_success = bool(int(SHADOW_TICK_COUNT or 0) > 0 or (last_tick and (now_ts() - int(last_tick)) <= 120))
+        except Exception as e:
+            recovery_error = str(e)[:240]
 
     try:
         cur.execute(
@@ -12159,7 +12242,7 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
             SELECT COUNT(*) AS c
             FROM nexus_shadow_executor_runs
             WHERE wallet_address=?
-              AND (source IN ('auto_get_tick','state_autotick','trading_state_autotick','health_autorecover_tick') OR config_json LIKE '%"action": "tick"%' OR config_json LIKE '%"action":"tick"%')
+              AND (source IN ('auto_get_tick','state_autotick','trading_state_autotick','health_autorecover_tick','health_boot_recovery_tick') OR config_json LIKE '%"action": "tick"%' OR config_json LIKE '%"action":"tick"%')
             """,
             (wallet_address,),
         )
@@ -12168,7 +12251,6 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
     except Exception:
         db_tick_count = 0
 
-    # A tick older than 2 minutes is suspicious for this debugging phase.
     stalled = bool(status == "running" and (seconds_since_tick is None or seconds_since_tick > 120))
 
     return {
@@ -12186,7 +12268,12 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
         "stalled": stalled,
         "stalled_after_sec": 120,
         "latest_run_id": run.get("run_id") if isinstance(run, dict) else None,
-        "source": "ENGINE-012_DB_RUNTIME_HEALTH_AUTORECOVERY",
+        "recovery_attempted": recovery_attempted,
+        "recovery_success": recovery_success,
+        "recovery_error": recovery_error,
+        "recovery_source": recovery_source,
+        "recovery_event_count": len(recovery_events),
+        "source": "ENGINE-013_DB_RUNTIME_HEALTH_BOOT_RECOVERY",
         "ts": now_i,
     }
 
@@ -12200,6 +12287,7 @@ def api_shadow_health():
         conn = _db()
         cur = conn.cursor()
         health = _nexus_shadow_health_for_wallet(cur, wa)
+        conn.commit()
         conn.close()
     return jsonify(health)
 
