@@ -179,11 +179,42 @@ def _handle_options_preflight():
     )
     return resp
 
+
+# -------------------------
+# Nexus deploy proof / debug build identifiers
+# -------------------------
+BACKEND_BUILD_ID = "B-2026.06.13-DEPLOY-PROOF-001"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-DEPLOY-PROOF-001"
+STRATEGIST_BUILD_ID = "S-DEPLOY-PROOF-001"
+SHADOW_BUILD_ID = "SH-DEPLOY-PROOF-001"
+SHADOW_ENTRY_MODE = "BACKEND_FIRST_PRICE_TICK"
+SHADOW_EXIT_MODE = "POSITIVE_ONLY_COST_GUARD"
+
+@app.get("/api/build-info")
+def api_build_info():
+    return {
+        "status": "ok",
+        "backend_build": BACKEND_BUILD_ID,
+        "frontend_target": FRONTEND_TARGET_BUILD_ID,
+        "strategist_version": STRATEGIST_BUILD_ID,
+        "shadow_version": SHADOW_BUILD_ID,
+        "entry_mode": SHADOW_ENTRY_MODE,
+        "exit_mode": SHADOW_EXIT_MODE,
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
+        "ts": int(time.time()),
+    }
+
 @app.get("/api/version")
 def api_version():
     return {
         "status": "ok",
         "ts": int(time.time()),
+        "backend_build": BACKEND_BUILD_ID,
+        "frontend_target": FRONTEND_TARGET_BUILD_ID,
+        "strategist_version": STRATEGIST_BUILD_ID,
+        "shadow_version": SHADOW_BUILD_ID,
+        "entry_mode": SHADOW_ENTRY_MODE,
+        "exit_mode": SHADOW_EXIT_MODE,
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
         "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
     }
