@@ -2,6 +2,7 @@
 from __future__ import annotations
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
+from datetime import datetime
 
 import os
 import time
@@ -183,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-010"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-011"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-010"
-SHADOW_BUILD_ID = "SH-ENGINE-010"
-SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_MONITOR"
+STRATEGIST_BUILD_ID = "S-ENGINE-011"
+SHADOW_BUILD_ID = "SH-ENGINE-011"
+SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_MONITOR_FIXED"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_TICK_PROOF"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_TICK_PROOF_FIXED"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -12123,7 +12124,7 @@ def _nexus_shadow_latest_runtime(cur, wallet_address: str, cfg: dict | None = No
 
 
 def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None = None) -> dict:
-    """ENGINE-010 health proof for the Shadow runtime.
+    """ENGINE-011 health proof for the Shadow runtime.
 
     This is DB-derived so it survives refreshes/redeploys and proves whether the
     engine is really ticking without relying on the Start Shadow button.
@@ -12177,7 +12178,7 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
         "stalled": stalled,
         "stalled_after_sec": 120,
         "latest_run_id": run.get("run_id") if isinstance(run, dict) else None,
-        "source": "ENGINE-010_DB_RUNTIME_HEALTH",
+        "source": "ENGINE-011_DB_RUNTIME_HEALTH",
         "ts": now_i,
     }
 
