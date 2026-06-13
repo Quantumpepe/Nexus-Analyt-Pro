@@ -13132,14 +13132,28 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         )
 
         exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and current_pnl_pct >= shadow_take_profit_pct
-        # Main liveness rule: after one runtime tick, a positive real-price PnL can be harvested.
-        exit_due_to_tick_profit = elapsed >= tick_sec and has_positive_edge and current_pnl_pct >= max(0.03, shadow_take_profit_pct * 0.25)
-        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and has_positive_edge and current_pnl_pct >= max(0.03, shadow_take_profit_pct * 0.20)
-        exit_due_to_late_session_profit = elapsed_ratio >= 0.85 and has_positive_edge and current_pnl_pct >= 0.02
+
+        # Looser live paper-cycle rules:
+        # The Strategist already gates entry through score, risk, market regime, pacing and token safety.
+        # Once a slot is ACTIVE, the lifecycle must not wait for a perfect profit-lock. Otherwise positions
+        # remain open for many hours, blocking fresh cycles even though prices and PnL update correctly.
+        min_harvest_usd = max(0.01, amount * 0.00001)  # 0.001% of position, but at least 1 cent
+        tiny_profit_pct = 0.005                         # 0.005% is enough to prove real movement
+        small_profit_pct = max(0.01, shadow_take_profit_pct * 0.10)
+        stale_flat_pct = 0.035
+        stale_loss_pct = 0.10
+
+        exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and current_pnl_usd >= min_harvest_usd and current_pnl_pct >= tiny_profit_pct
+        exit_due_to_tick_profit = elapsed >= tick_sec and has_positive_edge and current_pnl_pct >= small_profit_pct
+        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and has_positive_edge and current_pnl_pct >= tiny_profit_pct
+        exit_due_to_late_session_profit = elapsed_ratio >= 0.85 and has_positive_edge and current_pnl_pct >= tiny_profit_pct
         # Respect user profit-lock when it is a practical Shadow lock, but do not require it.
         exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct
-        # If a slot is old and slightly negative, allow a controlled defensive close only when quality/risk weakens.
-        exit_due_to_stale_weak_trade = elapsed >= max(tick_sec * 3, 900) and current_pnl_pct >= -0.12 and (row["quality"] < 36 or row["risk"] >= 36)
+        # Do not let small losers sit forever. The whole point of Shadow is rotation learning:
+        # after two ticks, close small red/flat trades so the slot can re-enter a cleaner setup.
+        exit_due_to_flat_rotation = elapsed >= max(tick_sec * 2, 300) and abs(current_pnl_pct) <= stale_flat_pct
+        exit_due_to_small_loss_rotation = elapsed >= max(tick_sec * 2, 300) and current_pnl_pct <= -stale_flat_pct and current_pnl_pct >= -stale_loss_pct
+        exit_due_to_stale_weak_trade = elapsed >= max(tick_sec * 3, 900) and current_pnl_pct >= -0.25 and (row["quality"] < 45 or row["risk"] >= 30 or regime in ("RED", "NEUTRAL"))
 
         exit_reason = None
         if exit_due_to_quality:
@@ -13152,12 +13166,18 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             exit_reason = "user_profit_lock"
         elif exit_due_to_shadow_take_profit:
             exit_reason = "shadow_tactical_take_profit"
+        elif exit_due_to_micro_profit:
+            exit_reason = "shadow_micro_profit_harvest"
         elif exit_due_to_tick_profit:
             exit_reason = "shadow_tick_profit_harvest"
         elif exit_due_to_stale_profit:
             exit_reason = "shadow_stale_profit_harvest"
         elif exit_due_to_late_session_profit:
             exit_reason = "late_session_profit_protection"
+        elif exit_due_to_flat_rotation:
+            exit_reason = "stale_flat_rotation"
+        elif exit_due_to_small_loss_rotation:
+            exit_reason = "small_loss_rotation"
         elif exit_due_to_stale_weak_trade:
             exit_reason = "stale_weak_trade_rotation"
 
@@ -13169,6 +13189,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             meta["shadow_exit_reason"] = exit_reason
             meta["shadow_take_profit_pct"] = round(shadow_take_profit_pct, 4)
             meta["shadow_min_hold_minutes"] = round(min_hold_min, 4)
+            meta["shadow_last_exit_pnl_pct"] = round(current_pnl_pct, 6)
+            meta["shadow_last_exit_pnl_usd"] = round(current_pnl_usd, 6)
+            meta["shadow_last_exit_elapsed_sec"] = int(elapsed)
             set_meta(item, meta)
             pnl_msg = ""
             try:
