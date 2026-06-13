@@ -183,10 +183,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-007"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-008"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-007"
-SHADOW_BUILD_ID = "SH-ENGINE-007"
+STRATEGIST_BUILD_ID = "S-ENGINE-008"
+SHADOW_BUILD_ID = "SH-ENGINE-008"
 SHADOW_ENTRY_MODE = "AUTO_STATE_TICK_PRICE_MARK"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
 SHADOW_EXIT_MODE = "AUTO_TICK_GROSS_HARVEST"
@@ -13891,7 +13891,28 @@ def api_nexus_shadow_executor():
                 updated_ts = int(runtime_meta.get("updated_ts") or rr.get("updated_ts") or rr.get("created_ts") or 0)
                 if updated_ts and (now_i - updated_ts) < tick_sec:
                     continue
-                tick_result = _nexus_shadow_runtime_tick(cur, wa, cfg_run, action="tick")
+                try:
+                    tick_result = _nexus_shadow_runtime_tick(cur, wa, cfg_run, action="tick")
+                except Exception as e:
+                    # ENGINE-008: polling/GET must never crash the dashboard.
+                    # A single bad runtime/slot row is reported as an event and skipped,
+                    # instead of returning HTTP 500 to the frontend.
+                    err_msg = str(e)[:220]
+                    try:
+                        _nexus_log_sim_event(
+                            cur,
+                            wa,
+                            "shadow_executor",
+                            "SHADOW",
+                            "AUTOTICK_ERROR",
+                            sid or chain or "",
+                            "error",
+                            "Shadow GET auto-tick skipped one runtime after internal error.",
+                            {"error": err_msg, "session_id": sid, "chain": chain, "source": "ENGINE-008_GET_AUTOTICK_GUARD"},
+                        )
+                    except Exception:
+                        pass
+                    continue
                 events_tick = tick_result.get("events") if isinstance(tick_result.get("events"), list) else []
                 is_no_queue = str(tick_result.get("runtime_status") or "").lower() == "idle" and any(
                     isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events_tick
