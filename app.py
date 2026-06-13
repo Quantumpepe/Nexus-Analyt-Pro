@@ -13089,8 +13089,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # a small positive real-price PnL and either the tactical TP, one runtime tick,
         # or stale-profit timer is reached. This restores movement without bringing back
         # blind refresh/start profits: Start/GET still do not force a cycle.
-        exit_due_to_quality = row["quality"] < 24
-        exit_due_to_risk = row["risk"] >= 48
+        # Quality/risk deterioration should not realize a paper cycle with costs by itself.
+        # Only close through normal net-positive harvest, hard-stop, or severe risk.
+        exit_due_to_quality = False
+        exit_due_to_risk = row["risk"] >= 70
         hard_stop_pct = abs(_clamp_float(cfg.get("hard_stop_pct", cfg.get("hardStopPct", meta_now.get("hard_stop_pct", meta_now.get("hardStopPct", 0)))), 0, 0, 100))
         profit_lock_pct = abs(_clamp_float(cfg.get("profit_lock_pct", cfg.get("profitLockPct", meta_now.get("profit_lock_pct", meta_now.get("profitLockPct", 0)))), 0, 0, 100))
         current_pnl_pct = _clamp_float(meta_now.get("paper_pnl_pct", 0), 0, -100, 100)
@@ -13133,27 +13135,43 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
 
         exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and current_pnl_pct >= shadow_take_profit_pct
 
-        # Looser live paper-cycle rules:
-        # The Strategist already gates entry through score, risk, market regime, pacing and token safety.
-        # Once a slot is ACTIVE, the lifecycle must not wait for a perfect profit-lock. Otherwise positions
-        # remain open for many hours, blocking fresh cycles even though prices and PnL update correctly.
+        # Looser live paper-cycle rules, but with a strict cost guard:
+        # Positive cycles may close faster, but normal flat/red trades must NOT be
+        # closed just to rotate, because every forced close applies estimated live
+        # roundtrip costs. That caused the ETH -31 USD cost spike. A normal cycle
+        # can only close when the gross PnL is net-positive after estimated costs.
+        # Losing trades close only on true hard-stop / severe risk, not on "flat"
+        # rotation or weak quality noise.
+        cost_preview = _nexus_shadow_cost_model(amount, item.get("chain") or meta_now.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
+        estimated_exit_cost_usd = _clamp_float(cost_preview.get("total_cost_usd"), 0, 0, 1_000_000_000)
+        net_if_closed_usd = current_pnl_usd - estimated_exit_cost_usd
         min_harvest_usd = max(0.01, amount * 0.00001)  # 0.001% of position, but at least 1 cent
         tiny_profit_pct = 0.005                         # 0.005% is enough to prove real movement
         small_profit_pct = max(0.01, shadow_take_profit_pct * 0.10)
-        stale_flat_pct = 0.035
-        stale_loss_pct = 0.10
+        has_net_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and net_if_closed_usd >= min_harvest_usd
+        exit_due_to_quality = row["quality"] < 18 and has_net_positive_edge
 
-        exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and current_pnl_usd >= min_harvest_usd and current_pnl_pct >= tiny_profit_pct
-        exit_due_to_tick_profit = elapsed >= tick_sec and has_positive_edge and current_pnl_pct >= small_profit_pct
-        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and has_positive_edge and current_pnl_pct >= tiny_profit_pct
-        exit_due_to_late_session_profit = elapsed_ratio >= 0.85 and has_positive_edge and current_pnl_pct >= tiny_profit_pct
-        # Respect user profit-lock when it is a practical Shadow lock, but do not require it.
-        exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct
-        # Do not let small losers sit forever. The whole point of Shadow is rotation learning:
-        # after two ticks, close small red/flat trades so the slot can re-enter a cleaner setup.
-        exit_due_to_flat_rotation = elapsed >= max(tick_sec * 2, 300) and abs(current_pnl_pct) <= stale_flat_pct
-        exit_due_to_small_loss_rotation = elapsed >= max(tick_sec * 2, 300) and current_pnl_pct <= -stale_flat_pct and current_pnl_pct >= -stale_loss_pct
-        exit_due_to_stale_weak_trade = elapsed >= max(tick_sec * 3, 900) and current_pnl_pct >= -0.25 and (row["quality"] < 45 or row["risk"] >= 30 or regime in ("RED", "NEUTRAL"))
+        exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
+        exit_due_to_tick_profit = elapsed >= tick_sec and has_net_positive_edge and current_pnl_pct >= small_profit_pct
+        exit_due_to_stale_profit = elapsed >= stale_profit_min * 60 and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
+        exit_due_to_late_session_profit = elapsed_ratio >= 0.85 and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
+        # Respect user profit-lock when it is a practical Shadow lock, but still
+        # require the cycle to be net-positive after estimated costs.
+        exit_due_to_profit_lock = profit_lock_pct > 0 and profit_lock_pct <= 5 and current_pnl_pct >= profit_lock_pct and has_net_positive_edge
+
+        # Disabled as cost-generating cycle exits:
+        # - stale_flat_rotation
+        # - small_loss_rotation
+        # - stale_weak_trade_rotation
+        # These states may remain ACTIVE/READY/PROTECT, but they must not realize
+        # estimated costs unless a real hard stop / risk break demands it.
+        exit_due_to_flat_rotation = False
+        exit_due_to_small_loss_rotation = False
+        exit_due_to_stale_weak_trade = False
+
+        meta_now["paper_estimated_exit_cost_usd"] = round(estimated_exit_cost_usd, 4)
+        meta_now["paper_net_if_closed_usd"] = round(net_if_closed_usd, 4)
+        set_meta(item, meta_now)
 
         exit_reason = None
         if exit_due_to_quality:
