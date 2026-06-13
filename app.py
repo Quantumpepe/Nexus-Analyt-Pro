@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-011"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-012"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-011"
-SHADOW_BUILD_ID = "SH-ENGINE-011"
-SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_MONITOR_FIXED"
+STRATEGIST_BUILD_ID = "S-ENGINE-012"
+SHADOW_BUILD_ID = "SH-ENGINE-012"
+SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_HEALTH_AUTORECOVERY"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_TICK_PROOF_FIXED"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_WITH_HEALTH_AUTORECOVERY"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -12131,6 +12131,14 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
     """
     now_i = now_ts()
     cfg = cfg if isinstance(cfg, dict) else {}
+    # ENGINE-012: health is not only a display endpoint. If the runtime is RUNNING
+    # but stale, the health request performs one safe watchdog tick. This is
+    # request-driven, session-local, and does not create new sessions. It fixes the
+    # observed case where Start Shadow woke the engine but normal polling did not.
+    try:
+        _nexus_shadow_autotick_running_sessions(cur, wallet_address, source="health_autorecover_tick", min_interval_sec=60)
+    except Exception:
+        pass
     latest = _nexus_shadow_latest_runtime(cur, wallet_address, cfg)
     runtime = latest.get("runtime") if isinstance(latest.get("runtime"), dict) else {}
     run = latest.get("run") if isinstance(latest.get("run"), dict) else {}
@@ -12151,7 +12159,7 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
             SELECT COUNT(*) AS c
             FROM nexus_shadow_executor_runs
             WHERE wallet_address=?
-              AND (source IN ('auto_get_tick','state_autotick') OR config_json LIKE '%"action": "tick"%' OR config_json LIKE '%"action":"tick"%')
+              AND (source IN ('auto_get_tick','state_autotick','trading_state_autotick','health_autorecover_tick') OR config_json LIKE '%"action": "tick"%' OR config_json LIKE '%"action":"tick"%')
             """,
             (wallet_address,),
         )
@@ -12178,7 +12186,7 @@ def _nexus_shadow_health_for_wallet(cur, wallet_address: str, cfg: dict | None =
         "stalled": stalled,
         "stalled_after_sec": 120,
         "latest_run_id": run.get("run_id") if isinstance(run, dict) else None,
-        "source": "ENGINE-011_DB_RUNTIME_HEALTH",
+        "source": "ENGINE-012_DB_RUNTIME_HEALTH_AUTORECOVERY",
         "ts": now_i,
     }
 
@@ -14006,7 +14014,7 @@ def api_nexus_shadow_executor():
                 if status_raw != "running":
                     continue
                 tick_sec = int(_clamp_float(cfg_run.get("tick_sec", cfg_run.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
-                updated_ts = int(runtime_meta.get("updated_ts") or rr.get("updated_ts") or rr.get("created_ts") or 0)
+                updated_ts = int(runtime_meta.get("last_tick_ts") or runtime_meta.get("updated_ts") or rr.get("updated_ts") or rr.get("created_ts") or 0)
                 if updated_ts and (now_i - updated_ts) < tick_sec:
                     continue
                 try:
@@ -14053,6 +14061,7 @@ def api_nexus_shadow_executor():
                         "simulated_exits": tick_result.get("simulated_exits", 0),
                         "promoted": tick_result.get("promoted", 0),
                         "strategist": tick_result.get("strategist") or {},
+                        "last_tick_ts": now_i,
                         "updated_ts": now_i,
                     },
                     "readiness": "SHADOW_RUNTIME_ACTIVE" if tick_result.get("runtime_status") == "running" else str(tick_result.get("runtime_status") or "idle").upper(),
