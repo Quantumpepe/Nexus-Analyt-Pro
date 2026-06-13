@@ -12419,29 +12419,42 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         return ""
 
     def _paper_live_price(item, meta, allow_network=True):
-        # Truth source for paper PnL: real market price only.
-        # Never use paper_mark_price, paper_entry_price, or a hardcoded 1.0 as a current mark.
+        """Return a real market price for Shadow paper PnL.
+
+        Critical rule: for native/session assets (ETH, BNB, POL, etc.) prefer the
+        backend market router over any stale queue/UI price. Older UI queue rows can
+        carry placeholder prices like 1.0; using those as truth freezes PnL forever
+        (Entry 1.00 / Current 1.00 for hours). The backend must refresh the mark from
+        market data on every tick.
+        """
+        sym = _paper_asset_symbol(item, meta)
+
+        if allow_network and sym:
+            try:
+                if "_price_multi" in globals() and callable(globals().get("_price_multi")):
+                    px = _price_multi(sym) or {}
+                    n = float(px.get("price") or 0)
+                    if math.isfinite(n) and n > 0:
+                        return n, str(px.get("source") or "market")
+            except Exception:
+                pass
+
+        # Fallback to provided prices only when network price is unavailable.
+        # Ignore the common 1.0 placeholder for known major assets, because it is not
+        # a real ETH/BNB/POL market price and blocks PnL/cycles.
         for value in [
             item.get("current_price"), item.get("price"), item.get("priceUsd"), item.get("mark_price"),
             cfg.get("current_price"), cfg.get("price"), cfg.get("priceUsd"), cfg.get("mark_price"),
         ]:
             try:
                 n = float(value)
-                if math.isfinite(n) and n > 0:
-                    return n, "provided"
+                if not (math.isfinite(n) and n > 0):
+                    continue
+                if sym in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON") and abs(n - 1.0) < 1e-9:
+                    continue
+                return n, "provided"
             except Exception:
                 continue
-        if allow_network:
-            sym = _paper_asset_symbol(item, meta)
-            if sym:
-                try:
-                    if "_price_multi" in globals() and callable(globals().get("_price_multi")):
-                        px = _price_multi(sym) or {}
-                        n = float(px.get("price") or 0)
-                        if math.isfinite(n) and n > 0:
-                            return n, str(px.get("source") or "market")
-                except Exception:
-                    pass
         return None, "unavailable"
 
     def _paper_base_price(item, meta):
@@ -13600,6 +13613,22 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "total_session_slots": total_session_slots,
         "slot_scope": "session_local_slot_units",
         "elapsed_ratio": round(elapsed_ratio, 4),
+        "last_tick_ts": ts,
+        "price_debug": [
+            {
+                "slot": x.get("slot") or x.get("slot_id"),
+                "state": str(x.get("status") or x.get("state") or "WAIT").upper(),
+                "asset": (get_meta(x).get("asset") or x.get("asset") or x.get("symbol") or ""),
+                "entry": get_meta(x).get("paper_entry_price"),
+                "mark": get_meta(x).get("paper_mark_price"),
+                "price_source": get_meta(x).get("paper_price_source"),
+                "price_missing": bool(get_meta(x).get("paper_price_missing")),
+                "pnl_pct": get_meta(x).get("paper_pnl_pct"),
+                "pnl_usd": get_meta(x).get("paper_pnl_usd"),
+                "cycles": get_meta(x).get("shadow_cycles"),
+                "exit_reason": get_meta(x).get("shadow_exit_reason"),
+            } for x in normalized[:10]
+        ],
         "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
     }
     return {
@@ -13628,7 +13657,7 @@ def api_nexus_shadow_executor():
             cur = conn.cursor()
             now_i = now_ts()
 
-            get_autotick_enabled = str(os.getenv("NEXUS_SHADOW_GET_AUTOTICK", "0")).strip().lower() in ("1", "true", "yes", "on")
+            get_autotick_enabled = str(os.getenv("NEXUS_SHADOW_GET_AUTOTICK", "1")).strip().lower() in ("1", "true", "yes", "on")
             # Safe auto-tick: continue already-running sessions only.
             # It must never create a new session, never persist NO_QUEUE, and never delete/cleanup queues.
             cur.execute(
@@ -13750,41 +13779,60 @@ def api_nexus_shadow_executor():
         cur.execute("SELECT * FROM nexus_trading_hold_state WHERE wallet_address=?", (wa,))
         hold_state = _nexus_trading_update_hold_phase(_nexus_trading_hold_row_to_dict(cur.fetchone()))
         body_queue = body.get("queue") if isinstance(body.get("queue"), list) else None
-        # Backend-first: an empty frontend queue must not override the persisted
-        # wallet/session queue. Otherwise Shadow buttons look broken and Test can
-        # clear/replace visible slots with an empty preview.
-        queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else execution.get("queue", [])
+        persisted_queue = execution.get("queue", []) if isinstance(execution.get("queue", []), list) else []
+        runtime_action_requested = action in ("start", "tick", "pause", "resume", "stop")
 
+        # Backend-first runtime rule:
+        # Runtime buttons must use the persisted backend queue as source of truth.
+        # The frontend queue can be stale, locally transformed, or carry placeholder
+        # prices/states. Let it seed only when the backend has no queue yet.
+        if runtime_action_requested:
+            queue = persisted_queue if len(persisted_queue) > 0 else (body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else [])
+        else:
+            queue = body_queue if isinstance(body_queue, list) and len(body_queue) > 0 else persisted_queue
+
+        action_for_tick = action
+        already_running_start = False
+        start_is_recent = False
         if action == "start":
-            # Idempotency guard: pressing Start Shadow while the selected runtime is
-            # already RUNNING must be read-only. It must not tick, reset ACTIVE slots,
-            # recalculate paper PnL, or create another run row.
+            # Idempotency guard with stale-runtime wakeup:
+            # - recent RUNNING: read-only, no tick and no PnL recalculation.
+            # - stale RUNNING: convert Start into a safe tick, without seed/reset.
             selected_session_id = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip()
             selected_chain = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
             latest_runtime = _nexus_shadow_latest_runtime(cur, wa, cfg)
             latest_status = str(latest_runtime.get("status") or "").lower()
             if latest_status == "running" and not _nexus_shadow_is_session_stopped(cur, wa, selected_session_id, selected_chain):
+                already_running_start = True
                 runtime_meta = latest_runtime.get("runtime") if isinstance(latest_runtime.get("runtime"), dict) else {}
-                conn.commit()
-                conn.close()
-                return jsonify({
-                    "status": "ok",
-                    "wallet": wa,
-                    "run": latest_runtime.get("run"),
-                    "execution": execution,
-                    "shadow_state_changes": [],
-                    "runtime_status": "running",
-                    "message": "Shadow runtime already running; Start Shadow ignored without ticking or changing paper state.",
-                    "event": {
-                        "type": "SHADOW_START_IGNORED",
-                        "message": "Start Shadow was pressed while runtime was already running. No tick, no slot reset, no PnL recalculation.",
-                    },
-                    "runtime": runtime_meta,
-                    "ts": now_ts(),
-                })
+                run_obj = latest_runtime.get("run") if isinstance(latest_runtime.get("run"), dict) else {}
+                last_ts = int(runtime_meta.get("last_tick_ts") or runtime_meta.get("updated_ts") or run_obj.get("updated_ts") or run_obj.get("created_ts") or 0)
+                tick_sec_cfg = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
+                start_is_recent = bool(last_ts and (now_ts() - last_ts) < max(20, min(tick_sec_cfg, 120)))
+                if start_is_recent:
+                    conn.commit()
+                    conn.close()
+                    return jsonify({
+                        "status": "ok",
+                        "wallet": wa,
+                        "run": latest_runtime.get("run"),
+                        "execution": execution,
+                        "shadow_state_changes": [],
+                        "runtime_status": "running",
+                        "message": "Shadow runtime already running; Start Shadow ignored because the last tick is recent.",
+                        "event": {
+                            "type": "SHADOW_START_IGNORED_RECENT",
+                            "message": "Start Shadow was pressed while runtime was already running and recently ticked. No slot reset, no duplicate tick, no PnL recalculation.",
+                        },
+                        "runtime": runtime_meta,
+                        "ts": now_ts(),
+                    })
+                # Wake stale running runtime by doing one normal tick. This prevents
+                # Start from becoming a permanent no-op if polling stopped/slept.
+                action_for_tick = "tick"
 
         if action in ("start", "tick", "pause", "resume", "stop"):
-            if action in ("start", "resume"):
+            if action in ("start", "resume") and not already_running_start:
                 # A fresh user start/resume explicitly re-opens the selected permission window.
                 # Clear old stop tombstones only for this selected session/chain.
                 _nexus_shadow_clear_session_stopped(
@@ -13810,7 +13858,7 @@ def api_nexus_shadow_executor():
                             _meta["strategist_entry_reason"] = "start_requires_regime_edge_cost_gate"
                             _seed_item["meta"] = _meta
                     _nexus_shadow_persist_queue_preview(cur, wa, normalized_seed)
-            runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action)
+            runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action_for_tick)
             result = {
                 "summary": {
                     "shadow_only": True,
