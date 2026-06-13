@@ -183,13 +183,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-008"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-009"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-008"
-SHADOW_BUILD_ID = "SH-ENGINE-008"
-SHADOW_ENTRY_MODE = "AUTO_STATE_TICK_PRICE_MARK"
+STRATEGIST_BUILD_ID = "S-ENGINE-009"
+SHADOW_BUILD_ID = "SH-ENGINE-009"
+SHADOW_ENTRY_MODE = "FRESH_BACKEND_PRICE_TICK_NO_WATCHLIST"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
-SHADOW_EXIT_MODE = "AUTO_TICK_GROSS_HARVEST"
+SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST"
 
 @app.get("/api/build-info")
 def api_build_info():
@@ -12469,19 +12469,35 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         """
         sym = _paper_asset_symbol(item, meta)
 
+        major_syms = ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON")
+
         if allow_network and sym:
             try:
-                if "_price_multi" in globals() and callable(globals().get("_price_multi")):
-                    px = _price_multi(sym) or {}
+                px = _price_multi_fresh_shadow(sym) if "_price_multi_fresh_shadow" in globals() else None
+                if isinstance(px, dict):
                     n = float(px.get("price") or 0)
                     if math.isfinite(n) and n > 0:
-                        return n, str(px.get("source") or "market")
-            except Exception:
-                pass
+                        meta["paper_price_source"] = str(px.get("source") or "fresh_market")
+                        meta["paper_price_ts"] = int(px.get("ts") or now_ts())
+                        meta["paper_price_symbol"] = sym
+                        if px.get("pair"):
+                            meta["paper_price_pair"] = px.get("pair")
+                        if px.get("id"):
+                            meta["paper_price_id"] = px.get("id")
+                        return n, str(px.get("source") or "fresh_market")
+            except Exception as e:
+                meta["paper_price_error"] = str(e)[:160]
 
-        # Fallback to provided prices only when network price is unavailable.
-        # Ignore the common 1.0 placeholder for known major assets, because it is not
-        # a real ETH/BNB/POL market price and blocks PnL/cycles.
+        # Critical: for core tradable assets never use Watchlist/UI/cfg prices as
+        # Shadow truth. The Watchlist can be minutes old. If fresh backend price
+        # is unavailable, mark the slot as price-missing instead of freezing
+        # Entry == Current on a stale value.
+        if sym in major_syms:
+            meta["paper_price_missing"] = True
+            meta["paper_price_source"] = "fresh_unavailable_no_watchlist_fallback"
+            return None, "fresh_unavailable_no_watchlist_fallback"
+
+        # Fallback to provided prices only for non-core/custom assets.
         for value in [
             item.get("current_price"), item.get("price"), item.get("priceUsd"), item.get("mark_price"),
             cfg.get("current_price"), cfg.get("price"), cfg.get("priceUsd"), cfg.get("mark_price"),
@@ -12490,9 +12506,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 n = float(value)
                 if not (math.isfinite(n) and n > 0):
                     continue
-                if sym in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON") and abs(n - 1.0) < 1e-9:
-                    continue
-                return n, "provided"
+                return n, "provided_non_core"
             except Exception:
                 continue
         return None, "unavailable"
@@ -12609,6 +12623,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         item["realized_profit_usd"] = meta.get("realized_profit_usd", meta.get("paper_realized_total_usd"))
         item["paper_quantity"] = meta.get("paper_quantity")
         item["paper_position_usd"] = meta.get("paper_position_usd")
+        item["paper_price_source"] = meta.get("paper_price_source")
+        item["paper_price_ts"] = meta.get("paper_price_ts")
+        item["paper_price_symbol"] = meta.get("paper_price_symbol")
+        item["paper_price_pair"] = meta.get("paper_price_pair")
+        item["paper_price_id"] = meta.get("paper_price_id")
         set_meta(item, meta)
         return item
 
@@ -13716,6 +13735,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 "entry": get_meta(x).get("paper_entry_price"),
                 "mark": get_meta(x).get("paper_mark_price"),
                 "price_source": get_meta(x).get("paper_price_source"),
+                "price_ts": get_meta(x).get("paper_price_ts"),
+                "price_symbol": get_meta(x).get("paper_price_symbol"),
+                "price_pair": get_meta(x).get("paper_price_pair"),
+                "price_id": get_meta(x).get("paper_price_id"),
                 "price_missing": bool(get_meta(x).get("paper_price_missing")),
                 "pnl_pct": get_meta(x).get("paper_pnl_pct"),
                 "pnl_usd": get_meta(x).get("paper_pnl_usd"),
@@ -21381,6 +21404,65 @@ def _price_multi(symbol: str) -> dict | None:
                     return {"symbol": (symbol or "").upper(), "price": px, "source": "coingecko", "id": coin_id}
     except Exception:
         pass
+    return None
+
+
+def _price_multi_fresh_shadow(symbol: str) -> dict | None:
+    """Fresh price router for Shadow paper trading.
+
+    This intentionally bypasses watchlist/UI prices and the long CoinGecko market
+    snapshot cache. Shadow Entry/Current must be marked from a fresh backend
+    market price on every tick; otherwise Entry == Current can freeze for many
+    minutes and no PnL/exit can occur.
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+
+    # 1) Fresh Binance ticker, no cache.
+    for pair in _binance_symbol_candidates(s):
+        try:
+            url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
+            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3)
+            if r.status_code == 400:
+                continue
+            r.raise_for_status()
+            j = r.json() or {}
+            price = float(j.get("price"))
+            if math.isfinite(price) and price > 0:
+                return {
+                    "symbol": s,
+                    "pair": pair,
+                    "price": price,
+                    "source": "fresh_binance",
+                    "ts": now_ts(),
+                }
+        except Exception:
+            continue
+
+    # 2) Fresh CoinGecko simple price, using static IDs first to avoid search ambiguity.
+    try:
+        coin_id = _STATIC_CG_IDS.get(s) or COINGECKO_KNOWN.get(s) or _cg_search_best_id_for_symbol(s)
+        if coin_id:
+            url = f"{COINGECKO_BASE}/simple/price"
+            j = _cg_request_json(
+                url,
+                params={"ids": coin_id, "vs_currencies": "usd"},
+                timeout=8,
+            ) or {}
+            raw = (j.get(coin_id) or {}).get("usd") if isinstance(j, dict) else None
+            price = float(raw)
+            if math.isfinite(price) and price > 0:
+                return {
+                    "symbol": s,
+                    "price": price,
+                    "source": "fresh_coingecko_simple",
+                    "id": coin_id,
+                    "ts": now_ts(),
+                }
+    except Exception:
+        pass
+
     return None
 
 def _cg_set_symbol_id_cache(symbol: str, coin_id: str):
