@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-014"
+BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-015"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-014"
-SHADOW_BUILD_ID = "SH-ENGINE-014"
+STRATEGIST_BUILD_ID = "S-ENGINE-015"
+SHADOW_BUILD_ID = "SH-ENGINE-015"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "SESSION_LOCAL_READY_TO_ACTIVE"
+SHADOW_PROMOTION_MODE = "SESSION_LOCAL_ADAPTIVE_THRESHOLD_35_40_45"
 SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_RECOVERY_AMOUNT_FIX"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -217,6 +217,10 @@ def api_build_info():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
+        "promotion_policy": "ADAPTIVE_THRESHOLD_35_40_45",
+        "promotion_threshold_low_risk": 35,
+        "promotion_threshold_normal_risk": 40,
+        "promotion_threshold_high_risk": 45,
         "exit_mode": SHADOW_EXIT_MODE,
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
         "ts": int(time.time()),
@@ -233,6 +237,10 @@ def api_version():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
+        "promotion_policy": "ADAPTIVE_THRESHOLD_35_40_45",
+        "promotion_threshold_low_risk": 35,
+        "promotion_threshold_normal_risk": 40,
+        "promotion_threshold_high_risk": 45,
         "exit_mode": SHADOW_EXIT_MODE,
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
         "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
@@ -11150,7 +11158,7 @@ def _nexus_recheck_apply(cur, wallet_address):
         elif quality.get("risk_score", 0) >= 70:
             new_state = "HOLD"
             reason = "Shadow recheck detected high risk; slot is protected in HOLD."
-        elif quality.get("risk_score", 0) >= 48:
+        elif quality.get("risk_score", 0) >= 60:
             new_state = "PROTECT"
             reason = "Shadow recheck detected elevated risk; slot moves to PROTECT."
         elif old_state in ("WAIT", "OBSERVE", "READY"):
@@ -11616,7 +11624,7 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
                 continue
             if _nexus_shadow_item_blocked_by_hold(candidate, hold):
                 continue
-            if q.get("hard_block") or candidate_risk >= 48:
+            if q.get("hard_block") or candidate_risk >= 60:
                 continue
 
             # If external signals are sparse, use quality + priority ranking so Shadow can
@@ -11687,7 +11695,7 @@ def _nexus_shadow_executor_simulate(queue, config=None, hold_state=None):
                 "risk_score": risk,
                 "message": transition_reason,
             })
-        elif risk >= 48:
+        elif risk >= 60:
             protect_count += 1
             stop_tests += 1
             next_state = "PROTECT"
@@ -13312,7 +13320,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             continue
         if row["hard_block"] or row["risk"] >= 70:
             events.append(set_state(item, "HOLD", "Strategist detected hard risk/security/liquidity block; paper slot moves to HOLD.", "STRATEGIST_HOLD"))
-        elif row["risk"] >= 48:
+        elif row["risk"] >= 60:
             events.append(set_state(item, "PROTECT", "Strategist detected elevated risk; paper slot moves to PROTECT.", "STRATEGIST_PROTECT"))
 
     # 2) Close active paper slots after one runtime cycle or if quality deteriorates.
@@ -13658,11 +13666,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # max_combined_slots into a hard active-slot limit. A RED market can make
         # entries rarer/cleaner, but active capacity remains the selected session's
         # slot-unit capacity.
-        "RED": {"min_edge": 58, "risk_max": 42, "pace": 0.75},
-        "NEUTRAL": {"min_edge": 52, "risk_max": 45, "pace": 1.00},
-        "GREEN": {"min_edge": 48, "risk_max": 50, "pace": 1.30},
-        "STRONG_GREEN": {"min_edge": 45, "risk_max": 55, "pace": 1.50},
-    }.get(regime, {"min_edge": 52, "risk_max": 45, "pace": 1.00})
+        # ENGINE-015: promotion edge is now row-risk adaptive (35/40/45).
+        # Regime still controls pacing and an upper risk guard, but no longer keeps
+        # clean READY slots stuck behind old 48-58 edge thresholds.
+        "RED": {"min_edge": 40, "risk_max": 55, "pace": 0.75},
+        "NEUTRAL": {"min_edge": 40, "risk_max": 55, "pace": 1.00},
+        "GREEN": {"min_edge": 38, "risk_max": 60, "pace": 1.30},
+        "STRONG_GREEN": {"min_edge": 35, "risk_max": 60, "pace": 1.50},
+    }.get(regime, {"min_edge": 40, "risk_max": 55, "pace": 1.00})
 
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
     hard_trade_limit = int(_clamp_float(cfg.get("hard_trade_limit", cfg.get("hardTradeLimit", max_trades + 5)), max_trades + 5, max_trades, max_trades + 50))
@@ -13702,8 +13713,17 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         q = _clamp_float(row["quality"], 0, -100, 100)
         risk = _clamp_float(row["risk"], 0, 0, 100)
         confidence = _clamp_float(row["confidence"], 0, 0, 100)
-        min_edge = float(regime_params.get("min_edge", 70))
-        risk_max = float(regime_params.get("risk_max", 38))
+        # ENGINE-015 adaptive promotion threshold:
+        # controlled risk (<=35) can enter at q>=35, normal risk (36-55) at q>=40,
+        # higher risk requires q>=45 but still must pass the risk_max guard below.
+        if risk <= 35:
+            adaptive_min_edge = 35.0
+        elif risk <= 55:
+            adaptive_min_edge = 40.0
+        else:
+            adaptive_min_edge = 45.0
+        min_edge = min(float(regime_params.get("min_edge", 40)), adaptive_min_edge)
+        risk_max = float(regime_params.get("risk_max", 55))
         # Expected move model:
         # - Use a more realistic paper expectation for short-term opportunities.
         # - READY slots around q=52-58 should be able to start when risk is controlled
@@ -13746,6 +13766,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             reason = "wait_expected_move_below_cost_buffer"
 
         meta["strategist_market_regime"] = regime
+        meta["strategist_promotion_policy"] = "ADAPTIVE_THRESHOLD_35_40_45"
+        meta["strategist_adaptive_min_edge"] = round(adaptive_min_edge, 4)
         meta["strategist_min_edge"] = round(min_edge, 4)
         meta["strategist_risk_max"] = round(risk_max, 4)
         meta["strategist_base_expected_pct"] = round(base_expected_pct, 4)
@@ -13805,7 +13827,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 continue
         elif st not in ("READY", "WAIT"):
             continue
-        if row["hard_block"] or row["risk"] >= 48:
+        if row["hard_block"] or row["risk"] >= 60:
             continue
         # Require positive net edge after estimated costs. Market regime controls aggressiveness.
         if _shadow_cost_gate(row):
@@ -13862,7 +13884,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             if not last_exit or ts - last_exit < min(120, max(30, tick_sec)):
                 # Show completed exit briefly before allowing the next Strategist entry decision.
                 continue
-        if not row["hard_block"] and row["risk"] < 48 and (row["quality"] >= 25 or row["confidence"] >= 45):
+        if not row["hard_block"] and row["risk"] < 60 and (row["quality"] >= 25 or row["confidence"] >= 45):
             ready_candidates.append(row)
     ready_candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
     ready_keep = {r["idx"] for r in ready_candidates[:max(0, ready_slots_target - active_count)]}
