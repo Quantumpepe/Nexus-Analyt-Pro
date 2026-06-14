@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-016"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-017"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-016"
-SHADOW_BUILD_ID = "SH-ENGINE-016"
+STRATEGIST_BUILD_ID = "S-ENGINE-017"
+SHADOW_BUILD_ID = "SH-ENGINE-017"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_ADAPTIVE_THRESHOLD_35_40_45"
-SHADOW_EXIT_MODE = "SHADOW_COST_CAP_NET_POSITIVE_V3"
+SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EXIT_GUARD_V4"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -13426,7 +13426,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             12, 3, 720
         )
 
-        exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and current_pnl_pct >= shadow_take_profit_pct
+        exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and has_net_positive_edge and current_pnl_pct >= shadow_take_profit_pct
 
         # Looser live paper-cycle rules, but with a strict cost guard:
         # Positive cycles may close faster, but normal flat/red trades must NOT be
@@ -13444,13 +13444,17 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         estimated_exit_cost_usd = min(estimated_exit_cost_usd_raw, max(0.01, amount * 0.0005))
         net_if_closed_usd = current_pnl_usd - estimated_exit_cost_usd
         min_harvest_usd = max(0.005, amount * 0.000002)  # 0.0002% of position, min half-cent
+        # ENGINE-017: a profit exit must be positive AFTER Shadow costs.
+        # The ENGINE-016 guard still allowed Gross +$0.92 / Costs -$1.25 to close,
+        # because it treated gross-positive movement as enough for harvest. That
+        # creates negative cycles in green markets. Keep hard-stop/risk exits, but
+        # all normal harvest/profit exits must clear costs plus a small net buffer.
+        min_net_harvest_usd = max(0.05, min(1.00, amount * 0.0002))
         tiny_profit_pct = 0.002                          # small real movement is enough in Shadow
         small_profit_pct = max(0.004, shadow_take_profit_pct * 0.05)
         has_gross_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and current_pnl_usd >= min_harvest_usd
-        # Keep a soft guard so huge estimated costs cannot close bad trades, but do not
-        # require fully net-positive-after-cost for paper cycle accounting.
-        has_net_positive_edge = has_gross_positive_edge and net_if_closed_usd >= -estimated_exit_cost_usd
-        exit_due_to_quality = row["quality"] < 18 and has_gross_positive_edge
+        has_net_positive_edge = has_gross_positive_edge and net_if_closed_usd >= min_net_harvest_usd
+        exit_due_to_quality = row["quality"] < 18 and has_net_positive_edge
 
         exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
         exit_due_to_tick_profit = elapsed >= tick_sec and has_net_positive_edge and current_pnl_pct >= small_profit_pct
@@ -13473,7 +13477,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta_now["paper_estimated_exit_cost_usd"] = round(estimated_exit_cost_usd, 4)
         meta_now["paper_estimated_exit_cost_usd_raw"] = round(estimated_exit_cost_usd_raw, 4)
         meta_now["paper_net_if_closed_usd"] = round(net_if_closed_usd, 4)
-        meta_now["shadow_exit_guard_mode"] = "gross_positive_harvest_soft_cost_guard"
+        meta_now["paper_min_net_harvest_usd"] = round(min_net_harvest_usd, 4)
+        meta_now["shadow_exit_guard_mode"] = "net_profit_after_costs_required_v4"
         set_meta(item, meta_now)
 
         exit_reason = None
