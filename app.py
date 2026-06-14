@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-021"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-019"
-STRATEGIST_BUILD_ID = "S-ENGINE-021"
-SHADOW_BUILD_ID = "SH-ENGINE-021"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-023"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
+STRATEGIST_BUILD_ID = "S-ENGINE-023"
+SHADOW_BUILD_ID = "SH-ENGINE-023"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "AGGRESSIVE_LEGACY_NO_LIMIT_CORE_SAFETY"
+SHADOW_PROMOTION_MODE = "AGGRESSIVE_LEGACY_SESSION_LOCAL_NO_HIDDEN_PACING"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EXIT_GUARD_V4"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -220,6 +220,8 @@ def api_build_info():
         "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
+        "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
+        "shadow_decision_scope": "SESSION_LOCAL",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -242,6 +244,8 @@ def api_version():
         "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
+        "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
+        "shadow_decision_scope": "SESSION_LOCAL",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -1933,6 +1937,30 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_wallet_ts ON support_tickets(wallet_address, created_ts)")
+
+    # Wallet-bound Aggressive Performance risk confirmations.
+    # This is an audit trail only; consent is still reset for each new budget/session in the UI.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_aggressive_risk_acceptances (
+            acceptance_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            scope TEXT DEFAULT 'draft',
+            performance_mode TEXT DEFAULT 'AGGRESSIVE',
+            warning_version TEXT DEFAULT 'AGGRESSIVE_WARNING_V1',
+            accepted INTEGER DEFAULT 1,
+            budget_usd REAL DEFAULT 0,
+            frontend_build TEXT DEFAULT '',
+            backend_build TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            origin TEXT DEFAULT '',
+            ip_preview TEXT DEFAULT '',
+            meta_json TEXT DEFAULT '{}',
+            created_ts INTEGER
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aggressive_accept_wallet_ts ON nexus_aggressive_risk_acceptances(wallet_address, created_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_aggressive_accept_session ON nexus_aggressive_risk_acceptances(wallet_address, session_id)")
 
     # Mail outbox/log. Every mail attempt is logged so failed SMTP delivery never breaks app flows.
     cur.execute("""
@@ -3670,6 +3698,85 @@ def _require_auth() -> Optional[str]:
         return _norm_addr(wa)
 
     return None
+
+@app.route("/api/nexus/trading/aggressive-ack", methods=["POST"])
+def api_nexus_trading_aggressive_ack():
+    """Store a wallet-bound audit trail for Aggressive Performance risk acceptance.
+
+    This is not a persistent permission flag. The frontend must still reset
+    Aggressive consent for every new budget/session. The record is only proof
+    that a specific wallet accepted a specific warning text/version for a draft
+    or session.
+    """
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth() or _pick_wallet_from_request()
+    wa = _norm_addr(wa or body.get("wallet") or body.get("wallet_address") or body.get("walletAddress") or "")
+    if not _looks_like_evm_addr(wa):
+        return err("wallet required for Aggressive risk acknowledgement", 400)
+
+    accepted = bool(body.get("accepted") or body.get("acknowledged") or body.get("consent"))
+    perf = str(body.get("performance_mode") or body.get("performanceMode") or body.get("performance") or "AGGRESSIVE").strip().upper()
+    if perf != "AGGRESSIVE":
+        return err("acknowledgement only applies to AGGRESSIVE performance mode", 400)
+    if not accepted:
+        return err("Aggressive risk acknowledgement must be accepted", 400)
+
+    scope = str(body.get("scope") or ("session" if body.get("session_id") or body.get("sessionId") else "draft")).strip().lower()
+    if scope not in ("draft", "session"):
+        scope = "draft"
+    sid = str(body.get("session_id") or body.get("sessionId") or body.get("trade_session_id") or "").strip()
+    warning_version = str(body.get("warning_version") or body.get("warningVersion") or "AGGRESSIVE_WARNING_V1").strip()[:80]
+    frontend_build = str(body.get("frontend_build") or body.get("frontendBuild") or "").strip()[:80]
+    try:
+        budget_usd = float(str(body.get("budget_usd") or body.get("budgetUsd") or 0).replace(",", "."))
+    except Exception:
+        budget_usd = 0.0
+
+    ts = now_ts()
+    acceptance_id = f"AGR-{ts}-{uuid.uuid4().hex[:18]}"
+    ua = str(request.headers.get("User-Agent") or "")[:300]
+    origin = str(request.headers.get("Origin") or request.headers.get("Referer") or "")[:300]
+    # Store only a short preview for audit correlation, not a full IP log.
+    ip_raw = str(request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",", 1)[0].strip()
+    ip_preview = ip_raw[:12] if ip_raw else ""
+    meta = {
+        "warning_text": "Aggressive Performance uses a faster legacy-style profile. More trades, higher costs, stronger fluctuations and losses are possible. Core safety remains active.",
+        "performance_mode": perf,
+        "scope": scope,
+        "session_id": sid,
+        "wallet": wa,
+    }
+
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        with DB_WRITE_LOCK:
+            cur.execute(
+                "INSERT INTO nexus_aggressive_risk_acceptances("
+                "acceptance_id,wallet_address,session_id,scope,performance_mode,warning_version,accepted,budget_usd,"
+                "frontend_build,backend_build,user_agent,origin,ip_preview,meta_json,created_ts"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    acceptance_id, wa, sid, scope, perf, warning_version, 1, float(budget_usd or 0.0),
+                    frontend_build, BACKEND_BUILD_ID, ua, origin, ip_preview,
+                    json.dumps(meta, ensure_ascii=False, separators=(",", ":")), ts,
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "acceptance_id": acceptance_id,
+        "wallet": wa,
+        "session_id": sid,
+        "scope": scope,
+        "warning_version": warning_version,
+        "backend_build": BACKEND_BUILD_ID,
+        "ts": ts,
+    })
+
 
     # ✅ Anonymous bypass (dev / SAFE mode) when NO bearer token
     if not auth.lower().startswith("bearer "):
@@ -12907,7 +13014,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running")
         set_meta(item, meta)
         item["shadow_transition"] = {"from": old, "to": ns, "reason": reason}
-        return {"type": event_type, "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
+        return {"type": event_type, "session_id": selected_session_id, "chain": selected_chain, "performance_mode": performance_mode, "risk_mode": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""), "pacing_mode": "DISABLED" if aggressive_legacy_mode else "ACTIVE", "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
 
     # User controls must be immediate and authoritative.
     if action == "pause":
@@ -13784,8 +13891,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     if best_quality >= 90 and regime == "STRONG_GREEN":
         paced_hard_allowed = max(paced_hard_allowed, min(hard_trade_limit, max_active))
     if aggressive_legacy_mode:
-        paced_soft_allowed = max(paced_soft_allowed, hard_trade_limit)
-        paced_hard_allowed = max(paced_hard_allowed, hard_trade_limit)
+        # Display/session-local allowance: no pacing brake, but do not expose 999999 in UI.
+        # Promotion checks below skip trade pacing in Aggressive; this value is only a readable snapshot.
+        paced_soft_allowed = max_active
+        paced_hard_allowed = max_active
     remaining_soft_entries = max(0, paced_soft_allowed - used_trade_slots)
     remaining_hard_entries = max(0, hard_trade_limit - used_trade_slots)
 
@@ -13963,7 +14072,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", f"Strategist promoted slot after Market Regime={regime}, performance={performance_mode}, positive net edge after costs or aggressive legacy bypass, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard.", "SHADOW_ACTIVE"))
+        events.append(set_state(item, "ACTIVE", (f"Session {selected_session_id or selected_chain or 'selected'} · {performance_mode}: Aggressive legacy mode promoted this slot; core safety passed and trade pacing is disabled." if aggressive_legacy_mode else f"Session {selected_session_id or selected_chain or 'selected'} · Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard."), "SHADOW_ACTIVE"))
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
@@ -13994,14 +14103,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             continue
         if row["idx"] in ready_keep:
             if st != "READY":
-                events.append(set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY"))
+                events.append(set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive legacy mode: slot is ready; core safety passed and pacing is disabled." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY"))
             else:
-                set_state(item, "READY", "Strategist keeps this slot ready as the next clean paper candidate.", "STRATEGIST_READY")
+                set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive legacy mode: slot is ready; core safety passed and pacing is disabled." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY")
         else:
             if st != "WAIT":
-                events.append(set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT"))
+                events.append(set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle kept this slot waiting; Aggressive soft brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT"))
             else:
-                set_state(item, "WAIT", "Strategist keeps this slot waiting for a cleaner edge.", "STRATEGIST_WAIT")
+                set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle kept this slot waiting; Aggressive soft brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT")
 
     # Sort by slot number for stable UI, not by updated_ts/priority.
     normalized.sort(key=lambda item: slot_no(item, 0))
@@ -14030,11 +14139,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "promoted": promoted,
         "tick_sec": tick_sec,
         "market_regime": regime,
-        "max_trades": max_trades,
-        "max_trades_label": "NO_LIMIT" if aggressive_legacy_mode else str(max_trades),
+        "max_trades": 0 if aggressive_legacy_mode else max_trades,
+        "max_trades_label": "No Limit" if aggressive_legacy_mode else str(max_trades),
         "risk_mode_label": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""),
         "aggressive_legacy_mode": bool(aggressive_legacy_mode),
-        "hard_trade_limit": hard_trade_limit,
+        "hard_trade_limit": 0 if aggressive_legacy_mode else hard_trade_limit,
+        "pacing_mode": "DISABLED" if aggressive_legacy_mode else "ACTIVE",
         "paced_soft_allowed": paced_soft_allowed,
         "paced_hard_allowed": paced_hard_allowed,
         "allowed_by_time": paced_soft_allowed,
@@ -14068,7 +14178,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 "exit_reason": get_meta(x).get("shadow_exit_reason"),
             } for x in normalized[:10]
         ],
-        "reason": "; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.",
+        "reason": ("Aggressive legacy mode: soft brakes, risk-engine throttling and trade pacing are disabled for this selected session; core safety, budget/runtime limits and net-profit exit guard remain active." if aggressive_legacy_mode else ("; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.")),
     }
     _shadow_mark_tick(f"runtime_{action}")
     return {
