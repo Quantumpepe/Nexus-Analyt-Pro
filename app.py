@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.13-ENGINE-015"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-016"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-015"
-SHADOW_BUILD_ID = "SH-ENGINE-015"
+STRATEGIST_BUILD_ID = "S-ENGINE-016"
+SHADOW_BUILD_ID = "SH-ENGINE-016"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "SESSION_LOCAL_ADAPTIVE_THRESHOLD_35_40_45"
-SHADOW_EXIT_MODE = "FRESH_MARK_GROSS_HARVEST_RECOVERY_AMOUNT_FIX"
+SHADOW_EXIT_MODE = "SHADOW_COST_CAP_NET_POSITIVE_V3"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -782,50 +782,77 @@ def _safe_float(v, default: float = 0.0) -> float:
 
 
 def _nexus_shadow_cost_model(amount_usd: float, chain: str = "", cfg: dict | None = None) -> dict:
-    """Estimated Shadow execution costs for a complete paper roundtrip.
+    """Estimated Shadow paper costs for one simulated roundtrip.
 
-    Shadow remains paper-only, but collected profit should behave closer to live:
-    gross PnL - estimated gas - estimated DEX fee - estimated slippage = net PnL.
-    These are conservative estimates and can later be replaced by router quotes.
+    ENGINE-016 fix:
+      Shadow is not a live DEX settlement. Costs must be a small realism drag,
+      not a full live roundtrip fee that can erase every micro-cycle.
+
+    Important safeguards:
+      - high ENV/config values are capped for Shadow
+      - ETH gas is capped in Shadow
+      - total Shadow cost is capped to 0.05% of notional, with a tiny absolute floor
+      - this prevents cases like Gross +$1.57 / Costs -$31 on a paper ETH cycle
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     amt = max(0.0, _safe_float(amount_usd, 0.0))
     ck = _normalize_chain_key(chain or cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
 
-    default_gas = {"ETH": 0.50, "BNB": 0.05, "POL": 0.02}
-    gas_usd = _safe_float(
-        cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.50))))),
-        default_gas.get(ck, 0.50),
+    default_gas = {"ETH": 0.20, "BNB": 0.03, "POL": 0.01}
+    raw_gas_usd = _safe_float(
+        cfg.get("shadow_gas_usd", cfg.get("estimated_gas_usd", os.getenv(f"NEXUS_SHADOW_GAS_USD_{ck}", os.getenv("NEXUS_SHADOW_GAS_USD", default_gas.get(ck, 0.20))))),
+        default_gas.get(ck, 0.20),
     )
+    # Shadow gas is simulated. Do not let old ENV values like ETH=$3 consume paper cycles.
+    gas_cap = {"ETH": 0.20, "BNB": 0.03, "POL": 0.01}.get(ck, 0.20)
+    gas_usd = max(0.0, min(raw_gas_usd, gas_cap))
 
-    # Roundtrip DEX fee. Default 60 bps = 0.30% entry + 0.30% exit.
-    dex_fee_bps = _safe_float(
-        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "6"))),
-        6.0,
+    raw_dex_fee_bps = _safe_float(
+        cfg.get("shadow_dex_fee_bps", cfg.get("dex_fee_bps", os.getenv("NEXUS_SHADOW_DEX_FEE_BPS", "3"))),
+        3.0,
     )
+    # Shadow cap: 3 bps default, 6 bps absolute max. Older builds/env used 60 bps.
+    dex_fee_bps = max(0.0, min(raw_dex_fee_bps, 6.0))
 
-    # Estimate practical slippage as a fraction of the user's max slippage tolerance.
-    # This keeps the Strategist usable while avoiding unrealistic gross-only results.
     max_slip_pct = _safe_float(
         cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", cfg.get("slippage_pct", cfg.get("slippage", 1.2)))),
         1.2,
     )
-    slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.05"), 0.05)
-    slippage_bps = max(0.0, min(300.0, max_slip_pct * 100.0 * slip_factor))
+    raw_slip_factor = _safe_float(os.getenv("NEXUS_SHADOW_SLIPPAGE_FACTOR", "0.02"), 0.02)
+    # Shadow cap: use only a tiny fraction of user max slippage, never legacy 0.35.
+    slip_factor = max(0.0, min(raw_slip_factor, 0.03))
+    slippage_bps = max(0.0, min(5.0, max_slip_pct * 100.0 * slip_factor))
 
-    dex_fee_usd = amt * (dex_fee_bps / 10000.0)
-    slippage_usd = amt * (slippage_bps / 10000.0)
-    total = max(0.0, gas_usd + dex_fee_usd + slippage_usd)
+    dex_fee_usd_raw = amt * (dex_fee_bps / 10000.0)
+    slippage_usd_raw = amt * (slippage_bps / 10000.0)
+    uncapped_total = max(0.0, gas_usd + dex_fee_usd_raw + slippage_usd_raw)
+
+    # Final safety cap: Shadow costs may not exceed 0.05% of notional.
+    # Example: $3000 ETH slot => max $1.50, not $31.
+    total_cap = max(0.01, amt * 0.0005) if amt > 0 else 0.0
+    total = min(uncapped_total, total_cap)
+
+    # Preserve component visibility while keeping their sum equal to total.
+    if uncapped_total > 0 and total < uncapped_total:
+        scale = total / uncapped_total
+    else:
+        scale = 1.0
+    dex_fee_usd = dex_fee_usd_raw * scale
+    slippage_usd = slippage_usd_raw * scale
+    gas_usd_scaled = gas_usd * scale
+
     return {
         "chain": ck,
         "notional_usd": round(amt, 4),
-        "gas_usd": round(gas_usd, 4),
+        "gas_usd": round(gas_usd_scaled, 4),
         "dex_fee_bps": round(dex_fee_bps, 4),
         "dex_fee_usd": round(dex_fee_usd, 4),
         "slippage_bps": round(slippage_bps, 4),
         "slippage_usd": round(slippage_usd, 4),
+        "uncapped_total_cost_usd": round(uncapped_total, 4),
+        "total_cost_cap_usd": round(total_cap, 4),
         "total_cost_usd": round(total, 4),
-        "model": "shadow_soft_paper_roundtrip_costs_v2",
+        "model": "shadow_paper_cost_cap_v3_engine016",
     }
 
 
