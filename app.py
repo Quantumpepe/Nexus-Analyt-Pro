@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-017"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.13-LAYOUT-004"
-STRATEGIST_BUILD_ID = "S-ENGINE-017"
-SHADOW_BUILD_ID = "SH-ENGINE-017"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-019"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-019"
+STRATEGIST_BUILD_ID = "S-ENGINE-019"
+SHADOW_BUILD_ID = "SH-ENGINE-019"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "SESSION_LOCAL_ADAPTIVE_THRESHOLD_35_40_45"
+SHADOW_PROMOTION_MODE = "PERFORMANCE_AGGRESSIVE_LEGACY_WITH_GUARDS"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EXIT_GUARD_V4"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -217,7 +217,7 @@ def api_build_info():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "ADAPTIVE_THRESHOLD_35_40_45",
+        "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -237,7 +237,7 @@ def api_version():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "ADAPTIVE_THRESHOLD_35_40_45",
+        "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -12544,6 +12544,16 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     action = str(action or "tick").strip().lower()
     ts = now_ts()
     tick_sec = int(_clamp_float(cfg.get("tick_sec", cfg.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
+
+    # ENGINE-019: the UI field is Performance, not Style.
+    # AGGRESSIVE restores the old high-frequency/legacy Shadow behavior while keeping
+    # the safety floor that must never be bypassed: hard blocks/security, budget/session
+    # limits, hard stops and the ENGINE-017 net-profit exit guard.
+    performance_mode = str(
+        cfg.get("performance") or cfg.get("performance_mode") or cfg.get("performanceMode")
+        or cfg.get("style") or cfg.get("trading_style") or cfg.get("strategy") or "TACTICAL"
+    ).strip().upper()
+    aggressive_legacy_mode = performance_mode == "AGGRESSIVE"
     # IMPORTANT: Max Combined Slots is NOT the same as max active slots.
     # max_combined_slots means: how many slot-units may be bundled into ONE position.
     # It must not cap the number of active slot-units in this session.
@@ -12602,6 +12612,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # Treat stale/misused 3 as the old maxCombinedSlots leak, not as a true active-unit cap.
         max_active = total_session_slots
 
+    if aggressive_legacy_mode:
+        # Performance=Aggressive means every session slot may work like the old 17.05 behavior.
+        # Max Combined Slots still only limits bundle size, not how many slots may run.
+        max_active = total_session_slots
+
     ready_slots_target = int(_clamp_float(
         cfg.get("shadow_ready_slots", cfg.get("ready_slots", os.getenv("NEXUS_SHADOW_READY_SLOTS", str(max_active)))),
         max_active,
@@ -12612,11 +12627,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # Same legacy leak protection for ready target. A 5-slot session should be able
         # to keep all 5 candidates READY/ACTIVE; combined size is a different concept.
         ready_slots_target = total_session_slots
+    if aggressive_legacy_mode:
+        ready_slots_target = total_session_slots
 
     # Keep the raw values visible in downstream summaries/debugging.
     cfg["max_combined_slots"] = max_combined_slots
     cfg["max_active_slot_units"] = max_active
     cfg["max_active_slot_units_scope"] = "session_slot_units_not_combined_cap"
+    cfg["performance_mode"] = performance_mode
+    cfg["aggressive_legacy_mode"] = bool(aggressive_legacy_mode)
 
     # Legacy migration: if frontend/backend selected a budget session but older queue
     # rows have no session id, stamp the in-memory runtime rows before persisting.
@@ -13385,7 +13404,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # Quality/risk deterioration should not realize a paper cycle with costs by itself.
         # Only close through normal net-positive harvest, hard-stop, or severe risk.
         exit_due_to_quality = False
-        exit_due_to_risk = row["risk"] >= 70
+        exit_due_to_risk = (not aggressive_legacy_mode) and row["risk"] >= 70
         hard_stop_pct = abs(_clamp_float(cfg.get("hard_stop_pct", cfg.get("hardStopPct", meta_now.get("hard_stop_pct", meta_now.get("hardStopPct", 0)))), 0, 0, 100))
         profit_lock_pct = abs(_clamp_float(cfg.get("profit_lock_pct", cfg.get("profitLockPct", meta_now.get("profit_lock_pct", meta_now.get("profitLockPct", 0)))), 0, 0, 100))
         current_pnl_pct = _clamp_float(meta_now.get("paper_pnl_pct", 0), 0, -100, 100)
@@ -13706,9 +13725,18 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "GREEN": {"min_edge": 38, "risk_max": 60, "pace": 1.30},
         "STRONG_GREEN": {"min_edge": 35, "risk_max": 60, "pace": 1.50},
     }.get(regime, {"min_edge": 40, "risk_max": 55, "pace": 1.00})
+    if aggressive_legacy_mode:
+        # Aggressive is a legacy/high-frequency mode: market regime and soft risk
+        # should not throttle READY -> ACTIVE. Hard blocks are still enforced below.
+        regime_params = {"min_edge": 0, "risk_max": 100, "pace": 99.0}
 
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
     hard_trade_limit = int(_clamp_float(cfg.get("hard_trade_limit", cfg.get("hardTradeLimit", max_trades + 5)), max_trades + 5, max_trades, max_trades + 50))
+    if aggressive_legacy_mode:
+        # Do not let Max Trades/Pacing behave like a brake in Aggressive.
+        # Runtime, budget, hard blocks and exit guard still define the safety floor.
+        max_trades = max(max_trades, total_session_slots * 24)
+        hard_trade_limit = max(hard_trade_limit, total_session_slots * 48)
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
     started_ts = _shadow_session_started_ts()
     elapsed_ratio = max(0.0, min(1.0, (ts - started_ts) / max(1.0, runtime_hours * 3600.0)))
@@ -13733,6 +13761,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     paced_hard_allowed = max(paced_soft_allowed, int(math.floor(elapsed_ratio * hard_trade_limit * float(regime_params.get("pace", 1.0)))))
     if best_quality >= 90 and regime == "STRONG_GREEN":
         paced_hard_allowed = max(paced_hard_allowed, min(hard_trade_limit, max_active))
+    if aggressive_legacy_mode:
+        paced_soft_allowed = max(paced_soft_allowed, hard_trade_limit)
+        paced_hard_allowed = max(paced_hard_allowed, hard_trade_limit)
     remaining_soft_entries = max(0, paced_soft_allowed - used_trade_slots)
     remaining_hard_entries = max(0, hard_trade_limit - used_trade_slots)
 
@@ -13745,6 +13776,17 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         q = _clamp_float(row["quality"], 0, -100, 100)
         risk = _clamp_float(row["risk"], 0, 0, 100)
         confidence = _clamp_float(row["confidence"], 0, 0, 100)
+        if aggressive_legacy_mode:
+            meta["strategist_market_regime"] = regime
+            meta["strategist_promotion_policy"] = "AGGRESSIVE_LEGACY_WITH_SAFETY_FLOOR"
+            meta["strategist_entry_allowed"] = True
+            meta["strategist_entry_reason"] = "aggressive_performance_legacy_bypass_soft_brakes"
+            meta["strategist_min_edge"] = 0
+            meta["strategist_risk_max"] = 100
+            meta["strategist_cost_gate_usd"] = 0
+            meta["strategist_cost_model"] = cost
+            set_meta(item, meta)
+            return True
         # ENGINE-015 adaptive promotion threshold:
         # controlled risk (<=35) can enter at q>=35, normal risk (36-55) at q>=40,
         # higher risk requires q>=45 but still must pass the risk_max guard below.
@@ -13859,9 +13901,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
                 continue
         elif st not in ("READY", "WAIT"):
             continue
-        if row["hard_block"] or row["risk"] >= 60:
+        if row["hard_block"]:
             continue
-        # Require positive net edge after estimated costs. Market regime controls aggressiveness.
+        if (not aggressive_legacy_mode) and row["risk"] >= 60:
+            continue
+        # Require positive net edge after estimated costs unless Performance=Aggressive bypass is active.
         if _shadow_cost_gate(row):
             candidates.append(row)
     candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
@@ -13872,10 +13916,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             break
         # Do not block this session because another ETH/BNB/POL session is already active.
         # Per-session capacity is enforced by active_count >= max_active above.
-        if used_trade_slots + promoted >= hard_trade_limit:
+        if (not aggressive_legacy_mode) and used_trade_slots + promoted >= hard_trade_limit:
             strategist_reason.append(f"Hard trade limit reached: {used_trade_slots + promoted}/{hard_trade_limit}.")
             break
-        if promoted >= remaining_soft_entries:
+        if (not aggressive_legacy_mode) and promoted >= remaining_soft_entries:
             # Tolerance entries are only allowed for very high quality in green regimes.
             if not (remaining_hard_entries > promoted and regime in ("GREEN", "STRONG_GREEN") and row["quality"] >= 85 and row["confidence"] >= 75 and row["risk"] < 35):
                 strategist_reason.append(f"Trade pacing holds entries: elapsed {elapsed_ratio*100:.1f}%, allowed {paced_soft_allowed}/{max_trades}, used {used_trade_slots}.")
@@ -13897,7 +13941,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", f"Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard.", "SHADOW_ACTIVE"))
+        events.append(set_state(item, "ACTIVE", f"Strategist promoted slot after Market Regime={regime}, performance={performance_mode}, positive net edge after costs or aggressive legacy bypass, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard.", "SHADOW_ACTIVE"))
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
@@ -13916,7 +13960,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             if not last_exit or ts - last_exit < min(120, max(30, tick_sec)):
                 # Show completed exit briefly before allowing the next Strategist entry decision.
                 continue
-        if not row["hard_block"] and row["risk"] < 60 and (row["quality"] >= 25 or row["confidence"] >= 45):
+        if (not row["hard_block"]) and (aggressive_legacy_mode or row["risk"] < 60) and (aggressive_legacy_mode or row["quality"] >= 25 or row["confidence"] >= 45):
             ready_candidates.append(row)
     ready_candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
     ready_keep = {r["idx"] for r in ready_candidates[:max(0, ready_slots_target - active_count)]}
