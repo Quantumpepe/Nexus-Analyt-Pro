@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-023"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-025"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-023"
-SHADOW_BUILD_ID = "SH-ENGINE-023"
+STRATEGIST_BUILD_ID = "S-ENGINE-025"
+SHADOW_BUILD_ID = "SH-ENGINE-025"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_LEGACY_SESSION_LOCAL_NO_HIDDEN_PACING"
-SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EXIT_GUARD_V4"
+SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EDGE_INIT_FIX_V5"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -13574,8 +13574,6 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             12, 3, 720
         )
 
-        exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and has_net_positive_edge and current_pnl_pct >= shadow_take_profit_pct
-
         # Looser live paper-cycle rules, but with a strict cost guard:
         # Positive cycles may close faster, but normal flat/red trades must NOT be
         # closed just to rotate, because every forced close applies estimated live
@@ -13602,6 +13600,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         small_profit_pct = max(0.004, shadow_take_profit_pct * 0.05)
         has_gross_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and current_pnl_usd >= min_harvest_usd
         has_net_positive_edge = has_gross_positive_edge and net_if_closed_usd >= min_net_harvest_usd
+        # ENGINE-025: define net-positive edge before every exit condition uses it.
+        # ENGINE-023 evaluated the take-profit exit before this variable existed,
+        # which raised UnboundLocalError and stalled Shadow decisions.
+        exit_due_to_shadow_take_profit = elapsed >= min_hold_min * 60 and has_net_positive_edge and current_pnl_pct >= shadow_take_profit_pct
         exit_due_to_quality = row["quality"] < 18 and has_net_positive_edge
 
         exit_due_to_micro_profit = elapsed >= max(30, min(tick_sec, 120)) and has_net_positive_edge and current_pnl_pct >= tiny_profit_pct
