@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-019"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-021"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-019"
-STRATEGIST_BUILD_ID = "S-ENGINE-019"
-SHADOW_BUILD_ID = "SH-ENGINE-019"
+STRATEGIST_BUILD_ID = "S-ENGINE-021"
+SHADOW_BUILD_ID = "SH-ENGINE-021"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "PERFORMANCE_AGGRESSIVE_LEGACY_WITH_GUARDS"
+SHADOW_PROMOTION_MODE = "AGGRESSIVE_LEGACY_NO_LIMIT_CORE_SAFETY"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EXIT_GUARD_V4"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -218,6 +218,8 @@ def api_build_info():
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
         "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
+        "aggressive_risk_mode": "LEGACY_PROTECTION",
+        "aggressive_max_trades": "NO_LIMIT",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -238,6 +240,8 @@ def api_version():
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
         "promotion_policy": "AGGRESSIVE_LEGACY_WHEN_PERFORMANCE_AGGRESSIVE",
+        "aggressive_risk_mode": "LEGACY_PROTECTION",
+        "aggressive_max_trades": "NO_LIMIT",
         "promotion_threshold_low_risk": 35,
         "promotion_threshold_normal_risk": 40,
         "promotion_threshold_high_risk": 45,
@@ -11259,6 +11263,11 @@ def _nexus_upsert_queue_item(cur, wallet_address, body):
         or meta.get("riskMode") or meta.get("risk_mode") or meta.get("trading_risk_mode") or ""
     ).strip().upper()[:40]
     max_trades_meta = int(_clamp_float(body.get("max_trades", body.get("maxTrades", meta.get("max_trades", meta.get("maxTrades", 0)))), 0, 0, 500))
+    if style == "AGGRESSIVE":
+        # Persist what the UI promises: Aggressive uses Legacy Protection and No Limit.
+        # This prevents old Dynamic/MaxTrades values from re-entering through queue meta.
+        risk_mode_meta = "LEGACY_PROTECTION"
+        max_trades_meta = 0
     hard_stop_meta = _clamp_float(body.get("hard_stop_pct", body.get("hardStopPct", meta.get("hard_stop_pct", meta.get("hardStopPct", 0)))), 0, 0, 100)
     profit_lock_meta = _clamp_float(body.get("profit_lock_pct", body.get("profitLockPct", meta.get("profit_lock_pct", meta.get("profitLockPct", 0)))), 0, 0, 100)
     max_slippage_meta = _clamp_float(body.get("max_slippage_pct", body.get("maxSlippagePct", meta.get("max_slippage_pct", meta.get("maxSlippagePct", 0)))), 0, 0, 100)
@@ -12554,6 +12563,17 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         or cfg.get("style") or cfg.get("trading_style") or cfg.get("strategy") or "TACTICAL"
     ).strip().upper()
     aggressive_legacy_mode = performance_mode == "AGGRESSIVE"
+    if aggressive_legacy_mode:
+        # In Aggressive Performance, the old high-frequency/legacy execution path is intentional.
+        # The Advanced Risk Engine and Max-Trades pacing must not re-enter through persisted
+        # config/session aliases. Only core hard-safety remains active.
+        cfg["risk_mode"] = "LEGACY_PROTECTION"
+        cfg["riskMode"] = "LEGACY_PROTECTION"
+        cfg["trading_risk_mode"] = "LEGACY_PROTECTION"
+        cfg["max_trades"] = 0
+        cfg["maxTrades"] = 0
+        cfg["hard_trade_limit"] = 999999
+        cfg["hardTradeLimit"] = 999999
     # IMPORTANT: Max Combined Slots is NOT the same as max active slots.
     # max_combined_slots means: how many slot-units may be bundled into ONE position.
     # It must not cap the number of active slot-units in this session.
@@ -13364,9 +13384,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         st = str(item.get("status") or item.get("state") or "WAIT").upper()
         if st in ("HOLD", "OBSERVE", "RELEASE_REQUIRED", "BLOCKED"):
             continue
-        if row["hard_block"] or row["risk"] >= 70:
+        if row["hard_block"]:
+            events.append(set_state(item, "HOLD", "Hard safety/security/liquidity block; paper slot moves to HOLD.", "STRATEGIST_HOLD"))
+        elif (not aggressive_legacy_mode) and row["risk"] >= 70:
             events.append(set_state(item, "HOLD", "Strategist detected hard risk/security/liquidity block; paper slot moves to HOLD.", "STRATEGIST_HOLD"))
-        elif row["risk"] >= 60:
+        elif (not aggressive_legacy_mode) and row["risk"] >= 60:
             events.append(set_state(item, "PROTECT", "Strategist detected elevated risk; paper slot moves to PROTECT.", "STRATEGIST_PROTECT"))
 
     # 2) Close active paper slots after one runtime cycle or if quality deteriorates.
@@ -13733,10 +13755,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     max_trades = int(_clamp_float(cfg.get("max_trades", cfg.get("maxTrades", 10)), 10, 1, 500))
     hard_trade_limit = int(_clamp_float(cfg.get("hard_trade_limit", cfg.get("hardTradeLimit", max_trades + 5)), max_trades + 5, max_trades, max_trades + 50))
     if aggressive_legacy_mode:
-        # Do not let Max Trades/Pacing behave like a brake in Aggressive.
-        # Runtime, budget, hard blocks and exit guard still define the safety floor.
-        max_trades = max(max_trades, total_session_slots * 24)
-        hard_trade_limit = max(hard_trade_limit, total_session_slots * 48)
+        # No Limit in Aggressive: Max Trades and pacing must not be hidden brakes.
+        # Runtime, budget, hard safety/security and the net-profit exit guard remain active.
+        max_trades = 999999
+        hard_trade_limit = 999999
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
     started_ts = _shadow_session_started_ts()
     elapsed_ratio = max(0.0, min(1.0, (ts - started_ts) / max(1.0, runtime_hours * 3600.0)))
@@ -14009,6 +14031,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "tick_sec": tick_sec,
         "market_regime": regime,
         "max_trades": max_trades,
+        "max_trades_label": "NO_LIMIT" if aggressive_legacy_mode else str(max_trades),
+        "risk_mode_label": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""),
+        "aggressive_legacy_mode": bool(aggressive_legacy_mode),
         "hard_trade_limit": hard_trade_limit,
         "paced_soft_allowed": paced_soft_allowed,
         "paced_hard_allowed": paced_hard_allowed,
