@@ -22759,36 +22759,36 @@ def _nexus_score_for_asset(asset: dict) -> dict:
     volume24h = _safe_float(asset.get("volume24h"), market.get("volume24h") or 0)
     market_cap = _safe_float(asset.get("marketCap") if asset.get("marketCap") is not None else asset.get("market_cap"), market.get("marketCap") or 0)
 
-    base = 54.0
+    base = 50.0
     parts = {"base": base, "trend": 0, "volume": 0, "market_condition": 0, "whale": 0, "liquidity": 0}
     reasons = []
 
-    if change24h > 7:
-        parts["trend"] = 18; reasons.append("Strong momentum")
-    elif change24h > 3.5:
-        parts["trend"] = 11; reasons.append("Positive trend")
-    elif change24h < -9:
-        parts["trend"] = -17
-    elif change24h < -4:
-        parts["trend"] = -8
+    if change24h > 10:
+        parts["trend"] = 10; reasons.append("Strong 24h momentum")
+    elif change24h > 3:
+        parts["trend"] = 5; reasons.append("Positive 24h trend")
+    elif change24h < -10:
+        parts["trend"] = -10; reasons.append("Heavy 24h weakness")
+    elif change24h < -3:
+        parts["trend"] = -5; reasons.append("Weak 24h trend")
 
-    if volume24h >= 4_000_000:
-        parts["volume"] = 12; reasons.append("Strong 24h volume")
-    elif volume24h >= 700_000:
-        parts["volume"] = 7; reasons.append("Healthy 24h volume")
-    elif volume24h < 45_000:
+    if volume24h >= 5_000_000:
+        parts["volume"] = 10; reasons.append("Strong 24h volume")
+    elif volume24h >= 500_000:
+        parts["volume"] = 6; reasons.append("Healthy 24h volume")
+    elif 0 < volume24h < 25_000:
         parts["volume"] = -6; reasons.append("Thin 24h volume")
 
-    if market_cap and market_cap < 900_000:
+    if market_cap and market_cap < 1_000_000:
         parts["liquidity"] = -6; reasons.append("Micro-cap risk")
-    elif market_cap and market_cap > 90_000_000:
+    elif market_cap and market_cap > 100_000_000:
         parts["liquidity"] = 4; reasons.append("Higher market-cap stability")
 
     market_condition = None
     try:
         if market.get("coin_id") or symbol:
             market_condition = _market_condition_for_coin(market.get("coin_id") or symbol, days=20)
-            parts["market_condition"] = int(_safe_float(market_condition.get("score_delta"))) * 1.25
+            parts["market_condition"] = int(_safe_float(market_condition.get("score_delta")))
             if market_condition.get("label"):
                 reasons.append(str(market_condition.get("label")))
     except Exception as e:
@@ -22798,7 +22798,7 @@ def _nexus_score_for_asset(asset: dict) -> dict:
     if token and _looks_like_evm_addr(token) and chain:
         try:
             whale = _get_whale_signal_bitquery(token, chain=chain, volume24h_usd=volume24h)
-            parts["whale"] = int(_safe_float(whale.get("score_delta"))) * 1.4
+            parts["whale"] = int(_safe_float(whale.get("score_delta")))
             if whale.get("summary"):
                 reasons.append(str(whale.get("summary")))
         except Exception as e:
@@ -22823,7 +22823,7 @@ def _nexus_score_for_asset(asset: dict) -> dict:
         reasons.append("Strategist candidate score hint")
 
     score = max(0, min(100, round(raw_score, 2)))
-    risk = "LOW" if score >= 68 else "MEDIUM" if score >= 46 else "HIGH"
+    risk = "LOW" if score >= 75 else "MEDIUM" if score >= 50 else "HIGH"
     rating = _nexus_rating(score)
     action = _nexus_action(score, risk)
     return {
@@ -22887,37 +22887,31 @@ def api_nexus_compare_scores():
 def _nexus_build_rotation_plan(assets: list[dict], budget_usd: float) -> dict:
     scored = [_nexus_score_for_asset(a) for a in assets]
     scored = sorted(scored, key=lambda x: float(x.get("score") or 0), reverse=True)
-    
+    eligible = [x for x in scored if x.get("action") != "SKIP" and str(x.get("risk")) != "HIGH" and float(x.get("score") or 0) >= 45]
+    weight_sum = sum(max(0.0, float(x.get("score") or 0) - 40.0) for x in eligible) or 0.0
     plan = []
     for i, x in enumerate(scored, start=1):
         score = float(x.get("score") or 0)
-        risk = str(x.get("risk") or "MEDIUM")
-
-        if risk == "HIGH" and score < 53:
-            action = "SKIP"
-        else:
-            action = "INCREASE" if score >= 45 else "HOLD"
-
-        target_weight = max(6.0, (score - 36) * 1.35) if action != "SKIP" else 0.0
-        target_weight = min(36.0, target_weight)
-
-        target_usd = float(budget_usd or 0) * (target_weight / 100.0)
-
+        eligible_row = x in eligible and weight_sum > 0
+        target_weight = (max(0.0, score - 40.0) / weight_sum * 100.0) if eligible_row else 0.0
+        target_usd = float(budget_usd or 0) * target_weight / 100.0
+        action = _nexus_action(score, x.get("risk"))
+        if not eligible_row:
+            action = "SKIP" if x.get("risk") == "HIGH" or score < 45 else "HOLD"
         plan.append({
             "rank": i,
             "symbol": x.get("symbol"),
             "chain": x.get("chain"),
             "token": x.get("token"),
-            "score": round(score, 2),
+            "score": x.get("score"),
             "rating": x.get("rating"),
-            "risk": risk,
+            "risk": x.get("risk"),
             "action": action,
             "target_weight_pct": round(target_weight, 2),
             "target_usd": round(target_usd, 2),
             "reasons": x.get("reasons") or [],
             "score_ref": x,
         })
-
     return {"status": "ok", "budget_usd": round(float(budget_usd or 0), 2), "plan": plan, "items": plan, "ts": now_ts()}
 
 
