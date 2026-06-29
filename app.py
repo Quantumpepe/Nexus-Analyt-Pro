@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-026-MOMENTUM"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-027-MOMENTUM-REAL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-026-MOMENTUM"
-SHADOW_BUILD_ID = "SH-ENGINE-026-MOMENTUM"
+STRATEGIST_BUILD_ID = "S-ENGINE-027-MOMENTUM-REAL"
+SHADOW_BUILD_ID = "SH-ENGINE-027-MOMENTUM-REAL"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "MOMENTUM_RECOVERY_ENTRY_PRIORITY"
+SHADOW_PROMOTION_MODE = "REAL_MOMENTUM_ENTRY_GATE"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EDGE_INIT_FIX_V5"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -217,7 +217,7 @@ def api_build_info():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
+        "promotion_policy": "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -241,7 +241,7 @@ def api_version():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
+        "promotion_policy": "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -11170,212 +11170,6 @@ def _nexus_execution_summary(cur, wallet_address):
         "simulation_only_until_vault": True, "vault_execution_enabled": False,
     }
 
-
-def _nexus_shadow_momentum_profile(item: dict, cfg: dict | None = None) -> dict:
-    """Local momentum/recovery profile for Shadow entry decisions.
-
-    Purpose:
-      - Do not let a weak 7D background trend become a hard entry blocker.
-      - If short-term momentum is clearly rising, allow a controlled recovery entry
-        even when Market Regime is RED/NEUTRAL.
-      - If short-term momentum is falling, reduce quality instead of forcing trades.
-
-    This uses only fields already present in queue/signals/meta/config. It performs
-    no network calls and cannot touch Vault/live execution.
-    """
-    item = item if isinstance(item, dict) else {}
-    cfg = cfg if isinstance(cfg, dict) else {}
-    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
-    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-
-    contexts = [signals, item, meta]
-    for key in (
-        "market", "market_context", "marketContext", "global_market", "globalMarket",
-        "market_state", "marketState", "volatility_pulse", "volatilityPulse",
-    ):
-        obj = cfg.get(key) if isinstance(cfg, dict) else None
-        if isinstance(obj, dict):
-            contexts.append(obj)
-    contexts.append(cfg)
-
-    def first_num(*names, default=None):
-        for ctx in contexts:
-            if not isinstance(ctx, dict):
-                continue
-            for name in names:
-                if name not in ctx:
-                    continue
-                try:
-                    v = ctx.get(name)
-                    if v is None or str(v).strip() == "":
-                        continue
-                    n = float(v)
-                    if math.isfinite(n):
-                        return n
-                except Exception:
-                    pass
-        return default
-
-    def first_text(*names, default=""):
-        for ctx in contexts:
-            if not isinstance(ctx, dict):
-                continue
-            for name in names:
-                v = ctx.get(name)
-                if v is not None and str(v).strip():
-                    return str(v).strip()
-        return default
-
-    # Most frontend/API fields are already percentages. If a change field arrives
-    # as a tiny fraction (0.015), normalize it to 1.5 only for values that are very
-    # likely fractions. Avoid changing normal small percentage values like 0.5%.
-    def pct(v):
-        if v is None:
-            return None
-        try:
-            x = float(v)
-            if not math.isfinite(x):
-                return None
-            if abs(x) <= 0.05 and x != 0:
-                return x * 100.0
-            return x
-        except Exception:
-            return None
-
-    ch_1m = pct(first_num("change_1m_pct", "change1m", "change_1m", "momentum_1m", "m1_pct"))
-    ch_5m = pct(first_num("change_5m_pct", "change5m", "change_5m", "momentum_5m", "m5_pct"))
-    ch_15m = pct(first_num("change_15m_pct", "change15m", "change_15m", "momentum_15m", "m15_pct"))
-    ch_30m = pct(first_num("change_30m_pct", "change30m", "change_30m", "momentum_30m", "m30_pct"))
-    ch_1h = pct(first_num("change_1h_pct", "change1h", "change_1h", "momentum_1h", "h1_pct", "price_change_percentage_1h_in_currency"))
-    ch_4h = pct(first_num("change_4h_pct", "change4h", "change_4h", "momentum_4h", "h4_pct"))
-    ch_24h = pct(first_num("change_24h_pct", "change24h", "change_24h", "market_change_24h", "marketChange24h", "price_change_percentage_24h", "price_change_percentage_24h_in_currency"))
-    ch_7d = pct(first_num("change_7d_pct", "change7d", "change_7d", "price_change_percentage_7d", "price_change_percentage_7d_in_currency"))
-
-    # Generic prepared momentum score if one already exists.
-    supplied_score = first_num("recovery_momentum_score", "recoveryMomentumScore", "momentum_score", "momentumScore", "momentum_quality", "momentumQuality")
-    rvol = first_num("rvol", "relative_volume", "relativeVolume", default=1.0)
-    volume_trend = first_num("volume_trend", "volumeTrend", "volume_change_pct", "volumeChangePct", default=0.0)
-    structure = first_text("market_structure", "marketStructure", "structure", "trend", "trend_state", "trendState", default="").upper().replace("-", "_").replace(" ", "_")
-
-    short_vals = [x for x in (ch_1m, ch_5m, ch_15m, ch_30m, ch_1h) if x is not None]
-    micro_vals = [x for x in (ch_1m, ch_5m, ch_15m) if x is not None]
-    mid_vals = [x for x in (ch_1h, ch_4h, ch_24h) if x is not None]
-    short_avg = sum(short_vals) / len(short_vals) if short_vals else None
-    micro_avg = sum(micro_vals) / len(micro_vals) if micro_vals else None
-    mid_avg = sum(mid_vals) / len(mid_vals) if mid_vals else None
-
-    score = 50.0
-    reasons = []
-
-    if supplied_score is not None:
-        # Treat an existing momentum score as useful input, not as an absolute truth.
-        score += (float(supplied_score) - 50.0) * 0.45
-        reasons.append(f"supplied momentum score {float(supplied_score):.1f}")
-
-    if short_avg is not None:
-        score += max(-22.0, min(24.0, short_avg * 10.0))
-        if short_avg > 0.15:
-            reasons.append(f"short momentum rising {short_avg:.2f}%")
-        elif short_avg < -0.15:
-            reasons.append(f"short momentum falling {short_avg:.2f}%")
-
-    if micro_avg is not None:
-        score += max(-10.0, min(12.0, micro_avg * 8.0))
-
-    if ch_1h is not None:
-        score += max(-12.0, min(14.0, ch_1h * 5.0))
-        if ch_1h > 0.25:
-            reasons.append(f"1h recovery {ch_1h:.2f}%")
-    if ch_4h is not None:
-        score += max(-10.0, min(12.0, ch_4h * 3.0))
-    if ch_24h is not None:
-        score += max(-12.0, min(14.0, ch_24h * 2.2))
-
-    # 7D is context only. Negative 7D with positive short/24h is often exactly the
-    # recovery setup the user wants; do not block it. Add a small recovery bonus.
-    recovery_from_red = False
-    if ch_7d is not None and ch_7d < -1.0:
-        if (short_avg is not None and short_avg > 0.20) or (ch_1h is not None and ch_1h > 0.35) or (ch_24h is not None and ch_24h > 0.50):
-            recovery_from_red = True
-            score += 8.0
-            reasons.append("recovery attempt despite weak 7D context")
-        else:
-            score -= min(8.0, abs(ch_7d) * 0.35)
-            reasons.append("weak 7D context, no short recovery yet")
-
-    if rvol is not None:
-        rv = float(rvol)
-        if rv >= 1.5:
-            score += 8.0
-            reasons.append(f"RVOL confirms momentum {rv:.2f}")
-        elif rv >= 1.15:
-            score += 4.0
-        elif rv < 0.75 and (short_avg is not None and short_avg > 0.15):
-            score -= 5.0
-            reasons.append("price rises without enough volume confirmation")
-
-    try:
-        vt = float(volume_trend or 0.0)
-        if vt > 5:
-            score += 3.0
-        elif vt < -10 and (short_avg is not None and short_avg > 0.15):
-            score -= 4.0
-    except Exception:
-        pass
-
-    if structure in ("BREAKOUT", "RECOVERY", "REBOUND", "ACCUMULATION", "UPTREND", "STRONG", "INTACT", "HIGHER_LOWS"):
-        score += 6.0
-        reasons.append(f"structure {structure.lower()}")
-    elif structure in ("BREAKDOWN", "DISTRIBUTION", "FAILED", "BROKEN"):
-        score -= 12.0
-        reasons.append(f"structure {structure.lower()}")
-    elif structure in ("WEAK", "UNSTABLE") and not recovery_from_red:
-        score -= 5.0
-
-    rising = score >= 62.0 and (
-        recovery_from_red
-        or (short_avg is not None and short_avg > 0.25)
-        or (ch_1h is not None and ch_1h > 0.45)
-        or (ch_24h is not None and ch_24h > 1.0)
-    )
-    falling = score <= 38.0 or (
-        (short_avg is not None and short_avg < -0.35)
-        and (ch_1h is None or ch_1h <= 0)
-    )
-
-    # Quality adjustment is intentionally bounded: momentum can unlock recovery entries,
-    # but cannot override hard safety/security/liquidity blocks.
-    if score >= 75:
-        quality_delta = 18.0
-    elif score >= 65:
-        quality_delta = 12.0
-    elif score >= 55:
-        quality_delta = 6.0
-    elif score <= 30:
-        quality_delta = -18.0
-    elif score <= 40:
-        quality_delta = -10.0
-    else:
-        quality_delta = 0.0
-
-    return {
-        "score": round(max(0.0, min(100.0, score)), 2),
-        "rising": bool(rising),
-        "falling": bool(falling),
-        "quality_delta": round(quality_delta, 2),
-        "recovery_from_red": bool(recovery_from_red),
-        "short_avg_pct": round(short_avg, 4) if short_avg is not None else None,
-        "micro_avg_pct": round(micro_avg, 4) if micro_avg is not None else None,
-        "mid_avg_pct": round(mid_avg, 4) if mid_avg is not None else None,
-        "change_1h_pct": round(ch_1h, 4) if ch_1h is not None else None,
-        "change_4h_pct": round(ch_4h, 4) if ch_4h is not None else None,
-        "change_24h_pct": round(ch_24h, 4) if ch_24h is not None else None,
-        "change_7d_pct": round(ch_7d, 4) if ch_7d is not None else None,
-        "rvol": round(float(rvol), 4) if rvol is not None else None,
-        "reasons": reasons[:6],
-        "mode": "momentum_recovery_v1",
-    }
-
 def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     """Score one prepared slot for Shadow/rotation readiness without live execution.
 
@@ -11408,8 +11202,46 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
     security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
 
+    # ENGINE-027: real momentum input for Strategist.
+    # Market color is only background. Short-term momentum/recovery can improve entry quality,
+    # especially in RED/NEUTRAL markets. Missing momentum stays neutral.
+    def _norm_momentum_pct(v):
+        x = _clamp_float(v, 0.0, -100.0, 100.0)
+        # Some payloads send fractions (0.012 = 1.2%). Convert small non-zero values.
+        if -1.0 <= x <= 1.0 and abs(x) > 0.0001:
+            x = x * 100.0
+        return _clamp_float(x, 0.0, -100.0, 100.0)
+
+    m1 = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_1m", "momentum1m", "change_1m", "change1m", default=0))
+    m5 = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_5m", "momentum5m", "change_5m", "change5m", default=0))
+    m15 = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_15m", "momentum15m", "change_15m", "change15m", default=0))
+    m1h = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_1h", "momentum1h", "change_1h", "change1h", "price_change_percentage_1h", default=0))
+    m4h = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_4h", "momentum4h", "change_4h", "change4h", default=0))
+    m24h = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_24h", "momentum24h", "change_24h", "change24h", "price_change_percentage_24h", default=0))
+    m7d = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_7d", "momentum7d", "change_7d", "change7d", "price_change_percentage_7d", default=0))
+
+    supplied_momentum = _nexus_trading_signal_value(item, signals, "momentum_score", "momentumScore", default=0)
+    momentum_score = _clamp_float(supplied_momentum, 0.0, -100.0, 100.0)
+    if abs(momentum_score) <= 0.0001:
+        momentum_score = (m5 * 2.0) + (m15 * 2.5) + (m1h * 1.5) + (m4h * 0.75) + (m24h * 0.25)
+        momentum_score = _clamp_float(momentum_score, 0.0, -100.0, 100.0)
+
+    recovery_raw = _nexus_trading_signal_value(item, signals, "recovery_momentum_score", "recoveryMomentumScore", "recovery_score", "recoveryScore", default=0)
+    recovery_momentum_score = _clamp_float(recovery_raw, 0.0, 0.0, 100.0)
+    if recovery_momentum_score <= 0:
+        recovery_momentum_score = 0.0
+        if m5 > 0: recovery_momentum_score += 12
+        if m15 > 0: recovery_momentum_score += 18
+        if m1h > 0: recovery_momentum_score += 18
+        if m15 > m1: recovery_momentum_score += 8
+        if m1h > m15: recovery_momentum_score += 6
+        if m24h < 0 and (m15 > 0 or m1h > 0): recovery_momentum_score += 14
+        if m7d < 0 and (m15 > 0 or m1h > 0): recovery_momentum_score += 8
+        if rvol >= 1.1: recovery_momentum_score += 8
+        if structure in ("RECOVERY", "REVERSAL", "ACCUMULATION", "BREAKOUT", "UPTREND", "INTACT"): recovery_momentum_score += 8
+        recovery_momentum_score = _clamp_float(recovery_momentum_score, 0.0, 0.0, 100.0)
+
     meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-    momentum_profile = _nexus_shadow_momentum_profile(item, cfg)
     max_slippage_source = cfg.get("max_slippage_pct", cfg.get("maxSlippagePct", None))
     if max_slippage_source is None:
         max_slippage_source = item.get("max_slippage_pct", item.get("maxSlippagePct", None))
@@ -11429,6 +11261,26 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
         quality += 4
     elif rvol < 0.7:
         quality -= 5
+
+    # ENGINE-027: Momentum is now part of the score, not only a label.
+    if momentum_score >= 8 or recovery_momentum_score >= 70:
+        quality += 14
+        confidence = max(confidence, 58)
+    elif momentum_score >= 3 or recovery_momentum_score >= 55:
+        quality += 9
+        confidence = max(confidence, 52)
+    elif momentum_score > 0 or recovery_momentum_score >= 40:
+        quality += 4
+    elif momentum_score <= -6:
+        quality -= 12
+    elif momentum_score < 0:
+        quality -= 5
+
+    # 7D red is context only. It may reduce confidence a little, but must not cancel
+    # a fresh 5m/15m/1h recovery.
+    if m7d < -8 and recovery_momentum_score < 55 and momentum_score <= 0:
+        quality -= 4
+
     if structure in ("BREAKOUT", "ACCUMULATION", "INTACT", "STRONG", "UPTREND"):
         quality += 6
     if structure in ("WEAK", "UNSTABLE", "DISTRIBUTION"):
@@ -11438,25 +11290,22 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     if slippage and slippage > max_slippage:
         quality -= 14
 
-    # ENGINE-026: momentum/recovery is an entry input. A red/weak 7D backdrop is
-    # no longer a hard brake when short-term momentum is clearly turning up.
-    quality += _clamp_float(momentum_profile.get("quality_delta"), 0, -25, 25)
-    if momentum_profile.get("rising"):
-        confidence = max(confidence, 58)
-        # Reduce only soft risk a little. Hard blocks below remain absolute.
-        risk = max(0, risk - 6)
-    elif momentum_profile.get("falling"):
-        confidence = min(confidence, 55)
-        risk = min(100, risk + 6)
-
     hard_block = security in ("FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED") or liquidity <= 10 or (slippage and slippage >= max_slippage * 2.5)
     return {
         "confidence": max(0, min(100, confidence)),
         "risk_score": max(0, min(100, risk)),
         "priority": max(-100, min(100, priority)),
         "quality": max(-100, min(100, quality)),
+        "momentum_score": round(_clamp_float(momentum_score, 0.0, -100.0, 100.0), 4),
+        "recovery_momentum_score": round(_clamp_float(recovery_momentum_score, 0.0, 0.0, 100.0), 4),
+        "momentum_1m": round(m1, 4),
+        "momentum_5m": round(m5, 4),
+        "momentum_15m": round(m15, 4),
+        "momentum_1h": round(m1h, 4),
+        "momentum_4h": round(m4h, 4),
+        "momentum_24h": round(m24h, 4),
+        "momentum_7d": round(m7d, 4),
         "hard_block": bool(hard_block),
-        "momentum": momentum_profile,
     }
 
 
@@ -13284,18 +13133,25 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_quality"] = round(quality, 4)
         meta["shadow_confidence"] = round(confidence, 4)
         meta["shadow_risk_score"] = round(risk, 4)
-        if isinstance(q.get("momentum"), dict):
-            meta["strategist_momentum_score"] = q["momentum"].get("score")
-            meta["strategist_momentum_rising"] = bool(q["momentum"].get("rising"))
-            meta["strategist_momentum_falling"] = bool(q["momentum"].get("falling"))
-            meta["strategist_momentum_mode"] = q["momentum"].get("mode")
-            meta["strategist_momentum_reason"] = "; ".join(q["momentum"].get("reasons") or [])[:300]
+        meta["strategist_momentum_score"] = round(_clamp_float(q.get("momentum_score"), 0, -100, 100), 4)
+        meta["strategist_recovery_momentum_score"] = round(_clamp_float(q.get("recovery_momentum_score"), 0, 0, 100), 4)
+        meta["strategist_momentum_components"] = {
+            "1m": q.get("momentum_1m", 0),
+            "5m": q.get("momentum_5m", 0),
+            "15m": q.get("momentum_15m", 0),
+            "1h": q.get("momentum_1h", 0),
+            "4h": q.get("momentum_4h", 0),
+            "24h": q.get("momentum_24h", 0),
+            "7d": q.get("momentum_7d", 0),
+        }
         set_meta(item, meta)
         item["strategist_score"] = round(quality, 4)
         item["shadow_quality"] = round(quality, 4)
         item["confidence"] = item["confidence_score"] = confidence
         item["risk_score"] = risk
-        scored.append({"idx": idx, "item": item, "quality": quality, "confidence": confidence, "risk": risk, "hard_block": bool(q.get("hard_block")), "momentum": q.get("momentum") if isinstance(q.get("momentum"), dict) else {}, "slot_no": slot_no(item, idx)})
+        item["momentum_score"] = _clamp_float(q.get("momentum_score"), 0, -100, 100)
+        item["recovery_momentum_score"] = _clamp_float(q.get("recovery_momentum_score"), 0, 0, 100)
+        scored.append({"idx": idx, "item": item, "quality": quality, "confidence": confidence, "risk": risk, "momentum_score": item["momentum_score"], "recovery_momentum_score": item["recovery_momentum_score"], "hard_block": bool(q.get("hard_block")), "slot_no": slot_no(item, idx)})
 
     events = []
     strategist_reason = []
@@ -14156,6 +14012,18 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             adaptive_min_edge = 45.0
         min_edge = min(float(regime_params.get("min_edge", 40)), adaptive_min_edge)
         risk_max = float(regime_params.get("risk_max", 55))
+        momentum_score = _clamp_float(row.get("momentum_score", meta.get("strategist_momentum_score", 0)), 0, -100, 100)
+        recovery_score = _clamp_float(row.get("recovery_momentum_score", meta.get("strategist_recovery_momentum_score", 0)), 0, 0, 100)
+        momentum_recovery_entry = bool(
+            (momentum_score >= 3 or recovery_score >= 55)
+            and confidence >= 45
+            and risk <= min(70.0, risk_max + 10.0)
+        )
+        if momentum_recovery_entry:
+            # Momentum can override market color and soften the edge/risk gate.
+            # Hard safety is still checked before this gate.
+            min_edge = min(min_edge, 32.0 if regime == "RED" else 35.0)
+            risk_max = max(risk_max, min(65.0, risk + 5.0))
         # Expected move model:
         # - Use a more realistic paper expectation for short-term opportunities.
         # - READY slots around q=52-58 should be able to start when risk is controlled
@@ -14164,26 +14032,17 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         #   slots. Regime does not cap active slot-units; pacing and edge/risk do.
         base_expected_pct = ((q - 45.0) * 0.11) + ((confidence - 45.0) * 0.035) - (risk * 0.010)
         rebound_bonus_pct = 0.0
-        momentum = row.get("momentum") if isinstance(row.get("momentum"), dict) else {}
-        momentum_score = _clamp_float(momentum.get("score"), 0, 0, 100)
-        momentum_bonus_pct = 0.0
-        if regime == "RED" and q >= 55 and confidence >= 45 and risk <= risk_max:
+        if regime == "RED" and momentum_recovery_entry:
+            rebound_bonus_pct = 0.65
+        elif regime == "NEUTRAL" and momentum_recovery_entry:
+            rebound_bonus_pct = 0.45
+        elif momentum_recovery_entry:
+            rebound_bonus_pct = 0.25
+        elif regime == "RED" and q >= 55 and confidence >= 45 and risk <= risk_max:
             rebound_bonus_pct = 0.35
         elif regime == "NEUTRAL" and q >= 52 and confidence >= 45 and risk <= risk_max:
             rebound_bonus_pct = 0.20
-        # Momentum can unlock exactly the missed setup from a red market: recent
-        # buying pressure/recovery can justify a small controlled entry even while
-        # 7D context remains weak. It is still capped and still must pass risk/cost.
-        if momentum.get("rising") and risk <= risk_max:
-            if momentum_score >= 75:
-                momentum_bonus_pct = 0.55
-            elif momentum_score >= 65:
-                momentum_bonus_pct = 0.35
-            elif momentum_score >= 58:
-                momentum_bonus_pct = 0.20
-        elif momentum.get("falling"):
-            momentum_bonus_pct = -0.25
-        expected_pct = max(0.0, base_expected_pct + rebound_bonus_pct + momentum_bonus_pct)
+        expected_pct = max(0.0, base_expected_pct + rebound_bonus_pct)
         expected_usd = amount * (expected_pct / 100.0)
 
         # Shadow cost gate should protect against noise, not block every small setup.
@@ -14193,16 +14052,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         # simulated DEX costs are larger than the first expected paper move.
         cost_buffer = min(total_cost * (1.05 if regime in ("RED", "NEUTRAL") else 1.00), max(0.01, amount * 0.0005))
 
-        # Rising momentum may lower the soft edge threshold a little. It must never
-        # bypass hard security/liquidity blocks or the risk guard.
-        if momentum.get("rising") and momentum_score >= 65 and risk <= risk_max:
-            min_edge = max(30.0, min_edge - 5.0)
-        elif momentum.get("falling"):
-            min_edge = min(60.0, min_edge + 5.0)
-
-        edge_ok = q >= min_edge
+        edge_ok = q >= min_edge or momentum_recovery_entry
         risk_ok = risk <= risk_max
         cost_ok = expected_usd > cost_buffer
+        if momentum_recovery_entry and risk_ok and expected_pct >= 0.15:
+            cost_ok = True
 
         # Safety fallback: if costs are zero/missing in Shadow and the score/risk gate is clean,
         # do not require a synthetic cost advantage that cannot be calculated.
@@ -14210,7 +14064,9 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             cost_ok = True
 
         ok_edge = edge_ok and risk_ok and cost_ok
-        if ok_edge:
+        if ok_edge and momentum_recovery_entry:
+            reason = "momentum_recovery_entry_allowed"
+        elif ok_edge:
             reason = "edge_after_cost_positive"
         elif not edge_ok:
             reason = f"wait_edge_below_{min_edge:g}"
@@ -14220,17 +14076,15 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             reason = "wait_expected_move_below_cost_buffer"
 
         meta["strategist_market_regime"] = regime
-        meta["strategist_promotion_policy"] = "ADAPTIVE_THRESHOLD_35_40_45"
+        meta["strategist_promotion_policy"] = "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR"
+        meta["strategist_momentum_recovery_entry"] = bool(momentum_recovery_entry)
+        meta["strategist_momentum_score"] = round(momentum_score, 4)
+        meta["strategist_recovery_momentum_score"] = round(recovery_score, 4)
         meta["strategist_adaptive_min_edge"] = round(adaptive_min_edge, 4)
         meta["strategist_min_edge"] = round(min_edge, 4)
         meta["strategist_risk_max"] = round(risk_max, 4)
         meta["strategist_base_expected_pct"] = round(base_expected_pct, 4)
         meta["strategist_rebound_bonus_pct"] = round(rebound_bonus_pct, 4)
-        meta["strategist_momentum_bonus_pct"] = round(momentum_bonus_pct, 4)
-        meta["strategist_momentum_score"] = round(momentum_score, 4)
-        meta["strategist_momentum_rising"] = bool(momentum.get("rising"))
-        meta["strategist_momentum_falling"] = bool(momentum.get("falling"))
-        meta["strategist_momentum_reason"] = "; ".join(momentum.get("reasons") or [])[:300]
         meta["strategist_expected_pct"] = round(expected_pct, 4)
         meta["strategist_expected_usd"] = round(expected_usd, 4)
         meta["strategist_cost_gate_usd"] = round(cost_buffer, 4)
