@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-027-MOMENTUM-REAL"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-028-AGGRESSIVE-GUARD"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-027-MOMENTUM-REAL"
-SHADOW_BUILD_ID = "SH-ENGINE-027-MOMENTUM-REAL"
+STRATEGIST_BUILD_ID = "S-ENGINE-028-AGGRESSIVE-GUARD"
+SHADOW_BUILD_ID = "SH-ENGINE-028-AGGRESSIVE-GUARD"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "REAL_MOMENTUM_ENTRY_GATE"
+SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EDGE_INIT_FIX_V5"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -217,7 +217,7 @@ def api_build_info():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
+        "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -241,7 +241,7 @@ def api_version():
         "shadow_version": SHADOW_BUILD_ID,
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
-        "promotion_policy": "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR",
+        "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -13991,14 +13991,40 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         risk = _clamp_float(row["risk"], 0, 0, 100)
         confidence = _clamp_float(row["confidence"], 0, 0, 100)
         if aggressive_legacy_mode:
+            # ENGINE-028: Aggressive stays fast, but RED market is no longer a blind-entry bypass.
+            # In RED, Aggressive still skips normal pacing/max-trade brakes, but it must see
+            # real recovery momentum before opening/keeping an ACTIVE paper position.
+            momentum_score = _clamp_float(row.get("momentum_score", meta.get("strategist_momentum_score", 0)), 0, -100, 100)
+            recovery_score = _clamp_float(row.get("recovery_momentum_score", meta.get("strategist_recovery_momentum_score", 0)), 0, 0, 100)
+            aggressive_red_guard_ok = bool(
+                regime != "RED"
+                or (
+                    (recovery_score >= 55 or momentum_score >= 3)
+                    and confidence >= 45
+                    and risk <= 70
+                    and q >= 30
+                )
+            )
             meta["strategist_market_regime"] = regime
-            meta["strategist_promotion_policy"] = "AGGRESSIVE_LEGACY_WITH_SAFETY_FLOOR"
-            meta["strategist_entry_allowed"] = True
-            meta["strategist_entry_reason"] = "aggressive_performance_legacy_bypass_soft_brakes"
-            meta["strategist_min_edge"] = 0
-            meta["strategist_risk_max"] = 100
+            meta["strategist_promotion_policy"] = "AGGRESSIVE_RED_ENTRY_GUARD_V1"
+            meta["strategist_min_edge"] = 0 if regime != "RED" else 30
+            meta["strategist_risk_max"] = 100 if regime != "RED" else 70
             meta["strategist_cost_gate_usd"] = 0
             meta["strategist_cost_model"] = cost
+            meta["strategist_momentum_score"] = round(momentum_score, 4)
+            meta["strategist_recovery_momentum_score"] = round(recovery_score, 4)
+            meta["aggressive_red_guard_ok"] = aggressive_red_guard_ok
+            if not aggressive_red_guard_ok:
+                meta["strategist_entry_allowed"] = False
+                meta["strategist_entry_reason"] = "aggressive_red_guard_waiting_for_recovery_momentum"
+                set_meta(item, meta)
+                return False
+            meta["strategist_entry_allowed"] = True
+            meta["strategist_entry_reason"] = (
+                "aggressive_red_guard_recovery_momentum_confirmed"
+                if regime == "RED" else
+                "aggressive_performance_legacy_bypass_soft_brakes"
+            )
             set_meta(item, meta)
             return True
         # ENGINE-015 adaptive promotion threshold:
@@ -14076,7 +14102,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             reason = "wait_expected_move_below_cost_buffer"
 
         meta["strategist_market_regime"] = regime
-        meta["strategist_promotion_policy"] = "REAL_MOMENTUM_RECOVERY_OVER_MARKET_COLOR"
+        meta["strategist_promotion_policy"] = "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM"
         meta["strategist_momentum_recovery_entry"] = bool(momentum_recovery_entry)
         meta["strategist_momentum_score"] = round(momentum_score, 4)
         meta["strategist_recovery_momentum_score"] = round(recovery_score, 4)
@@ -14180,7 +14206,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running"
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
-        events.append(set_state(item, "ACTIVE", (f"Session {selected_session_id or selected_chain or 'selected'} · {performance_mode}: Aggressive legacy mode promoted this slot; core safety passed and trade pacing is disabled." if aggressive_legacy_mode else f"Session {selected_session_id or selected_chain or 'selected'} · Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard."), "SHADOW_ACTIVE"))
+        events.append(set_state(item, "ACTIVE", (f"Session {selected_session_id or selected_chain or 'selected'} · {performance_mode}: Aggressive mode promoted this slot; core safety passed, pacing is disabled, and RED entries require recovery momentum." if aggressive_legacy_mode else f"Session {selected_session_id or selected_chain or 'selected'} · Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard."), "SHADOW_ACTIVE"))
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
@@ -14211,14 +14237,14 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             continue
         if row["idx"] in ready_keep:
             if st != "READY":
-                events.append(set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive legacy mode: slot is ready; core safety passed and pacing is disabled." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY"))
+                events.append(set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive mode: slot is ready; core safety passed, pacing is disabled, and RED entries require recovery momentum." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY"))
             else:
-                set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive legacy mode: slot is ready; core safety passed and pacing is disabled." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY")
+                set_state(item, "READY", (f"Session {selected_session_id or selected_chain or 'selected'} · Aggressive mode: slot is ready; core safety passed, pacing is disabled, and RED entries require recovery momentum." if aggressive_legacy_mode else "Strategist keeps this slot ready as the next clean paper candidate."), "STRATEGIST_READY")
         else:
             if st != "WAIT":
-                events.append(set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle kept this slot waiting; Aggressive soft brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT"))
+                events.append(set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle or Aggressive RED guard kept this slot waiting; soft pacing brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT"))
             else:
-                set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle kept this slot waiting; Aggressive soft brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT")
+                set_state(item, "WAIT", (f"Session {selected_session_id or selected_chain or 'selected'} · Hard safety/lifecycle or Aggressive RED guard kept this slot waiting; soft pacing brakes are disabled." if aggressive_legacy_mode else "Strategist keeps this slot waiting for a cleaner edge."), "STRATEGIST_WAIT")
 
     # Sort by slot number for stable UI, not by updated_ts/priority.
     normalized.sort(key=lambda item: slot_no(item, 0))
