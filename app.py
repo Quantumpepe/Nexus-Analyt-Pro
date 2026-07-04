@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-035-NKR-RULES"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-036-NKR-PAYOUT-REINVEST"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-035-NKR-RULES"
-SHADOW_BUILD_ID = "SH-ENGINE-035-NKR-RULES"
+STRATEGIST_BUILD_ID = "S-ENGINE-036-NKR-PAYOUT-REINVEST"
+SHADOW_BUILD_ID = "SH-ENGINE-036-NKR-PAYOUT-REINVEST"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -215,6 +215,14 @@ NEXUS_NKR_DYNAMIC_RELEASE_MODE = "NKR_DYNAMIC_RELEASE_MODE_V1"
 NEXUS_NKR_RED_RECOVERY_GUARD = "NKR_RED_MARKET_RECOVERY_GUARD_V1"
 NEXUS_NKR_CAPITAL_RELEASE_POLICY = "CAPITAL_RELEASE_BY_MODE_REGIME_OBSERVATION_AND_RECOVERY_MOMENTUM"
 NEXUS_NKR_OBSERVATION_WINDOWS_MIN = [15, 60, 240, 720, 1440]
+NEXUS_NKR_PAYOUT_MODE = "NKR_PAYOUT_REINVEST_V1"
+NEXUS_NKR_DEFAULT_PROFIT_MODE = "REINVEST"
+NEXUS_NKR_PAYOUT_POLICY = "REINVEST_BY_DEFAULT_PAYOUT_ONLY_BY_USER_CHOICE_AND_MARKET_SAFETY"
+NEXUS_NKR_PROFIT_BASIS = "USDC_USDT_NET_PROFIT"
+NEXUS_NKR_PAYOUT_MARKET_GUARD = "RED_MARKET_PAUSES_PAYOUT_GREEN_ALLOWS_HIGHER_PAYOUT"
+NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_GREEN_PCT = 10
+NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_NEUTRAL_PCT = 5
+NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_RED_PCT = 0
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -268,6 +276,10 @@ def api_build_info():
         "nkr_dynamic_release": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
         "nkr_red_recovery_guard": NEXUS_NKR_RED_RECOVERY_GUARD,
         "nkr_capital_release_policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
+        "nkr_payout_reinvest": NEXUS_NKR_PAYOUT_MODE,
+        "nkr_default_profit_mode": NEXUS_NKR_DEFAULT_PROFIT_MODE,
+        "nkr_payout_policy": NEXUS_NKR_PAYOUT_POLICY,
+        "nkr_profit_basis": NEXUS_NKR_PROFIT_BASIS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -318,6 +330,10 @@ def api_version():
         "nkr_dynamic_release": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
         "nkr_red_recovery_guard": NEXUS_NKR_RED_RECOVERY_GUARD,
         "nkr_capital_release_policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
+        "nkr_payout_reinvest": NEXUS_NKR_PAYOUT_MODE,
+        "nkr_default_profit_mode": NEXUS_NKR_DEFAULT_PROFIT_MODE,
+        "nkr_payout_policy": NEXUS_NKR_PAYOUT_POLICY,
+        "nkr_profit_basis": NEXUS_NKR_PROFIT_BASIS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -1069,6 +1085,177 @@ def api_nexus_nkr_release_decision():
         momentum_score=body.get("momentumScore") or body.get("momentum_score") or 0,
         opportunity_score=body.get("opportunityScore") or body.get("opportunity_score") or 0,
         capital_usd=body.get("capitalUsd") or body.get("capital_usd") or body.get("budgetUsd") or 0,
+    )
+    return jsonify({"status": "ok", "decision": decision})
+
+
+def _nkr_normalize_profit_mode(raw: str = "") -> str:
+    s = str(raw or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "REINVEST": "REINVEST",
+        "AUTO_REINVEST": "REINVEST",
+        "REINVEST_PROFIT": "REINVEST",
+        "PAYOUT": "PAYOUT",
+        "PAY_OUT": "PAYOUT",
+        "PROFIT_PAYOUT": "PAYOUT",
+        "PAYOUT_PERCENTAGE": "PAYOUT_PERCENTAGE",
+        "PERCENTAGE": "PAYOUT_PERCENTAGE",
+        "HOLD": "HOLD_STABLE",
+        "HOLD_STABLE": "HOLD_STABLE",
+        "STABLE": "HOLD_STABLE",
+        "LOCK_PROFIT": "HOLD_STABLE",
+    }
+    return aliases.get(s, NEXUS_NKR_DEFAULT_PROFIT_MODE)
+
+
+def _nkr_default_payout_pct_for_regime(regime: str, performance: str = "TACTICAL") -> float:
+    rg = _nkr_normalize_regime(regime)
+    mode = _nkr_normalize_performance_mode(performance)
+    if rg == "GREEN":
+        base = float(NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_GREEN_PCT)
+    elif rg == "RED":
+        base = float(NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_RED_PCT)
+    else:
+        base = float(NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_NEUTRAL_PCT)
+
+    if mode == "DEFENSIVE":
+        base = max(0.0, base - 2.0)
+    elif mode == "AGGRESSIVE":
+        base = min(15.0, base + 2.0)
+    elif mode == "DYNAMIC" and rg == "GREEN":
+        base = min(15.0, base + 1.0)
+    return _nkr_clamp_pct(base, 0.0, 15.0)
+
+
+def _nkr_payout_reinvest_decision(profit_usd: float = 0.0, working_capital_usd: float = 0.0,
+                                  base_capital_usd: float = 0.0, market_regime: str = "NEUTRAL",
+                                  performance: str = "TACTICAL", profit_mode: str = "REINVEST",
+                                  payout_pct: float | None = None, user_requested_payout: bool = False) -> dict:
+    profit = max(0.0, _safe_float(profit_usd, 0.0))
+    working = max(0.0, _safe_float(working_capital_usd, 0.0))
+    base_cap = max(0.0, _safe_float(base_capital_usd, 0.0))
+    rg = _nkr_normalize_regime(market_regime)
+    mode = _nkr_normalize_performance_mode(performance)
+    pmode = _nkr_normalize_profit_mode(profit_mode)
+
+    if payout_pct is None:
+        payout_pct_f = _nkr_default_payout_pct_for_regime(rg, mode)
+    else:
+        payout_pct_f = _nkr_clamp_pct(_safe_float(payout_pct, 0.0), 0.0, 25.0)
+
+    # Red market safety: user can request payout, but automatic payout is paused.
+    red_paused = bool(rg == "RED" and pmode in ("PAYOUT", "PAYOUT_PERCENTAGE") and not user_requested_payout)
+
+    payout_usd = 0.0
+    reinvest_usd = profit
+    hold_stable_usd = 0.0
+    action = "REINVEST_PROFIT"
+    reason = "default_reinvest_profit"
+
+    if profit <= 0:
+        action = "NO_PROFIT_TO_DISTRIBUTE"
+        reason = "profit_not_positive"
+        reinvest_usd = 0.0
+    elif pmode == "HOLD_STABLE":
+        action = "HOLD_PROFIT_STABLE"
+        reason = "user_or_policy_holds_profit_in_usdc_usdt"
+        hold_stable_usd = profit
+        reinvest_usd = 0.0
+    elif pmode in ("PAYOUT", "PAYOUT_PERCENTAGE"):
+        if red_paused:
+            action = "PAYOUT_PAUSED_RED_MARKET"
+            reason = "red_market_pauses_automatic_payout"
+            hold_stable_usd = profit
+            reinvest_usd = 0.0
+        else:
+            # Percentage payout is from working capital if provided, otherwise from profit.
+            payout_base = working if working > 0 else profit
+            requested_payout = payout_base * payout_pct_f / 100.0
+            payout_usd = min(profit, max(0.0, requested_payout))
+            reinvest_usd = max(0.0, profit - payout_usd)
+            action = "PAYOUT_AND_REINVEST_REST" if reinvest_usd > 0 else "PAYOUT_PROFIT"
+            reason = "payout_percentage_from_working_capital_or_profit"
+    else:
+        action = "REINVEST_PROFIT"
+        reason = "default_reinvest_profit"
+        reinvest_usd = profit
+
+    protected_base_usd = base_cap if base_cap > 0 else max(0.0, working - profit)
+    return {
+        "mode": NEXUS_NKR_PAYOUT_MODE,
+        "policy": NEXUS_NKR_PAYOUT_POLICY,
+        "profitBasis": NEXUS_NKR_PROFIT_BASIS,
+        "performance": mode,
+        "marketRegime": rg,
+        "profitMode": pmode,
+        "profitUsd": round(profit, 2),
+        "workingCapitalUsd": round(working, 2),
+        "protectedBaseCapitalUsd": round(protected_base_usd, 2),
+        "payoutPct": round(payout_pct_f, 4),
+        "payoutUsd": round(payout_usd, 2),
+        "reinvestUsd": round(reinvest_usd, 2),
+        "holdStableUsd": round(hold_stable_usd, 2),
+        "redMarketPayoutPaused": bool(red_paused),
+        "defaultCapitalState": NEXUS_DEFAULT_CAPITAL_STATE,
+        "tokenPositionPolicy": NEXUS_TOKEN_POSITION_POLICY,
+        "action": action,
+        "reason": reason,
+        "executionEnabled": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_payout_policy() -> dict:
+    return {
+        "mode": NEXUS_NKR_PAYOUT_MODE,
+        "policy": NEXUS_NKR_PAYOUT_POLICY,
+        "profitBasis": NEXUS_NKR_PROFIT_BASIS,
+        "marketGuard": NEXUS_NKR_PAYOUT_MARKET_GUARD,
+        "defaultProfitMode": NEXUS_NKR_DEFAULT_PROFIT_MODE,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "defaultWeeklyPayoutPct": {
+            "GREEN": NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_GREEN_PCT,
+            "NEUTRAL": NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_NEUTRAL_PCT,
+            "RED": NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_RED_PCT,
+        },
+        "availableProfitModes": ["REINVEST", "PAYOUT", "PAYOUT_PERCENTAGE", "HOLD_STABLE"],
+        "rules": [
+            "Default is reinvest profit into the NKR capital base.",
+            "User can switch to payout mode after profit exists.",
+            "Payout is calculated from net USDC/USDT value, not from volatile token balances.",
+            "Automatic payout is paused in RED market unless the user explicitly requests it.",
+            "Profit can be held in USDC/USDT instead of reinvested.",
+            "This is Shadow/policy-only and does not move Vault funds.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/nkr-payout-policy")
+def api_nexus_nkr_payout_policy():
+    return jsonify({"status": "ok", **_nkr_payout_policy()})
+
+
+@app.post("/api/nexus/nkr-payout-decision")
+def api_nexus_nkr_payout_decision():
+    body = request.get_json(silent=True) or {}
+    user_requested = str(body.get("userRequestedPayout") or body.get("user_requested_payout") or request.args.get("userRequestedPayout") or "").strip().lower() in ("1", "true", "yes", "on")
+    payout_pct_val = body.get("payoutPct") if body.get("payoutPct") is not None else body.get("payout_pct")
+    if payout_pct_val is None:
+        payout_pct_val = request.args.get("payoutPct")
+    payout_pct = None if payout_pct_val in (None, "") else _safe_float(payout_pct_val, 0.0)
+    decision = _nkr_payout_reinvest_decision(
+        profit_usd=body.get("profitUsd") or body.get("profit_usd") or request.args.get("profitUsd") or 0,
+        working_capital_usd=body.get("workingCapitalUsd") or body.get("working_capital_usd") or request.args.get("workingCapitalUsd") or 0,
+        base_capital_usd=body.get("baseCapitalUsd") or body.get("base_capital_usd") or request.args.get("baseCapitalUsd") or 0,
+        market_regime=body.get("marketRegime") or body.get("market_regime") or request.args.get("marketRegime") or "NEUTRAL",
+        performance=body.get("performance") or body.get("performanceMode") or request.args.get("performance") or "TACTICAL",
+        profit_mode=body.get("profitMode") or body.get("profit_mode") or request.args.get("profitMode") or NEXUS_NKR_DEFAULT_PROFIT_MODE,
+        payout_pct=payout_pct,
+        user_requested_payout=user_requested,
     )
     return jsonify({"status": "ok", "decision": decision})
 
