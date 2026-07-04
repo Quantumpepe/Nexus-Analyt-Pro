@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-037-NKR-PERIOD-OBSERVATION"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-038-NKR-UI-CONTRACT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-037-NKR-PERIOD-OBSERVATION"
-SHADOW_BUILD_ID = "SH-ENGINE-037-NKR-PERIOD-OBSERVATION"
+STRATEGIST_BUILD_ID = "S-ENGINE-038-NKR-UI-CONTRACT"
+SHADOW_BUILD_ID = "SH-ENGINE-038-NKR-UI-CONTRACT"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -229,6 +229,15 @@ NEXUS_NKR_DEFAULT_PERIOD_DAYS = 10
 NEXUS_NKR_PERIOD_OPTIONS_DAYS = [10, 20, 30]
 NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT = 85
 NEXUS_NKR_END_LOCK_POLICY = "NEAR_PERIOD_END_LOCK_PROFIT_TO_USDC_USDT_AND_REDUCE_NEW_RISK"
+NEXUS_NKR_UI_CONTRACT_MODE = "NKR_FRONTEND_CONTRACT_V1"
+NEXUS_NKR_UI_TAB_LABEL = "NKR"
+NEXUS_NKR_UI_SECTION_TITLE = "NKR Capital Rotation"
+NEXUS_NKR_UI_SOURCE_TAB_RENAME = "NEXUS_ROTATION_TO_NKR"
+NEXUS_NKR_UI_DEFAULT_MODE = "DYNAMIC"
+NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES = 60
+NEXUS_NKR_UI_DEFAULT_PROFIT_MODE = "REINVEST"
+NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS = 10
+NEXUS_NKR_UI_CONTRACT_POLICY = "FRONTEND_SELECTS_NKR_MODE_OBSERVATION_PROFIT_PERIOD_BACKEND_COMPUTES_POLICY"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -292,6 +301,14 @@ def api_build_info():
         "nkr_period_options_days": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
         "nkr_profit_lock_window_pct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
         "nkr_end_lock_policy": NEXUS_NKR_END_LOCK_POLICY,
+        "nkr_ui_contract": NEXUS_NKR_UI_CONTRACT_MODE,
+        "nkr_ui_tab_label": NEXUS_NKR_UI_TAB_LABEL,
+        "nkr_ui_section_title": NEXUS_NKR_UI_SECTION_TITLE,
+        "nkr_ui_source_tab_rename": NEXUS_NKR_UI_SOURCE_TAB_RENAME,
+        "nkr_ui_default_mode": NEXUS_NKR_UI_DEFAULT_MODE,
+        "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
+        "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
+        "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -352,6 +369,14 @@ def api_version():
         "nkr_period_options_days": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
         "nkr_profit_lock_window_pct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
         "nkr_end_lock_policy": NEXUS_NKR_END_LOCK_POLICY,
+        "nkr_ui_contract": NEXUS_NKR_UI_CONTRACT_MODE,
+        "nkr_ui_tab_label": NEXUS_NKR_UI_TAB_LABEL,
+        "nkr_ui_section_title": NEXUS_NKR_UI_SECTION_TITLE,
+        "nkr_ui_source_tab_rename": NEXUS_NKR_UI_SOURCE_TAB_RENAME,
+        "nkr_ui_default_mode": NEXUS_NKR_UI_DEFAULT_MODE,
+        "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
+        "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
+        "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -1438,6 +1463,191 @@ def api_nexus_nkr_period_decision():
         profit_mode=body.get("profitMode") or body.get("profit_mode") or request.args.get("profitMode") or NEXUS_NKR_DEFAULT_PROFIT_MODE,
     )
     return jsonify({"status": "ok", "decision": decision})
+
+
+# -------------------------
+# ENGINE-038: NKR Frontend UI Contract V1
+# -------------------------
+def _nkr_ui_contract_policy() -> dict:
+    """Contract for the future JSX change: Nexus Rotation becomes NKR.
+
+    This is intentionally a backend/UI contract only. It exposes the allowed
+    selections and field names for the frontend, but does not execute trades,
+    move Vault funds, or mutate user state.
+    """
+    return {
+        "mode": NEXUS_NKR_UI_CONTRACT_MODE,
+        "policy": NEXUS_NKR_UI_CONTRACT_POLICY,
+        "sourceTab": "Nexus Rotation",
+        "targetTab": NEXUS_NKR_UI_TAB_LABEL,
+        "sectionTitle": NEXUS_NKR_UI_SECTION_TITLE,
+        "description": "Capital allocation, watchlist rotation, stablecoin reserve, reinvest/payout, and period control.",
+        "frontendFieldNames": {
+            "nkrMode": "nkrCapitalMode",
+            "observationWindowMinutes": "observationWindowMinutes",
+            "profitMode": "profitMode",
+            "periodDays": "periodDays",
+            "maxActiveAssets": "maxActiveAssets",
+            "maxCapitalPerAssetPct": "maxCapitalPerAssetPct",
+            "baseCapitalUsd": "baseCapitalUsd",
+            "workingCapitalUsd": "workingCapitalUsd",
+            "profitUsd": "profitUsd",
+            "watchlistSymbols": "watchlistSymbols",
+        },
+        "defaults": {
+            "nkrCapitalMode": NEXUS_NKR_UI_DEFAULT_MODE,
+            "observationWindowMinutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
+            "profitMode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
+            "periodDays": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
+            "maxActiveAssets": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+            "maxCapitalPerAssetPct": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+            "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        },
+        "selectOptions": {
+            "nkrCapitalMode": [
+                {"value": "DYNAMIC", "label": "Dynamic", "description": "NKR adapts between Tactical and Aggressive by market quality."},
+                {"value": "TACTICAL", "label": "Tactical", "description": "Balanced capital release."},
+                {"value": "AGGRESSIVE", "label": "Aggressive", "description": "Faster capital release, still protected by red-market recovery guard."},
+                {"value": "DEFENSIVE", "label": "Defensive", "description": "Higher cash reserve and slower release."},
+            ],
+            "observationWindowMinutes": [
+                {"value": 15, "label": "15m"},
+                {"value": 60, "label": "1h"},
+                {"value": 240, "label": "4h"},
+                {"value": 720, "label": "12h"},
+                {"value": 1440, "label": "24h"},
+            ],
+            "profitMode": [
+                {"value": "REINVEST", "label": "Reinvest profit"},
+                {"value": "PAYOUT", "label": "Pay out profit"},
+                {"value": "PAYOUT_PERCENTAGE", "label": "Pay out percentage"},
+                {"value": "HOLD_STABLE", "label": "Hold profit in USDC/USDT"},
+            ],
+            "periodDays": [
+                {"value": 10, "label": "10 days"},
+                {"value": 20, "label": "20 days"},
+                {"value": 30, "label": "Monthly"},
+            ],
+        },
+        "endpointMap": {
+            "policy": "/api/nexus/nkr-ui-contract",
+            "dashboardPreview": "/api/nexus/nkr-dashboard-preview",
+            "watchlistPolicy": "/api/nexus/nkr-watchlist-policy",
+            "watchlistPreview": "/api/nexus/nkr-watchlist-preview",
+            "capitalPolicy": "/api/nexus/nkr-capital-policy",
+            "capitalPlan": "/api/nexus/nkr-capital-plan",
+            "rulesPolicy": "/api/nexus/nkr-rules-policy",
+            "releaseDecision": "/api/nexus/nkr-release-decision",
+            "payoutPolicy": "/api/nexus/nkr-payout-policy",
+            "payoutDecision": "/api/nexus/nkr-payout-decision",
+            "periodPolicy": "/api/nexus/nkr-period-policy",
+            "periodDecision": "/api/nexus/nkr-period-decision",
+        },
+        "separationRules": [
+            "NKR Capital Mode controls capital release and allocation.",
+            "Trading Performance controls how the trader uses already released capital.",
+            "Frontend may show both, but must not treat them as the same setting.",
+            "NKR outputs preview/policy only until Vault execution is explicitly enabled later.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_dashboard_preview_decision(body: dict) -> dict:
+    symbols_raw = body.get("watchlistSymbols") or body.get("symbols") or "ETH,BNB,POL"
+    if isinstance(symbols_raw, list):
+        symbols = []
+        for x in symbols_raw:
+            symbols.extend(_nkr_parse_watchlist_symbols(str(x)))
+    else:
+        symbols = _nkr_parse_watchlist_symbols(str(symbols_raw))
+
+    market_regime = body.get("marketRegime") or body.get("market_regime") or "NEUTRAL"
+    nkr_mode = body.get("nkrCapitalMode") or body.get("nkr_mode") or body.get("performance") or NEXUS_NKR_UI_DEFAULT_MODE
+    observation_minutes = body.get("observationWindowMinutes") or body.get("observation_minutes") or NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES
+    profit_mode = body.get("profitMode") or body.get("profit_mode") or NEXUS_NKR_UI_DEFAULT_PROFIT_MODE
+    period_days = body.get("periodDays") or body.get("period_days") or NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS
+    capital_usd = _safe_float(body.get("capitalUsd") or body.get("capital_usd") or body.get("workingCapitalUsd"), 0.0)
+    working_capital_usd = _safe_float(body.get("workingCapitalUsd") or capital_usd, capital_usd)
+    base_capital_usd = _safe_float(body.get("baseCapitalUsd") or body.get("base_capital_usd") or 0.0, 0.0)
+    profit_usd = _safe_float(body.get("profitUsd") or body.get("profit_usd") or 0.0, 0.0)
+    elapsed_days = _safe_float(body.get("elapsedDays") or body.get("elapsed_days") or 0.0, 0.0)
+    recovery_score = _safe_float(body.get("recoveryScore") or body.get("recovery_score") or 0.0, 0.0)
+    momentum_score = _safe_float(body.get("momentumScore") or body.get("momentum_score") or 0.0, 0.0)
+    opportunity_score = _safe_float(body.get("opportunityScore") or body.get("opportunity_score") or 0.0, 0.0)
+
+    release = _nkr_capital_release_decision(
+        market_regime=market_regime,
+        performance=nkr_mode,
+        observation_minutes=observation_minutes,
+        recovery_score=recovery_score,
+        momentum_score=momentum_score,
+        opportunity_score=opportunity_score,
+    )
+    payout = _nkr_payout_reinvest_decision(
+        profit_usd=profit_usd,
+        working_capital_usd=working_capital_usd,
+        market_regime=market_regime,
+        performance=nkr_mode,
+        profit_mode=profit_mode,
+        payout_pct=body.get("payoutPct") or body.get("payout_pct") or None,
+        explicit_user_request=bool(body.get("explicitUserRequest") or body.get("explicit_user_request") or False),
+    )
+    period = _nkr_period_observation_decision(
+        period_days=period_days,
+        elapsed_days=elapsed_days,
+        market_regime=market_regime,
+        performance=nkr_mode,
+        profit_usd=profit_usd,
+        working_capital_usd=working_capital_usd,
+        base_capital_usd=base_capital_usd,
+        last_payout_day=body.get("lastPayoutDay") or body.get("last_payout_day") or 0,
+        profit_mode=profit_mode,
+    )
+    capital_plan = _nkr_capital_allocation_plan(
+        symbols=symbols,
+        capital_usd=capital_usd,
+        market=body.get("market") if isinstance(body.get("market"), dict) else {},
+        market_regime=market_regime,
+        performance=nkr_mode,
+        observation_minutes=observation_minutes,
+        recovery_score=recovery_score,
+        momentum_score=momentum_score,
+        opportunity_score=opportunity_score,
+    )
+    return {
+        "uiContract": NEXUS_NKR_UI_CONTRACT_MODE,
+        "tabLabel": NEXUS_NKR_UI_TAB_LABEL,
+        "sectionTitle": NEXUS_NKR_UI_SECTION_TITLE,
+        "nkrCapitalMode": _nkr_normalize_performance_mode(nkr_mode),
+        "marketRegime": _nkr_normalize_regime(market_regime),
+        "observationWindowMinutes": int(_safe_float(observation_minutes, NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES)),
+        "profitMode": _nkr_normalize_profit_mode(profit_mode),
+        "periodDays": _nkr_normalize_period_days(period_days),
+        "releaseDecision": release,
+        "capitalPlan": capital_plan,
+        "payoutDecision": payout,
+        "periodDecision": period,
+        "frontendNote": "Preview only. JSX can use this payload to render NKR selection and dashboard cards.",
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/nkr-ui-contract")
+def api_nexus_nkr_ui_contract():
+    return jsonify({"status": "ok", **_nkr_ui_contract_policy()})
+
+
+@app.post("/api/nexus/nkr-dashboard-preview")
+def api_nexus_nkr_dashboard_preview():
+    body = request.get_json(silent=True) or {}
+    return jsonify({"status": "ok", "preview": _nkr_dashboard_preview_decision(body)})
 
 
 import traceback
