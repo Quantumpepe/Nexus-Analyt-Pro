@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-040-VAULT-CORE-PREP"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-041-ENGINE-BOUNDARY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-040-VAULT-CORE-PREP"
-SHADOW_BUILD_ID = "SH-ENGINE-040-VAULT-CORE-PREP"
+STRATEGIST_BUILD_ID = "S-ENGINE-041-ENGINE-BOUNDARY"
+SHADOW_BUILD_ID = "SH-ENGINE-041-ENGINE-BOUNDARY"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -259,6 +259,12 @@ NEXUS_VAULT_SECURITY_MODULES = ["CHAIN_ALLOWLIST", "TOKEN_ALLOWLIST", "ROUTE_ALL
 NEXUS_VAULT_EMERGENCY_STOP_DEFAULT = False
 NEXUS_VAULT_MAX_DAILY_WITHDRAW_USD_PREVIEW = 25000.0
 NEXUS_VAULT_MAX_SINGLE_TX_USD_PREVIEW = 10000.0
+NEXUS_ENGINE_BOUNDARY_MODE = "ENGINE_BOUNDARY_CONTRACT_V1"
+NEXUS_ENGINE_BOUNDARY_POLICY = "SEPARATE_MARKET_STRATEGIST_NKR_TRADER_VAULT_AND_ROUTER_RESPONSIBILITIES"
+NEXUS_ENGINE_SEPARATION_STATUS = "PREP_ONLY_NO_RUNTIME_REWRITE_NO_LIVE_MUTATION"
+NEXUS_ENGINE_MODULES = ["MARKET_ENGINE", "STRATEGIST_ENGINE", "NKR_ENGINE", "TRADER_ENGINE", "VAULT_ENGINE", "ASSET_ROUTER", "WITHDRAW_QUOTE"]
+NEXUS_ENGINE_FLOW_POLICY = "MARKET_READS_STRATEGIST_SCORES_NKR_ALLOCATES_TRADER_REQUESTS_VAULT_VALIDATES"
+NEXUS_ENGINE_BOUNDARY_GUARD = "NO_MODULE_MAY_BYPASS_VAULT_VALIDATION_FOR_LIVE_MUTATION"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -348,6 +354,12 @@ def api_build_info():
         "vault_allowed_user_assets": NEXUS_VAULT_ALLOWED_USER_ASSETS,
         "vault_security_modules": NEXUS_VAULT_SECURITY_MODULES,
         "vault_emergency_stop_default": NEXUS_VAULT_EMERGENCY_STOP_DEFAULT,
+        "engine_boundary": NEXUS_ENGINE_BOUNDARY_MODE,
+        "engine_boundary_policy": NEXUS_ENGINE_BOUNDARY_POLICY,
+        "engine_separation_status": NEXUS_ENGINE_SEPARATION_STATUS,
+        "engine_modules": NEXUS_ENGINE_MODULES,
+        "engine_flow_policy": NEXUS_ENGINE_FLOW_POLICY,
+        "engine_boundary_guard": NEXUS_ENGINE_BOUNDARY_GUARD,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -434,6 +446,12 @@ def api_version():
         "vault_allowed_user_assets": NEXUS_VAULT_ALLOWED_USER_ASSETS,
         "vault_security_modules": NEXUS_VAULT_SECURITY_MODULES,
         "vault_emergency_stop_default": NEXUS_VAULT_EMERGENCY_STOP_DEFAULT,
+        "engine_boundary": NEXUS_ENGINE_BOUNDARY_MODE,
+        "engine_boundary_policy": NEXUS_ENGINE_BOUNDARY_POLICY,
+        "engine_separation_status": NEXUS_ENGINE_SEPARATION_STATUS,
+        "engine_modules": NEXUS_ENGINE_MODULES,
+        "engine_flow_policy": NEXUS_ENGINE_FLOW_POLICY,
+        "engine_boundary_guard": NEXUS_ENGINE_BOUNDARY_GUARD,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -24334,6 +24352,121 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
 
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
+
+
+# ENGINE-041: Engine Boundary / Separation Contract V1
+# Policy-only module boundary contract. This prepares the codebase for vault-safe
+# separation without changing the proven strategist/trader/shadow behavior.
+def _nexus_engine_boundary_policy() -> dict:
+    modules = [
+        {
+            "id": "MARKET_ENGINE",
+            "responsibility": "Collect and normalize market prices, candles, liquidity and regime inputs.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": False,
+            "output": "market_ticks_and_regime_inputs",
+        },
+        {
+            "id": "STRATEGIST_ENGINE",
+            "responsibility": "Score market quality, momentum, recovery, risk and opportunity.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": False,
+            "output": "scores_and_recommendations",
+        },
+        {
+            "id": "NKR_ENGINE",
+            "responsibility": "Allocate stablecoin capital across allowed watchlist assets, payout/reinvest modes and observation periods.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": False,
+            "output": "capital_allocation_plan",
+        },
+        {
+            "id": "TRADER_ENGINE",
+            "responsibility": "Translate approved strategy/allocation into slot actions and execution requests.",
+            "mayDecideTrades": True,
+            "mayMoveFunds": False,
+            "output": "trade_intent_preview",
+        },
+        {
+            "id": "VAULT_ENGINE",
+            "responsibility": "Validate chain, token, route, limits, emergency stop and signed user permission before any live mutation.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": "future_only_after_validation_and_signature",
+            "output": "vault_validation_result",
+        },
+        {
+            "id": "ASSET_ROUTER",
+            "responsibility": "Map user-facing assets like BTC, SOL and XRP to approved internal EVM routes without exposing wrapped wording to users.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": False,
+            "output": "route_plan",
+        },
+        {
+            "id": "WITHDRAW_QUOTE",
+            "responsibility": "Calculate net-first withdrawal previews including swap, gas, bridge, slippage and routing buffer.",
+            "mayDecideTrades": False,
+            "mayMoveFunds": False,
+            "output": "net_first_quote",
+        },
+    ]
+    return {
+        "status": "ok",
+        "mode": NEXUS_ENGINE_BOUNDARY_MODE,
+        "policy": NEXUS_ENGINE_BOUNDARY_POLICY,
+        "separationStatus": NEXUS_ENGINE_SEPARATION_STATUS,
+        "flowPolicy": NEXUS_ENGINE_FLOW_POLICY,
+        "guard": NEXUS_ENGINE_BOUNDARY_GUARD,
+        "modules": modules,
+        "safeByDefault": True,
+        "liveMutation": False,
+        "notes": [
+            "This is a boundary contract only; it does not rewrite runtime execution.",
+            "Strategist scores; NKR allocates capital; Trader requests actions; Vault validates before any live mutation.",
+            "No module may bypass Vault validation once live execution is connected.",
+        ],
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _nexus_engine_flow_preview(body: dict | None = None) -> dict:
+    body = body or {}
+    requested_action = str(body.get("action") or body.get("requestedAction") or "shadow_trade_preview").strip().lower()
+    chain = str(body.get("chain") or body.get("network") or NEXUS_VAULT_CORE_CHAIN).strip().upper()
+    asset = str(body.get("asset") or body.get("symbol") or "ETH").strip().upper()
+    market_regime = str(body.get("marketRegime") or body.get("regime") or "NEUTRAL").strip().upper()
+    nkr_mode = str(body.get("nkrMode") or body.get("mode") or NEXUS_NKR_UI_DEFAULT_MODE).strip().upper()
+    amount_usd = _safe_float(body.get("amountUsd") or body.get("capitalUsd") or 0)
+
+    steps = [
+        {"step": 1, "module": "MARKET_ENGINE", "status": "read_only", "output": {"asset": asset, "chain": chain, "marketRegime": market_regime}},
+        {"step": 2, "module": "STRATEGIST_ENGINE", "status": "score_only", "output": "momentum/risk/recovery/opportunity scores"},
+        {"step": 3, "module": "NKR_ENGINE", "status": "allocation_preview", "output": {"nkrMode": nkr_mode, "capitalUsd": amount_usd, "baseAsset": NEXUS_VAULT_DEFAULT_BASE_ASSET}},
+        {"step": 4, "module": "TRADER_ENGINE", "status": "intent_preview_only", "output": {"requestedAction": requested_action, "liveOrder": False}},
+        {"step": 5, "module": "VAULT_ENGINE", "status": "validation_preview_only", "output": {"liveMutation": False, "privateKeysInBackend": False}},
+    ]
+    return {
+        "status": "ok",
+        "mode": NEXUS_ENGINE_BOUNDARY_MODE,
+        "requestedAction": requested_action,
+        "input": {"chain": chain, "asset": asset, "marketRegime": market_regime, "nkrMode": nkr_mode, "amountUsd": amount_usd},
+        "steps": steps,
+        "decision": "preview_only_no_live_execution",
+        "guard": NEXUS_ENGINE_BOUNDARY_GUARD,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+@app.get("/api/nexus/engine-boundary-policy")
+def api_nexus_engine_boundary_policy():
+    return jsonify(_nexus_engine_boundary_policy())
+
+
+@app.post("/api/nexus/engine-flow-preview")
+def api_nexus_engine_flow_preview():
+    body = request.get_json(silent=True) or {}
+    return jsonify(_nexus_engine_flow_preview(body))
 
 if __name__ == "__main__":
 
