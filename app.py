@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-034-NKR-CAPITAL"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-035-NKR-RULES"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-034-NKR-CAPITAL"
-SHADOW_BUILD_ID = "SH-ENGINE-034-NKR-CAPITAL"
+STRATEGIST_BUILD_ID = "S-ENGINE-035-NKR-RULES"
+SHADOW_BUILD_ID = "SH-ENGINE-035-NKR-RULES"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -209,6 +209,12 @@ NEXUS_NKR_CASH_RESERVE_GREEN_PCT = 15
 NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT = 25
 NEXUS_NKR_CASH_RESERVE_RED_PCT = 45
 NEXUS_NKR_DEFAULT_CAPITAL_USD = 0
+NEXUS_NKR_RULES_MODE = "NKR_CAPITAL_RELEASE_RULES_V1"
+NEXUS_NKR_OBSERVATION_MODE = "NKR_OBSERVATION_WINDOW_V1"
+NEXUS_NKR_DYNAMIC_RELEASE_MODE = "NKR_DYNAMIC_RELEASE_MODE_V1"
+NEXUS_NKR_RED_RECOVERY_GUARD = "NKR_RED_MARKET_RECOVERY_GUARD_V1"
+NEXUS_NKR_CAPITAL_RELEASE_POLICY = "CAPITAL_RELEASE_BY_MODE_REGIME_OBSERVATION_AND_RECOVERY_MOMENTUM"
+NEXUS_NKR_OBSERVATION_WINDOWS_MIN = [15, 60, 240, 720, 1440]
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -257,6 +263,11 @@ def api_build_info():
         "nkr_cash_reserve_green_pct": NEXUS_NKR_CASH_RESERVE_GREEN_PCT,
         "nkr_cash_reserve_neutral_pct": NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT,
         "nkr_cash_reserve_red_pct": NEXUS_NKR_CASH_RESERVE_RED_PCT,
+        "nkr_rules": NEXUS_NKR_RULES_MODE,
+        "nkr_observation": NEXUS_NKR_OBSERVATION_MODE,
+        "nkr_dynamic_release": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
+        "nkr_red_recovery_guard": NEXUS_NKR_RED_RECOVERY_GUARD,
+        "nkr_capital_release_policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -302,6 +313,11 @@ def api_version():
         "nkr_cash_reserve_green_pct": NEXUS_NKR_CASH_RESERVE_GREEN_PCT,
         "nkr_cash_reserve_neutral_pct": NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT,
         "nkr_cash_reserve_red_pct": NEXUS_NKR_CASH_RESERVE_RED_PCT,
+        "nkr_rules": NEXUS_NKR_RULES_MODE,
+        "nkr_observation": NEXUS_NKR_OBSERVATION_MODE,
+        "nkr_dynamic_release": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
+        "nkr_red_recovery_guard": NEXUS_NKR_RED_RECOVERY_GUARD,
+        "nkr_capital_release_policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -663,6 +679,10 @@ def _nkr_capital_manager_policy() -> dict:
         "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
         "defaultExitPolicy": NEXUS_DEFAULT_EXIT_POLICY,
         "watchlistRotation": NEXUS_NKR_WATCHLIST_MODE,
+        "nkrRules": NEXUS_NKR_RULES_MODE,
+        "observationMode": NEXUS_NKR_OBSERVATION_MODE,
+        "dynamicReleaseMode": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
+        "redRecoveryGuard": NEXUS_NKR_RED_RECOVERY_GUARD,
         "assetRouter": NEXUS_ASSET_ROUTER_MODE,
         "maxActiveAssetsDefault": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
         "maxCapitalPerAssetPctDefault": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
@@ -733,7 +753,20 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
     selected = [x for x in ranked if x.get("recommendation") in ("candidate", "watch") and x.get("routeOk")][:max_active]
 
     regime = _nkr_normalize_regime(market_regime)
-    cash_pct = _nkr_cash_reserve_pct_for_regime(regime, performance=performance)
+    # NKR Rules V1: capital release is mode/regime/observation aware.
+    # For the existing capital-plan endpoint we use a conservative 1h observation
+    # and the best selected score as the opportunity proxy.
+    best_selected_score = max([_safe_float(x.get("score"), 0.0) for x in selected] or [0.0])
+    release_decision = _nkr_capital_release_decision(
+        market_regime=regime,
+        performance=performance,
+        observation_minutes=60,
+        recovery_score=best_selected_score,
+        momentum_score=0.0,
+        opportunity_score=best_selected_score,
+        capital_usd=capital,
+    )
+    cash_pct = _safe_float(release_decision.get("cashReservePct"), _nkr_cash_reserve_pct_for_regime(regime, performance=performance))
     investable = max(0.0, capital * (1.0 - cash_pct / 100.0))
     cash_reserve = max(0.0, capital - investable)
 
@@ -786,6 +819,7 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
         "cashReservePct": round(cash_pct, 2),
         "cashReserveUsd": round(cash_reserve, 2),
         "investableUsd": round(max(0.0, capital - cash_reserve), 2),
+        "releaseDecision": release_decision,
         "maxActiveAssets": max_active,
         "maxCapitalPerAssetPct": round(max_pct, 2),
         "ranked": ranked,
@@ -831,6 +865,213 @@ def api_nexus_nkr_capital_plan():
         max_capital_per_asset_pct=_safe_float(max_pct, NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
     )
     return jsonify({"status": "ok", **_nkr_capital_manager_policy(), "plan": plan})
+
+
+# -------------------------
+# NKR Capital Rules V1
+# -------------------------
+def _nkr_clamp_pct(value, lo=0.0, hi=100.0):
+    return max(float(lo), min(float(hi), _safe_float(value, 0.0)))
+
+
+def _nkr_normalize_performance_mode(raw: str) -> str:
+    s = str(raw or "TACTICAL").strip().upper()
+    if s in ("DYNAMIC", "DYNAMISCH", "AUTO"):
+        return "DYNAMIC"
+    if s in ("AGGRESSIVE", "AGGRESSIV"):
+        return "AGGRESSIVE"
+    if s in ("DEFENSIVE", "DEFENSIV"):
+        return "DEFENSIVE"
+    return "TACTICAL"
+
+
+def _nkr_release_profile_for_mode(performance: str) -> dict:
+    mode = _nkr_normalize_performance_mode(performance)
+    profiles = {
+        "DEFENSIVE": {
+            "RED": {"min": 0, "max": 15, "requiresRecovery": True},
+            "NEUTRAL": {"min": 20, "max": 35, "requiresRecovery": False},
+            "GREEN": {"min": 40, "max": 60, "requiresRecovery": False},
+            "observation": {"15m": 10, "1h": 20, "4h": 35, "12h": 50, "24h": 60},
+        },
+        "TACTICAL": {
+            "RED": {"min": 15, "max": 30, "requiresRecovery": True},
+            "NEUTRAL": {"min": 35, "max": 55, "requiresRecovery": False},
+            "GREEN": {"min": 65, "max": 85, "requiresRecovery": False},
+            "observation": {"15m": 25, "1h": 45, "4h": 65, "12h": 80, "24h": 85},
+        },
+        "AGGRESSIVE": {
+            "RED": {"min": 25, "max": 45, "requiresRecovery": True},
+            "NEUTRAL": {"min": 55, "max": 75, "requiresRecovery": False},
+            "GREEN": {"min": 80, "max": 100, "requiresRecovery": False},
+            "observation": {"15m": 40, "1h": 65, "4h": 85, "12h": 100, "24h": 100},
+        },
+    }
+    if mode == "DYNAMIC":
+        # Dynamic starts from Tactical and can scale toward Aggressive when score/recovery is strong.
+        base = dict(profiles["TACTICAL"])
+        base["mode"] = "DYNAMIC"
+        base["dynamicSource"] = "TACTICAL_TO_AGGRESSIVE_BY_SCORE"
+        return base
+    out = dict(profiles.get(mode, profiles["TACTICAL"]))
+    out["mode"] = mode
+    return out
+
+
+def _nkr_observation_cap_pct(minutes: int, performance: str, dynamic_boost_pct: float = 0.0) -> float:
+    profile = _nkr_release_profile_for_mode(performance)
+    obs = profile.get("observation") or {}
+    try:
+        m = int(minutes or 0)
+    except Exception:
+        m = 0
+    if m >= 1440:
+        key = "24h"
+    elif m >= 720:
+        key = "12h"
+    elif m >= 240:
+        key = "4h"
+    elif m >= 60:
+        key = "1h"
+    else:
+        key = "15m"
+    cap = _safe_float(obs.get(key), 0.0)
+    return _nkr_clamp_pct(cap + _safe_float(dynamic_boost_pct, 0.0), 0.0, 100.0)
+
+
+def _nkr_dynamic_mode_boost(regime: str, recovery_score: float, momentum_score: float, opportunity_score: float) -> float:
+    rg = _nkr_normalize_regime(regime)
+    rec = _safe_float(recovery_score, 0.0)
+    mom = _safe_float(momentum_score, 0.0)
+    opp = _safe_float(opportunity_score, 0.0)
+    boost = 0.0
+    if rg == "GREEN" and (opp >= 70 or mom >= 3 or rec >= 65):
+        boost = 12.0
+    elif rg == "NEUTRAL" and (opp >= 65 or mom >= 3 or rec >= 60):
+        boost = 10.0
+    elif rg == "RED" and (rec >= 60 and mom >= 2):
+        boost = 8.0
+    return boost
+
+
+def _nkr_capital_release_decision(market_regime: str = "NEUTRAL", performance: str = "TACTICAL",
+                                  observation_minutes: int = 60, recovery_score: float = 0.0,
+                                  momentum_score: float = 0.0, opportunity_score: float = 0.0,
+                                  capital_usd: float = 0.0) -> dict:
+    mode = _nkr_normalize_performance_mode(performance)
+    regime = _nkr_normalize_regime(market_regime)
+    rec = _safe_float(recovery_score, 0.0)
+    mom = _safe_float(momentum_score, 0.0)
+    opp = _safe_float(opportunity_score, 0.0)
+    cap = max(0.0, _safe_float(capital_usd, 0.0))
+
+    effective_mode = mode
+    dynamic_boost = 0.0
+    if mode == "DYNAMIC":
+        dynamic_boost = _nkr_dynamic_mode_boost(regime, rec, mom, opp)
+
+    profile = _nkr_release_profile_for_mode(mode)
+    band = profile.get(regime) or profile.get("NEUTRAL") or {"min": 0, "max": 0, "requiresRecovery": False}
+    requires_recovery = bool(band.get("requiresRecovery"))
+
+    # Red market guard: no capital release without real recovery momentum.
+    red_guard_blocks = bool(regime == "RED" and requires_recovery and not (rec >= 55 or mom >= 3 or opp >= 65))
+
+    obs_cap = _nkr_observation_cap_pct(observation_minutes, mode, dynamic_boost_pct=dynamic_boost)
+    band_min = _safe_float(band.get("min"), 0.0)
+    band_max = _safe_float(band.get("max"), 0.0) + dynamic_boost
+
+    if red_guard_blocks:
+        release_pct = 0.0
+        state = "WAIT_RECOVERY_MOMENTUM"
+        reason = "red_market_requires_recovery_momentum"
+    else:
+        # Strength between min and max. Observation cap prevents over-release too early.
+        strength = max(0.0, min(1.0, (max(rec, opp, mom * 20.0) - 45.0) / 35.0))
+        target = band_min + (max(0.0, band_max - band_min) * strength)
+        release_pct = min(target, obs_cap)
+        state = "RELEASE_ALLOWED" if release_pct > 0 else "WAIT"
+        reason = "capital_release_by_mode_regime_observation"
+
+    release_pct = _nkr_clamp_pct(release_pct, 0.0, 100.0)
+    release_usd = cap * release_pct / 100.0
+    reserve_usd = max(0.0, cap - release_usd)
+
+    return {
+        "mode": NEXUS_NKR_RULES_MODE,
+        "policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
+        "performance": mode,
+        "effectiveMode": effective_mode,
+        "marketRegime": regime,
+        "observationMinutes": int(observation_minutes or 0),
+        "recoveryScore": round(rec, 4),
+        "momentumScore": round(mom, 4),
+        "opportunityScore": round(opp, 4),
+        "dynamicBoostPct": round(dynamic_boost, 4),
+        "requiresRecoveryMomentum": bool(requires_recovery),
+        "redMarketGuardBlocked": bool(red_guard_blocks),
+        "observationCapPct": round(obs_cap, 4),
+        "releaseBandPct": {"min": round(band_min, 4), "max": round(_safe_float(band.get("max"), 0.0), 4)},
+        "releasePct": round(release_pct, 4),
+        "releaseUsd": round(release_usd, 2),
+        "cashReservePct": round(100.0 - release_pct, 4),
+        "cashReserveUsd": round(reserve_usd, 2),
+        "state": state,
+        "reason": reason,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "executionEnabled": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_rules_policy() -> dict:
+    return {
+        "mode": NEXUS_NKR_RULES_MODE,
+        "observationMode": NEXUS_NKR_OBSERVATION_MODE,
+        "dynamicReleaseMode": NEXUS_NKR_DYNAMIC_RELEASE_MODE,
+        "redRecoveryGuard": NEXUS_NKR_RED_RECOVERY_GUARD,
+        "policy": NEXUS_NKR_CAPITAL_RELEASE_POLICY,
+        "observationWindowsMinutes": list(NEXUS_NKR_OBSERVATION_WINDOWS_MIN),
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "releaseProfiles": {
+            "DEFENSIVE": _nkr_release_profile_for_mode("DEFENSIVE"),
+            "TACTICAL": _nkr_release_profile_for_mode("TACTICAL"),
+            "AGGRESSIVE": _nkr_release_profile_for_mode("AGGRESSIVE"),
+            "DYNAMIC": _nkr_release_profile_for_mode("DYNAMIC"),
+        },
+        "rules": [
+            "Capital release depends on market regime, performance mode and observation window.",
+            "Aggressive releases capital faster than Tactical, but RED still requires recovery momentum.",
+            "Dynamic scales between Tactical and Aggressive when recovery/opportunity quality is strong.",
+            "RED market without recovery momentum keeps capital in USDC/USDT.",
+            "This is Shadow/policy-only and does not move Vault funds.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/nkr-rules-policy")
+def api_nexus_nkr_rules_policy():
+    return jsonify({"status": "ok", **_nkr_rules_policy()})
+
+
+@app.post("/api/nexus/nkr-release-decision")
+def api_nexus_nkr_release_decision():
+    body = request.get_json(silent=True) or {}
+    decision = _nkr_capital_release_decision(
+        market_regime=body.get("marketRegime") or body.get("market_regime") or request.args.get("marketRegime") or "NEUTRAL",
+        performance=body.get("performance") or body.get("performanceMode") or request.args.get("performance") or "TACTICAL",
+        observation_minutes=int(body.get("observationMinutes") or body.get("observation_minutes") or request.args.get("observationMinutes") or 60),
+        recovery_score=body.get("recoveryScore") or body.get("recovery_score") or 0,
+        momentum_score=body.get("momentumScore") or body.get("momentum_score") or 0,
+        opportunity_score=body.get("opportunityScore") or body.get("opportunity_score") or 0,
+        capital_usd=body.get("capitalUsd") or body.get("capital_usd") or body.get("budgetUsd") or 0,
+    )
+    return jsonify({"status": "ok", "decision": decision})
+
 
 import traceback
 from flask import make_response, jsonify
