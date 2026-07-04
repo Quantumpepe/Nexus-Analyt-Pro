@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-038-NKR-UI-CONTRACT"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-039-WITHDRAW-QUOTE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-038-NKR-UI-CONTRACT"
-SHADOW_BUILD_ID = "SH-ENGINE-038-NKR-UI-CONTRACT"
+STRATEGIST_BUILD_ID = "S-ENGINE-039-WITHDRAW-QUOTE"
+SHADOW_BUILD_ID = "SH-ENGINE-039-WITHDRAW-QUOTE"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -238,6 +238,15 @@ NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES = 60
 NEXUS_NKR_UI_DEFAULT_PROFIT_MODE = "REINVEST"
 NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS = 10
 NEXUS_NKR_UI_CONTRACT_POLICY = "FRONTEND_SELECTS_NKR_MODE_OBSERVATION_PROFIT_PERIOD_BACKEND_COMPUTES_POLICY"
+NEXUS_WITHDRAW_QUOTE_MODE = "WITHDRAW_QUOTE_COST_BUFFER_V1"
+NEXUS_WITHDRAW_QUOTE_POLICY = "DISPLAY_NET_FIRST_WITH_COSTS_INCLUDED_BEFORE_VAULT_EXECUTION"
+NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET = "USDC_USDT"
+NEXUS_WITHDRAW_NET_FIRST_POLICY = "USER_SEES_APPROX_RECEIVE_AMOUNT_AFTER_SWAP_GAS_BRIDGE_SLIPPAGE_AND_ROUTING_BUFFER"
+NEXUS_WITHDRAW_ROUTING_BUFFER_MIN_USD = 1.0
+NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD = 25.0
+NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT = 0.20
+NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY = "UNUSED_BUFFER_RETURNS_TO_USER_STABLE_BALANCE"
+NEXUS_WITHDRAW_EXECUTION_STATUS = "PREVIEW_ONLY_NO_VAULT_MUTATION"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -309,6 +318,15 @@ def api_build_info():
         "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
         "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
         "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
+        "withdraw_quote": NEXUS_WITHDRAW_QUOTE_MODE,
+        "withdraw_quote_policy": NEXUS_WITHDRAW_QUOTE_POLICY,
+        "withdraw_default_output_asset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
+        "withdraw_net_first_policy": NEXUS_WITHDRAW_NET_FIRST_POLICY,
+        "withdraw_routing_buffer_pct": NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT,
+        "withdraw_routing_buffer_min_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MIN_USD,
+        "withdraw_routing_buffer_max_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD,
+        "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
+        "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -377,6 +395,15 @@ def api_version():
         "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
         "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
         "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
+        "withdraw_quote": NEXUS_WITHDRAW_QUOTE_MODE,
+        "withdraw_quote_policy": NEXUS_WITHDRAW_QUOTE_POLICY,
+        "withdraw_default_output_asset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
+        "withdraw_net_first_policy": NEXUS_WITHDRAW_NET_FIRST_POLICY,
+        "withdraw_routing_buffer_pct": NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT,
+        "withdraw_routing_buffer_min_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MIN_USD,
+        "withdraw_routing_buffer_max_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD,
+        "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
+        "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -1542,6 +1569,8 @@ def _nkr_ui_contract_policy() -> dict:
             "payoutDecision": "/api/nexus/nkr-payout-decision",
             "periodPolicy": "/api/nexus/nkr-period-policy",
             "periodDecision": "/api/nexus/nkr-period-decision",
+            "withdrawQuotePolicy": "/api/nexus/withdraw-quote-policy",
+            "withdrawQuotePreview": "/api/nexus/withdraw-quote-preview",
         },
         "separationRules": [
             "NKR Capital Mode controls capital release and allocation.",
@@ -1648,6 +1677,175 @@ def api_nexus_nkr_ui_contract():
 def api_nexus_nkr_dashboard_preview():
     body = request.get_json(silent=True) or {}
     return jsonify({"status": "ok", "preview": _nkr_dashboard_preview_decision(body)})
+
+
+# -------------------------
+# ENGINE-039: Withdraw Quote / Cost Buffer V1
+# -------------------------
+def _nexus_withdraw_quote_policy() -> dict:
+    """Preview-only withdraw quote policy for later Vault execution.
+
+    This calculates a net-first estimate so the user sees the approximate amount
+    received after costs. It does not execute swaps, bridges, sends, or Vault
+    mutations.
+    """
+    return {
+        "mode": NEXUS_WITHDRAW_QUOTE_MODE,
+        "policy": NEXUS_WITHDRAW_QUOTE_POLICY,
+        "defaultOutputAsset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
+        "netFirstPolicy": NEXUS_WITHDRAW_NET_FIRST_POLICY,
+        "costComponents": [
+            "swap_fee_estimate",
+            "gas_fee_estimate",
+            "bridge_fee_estimate",
+            "slippage_estimate",
+            "nexus_routing_buffer",
+        ],
+        "routingBuffer": {
+            "defaultPct": NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT,
+            "minUsd": NEXUS_WITHDRAW_ROUTING_BUFFER_MIN_USD,
+            "maxUsd": NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD,
+            "unusedBufferPolicy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
+        },
+        "displayRules": [
+            "Show net receive amount first.",
+            "Show costs included, not as a surprise after confirmation.",
+            "Show route and assumptions separately for advanced users.",
+            "Original asset output only when user explicitly requests it.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nexus_normalize_withdraw_asset(asset) -> str:
+    a = str(asset or NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET).strip().upper().replace(" ", "_").replace("-", "_")
+    if a in {"USDC", "USDT", "USD", "STABLE", "STABLECOIN", "USDC_USDT"}:
+        return "USDC_USDT"
+    if a in {"BTC", "WBTC", "CBBTC", "BTCB"}:
+        return "BTC"
+    if a in {"ETH", "WETH"}:
+        return "ETH"
+    if a in {"BNB", "WBNB"}:
+        return "BNB"
+    if a in {"POL", "MATIC", "WPOL", "WMATIC"}:
+        return "POL"
+    if a in {"SOL", "WSOL"}:
+        return "SOL"
+    if a in {"XRP"}:
+        return "XRP"
+    return a[:24] or "USDC_USDT"
+
+
+def _nexus_route_fee_defaults(output_asset: str, chain: str) -> dict:
+    asset = _nexus_normalize_withdraw_asset(output_asset)
+    ch = str(chain or "ETH").strip().upper()
+    # Conservative placeholder estimates for preview-only planning. Later Vault
+    # integration should replace these with live router/gas quotes.
+    gas = 2.50
+    bridge = 0.0
+    swap_pct = 0.10
+    slippage_pct = 0.15
+    if ch in {"ETH", "ETHEREUM"}:
+        gas = 8.0
+    elif ch in {"BNB", "BSC"}:
+        gas = 0.60
+    elif ch in {"POL", "POLYGON", "MATIC"}:
+        gas = 0.25
+    if asset not in {"USDC_USDT", "USDC", "USDT"}:
+        swap_pct = 0.18
+        slippage_pct = 0.25
+    if asset in {"BTC", "SOL", "XRP"}:
+        bridge = 4.0
+        swap_pct = 0.22
+        slippage_pct = 0.35
+    return {"gasUsd": gas, "bridgeUsd": bridge, "swapPct": swap_pct, "slippagePct": slippage_pct}
+
+
+def _nexus_withdraw_quote_preview(body: dict) -> dict:
+    gross_usd = _safe_float(body.get("amountUsd") or body.get("amount_usd") or body.get("grossUsd") or body.get("gross_usd"), 0.0)
+    output_asset = _nexus_normalize_withdraw_asset(body.get("outputAsset") or body.get("output_asset") or body.get("asset") or NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET)
+    input_asset = _nexus_normalize_withdraw_asset(body.get("inputAsset") or body.get("input_asset") or NEXUS_DEFAULT_CAPITAL_STATE)
+    chain = str(body.get("chain") or body.get("targetChain") or body.get("target_chain") or "ETH").strip().upper()
+    asset_price_usd = _safe_float(body.get("assetPriceUsd") or body.get("asset_price_usd") or 0.0, 0.0)
+    override = body.get("costs") if isinstance(body.get("costs"), dict) else {}
+    defaults = _nexus_route_fee_defaults(output_asset, chain)
+    gas_usd = _safe_float(override.get("gasUsd") or body.get("gasUsd") or body.get("gas_usd"), defaults["gasUsd"])
+    bridge_usd = _safe_float(override.get("bridgeUsd") or body.get("bridgeUsd") or body.get("bridge_usd"), defaults["bridgeUsd"])
+    swap_pct = _safe_float(override.get("swapPct") or body.get("swapPct") or body.get("swap_pct"), defaults["swapPct"])
+    slippage_pct = _safe_float(override.get("slippagePct") or body.get("slippagePct") or body.get("slippage_pct"), defaults["slippagePct"])
+    buffer_pct = _safe_float(override.get("routingBufferPct") or body.get("routingBufferPct") or body.get("routing_buffer_pct"), NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT)
+    buffer_pct = max(0.0, min(buffer_pct, 2.0))
+    variable_cost_usd = gross_usd * ((swap_pct + slippage_pct) / 100.0)
+    raw_buffer_usd = gross_usd * (buffer_pct / 100.0)
+    if gross_usd <= 0:
+        routing_buffer_usd = 0.0
+    else:
+        routing_buffer_usd = min(NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD, max(NEXUS_WITHDRAW_ROUTING_BUFFER_MIN_USD, raw_buffer_usd))
+    total_cost_usd = max(0.0, gas_usd + bridge_usd + variable_cost_usd + routing_buffer_usd)
+    net_usd = max(0.0, gross_usd - total_cost_usd)
+    net_asset_amount = None
+    if asset_price_usd > 0 and output_asset not in {"USDC_USDT", "USDC", "USDT"}:
+        net_asset_amount = net_usd / asset_price_usd
+    elif output_asset in {"USDC_USDT", "USDC", "USDT"}:
+        net_asset_amount = net_usd
+    display_receive = f"approx. {net_usd:.2f} USDC/USDT, costs included"
+    if output_asset not in {"USDC_USDT", "USDC", "USDT"}:
+        if net_asset_amount is not None:
+            display_receive = f"approx. {net_asset_amount:.8f} {output_asset}, costs included"
+        else:
+            display_receive = f"approx. {net_usd:.2f} USD worth of {output_asset}, costs included"
+    warnings = []
+    if gross_usd <= 0:
+        warnings.append("No withdraw amount supplied; preview is zero.")
+    if output_asset in {"BTC", "SOL", "XRP"}:
+        warnings.append("User-facing native asset output is previewed; backend may route via approved EVM wrapped/bridged assets internally later.")
+    if chain in {"ETH", "ETHEREUM"}:
+        warnings.append("ETH gas estimate is placeholder-only until live Vault/router quote is connected.")
+    return {
+        "mode": NEXUS_WITHDRAW_QUOTE_MODE,
+        "policy": NEXUS_WITHDRAW_QUOTE_POLICY,
+        "inputAsset": input_asset,
+        "outputAsset": output_asset,
+        "targetChain": chain,
+        "grossUsd": round(gross_usd, 6),
+        "netUsd": round(net_usd, 6),
+        "estimatedReceiveAmount": None if net_asset_amount is None else round(net_asset_amount, 10),
+        "estimatedReceiveAsset": output_asset,
+        "displayReceive": display_receive,
+        "costsIncluded": {
+            "gasUsd": round(gas_usd, 6),
+            "bridgeUsd": round(bridge_usd, 6),
+            "swapPct": round(swap_pct, 6),
+            "swapUsd": round(gross_usd * (swap_pct / 100.0), 6),
+            "slippagePct": round(slippage_pct, 6),
+            "slippageUsd": round(gross_usd * (slippage_pct / 100.0), 6),
+            "routingBufferPct": round(buffer_pct, 6),
+            "routingBufferUsd": round(routing_buffer_usd, 6),
+            "totalCostUsd": round(total_cost_usd, 6),
+        },
+        "unusedBufferPolicy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
+        "netFirst": True,
+        "previewOnly": True,
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "warnings": warnings,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/withdraw-quote-policy")
+def api_nexus_withdraw_quote_policy():
+    return jsonify({"status": "ok", **_nexus_withdraw_quote_policy()})
+
+
+@app.post("/api/nexus/withdraw-quote-preview")
+def api_nexus_withdraw_quote_preview():
+    body = request.get_json(silent=True) or {}
+    return jsonify({"status": "ok", "quote": _nexus_withdraw_quote_preview(body)})
 
 
 import traceback
