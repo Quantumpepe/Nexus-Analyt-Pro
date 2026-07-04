@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-033-NKR-WATCHLIST"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-034-NKR-CAPITAL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-033-NKR-WATCHLIST"
-SHADOW_BUILD_ID = "SH-ENGINE-033-NKR-WATCHLIST"
+STRATEGIST_BUILD_ID = "S-ENGINE-034-NKR-CAPITAL"
+SHADOW_BUILD_ID = "SH-ENGINE-034-NKR-CAPITAL"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -203,6 +203,12 @@ NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
 NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
 NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 3
 NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
+NEXUS_NKR_CAPITAL_MANAGER_MODE = "NKR_CAPITAL_MANAGER_V1"
+NEXUS_NKR_CAPITAL_MANAGER_POLICY = "ALLOCATE_STABLE_CAPITAL_BY_STRATEGIST_SCORE_WITH_CASH_RESERVE"
+NEXUS_NKR_CASH_RESERVE_GREEN_PCT = 15
+NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT = 25
+NEXUS_NKR_CASH_RESERVE_RED_PCT = 45
+NEXUS_NKR_DEFAULT_CAPITAL_USD = 0
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -246,6 +252,11 @@ def api_build_info():
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+        "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
+        "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
+        "nkr_cash_reserve_green_pct": NEXUS_NKR_CASH_RESERVE_GREEN_PCT,
+        "nkr_cash_reserve_neutral_pct": NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT,
+        "nkr_cash_reserve_red_pct": NEXUS_NKR_CASH_RESERVE_RED_PCT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -286,6 +297,11 @@ def api_version():
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+        "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
+        "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
+        "nkr_cash_reserve_green_pct": NEXUS_NKR_CASH_RESERVE_GREEN_PCT,
+        "nkr_cash_reserve_neutral_pct": NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT,
+        "nkr_cash_reserve_red_pct": NEXUS_NKR_CASH_RESERVE_RED_PCT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -628,6 +644,193 @@ def api_nexus_nkr_watchlist_preview():
         "executionEnabled": False,
         "note": "Preview only. No capital is moved and no session is started by this endpoint.",
     })
+
+
+# -------------------------
+# NKR Capital Manager V1
+# -------------------------
+def _nkr_capital_manager_policy() -> dict:
+    """NKR capital allocation layer between Strategist and Trader.
+
+    This is the first real NKR core, but it is still Shadow/policy-only:
+    it allocates USDC/USDT capital recommendations across allowed watchlist
+    assets and cash reserve. It does not move Vault funds, bridge assets,
+    or start live/on-chain execution.
+    """
+    return {
+        "mode": NEXUS_NKR_CAPITAL_MANAGER_MODE,
+        "policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "defaultExitPolicy": NEXUS_DEFAULT_EXIT_POLICY,
+        "watchlistRotation": NEXUS_NKR_WATCHLIST_MODE,
+        "assetRouter": NEXUS_ASSET_ROUTER_MODE,
+        "maxActiveAssetsDefault": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "maxCapitalPerAssetPctDefault": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+        "cashReserveByRegimePct": {
+            "GREEN": NEXUS_NKR_CASH_RESERVE_GREEN_PCT,
+            "NEUTRAL": NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT,
+            "RED": NEXUS_NKR_CASH_RESERVE_RED_PCT,
+        },
+        "rules": [
+            "NKR is the capital manager between Strategist and Trader.",
+            "NKR keeps capital accounting in USDC/USDT by default.",
+            "NKR may allocate capital only to allowed watchlist assets with valid routes.",
+            "NKR keeps a cash/stablecoin reserve based on market regime.",
+            "NKR respects max active assets and max capital per asset.",
+            "NKR produces shadow allocation recommendations only in V1.",
+            "Trader remains the executor; Vault remains the safety permission layer.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_normalize_regime(raw: str) -> str:
+    s = str(raw or "").strip().upper()
+    if "RED" in s or "BEAR" in s:
+        return "RED"
+    if "GREEN" in s or "BULL" in s or "AKTIV" in s:
+        return "GREEN"
+    return "NEUTRAL"
+
+
+def _nkr_cash_reserve_pct_for_regime(regime: str, performance: str = "TACTICAL") -> float:
+    rg = _nkr_normalize_regime(regime)
+    perf = str(performance or "TACTICAL").strip().upper()
+    if rg == "GREEN":
+        base = float(NEXUS_NKR_CASH_RESERVE_GREEN_PCT)
+    elif rg == "RED":
+        base = float(NEXUS_NKR_CASH_RESERVE_RED_PCT)
+    else:
+        base = float(NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT)
+
+    if perf == "AGGRESSIVE":
+        base -= 5.0
+    elif perf == "DEFENSIVE":
+        base += 10.0
+    return max(10.0, min(70.0, base))
+
+
+def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market: dict | None = None,
+                                 market_regime: str = "NEUTRAL", performance: str = "TACTICAL",
+                                 max_active_assets: int | None = None,
+                                 max_capital_per_asset_pct: float | None = None) -> dict:
+    """Create a Shadow-only NKR capital allocation plan.
+
+    Inputs are intentionally simple so the frontend/backend can preview NKR
+    without executing trades. Later this should consume real Strategist scores.
+    """
+    market = market if isinstance(market, dict) else {}
+    capital = max(0.0, _safe_float(capital_usd, 0.0))
+    max_active = int(max_active_assets or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)
+    max_active = max(1, min(8, max_active))
+    max_pct = _safe_float(max_capital_per_asset_pct, NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
+    max_pct = max(5.0, min(80.0, max_pct))
+
+    scored = [_nkr_asset_score_stub(sym, market.get(sym) if isinstance(market, dict) else {}) for sym in symbols]
+    ranked = sorted(scored, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    selected = [x for x in ranked if x.get("recommendation") in ("candidate", "watch") and x.get("routeOk")][:max_active]
+
+    regime = _nkr_normalize_regime(market_regime)
+    cash_pct = _nkr_cash_reserve_pct_for_regime(regime, performance=performance)
+    investable = max(0.0, capital * (1.0 - cash_pct / 100.0))
+    cash_reserve = max(0.0, capital - investable)
+
+    allocations = []
+    if selected and investable > 0:
+        weights = []
+        for item in selected:
+            # keep weights positive and favor strong scores, but don't over-concentrate
+            score = max(1.0, _safe_float(item.get("score"), 0.0))
+            weights.append(score)
+        total_weight = sum(weights) or 1.0
+        max_amt = capital * (max_pct / 100.0)
+        remaining = investable
+        # First pass with per-asset cap
+        raw_amounts = []
+        for item, weight in zip(selected, weights):
+            raw = investable * (weight / total_weight)
+            amt = min(max_amt, raw)
+            raw_amounts.append(amt)
+            remaining -= amt
+        # Redistribute leftover to assets still below cap
+        if remaining > 0.01:
+            for idx, amt in enumerate(list(raw_amounts)):
+                room = max(0.0, max_amt - amt)
+                add = min(room, remaining)
+                raw_amounts[idx] += add
+                remaining -= add
+                if remaining <= 0.01:
+                    break
+        cash_reserve += max(0.0, remaining)
+        for item, amt in zip(selected, raw_amounts):
+            allocations.append({
+                "symbol": item.get("symbol"),
+                "displaySymbol": item.get("displaySymbol"),
+                "executionChain": item.get("selectedExecutionChain"),
+                "score": item.get("score"),
+                "recommendation": item.get("recommendation"),
+                "capitalUsd": round(float(amt), 2),
+                "capitalPct": round((float(amt) / capital * 100.0), 2) if capital > 0 else 0,
+                "state": "ALLOCATE_PREVIEW",
+                "reason": "nkr_capital_manager_shadow_allocation",
+            })
+
+    return {
+        "mode": NEXUS_NKR_CAPITAL_MANAGER_MODE,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "marketRegime": regime,
+        "performance": str(performance or "TACTICAL").strip().upper() or "TACTICAL",
+        "inputCapitalUsd": round(capital, 2),
+        "cashReservePct": round(cash_pct, 2),
+        "cashReserveUsd": round(cash_reserve, 2),
+        "investableUsd": round(max(0.0, capital - cash_reserve), 2),
+        "maxActiveAssets": max_active,
+        "maxCapitalPerAssetPct": round(max_pct, 2),
+        "ranked": ranked,
+        "allocations": allocations,
+        "executionEnabled": False,
+        "vaultMutation": False,
+        "note": "Shadow allocation preview only. NKR V1 does not move funds or start live trades.",
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/nkr-capital-policy")
+def api_nexus_nkr_capital_policy():
+    return jsonify({"status": "ok", **_nkr_capital_manager_policy()})
+
+
+@app.post("/api/nexus/nkr-capital-plan")
+def api_nexus_nkr_capital_plan():
+    body = request.get_json(silent=True) or {}
+    raw_symbols = body.get("symbols") or body.get("watchlist") or request.args.get("symbols") or ""
+    if isinstance(raw_symbols, list):
+        symbols = []
+        for x in raw_symbols:
+            symbols.extend(_nkr_parse_watchlist_symbols(str(x)))
+        symbols = list(dict.fromkeys(symbols))[:80]
+    else:
+        symbols = _nkr_parse_watchlist_symbols(str(raw_symbols or ""))
+
+    capital = _safe_float(body.get("capitalUsd") or body.get("capital_usd") or body.get("budgetUsd") or body.get("budget_usd"), NEXUS_NKR_DEFAULT_CAPITAL_USD)
+    market_map = body.get("market") if isinstance(body.get("market"), dict) else {}
+    market_regime = body.get("marketRegime") or body.get("market_regime") or request.args.get("marketRegime") or "NEUTRAL"
+    performance = body.get("performance") or body.get("performanceMode") or request.args.get("performance") or "TACTICAL"
+    max_active = body.get("maxActiveAssets") or body.get("max_active_assets") or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT
+    max_pct = body.get("maxCapitalPerAssetPct") or body.get("max_capital_per_asset_pct") or NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT
+
+    plan = _nkr_capital_allocation_plan(
+        symbols=symbols,
+        capital_usd=capital,
+        market=market_map,
+        market_regime=market_regime,
+        performance=performance,
+        max_active_assets=int(max_active or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT),
+        max_capital_per_asset_pct=_safe_float(max_pct, NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
+    )
+    return jsonify({"status": "ok", **_nkr_capital_manager_policy(), "plan": plan})
 
 import traceback
 from flask import make_response, jsonify
