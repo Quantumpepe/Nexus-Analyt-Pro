@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-058-NKR-PROFIT-RUNNER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
-SHADOW_BUILD_ID = "SH-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
+STRATEGIST_BUILD_ID = "S-ENGINE-058-NKR-PROFIT-RUNNER"
+SHADOW_BUILD_ID = "SH-ENGINE-058-NKR-PROFIT-RUNNER"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -348,6 +348,17 @@ def api_build_info():
         "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
         "nkr_portfolio_allocation": NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE,
         "nkr_portfolio_policy": NEXUS_NKR_PORTFOLIO_POLICY,
+        "nkr_profit_runner": NEXUS_NKR_PROFIT_RUNNER_MODE,
+        "nkr_profit_runner_policy": NEXUS_NKR_PROFIT_RUNNER_POLICY,
+        "nkr_small_profit_no_close_usd": NEXUS_NKR_SMALL_PROFIT_NO_CLOSE_USD,
+        "nkr_profit_lock_pct_by_mode": {
+            "DYNAMIC": NEXUS_NKR_DYNAMIC_PROFIT_LOCK_PCT,
+            "TACTICAL": NEXUS_NKR_TACTICAL_PROFIT_LOCK_PCT,
+            "AGGRESSIVE": NEXUS_NKR_AGGRESSIVE_PROFIT_LOCK_PCT,
+            "DEFENSIVE": NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT,
+        },
+        "nkr_max_rotations_per_day_default": NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT,
+        "nkr_max_rotations_per_10d_default": NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT,
         "withdraw_quote": NEXUS_WITHDRAW_QUOTE_MODE,
         "withdraw_quote_policy": NEXUS_WITHDRAW_QUOTE_POLICY,
         "withdraw_default_output_asset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
@@ -26841,6 +26852,40 @@ def api_nkr_portfolio_policy():
         "ts": now_ts(),
     })
 
+
+@app.route("/api/nkr/profit-runner-policy", methods=["GET"])
+def api_nkr_profit_runner_policy():
+    mode = str(request.args.get("nkrMode") or request.args.get("mode") or "DYNAMIC").strip().upper()
+    if mode not in {"DYNAMIC", "TACTICAL", "AGGRESSIVE", "DEFENSIVE"}:
+        mode = "DYNAMIC"
+    pct_map = {
+        "DYNAMIC": NEXUS_NKR_DYNAMIC_PROFIT_LOCK_PCT,
+        "TACTICAL": NEXUS_NKR_TACTICAL_PROFIT_LOCK_PCT,
+        "AGGRESSIVE": NEXUS_NKR_AGGRESSIVE_PROFIT_LOCK_PCT,
+        "DEFENSIVE": NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT,
+    }
+    return jsonify({
+        "status": "ok",
+        "mode": NEXUS_NKR_PROFIT_RUNNER_MODE,
+        "policy": NEXUS_NKR_PROFIT_RUNNER_POLICY,
+        "nkrMode": mode,
+        "profitLockPct": pct_map.get(mode, NEXUS_NKR_DYNAMIC_PROFIT_LOCK_PCT),
+        "smallProfitNoCloseUsd": NEXUS_NKR_SMALL_PROFIT_NO_CLOSE_USD,
+        "cooldownMinutes": NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES,
+        "maxRotationsPerDay": NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT,
+        "maxRotationsPer10Days": NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT,
+        "rules": {
+            "smallProfitDoesNotClose": True,
+            "runWinners": True,
+            "closeOnlyOn": ["TARGET_PROFIT_LOCK", "TRAILING_PROTECTION", "PERIOD_END_LOCK", "RISK_GUARD", "USER_STOP_OR_PANIC"],
+            "holdStableProfitModeSupported": True,
+            "walletBound": True,
+            "liveExecution": False,
+            "vaultMutation": False,
+        },
+        "ts": now_ts(),
+    })
+
 # ============================================================================
 # ENGINE-055: NKR Backend Persistence Lock / Panic Control V1
 # ============================================================================
@@ -26853,6 +26898,16 @@ NEXUS_NKR_DYNAMIC_CASH_RESERVE_PCT = 20
 NEXUS_NKR_TACTICAL_CASH_RESERVE_PCT = 25
 NEXUS_NKR_AGGRESSIVE_CASH_RESERVE_PCT = 10
 NEXUS_NKR_DEFENSIVE_CASH_RESERVE_PCT = 35
+NEXUS_NKR_PROFIT_RUNNER_MODE = "NKR_PROFIT_RUNNER_EXIT_GUARD_V1"
+NEXUS_NKR_PROFIT_RUNNER_POLICY = "DO_NOT_CLOSE_SMALL_PROFIT_RUN_WINNERS_UNTIL_TARGET_TRAIL_PERIOD_END_OR_RISK_GUARD"
+NEXUS_NKR_SMALL_PROFIT_NO_CLOSE_USD = 50.0
+NEXUS_NKR_DYNAMIC_PROFIT_LOCK_PCT = 2.0
+NEXUS_NKR_TACTICAL_PROFIT_LOCK_PCT = 1.7
+NEXUS_NKR_AGGRESSIVE_PROFIT_LOCK_PCT = 2.8
+NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT = 1.2
+NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES = 45
+NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT = 6
+NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 50
 
 
 
