@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-047-SHADOW-TEST-REPORT"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-047-SHADOW-TEST-REPORT"
-SHADOW_BUILD_ID = "SH-ENGINE-047-SHADOW-TEST-REPORT"
+STRATEGIST_BUILD_ID = "S-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
+SHADOW_BUILD_ID = "SH-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -10888,7 +10888,9 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
             "tradingSessions", "activeTradingSessionId",
             "rotationRuntimeHours", "rotationMaxActiveSessions", "rotationRiskLimit",
             "rotationMaxSlippage", "rotationMinNetAdvantage", "rotationMode",
-            "rotationNetworkScope"
+            "rotationNetworkScope", "rotationBudgetRelease",
+            "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays",
+            "nkrControlState", "rotationShadowSnapshot", "rotationShadowEvents"
         }
         clean_ui = {}
         for k, v in ui_state.items():
@@ -10898,6 +10900,10 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
                 clean_ui[k] = v
             elif k in ("tradingSessions",) and isinstance(v, list):
                 clean_ui[k] = [x for x in v[:30] if isinstance(x, dict)]
+            elif k in ("rotationShadowEvents",) and isinstance(v, list):
+                clean_ui[k] = [x for x in v[:50] if isinstance(x, dict)]
+            elif k in ("rotationShadowSnapshot",) and isinstance(v, dict):
+                clean_ui[k] = dict(v)
         base["ui"] = {**(base.get("ui") if isinstance(base.get("ui"), dict) else {}), **clean_ui}
     nowi = int(time.time() * 1000)
     conn = _db()
@@ -26804,3 +26810,257 @@ def api_nexus_fee_policy():
     profit_usd = _safe_float(request.args.get("profitUsd") or request.args.get("profit_usd") or 0)
     stable = str(request.args.get("feeStable") or request.args.get("fee_stable") or "").strip().upper()
     return jsonify({"status": "ok", "chain": chain, "feePolicy": _nexus_fee_preview(profit_usd, chain, stable), "ts": now_ts()})
+
+# ============================================================================
+# ENGINE-055: NKR Backend Persistence Lock / Panic Control V1
+# ============================================================================
+NEXUS_NKR_BACKEND_PERSISTENCE_MODE = "NKR_BACKEND_PERSISTENCE_LOCK_V1"
+NEXUS_NKR_PANIC_CONTROL_MODE = "NKR_AND_TRADER_PANIC_PROTECT_V1"
+
+
+def _nkr_is_session(sess: dict) -> bool:
+    if not isinstance(sess, dict):
+        return False
+    typ = str(sess.get("type") or sess.get("sessionType") or sess.get("engineType") or "").strip().upper()
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    sid = str(sess.get("id") or sess.get("session_id") or "").upper()
+    return typ == "NKR" or bool(meta.get("nkr_session")) or sid.startswith("NKR-")
+
+
+def _nkr_now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
+    src = dict(sess or {})
+    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+    status = str(src.get("status") or "WAITING").strip().upper()
+    action_u = str(action or "").strip().upper()
+    if action_u == "PAUSE":
+        next_status = "PAUSED"
+        src["pausedAt"] = nowi
+        msg = "PAUSED_BY_USER"
+    elif action_u == "RESUME":
+        # Explicit user resume is allowed for PAUSED/STOPPED shadow NKR sessions.
+        # Stale frontend syncs still cannot revive STOPPED because this is a dedicated control endpoint.
+        next_status = "ACTIVE"
+        src["resumedAt"] = nowi
+        msg = "RESUMED_BY_USER"
+    elif action_u in {"STOP", "PANIC_STOP"}:
+        next_status = "STOPPED"
+        src["stoppedAt"] = nowi
+        src["reservedUsd"] = 0
+        src["active"] = False
+        msg = "STOPPED_BY_USER" if action_u == "STOP" else "PANIC_STOP_PROTECT"
+    else:
+        next_status = status or "WAITING"
+        msg = "CONTROL_NOOP"
+    src.update({
+        "status": next_status,
+        "lifecycleState": next_status,
+        "positionState": "STOPPED" if next_status == "STOPPED" else ("PAUSED" if next_status == "PAUSED" else (src.get("positionState") or "WAITING")),
+        "executionMode": str(src.get("executionMode") or meta.get("execution_mode") or "shadow").lower(),
+        "liveVaultReady": False,
+        "updatedAt": nowi,
+        "meta": {
+            **meta,
+            "nkr_session": True,
+            "wallet_bound": True,
+            "lifecycle_state": next_status,
+            "position_state": "STOPPED" if next_status == "STOPPED" else ("PAUSED" if next_status == "PAUSED" else (meta.get("position_state") or "WAITING")),
+            "nkr_user_control": msg,
+            "live_vault_ready": False,
+            "execution_mode": "shadow",
+            "reserved_usd": 0 if next_status == "STOPPED" else meta.get("reserved_usd", src.get("reservedUsd", 0)),
+            "backend_persistence": NEXUS_NKR_BACKEND_PERSISTENCE_MODE,
+        },
+    })
+    return src
+
+
+def _nkr_get_wallet_bundle(wa: str) -> dict:
+    state, state_ts = _db_get_user_app_state(wa)
+    sessions, active, sess_ts = _db_get_rotation_sessions(wa)
+    nkr_sessions = [x for x in (sessions or []) if _nkr_is_session(x)]
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
+    if any(str((x or {}).get("status") or "").upper() == "PAUSED" for x in nkr_sessions):
+        control = "PAUSED"
+    elif any(str((x or {}).get("status") or "").upper() == "STOPPED" for x in nkr_sessions):
+        control = "STOPPED"
+    elif any(str((x or {}).get("status") or "").upper() in {"ACTIVE", "WAITING", "OPEN"} for x in nkr_sessions):
+        control = "RUNNING"
+    return {
+        "status": "ok",
+        "wallet": _norm_addr(wa),
+        "mode": NEXUS_NKR_BACKEND_PERSISTENCE_MODE,
+        "controlState": control,
+        "settings": {
+            "nkrBudgetUsd": ui.get("rotationBudgetRelease"),
+            "nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"),
+            "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"),
+            "nkrProfitMode": ui.get("nkrProfitMode", "HOLD_STABLE"),
+            "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
+        },
+        "sessions": nkr_sessions,
+        "activeNkrSessionId": active if any(str((x or {}).get("id") or x.get("session_id") or "") == str(active) for x in nkr_sessions) else "",
+        "rules": {
+            "wallet_bound_backend": True,
+            "multi_device_visible": True,
+            "paused_survives_reload": True,
+            "stopped_does_not_auto_resume": True,
+            "deleted_never_returns": True,
+            "live_execution": False,
+            "vault_ready": False,
+            "private_keys_in_backend": False,
+        },
+        "updated_ts": max(int(state_ts or 0), int(sess_ts or 0)),
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nkr/state", methods=["GET", "POST"])
+def api_nkr_state():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        ui = {}
+        if isinstance(body, dict):
+            # Store NKR settings in the existing wallet-bound user_app_state row.
+            for src, dst in [
+                ("nkrBudgetUsd", "rotationBudgetRelease"), ("budgetUsd", "rotationBudgetRelease"),
+                ("nkrCapitalMode", "nkrCapitalMode"), ("nkrObservationWindow", "nkrObservationWindow"),
+                ("nkrProfitMode", "nkrProfitMode"), ("nkrPeriodDays", "nkrPeriodDays"),
+                ("nkrControlState", "nkrControlState"), ("controlState", "nkrControlState"),
+            ]:
+                if src in body:
+                    ui[dst] = body.get(src)
+            if isinstance(body.get("ui"), dict):
+                ui.update({k: v for k, v in body.get("ui", {}).items() if k in {
+                    "rotationBudgetRelease", "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays", "nkrControlState",
+                    "rotationShadowSnapshot", "rotationShadowEvents"
+                }})
+        if ui:
+            _db_set_user_app_state(wa, {"ui": ui})
+        sessions = body.get("sessions") if isinstance(body, dict) else None
+        if isinstance(sessions, list):
+            active = str(body.get("activeNkrSessionId") or body.get("activeRotationSessionId") or "")
+            _db_set_rotation_sessions(wa, [x for x in sessions if isinstance(x, dict) and _nkr_is_session(x)], active, replace_missing=False)
+        out = jsonify(_nkr_get_wallet_bundle(wa))
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    out = jsonify(_nkr_get_wallet_bundle(wa))
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
+
+
+@app.route("/api/nkr/control", methods=["POST"])
+def api_nkr_control():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").strip().upper()
+    if action not in {"PAUSE", "RESUME", "STOP", "DELETE", "PANIC_STOP"}:
+        return err("invalid action", 400)
+    nowi = _nkr_now_ms()
+    sessions, active, _ = _db_get_rotation_sessions(wa)
+    nkr_sessions = [dict(x) for x in sessions if _nkr_is_session(x)]
+    target_id = str(body.get("sessionId") or body.get("session_id") or "").strip()
+    if target_id:
+        nkr_sessions = [x for x in nkr_sessions if str(x.get("id") or x.get("session_id") or "") == target_id]
+    if action == "DELETE":
+        # Delete forever: add tombstone and physically remove session/events.
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                cur = conn.cursor()
+                ids = [str(x.get("id") or x.get("session_id") or "") for x in nkr_sessions if str(x.get("id") or x.get("session_id") or "")]
+                for sid in ids:
+                    cur.execute(
+                        "INSERT INTO rotation_deleted_sessions(wallet_address, session_id, deleted_ts, reason) VALUES(?,?,?,?) "
+                        "ON CONFLICT(wallet_address, session_id) DO UPDATE SET deleted_ts=excluded.deleted_ts, reason=excluded.reason",
+                        (_norm_addr(wa), sid, nowi, "nkr_user_delete"),
+                    )
+                    cur.execute("DELETE FROM rotation_events WHERE wallet_address=? AND session_id=?", (_norm_addr(wa), sid))
+                    cur.execute("DELETE FROM rotation_sessions WHERE wallet_address=? AND session_id=?", (_norm_addr(wa), sid))
+                cur.execute("INSERT INTO rotation_ui_state(wallet_address, active_session_id, updated_ts) VALUES(?,?,?) ON CONFLICT(wallet_address) DO UPDATE SET active_session_id=excluded.active_session_id, updated_ts=excluded.updated_ts", (_norm_addr(wa), "", nowi))
+                conn.commit()
+        finally:
+            conn.close()
+        _db_set_user_app_state(wa, {"ui": {"nkrControlState": "WAITING"}})
+        bundle = _nkr_get_wallet_bundle(wa)
+        bundle["message"] = "NKR session deleted forever for this wallet. It will not be rehydrated on another device."
+        out = jsonify(bundle)
+        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return out
+    if not nkr_sessions and action in {"PAUSE", "STOP", "PANIC_STOP"}:
+        _db_set_user_app_state(wa, {"ui": {"nkrControlState": "PAUSED" if action == "PAUSE" else "STOPPED"}})
+    else:
+        updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
+        next_control = "PAUSED" if action == "PAUSE" else ("RUNNING" if action == "RESUME" else "STOPPED")
+        _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
+        _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
+    bundle = _nkr_get_wallet_bundle(wa)
+    bundle["message"] = {
+        "PAUSE": "NKR paused and stored wallet-bound in backend.",
+        "RESUME": "NKR resumed by explicit user action.",
+        "STOP": "NKR stopped/protected. It will not resume unless user explicitly resumes or deletes.",
+        "PANIC_STOP": "NKR panic-protected. Paper/live-intent is stopped and capital should be secured by live executor when connected.",
+    }.get(action, "NKR control updated.")
+    out = jsonify(bundle)
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
+
+
+@app.route("/api/nexus/panic-protect", methods=["POST"])
+def api_nexus_panic_protect():
+    """Wallet-level panic protection intent for NKR + Trader.
+
+    Shadow mode: marks NKR sessions STOPPED and Trading UI sessions PROTECTED/STOPPED in wallet app-state.
+    Future live mode: this is the single guard point where the executor must prefer safe exit/sell-to-stable
+    over continuing strategies. This endpoint never requires private keys and never sends txs in this backend.
+    """
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    nowi = _nkr_now_ms()
+    sessions, active, _ = _db_get_rotation_sessions(wa)
+    nkr_sessions = [dict(x) for x in sessions if _nkr_is_session(x)]
+    if nkr_sessions:
+        _db_set_rotation_sessions(wa, [_nkr_session_update_for_control(x, "PANIC_STOP", nowi) for x in nkr_sessions], active_session_id=active, replace_missing=False)
+    state, _ = _db_get_user_app_state(wa)
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    trading = ui.get("tradingSessions") if isinstance(ui.get("tradingSessions"), list) else []
+    protected_trading = []
+    for sess in trading:
+        if not isinstance(sess, dict):
+            continue
+        st = str(sess.get("status") or "").upper()
+        if st in {"CLOSED", "DELETED", "ARCHIVED", "COMPLETE", "COMPLETED"}:
+            protected_trading.append(sess)
+            continue
+        protected_trading.append({
+            **sess,
+            "status": "PROTECTED",
+            "lifecycleState": "PROTECTED",
+            "positionState": "PROTECTED",
+            "updatedAt": nowi,
+            "panicStoppedAt": nowi,
+            "meta": {**(sess.get("meta") if isinstance(sess.get("meta"), dict) else {}), "panic_protect": True, "intent": "SELL_OR_SECURE_TO_STABLE_WHEN_LIVE_EXECUTOR_CONNECTED"},
+        })
+    _db_set_user_app_state(wa, {"ui": {"nkrControlState": "STOPPED", "tradingSessions": protected_trading}})
+    bundle = _nkr_get_wallet_bundle(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet": _norm_addr(wa),
+        "mode": NEXUS_NKR_PANIC_CONTROL_MODE,
+        "live_execution": False,
+        "vault_ready": False,
+        "nkr": bundle,
+        "trader": {"protected_sessions": len(protected_trading), "intent": "stop_or_sell_to_stable_when_live_executor_connected"},
+        "message": "Panic protection stored in backend. In live mode the executor must prefer safe exit/sell-to-stable; this backend sends no private-key transaction.",
+        "ts": now_ts(),
+    })
