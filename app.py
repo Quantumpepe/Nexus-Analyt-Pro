@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-032-ASSET-ROUTER"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-033-NKR-WATCHLIST"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-032-ASSET-ROUTER"
-SHADOW_BUILD_ID = "SH-ENGINE-032-ASSET-ROUTER"
+STRATEGIST_BUILD_ID = "S-ENGINE-033-NKR-WATCHLIST"
+SHADOW_BUILD_ID = "SH-ENGINE-033-NKR-WATCHLIST"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -199,6 +199,10 @@ NEXUS_ASSET_ROUTER_MODE = "ASSET_ABSTRACTION_ROUTER_V1"
 NEXUS_USER_ASSET_DISPLAY_POLICY = "USER_SEES_NATIVE_SYMBOL_BACKEND_ROUTES_WRAPPED_ASSETS"
 NEXUS_WRAPPED_ASSET_POLICY = "INTERNAL_ONLY_VERIFIED_ALLOWLIST"
 NEXUS_DEFAULT_WITHDRAW_POLICY = "USDC_USDT_DEFAULT_ORIGINAL_ASSET_ONLY_ON_USER_REQUEST"
+NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
+NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
+NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 3
+NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -238,6 +242,10 @@ def api_build_info():
         "user_asset_display_policy": NEXUS_USER_ASSET_DISPLAY_POLICY,
         "wrapped_asset_policy": NEXUS_WRAPPED_ASSET_POLICY,
         "default_withdraw_policy": NEXUS_DEFAULT_WITHDRAW_POLICY,
+        "nkr_watchlist_rotation": NEXUS_NKR_WATCHLIST_MODE,
+        "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
+        "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -274,6 +282,10 @@ def api_version():
         "user_asset_display_policy": NEXUS_USER_ASSET_DISPLAY_POLICY,
         "wrapped_asset_policy": NEXUS_WRAPPED_ASSET_POLICY,
         "default_withdraw_policy": NEXUS_DEFAULT_WITHDRAW_POLICY,
+        "nkr_watchlist_rotation": NEXUS_NKR_WATCHLIST_MODE,
+        "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
+        "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -501,6 +513,121 @@ def api_nexus_asset_route():
     route = _nexus_public_asset_route(symbol, chain=chain)
     code = 200 if route.get("found") else 404
     return jsonify({"status": "ok" if route.get("found") else "error", **route}), code
+
+# -------------------------
+# NKR Watchlist Rotation V1
+# -------------------------
+def _nkr_watchlist_rotation_policy() -> dict:
+    """Preparation layer for NKR capital rotation inside the user's allowed watchlist.
+
+    This is policy/scoring preparation only. It does not start trades and does
+    not alter the proven ENGINE-028/030 trading decisions. NKR may later use
+    this to choose stronger assets inside the user's allowed watchlist instead
+    of only using manually started sessions.
+    """
+    return {
+        "mode": NEXUS_NKR_WATCHLIST_MODE,
+        "policy": NEXUS_NKR_WATCHLIST_POLICY,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "defaultExitPolicy": NEXUS_DEFAULT_EXIT_POLICY,
+        "assetRouter": NEXUS_ASSET_ROUTER_MODE,
+        "allowedSource": "USER_WATCHLIST_ONLY",
+        "maxActiveAssetsDefault": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "maxCapitalPerAssetPctDefault": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+        "rules": [
+            "NKR may only select assets from the user's allowed watchlist.",
+            "NKR should prefer assets with stronger momentum, recovery quality and relative strength.",
+            "NKR must keep capital accounting in USDC/USDT by default.",
+            "NKR must respect allowed chains, allowed assets, max active assets and max capital per asset.",
+            "NKR must not select a token that fails security, liquidity or route validation.",
+            "NKR is a capital allocator, not the Strategist and not the Trader.",
+        ],
+        "vaultReady": True,
+        "liveExecution": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_parse_watchlist_symbols(raw: str) -> list[str]:
+    out = []
+    for part in re.split(r"[,;\s]+", str(raw or "")):
+        sym = str(part or "").strip().upper()
+        if not sym:
+            continue
+        sym = re.sub(r"[^A-Z0-9]", "", sym)[:12]
+        if sym and sym not in out:
+            out.append(sym)
+    return out[:80]
+
+
+def _nkr_asset_score_stub(symbol: str, market: dict | None = None) -> dict:
+    """Deterministic lightweight opportunity score placeholder.
+
+    Later this should consume Strategist scores, momentum, RVOL, relative strength,
+    whale/on-chain signals and route/security checks. In ENGINE-033 it remains
+    safe and non-invasive: it produces explainable preview data only.
+    """
+    sym = str(symbol or "").strip().upper()
+    market = market if isinstance(market, dict) else {}
+    pct = _safe_float(market.get("pct") or market.get("change24h") or market.get("change_pct"), 0.0)
+    momentum = _safe_float(market.get("momentum") or market.get("momentum_score"), 0.0)
+    recovery = _safe_float(market.get("recovery") or market.get("recovery_score"), 0.0)
+    risk = _safe_float(market.get("risk") or market.get("risk_score"), 35.0)
+    route = _nexus_public_asset_route(sym)
+    route_ok = bool(route.get("found"))
+    # Conservative preview scoring. This is not used for execution.
+    score = 50.0 + min(20.0, max(-20.0, pct * 4.0)) + min(15.0, momentum) + min(15.0, recovery) - min(20.0, max(0.0, risk - 50.0) * 0.4)
+    if not route_ok:
+        score -= 20.0
+    score = max(0.0, min(100.0, score))
+    if score >= 75:
+        recommendation = "candidate"
+    elif score >= 55:
+        recommendation = "watch"
+    else:
+        recommendation = "avoid"
+    return {
+        "symbol": sym,
+        "score": round(score, 2),
+        "recommendation": recommendation,
+        "routeOk": route_ok,
+        "displaySymbol": route.get("displaySymbol") or sym,
+        "selectedExecutionChain": route.get("selectedExecutionChain") or "",
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "reason": "preview_score_only_not_execution",
+    }
+
+
+@app.get("/api/nexus/nkr-watchlist-policy")
+def api_nexus_nkr_watchlist_policy():
+    return jsonify({"status": "ok", **_nkr_watchlist_rotation_policy()})
+
+
+@app.post("/api/nexus/nkr-watchlist-preview")
+def api_nexus_nkr_watchlist_preview():
+    body = request.get_json(silent=True) or {}
+    raw_symbols = body.get("symbols") or body.get("watchlist") or request.args.get("symbols") or ""
+    if isinstance(raw_symbols, list):
+        symbols = []
+        for x in raw_symbols:
+            symbols.extend(_nkr_parse_watchlist_symbols(str(x)))
+        symbols = list(dict.fromkeys(symbols))[:80]
+    else:
+        symbols = _nkr_parse_watchlist_symbols(str(raw_symbols or ""))
+    market_map = body.get("market") if isinstance(body.get("market"), dict) else {}
+    scored = [_nkr_asset_score_stub(sym, market_map.get(sym) if isinstance(market_map, dict) else {}) for sym in symbols]
+    ranked = sorted(scored, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    max_active = int(body.get("maxActiveAssets") or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)
+    selected = [x for x in ranked if x.get("recommendation") in ("candidate", "watch") and x.get("routeOk")][:max(1, max_active)]
+    return jsonify({
+        "status": "ok",
+        **_nkr_watchlist_rotation_policy(),
+        "inputSymbols": symbols,
+        "ranked": ranked,
+        "selectedPreview": selected,
+        "executionEnabled": False,
+        "note": "Preview only. No capital is moved and no session is started by this endpoint.",
+    })
 
 import traceback
 from flask import make_response, jsonify
