@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-031-STABLE-CAPITAL"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-032-ASSET-ROUTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-031-STABLE-CAPITAL"
-SHADOW_BUILD_ID = "SH-ENGINE-031-STABLE-CAPITAL"
+STRATEGIST_BUILD_ID = "S-ENGINE-032-ASSET-ROUTER"
+SHADOW_BUILD_ID = "SH-ENGINE-032-ASSET-ROUTER"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -195,6 +195,10 @@ NEXUS_CAPITAL_CORE_MODE = "STABLECOIN_CAPITAL_CORE_V1"
 NEXUS_DEFAULT_CAPITAL_STATE = "USDC_USDT"
 NEXUS_TOKEN_POSITION_POLICY = "TOKEN_ONLY_DURING_ACTIVE_TRADE"
 NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_USDT_UNLESS_USER_REQUESTS_ORIGINAL_ASSET"
+NEXUS_ASSET_ROUTER_MODE = "ASSET_ABSTRACTION_ROUTER_V1"
+NEXUS_USER_ASSET_DISPLAY_POLICY = "USER_SEES_NATIVE_SYMBOL_BACKEND_ROUTES_WRAPPED_ASSETS"
+NEXUS_WRAPPED_ASSET_POLICY = "INTERNAL_ONLY_VERIFIED_ALLOWLIST"
+NEXUS_DEFAULT_WITHDRAW_POLICY = "USDC_USDT_DEFAULT_ORIGINAL_ASSET_ONLY_ON_USER_REQUEST"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -230,6 +234,10 @@ def api_build_info():
         "default_capital_state": NEXUS_DEFAULT_CAPITAL_STATE,
         "token_position_policy": NEXUS_TOKEN_POSITION_POLICY,
         "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
+        "asset_router": NEXUS_ASSET_ROUTER_MODE,
+        "user_asset_display_policy": NEXUS_USER_ASSET_DISPLAY_POLICY,
+        "wrapped_asset_policy": NEXUS_WRAPPED_ASSET_POLICY,
+        "default_withdraw_policy": NEXUS_DEFAULT_WITHDRAW_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -262,6 +270,10 @@ def api_version():
         "default_capital_state": NEXUS_DEFAULT_CAPITAL_STATE,
         "token_position_policy": NEXUS_TOKEN_POSITION_POLICY,
         "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
+        "asset_router": NEXUS_ASSET_ROUTER_MODE,
+        "user_asset_display_policy": NEXUS_USER_ASSET_DISPLAY_POLICY,
+        "wrapped_asset_policy": NEXUS_WRAPPED_ASSET_POLICY,
+        "default_withdraw_policy": NEXUS_DEFAULT_WITHDRAW_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -305,6 +317,190 @@ def _nexus_stable_capital_policy() -> dict:
 @app.get("/api/nexus/capital-policy")
 def api_nexus_capital_policy():
     return jsonify({"status": "ok", **_nexus_stable_capital_policy()})
+
+# -------------------------
+# Nexus Asset Router / User Asset Abstraction
+# -------------------------
+def _nexus_asset_router_registry() -> dict:
+    """Policy/registry layer for user-facing assets vs internal execution routes.
+
+    Users should see BTC/SOL/XRP as assets. The backend may route those assets
+    through verified EVM representations internally, but wrapped/bridged token
+    details stay an advanced/internal concern and never become the default UI
+    label. This is a preparation layer for Vault/NKR/live execution; it does
+    not change the proven ENGINE-028/030 trading logic.
+    """
+    return {
+        "mode": NEXUS_ASSET_ROUTER_MODE,
+        "display_policy": NEXUS_USER_ASSET_DISPLAY_POLICY,
+        "wrapped_policy": NEXUS_WRAPPED_ASSET_POLICY,
+        "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
+        "default_withdraw_policy": NEXUS_DEFAULT_WITHDRAW_POLICY,
+        "stable_assets": ["USDC", "USDT"],
+        "core_chain": "ETH",
+        "phase1_execution_chains": ["ETH", "BNB", "POL"],
+        "rules": [
+            "User-facing symbols stay simple: BTC, SOL, XRP, ETH, BNB, POL.",
+            "Wrapped/bridged routes are internal backend execution details.",
+            "Only verified allowlisted contracts may be used for synthetic/native asset exposure.",
+            "Default exit goes back to USDC/USDT.",
+            "Original asset withdrawal is only used when the user explicitly requests it.",
+            "If the user requests BTC back, the UI says BTC; routing and wrapping details stay backend/advanced only.",
+        ],
+        "assets": {
+            "BTC": {
+                "displaySymbol": "BTC",
+                "displayName": "Bitcoin",
+                "userVisibleRouteLabel": "BTC",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "internalOnly": True,
+                "phase": "prepared",
+                "routes": {
+                    "ETH": {
+                        "routeType": "wrapped_evm",
+                        "internalSymbols": ["WBTC", "cbBTC"],
+                        "stableOut": ["USDC", "USDT"],
+                        "contractAllowlistRequired": True,
+                        "enabledForLive": False,
+                    },
+                    "BNB": {
+                        "routeType": "wrapped_evm",
+                        "internalSymbols": ["BTCB"],
+                        "stableOut": ["USDT", "USDC"],
+                        "contractAllowlistRequired": True,
+                        "enabledForLive": False,
+                    },
+                },
+            },
+            "SOL": {
+                "displaySymbol": "SOL",
+                "displayName": "Solana",
+                "userVisibleRouteLabel": "SOL",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "internalOnly": True,
+                "phase": "prepared",
+                "routes": {
+                    "ETH": {
+                        "routeType": "wrapped_or_bridged_evm",
+                        "internalSymbols": ["verified_wrapped_SOL_only"],
+                        "stableOut": ["USDC", "USDT"],
+                        "contractAllowlistRequired": True,
+                        "enabledForLive": False,
+                    },
+                    "BNB": {
+                        "routeType": "wrapped_or_bridged_evm",
+                        "internalSymbols": ["verified_wrapped_SOL_only"],
+                        "stableOut": ["USDT", "USDC"],
+                        "contractAllowlistRequired": True,
+                        "enabledForLive": False,
+                    },
+                },
+            },
+            "XRP": {
+                "displaySymbol": "XRP",
+                "displayName": "XRP",
+                "userVisibleRouteLabel": "XRP",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "internalOnly": True,
+                "phase": "prepared",
+                "routes": {
+                    "BNB": {
+                        "routeType": "wrapped_evm",
+                        "internalSymbols": ["XRP_BEP20_verified"],
+                        "stableOut": ["USDT", "USDC"],
+                        "contractAllowlistRequired": True,
+                        "enabledForLive": False,
+                    },
+                },
+            },
+            "ETH": {
+                "displaySymbol": "ETH",
+                "displayName": "Ethereum",
+                "userVisibleRouteLabel": "ETH",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "phase": "phase1",
+                "routes": {"ETH": {"routeType": "native_or_weth", "stableOut": ["USDC", "USDT"], "enabledForLive": True}},
+            },
+            "BNB": {
+                "displaySymbol": "BNB",
+                "displayName": "BNB",
+                "userVisibleRouteLabel": "BNB",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "phase": "phase1",
+                "routes": {"BNB": {"routeType": "native_or_wbnb", "stableOut": ["USDT", "USDC"], "enabledForLive": True}},
+            },
+            "POL": {
+                "displaySymbol": "POL",
+                "displayName": "Polygon Ecosystem Token",
+                "userVisibleRouteLabel": "POL",
+                "defaultExitAsset": "USDC/USDT",
+                "originalWithdrawAllowed": True,
+                "phase": "phase1",
+                "routes": {"POL": {"routeType": "native_or_wpol", "stableOut": ["USDC", "USDT"], "enabledForLive": True}},
+            },
+        },
+        "ts": int(time.time()),
+    }
+
+
+def _nexus_public_asset_route(symbol: str, chain: str = "") -> dict:
+    reg = _nexus_asset_router_registry()
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return {"found": False, "error": "missing_symbol", "symbol": sym, "ts": int(time.time())}
+    asset = (reg.get("assets") or {}).get(sym)
+    if not isinstance(asset, dict):
+        return {"found": False, "error": "asset_not_configured", "symbol": sym, "ts": int(time.time())}
+
+    routes = asset.get("routes") or {}
+    chain_key = _normalize_chain_key(chain) if chain else ""
+    selected_chain = ""
+    selected_route = None
+    if chain_key and chain_key in routes:
+        selected_chain = chain_key
+        selected_route = routes.get(chain_key)
+    elif routes:
+        # Prefer phase-1 chains, then first configured route.
+        for ck in ("ETH", "BNB", "POL"):
+            if ck in routes:
+                selected_chain = ck
+                selected_route = routes.get(ck)
+                break
+        if selected_route is None:
+            selected_chain, selected_route = next(iter(routes.items()))
+
+    return {
+        "found": True,
+        "symbol": sym,
+        "displaySymbol": asset.get("displaySymbol") or sym,
+        "displayName": asset.get("displayName") or sym,
+        "userVisibleRouteLabel": asset.get("userVisibleRouteLabel") or sym,
+        "defaultExitAsset": asset.get("defaultExitAsset") or "USDC/USDT",
+        "originalWithdrawAllowed": bool(asset.get("originalWithdrawAllowed", False)),
+        "selectedExecutionChain": selected_chain,
+        "selectedRoute": selected_route or {},
+        "backendNote": "Internal wrapped/bridged details are backend-only; UI should show the displaySymbol.",
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/asset-router")
+def api_nexus_asset_router():
+    return jsonify({"status": "ok", **_nexus_asset_router_registry()})
+
+
+@app.get("/api/nexus/asset-route")
+def api_nexus_asset_route():
+    symbol = request.args.get("symbol") or request.args.get("asset") or request.args.get("coin") or ""
+    chain = request.args.get("chain") or request.args.get("execution_chain") or ""
+    route = _nexus_public_asset_route(symbol, chain=chain)
+    code = 200 if route.get("found") else 404
+    return jsonify({"status": "ok" if route.get("found") else "error", **route}), code
 
 import traceback
 from flask import make_response, jsonify
