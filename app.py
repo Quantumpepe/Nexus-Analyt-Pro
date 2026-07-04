@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-041-ENGINE-BOUNDARY"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-042-SHADOW-READINESS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-041-ENGINE-BOUNDARY"
-SHADOW_BUILD_ID = "SH-ENGINE-041-ENGINE-BOUNDARY"
+STRATEGIST_BUILD_ID = "S-ENGINE-042-SHADOW-READINESS"
+SHADOW_BUILD_ID = "SH-ENGINE-042-SHADOW-READINESS"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -265,6 +265,11 @@ NEXUS_ENGINE_SEPARATION_STATUS = "PREP_ONLY_NO_RUNTIME_REWRITE_NO_LIVE_MUTATION"
 NEXUS_ENGINE_MODULES = ["MARKET_ENGINE", "STRATEGIST_ENGINE", "NKR_ENGINE", "TRADER_ENGINE", "VAULT_ENGINE", "ASSET_ROUTER", "WITHDRAW_QUOTE"]
 NEXUS_ENGINE_FLOW_POLICY = "MARKET_READS_STRATEGIST_SCORES_NKR_ALLOCATES_TRADER_REQUESTS_VAULT_VALIDATES"
 NEXUS_ENGINE_BOUNDARY_GUARD = "NO_MODULE_MAY_BYPASS_VAULT_VALIDATION_FOR_LIVE_MUTATION"
+NEXUS_SHADOW_READINESS_MODE = "NEXUS_SHADOW_READINESS_CHECK_V1"
+NEXUS_SHADOW_READINESS_POLICY = "VERIFY_MODULE_STATUS_BEFORE_BIG_SHADOW_TEST"
+NEXUS_SHADOW_READINESS_STATUS = "SHADOW_TEST_ALLOWED_PREVIEW_ONLY_MODULES_LOCKED"
+NEXUS_SHADOW_READINESS_LIVE_EXECUTION = "DISABLED"
+NEXUS_SHADOW_READINESS_REQUIRED_MODULES = ["TRADING_LOGIC", "DECISION_LOG", "RECOVERY_EXIT", "STABLE_CAPITAL", "ASSET_ROUTER", "NKR_WATCHLIST", "NKR_CAPITAL_MANAGER", "NKR_RULES", "NKR_PAYOUT", "NKR_PERIOD", "NKR_UI_CONTRACT", "WITHDRAW_QUOTE", "VAULT_CORE_PREP", "ENGINE_BOUNDARY"]
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -360,6 +365,16 @@ def api_build_info():
         "engine_modules": NEXUS_ENGINE_MODULES,
         "engine_flow_policy": NEXUS_ENGINE_FLOW_POLICY,
         "engine_boundary_guard": NEXUS_ENGINE_BOUNDARY_GUARD,
+        "shadow_readiness": NEXUS_SHADOW_READINESS_MODE,
+        "shadow_readiness_policy": NEXUS_SHADOW_READINESS_POLICY,
+        "shadow_readiness_status": NEXUS_SHADOW_READINESS_STATUS,
+        "shadow_readiness_live_execution": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
+        "shadow_readiness_required_modules": NEXUS_SHADOW_READINESS_REQUIRED_MODULES,
+        "shadow_readiness": NEXUS_SHADOW_READINESS_MODE,
+        "shadow_readiness_policy": NEXUS_SHADOW_READINESS_POLICY,
+        "shadow_readiness_status": NEXUS_SHADOW_READINESS_STATUS,
+        "shadow_readiness_live_execution": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
+        "shadow_readiness_required_modules": NEXUS_SHADOW_READINESS_REQUIRED_MODULES,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -24467,6 +24482,121 @@ def api_nexus_engine_boundary_policy():
 def api_nexus_engine_flow_preview():
     body = request.get_json(silent=True) or {}
     return jsonify(_nexus_engine_flow_preview(body))
+
+
+# ENGINE-042: Shadow Readiness / System Module Status V1
+# Central readiness contract before the large Shadow test. This module does not
+# execute trades, move funds, alter costs, or change the proven entry/exit logic.
+def _nexus_shadow_readiness_modules() -> list[dict]:
+    return [
+        {"id": "TRADING_LOGIC", "mode": "ENGINE_028_BASE_PLUS_RECOVERY_EXIT", "status": "ready", "liveExecution": False, "notes": "Proven shadow trading logic remains unchanged."},
+        {"id": "DECISION_LOG", "mode": "DECISION_LOG_V1_OUTCOME_TRACKING_PREP", "status": "ready", "liveExecution": False, "notes": "Decision and outcome capture is prepared."},
+        {"id": "RECOVERY_EXIT", "mode": SHADOW_EXIT_MODE, "status": "ready", "liveExecution": False, "notes": "Break-even recovery exit is active in shadow logic."},
+        {"id": "STABLE_CAPITAL", "mode": NEXUS_CAPITAL_CORE_MODE, "status": "ready", "liveExecution": False, "notes": "USDC/USDT capital bunker policy is prepared."},
+        {"id": "ASSET_ROUTER", "mode": NEXUS_ASSET_ROUTER_MODE, "status": "ready", "liveExecution": False, "notes": "User-facing BTC/SOL/XRP abstraction is prepared."},
+        {"id": "NKR_WATCHLIST", "mode": NEXUS_NKR_WATCHLIST_MODE, "status": "ready_preview", "liveExecution": False, "notes": "NKR can select from allowed watchlist assets in preview."},
+        {"id": "NKR_CAPITAL_MANAGER", "mode": NEXUS_NKR_CAPITAL_MANAGER_MODE, "status": "ready_preview", "liveExecution": False, "notes": "NKR capital allocation plan is preview-only."},
+        {"id": "NKR_RULES", "mode": NEXUS_NKR_RULES_MODE, "status": "ready_preview", "liveExecution": False, "notes": "Dynamic/Tactical/Aggressive capital release rules are prepared."},
+        {"id": "NKR_PAYOUT", "mode": NEXUS_NKR_PAYOUT_MODE, "status": "ready_preview", "liveExecution": False, "notes": "Reinvest, payout and hold-stable decisions are preview-only."},
+        {"id": "NKR_PERIOD", "mode": NEXUS_NKR_PERIOD_MODE, "status": "ready_preview", "liveExecution": False, "notes": "10d/20d/monthly period logic and end-lock policy are prepared."},
+        {"id": "NKR_UI_CONTRACT", "mode": NEXUS_NKR_UI_CONTRACT_MODE, "status": "ready", "liveExecution": False, "notes": "Frontend contract for Nexus Rotation to NKR is prepared."},
+        {"id": "WITHDRAW_QUOTE", "mode": NEXUS_WITHDRAW_QUOTE_MODE, "status": "ready_preview", "liveExecution": False, "notes": "Net-first withdrawal quote is preview-only."},
+        {"id": "VAULT_CORE_PREP", "mode": NEXUS_VAULT_CORE_MODE, "status": "prep_only", "liveExecution": False, "notes": "Vault validation is prepared; no private keys, no signing, no on-chain send."},
+        {"id": "ENGINE_BOUNDARY", "mode": NEXUS_ENGINE_BOUNDARY_MODE, "status": "ready", "liveExecution": False, "notes": "Module responsibilities are separated by contract."},
+    ]
+
+
+def _nexus_shadow_readiness_policy() -> dict:
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_READINESS_MODE,
+        "policy": NEXUS_SHADOW_READINESS_POLICY,
+        "readinessStatus": NEXUS_SHADOW_READINESS_STATUS,
+        "liveExecution": False,
+        "liveExecutionStatus": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
+        "requiredModules": NEXUS_SHADOW_READINESS_REQUIRED_MODULES,
+        "allowedNextStep": "large_shadow_test_preparation",
+        "blockedActions": ["live_vault_mutation", "private_key_storage", "onchain_send", "real_bridge", "real_swap", "cost_change_without_quote"],
+        "safeByDefault": True,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _nexus_system_module_status() -> dict:
+    modules = _nexus_shadow_readiness_modules()
+    ready_count = len([m for m in modules if str(m.get("status", "")).startswith("ready")])
+    prep_count = len([m for m in modules if "prep" in str(m.get("status", ""))])
+    live_enabled = any(bool(m.get("liveExecution")) for m in modules)
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_READINESS_MODE,
+        "overall": "ready_for_shadow_test" if not live_enabled else "blocked_live_execution_detected",
+        "modulesTotal": len(modules),
+        "modulesReadyOrPreview": ready_count,
+        "modulesPrepOnly": prep_count,
+        "liveExecution": live_enabled,
+        "modules": modules,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _nexus_shadow_readiness_check(body: dict | None = None) -> dict:
+    body = body or {}
+    requested_test_days = int(_safe_float(body.get("testDays") or body.get("days") or 5) or 5)
+    capital_usd = _safe_float(body.get("capitalUsd") or body.get("capital") or 0)
+    chains = body.get("chains") or NEXUS_VAULT_ALLOWED_CHAINS
+    if not isinstance(chains, list):
+        chains = [str(chains)]
+    modules = _nexus_shadow_readiness_modules()
+    blockers = []
+    warnings = []
+    if any(bool(m.get("liveExecution")) for m in modules):
+        blockers.append("live_execution_must_remain_disabled_before_shadow_test")
+    if requested_test_days < 1:
+        warnings.append("test_days_too_low_default_5_recommended")
+    if capital_usd <= 0:
+        warnings.append("capital_usd_not_supplied_preview_only")
+    if "VAULT_CORE_PREP" not in [m.get("id") for m in modules]:
+        blockers.append("vault_core_prep_missing")
+    overall = "ready_for_shadow_test" if not blockers else "not_ready"
+    return {
+        "status": "ok" if not blockers else "blocked",
+        "mode": NEXUS_SHADOW_READINESS_MODE,
+        "overall": overall,
+        "shadowTestAllowed": not blockers,
+        "liveExecution": False,
+        "previewOnlyModulesLocked": True,
+        "input": {"testDays": requested_test_days, "capitalUsd": capital_usd, "chains": chains},
+        "moduleStatus": modules,
+        "blockers": blockers,
+        "warnings": warnings,
+        "nextRecommendedStep": "ENGINE_043_SHADOW_TEST_CONTROLLER_OR_FRONTEND_NKR_UI",
+        "notes": [
+            "This check confirms module readiness only; it does not start a test.",
+            "Vault, Withdraw Quote and NKR modules stay preview/prep-only until live execution is intentionally built later.",
+            "The proven entry/exit trading behavior is not changed by this readiness check.",
+        ],
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+@app.get("/api/nexus/shadow-readiness-policy")
+def api_nexus_shadow_readiness_policy():
+    return jsonify(_nexus_shadow_readiness_policy())
+
+
+@app.get("/api/nexus/system-module-status")
+def api_nexus_system_module_status():
+    return jsonify(_nexus_system_module_status())
+
+
+@app.post("/api/nexus/shadow-readiness-check")
+def api_nexus_shadow_readiness_check():
+    body = request.get_json(silent=True) or {}
+    return jsonify(_nexus_shadow_readiness_check(body))
 
 if __name__ == "__main__":
 
