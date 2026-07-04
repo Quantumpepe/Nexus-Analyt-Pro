@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-043-SYSTEM-INFO-STATUS"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-043-SYSTEM-INFO-STATUS"
-SHADOW_BUILD_ID = "SH-ENGINE-043-SYSTEM-INFO-STATUS"
+STRATEGIST_BUILD_ID = "S-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
+SHADOW_BUILD_ID = "SH-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -371,11 +371,13 @@ def api_build_info():
         "engine_flow_policy": NEXUS_ENGINE_FLOW_POLICY,
         "engine_boundary_guard": NEXUS_ENGINE_BOUNDARY_GUARD,
         "shadow_readiness": NEXUS_SHADOW_READINESS_MODE,
+            "shadow_readiness_method_fix": NEXUS_SHADOW_READINESS_METHOD_FIX,
         "shadow_readiness_policy": NEXUS_SHADOW_READINESS_POLICY,
         "shadow_readiness_status": NEXUS_SHADOW_READINESS_STATUS,
         "shadow_readiness_live_execution": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
         "shadow_readiness_required_modules": NEXUS_SHADOW_READINESS_REQUIRED_MODULES,
         "shadow_readiness": NEXUS_SHADOW_READINESS_MODE,
+            "shadow_readiness_method_fix": NEXUS_SHADOW_READINESS_METHOD_FIX,
         "shadow_readiness_policy": NEXUS_SHADOW_READINESS_POLICY,
         "shadow_readiness_status": NEXUS_SHADOW_READINESS_STATUS,
         "shadow_readiness_live_execution": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
@@ -24603,11 +24605,25 @@ def api_nexus_system_module_status():
     return jsonify(_nexus_system_module_status())
 
 
+@app.get("/api/nexus/shadow-readiness-check")
 @app.post("/api/nexus/shadow-readiness-check")
 def api_nexus_shadow_readiness_check():
-    body = request.get_json(silent=True) or {}
+    if request.method == "GET":
+        body = {
+            "testDays": request.args.get("testDays") or request.args.get("test_days") or 5,
+            "capitalUsd": request.args.get("capitalUsd") or request.args.get("capital_usd") or 0,
+            "chains": request.args.getlist("chains") or request.args.get("chains") or ["ETH", "BNB", "POL"],
+        }
+    else:
+        body = request.get_json(silent=True) or {}
     return jsonify(_nexus_shadow_readiness_check(body))
 
+
+
+# ENGINE-045: Shadow Readiness Method Fix V1
+# Allows both GET and POST for /api/nexus/shadow-readiness-check so System Info
+# can safely poll it from the frontend without 405 Method Not Allowed.
+NEXUS_SHADOW_READINESS_METHOD_FIX = "SHADOW_READINESS_GET_POST_SAFE_V1"
 
 # ENGINE-043: System Info Status Panel V1
 # Owner/admin System Info contract for showing what is running, ready, preview-only,
