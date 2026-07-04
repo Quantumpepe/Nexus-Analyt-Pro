@@ -184,13 +184,17 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-030-RECOVERY-EXIT"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-031-STABLE-CAPITAL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-030-RECOVERY-EXIT"
-SHADOW_BUILD_ID = "SH-ENGINE-030-RECOVERY-EXIT"
+STRATEGIST_BUILD_ID = "S-ENGINE-031-STABLE-CAPITAL"
+SHADOW_BUILD_ID = "SH-ENGINE-031-STABLE-CAPITAL"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
+NEXUS_CAPITAL_CORE_MODE = "STABLECOIN_CAPITAL_CORE_V1"
+NEXUS_DEFAULT_CAPITAL_STATE = "USDC_USDT"
+NEXUS_TOKEN_POSITION_POLICY = "TOKEN_ONLY_DURING_ACTIVE_TRADE"
+NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_USDT_UNLESS_USER_REQUESTS_ORIGINAL_ASSET"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -222,6 +226,10 @@ def api_build_info():
         "outcome_tracking": "OUTCOME_TRACKING_V1",
         "recovery_exit": "BREAK_EVEN_RECOVERY_EXIT_V1",
         "recovery_exit_policy": "RESCUED_DEEP_LOSS_CAN_EXIT_NEAR_BREAKEVEN",
+        "stable_capital_core": NEXUS_CAPITAL_CORE_MODE,
+        "default_capital_state": NEXUS_DEFAULT_CAPITAL_STATE,
+        "token_position_policy": NEXUS_TOKEN_POSITION_POLICY,
+        "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -250,6 +258,10 @@ def api_version():
         "outcome_tracking": "OUTCOME_TRACKING_V1",
         "recovery_exit": "BREAK_EVEN_RECOVERY_EXIT_V1",
         "recovery_exit_policy": "RESCUED_DEEP_LOSS_CAN_EXIT_NEAR_BREAKEVEN",
+        "stable_capital_core": NEXUS_CAPITAL_CORE_MODE,
+        "default_capital_state": NEXUS_DEFAULT_CAPITAL_STATE,
+        "token_position_policy": NEXUS_TOKEN_POSITION_POLICY,
+        "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -261,6 +273,38 @@ def api_version():
         "render_git_commit": os.getenv("RENDER_GIT_COMMIT"),
         "grid_allow_anon": os.getenv("GRID_ALLOW_ANON"),
     }
+
+
+
+def _nexus_stable_capital_policy() -> dict:
+    """Stablecoin capital policy for Vault/NKR/live execution preparation.
+
+    Trading may temporarily hold tokens while a position is active, but Nexus
+    treats USDC/USDT as the default capital bunker and default exit asset.
+    This function is policy-only in ENGINE-031; it does not alter the proven
+    ENGINE-028/030 trading decisions.
+    """
+    return {
+        "mode": NEXUS_CAPITAL_CORE_MODE,
+        "capital_state_default": NEXUS_DEFAULT_CAPITAL_STATE,
+        "stable_assets": ["USDC", "USDT"],
+        "token_position_policy": NEXUS_TOKEN_POSITION_POLICY,
+        "default_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
+        "rules": [
+            "User capital is accounted in USDC/USDT by default.",
+            "Tokens are temporary active trading positions only.",
+            "After a normal exit, capital returns to USDC/USDT.",
+            "Original-asset withdrawal is only used when the user explicitly requests it.",
+            "Profit, cost and fee accounting should use net stablecoin value first.",
+        ],
+        "vault_ready": True,
+        "nkr_ready": True,
+        "ts": int(time.time()),
+    }
+
+@app.get("/api/nexus/capital-policy")
+def api_nexus_capital_policy():
+    return jsonify({"status": "ok", **_nexus_stable_capital_policy()})
 
 import traceback
 from flask import make_response, jsonify
