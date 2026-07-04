@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-046-SHADOW-TEST-CONTROLLER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
-SHADOW_BUILD_ID = "SH-ENGINE-045-SHADOW-READINESS-METHOD-FIX"
+STRATEGIST_BUILD_ID = "S-ENGINE-046-SHADOW-TEST-CONTROLLER"
+SHADOW_BUILD_ID = "SH-ENGINE-046-SHADOW-TEST-CONTROLLER"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -24625,6 +24625,19 @@ def api_nexus_shadow_readiness_check():
 # can safely poll it from the frontend without 405 Method Not Allowed.
 NEXUS_SHADOW_READINESS_METHOD_FIX = "SHADOW_READINESS_GET_POST_SAFE_V1"
 
+# ENGINE-046: Shadow Test Controller V1
+# Owner/admin shadow-test controller contract. This creates a safe test plan and
+# status surface only. It never enables live execution, vault mutation, swaps,
+# bridges, signatures, or private-key handling.
+NEXUS_SHADOW_TEST_CONTROLLER_MODE = "NEXUS_SHADOW_TEST_CONTROLLER_V1"
+NEXUS_SHADOW_TEST_CONTROLLER_POLICY = "CONTROLLED_SHADOW_TEST_PLAN_STATUS_AND_REPORT_PREP"
+NEXUS_SHADOW_TEST_CONTROLLER_EXECUTION = "SHADOW_ONLY_NO_LIVE_EXECUTION"
+NEXUS_SHADOW_TEST_DEFAULT_DAYS = 5
+NEXUS_SHADOW_TEST_DEFAULT_ASSETS = ["ETH", "BNB", "POL"]
+NEXUS_SHADOW_TEST_DEFAULT_NKR_MODE = "DYNAMIC"
+NEXUS_SHADOW_TEST_DEFAULT_TRADING_MODE = "TACTICAL"
+NEXUS_SHADOW_TEST_ALLOWED_RUNTIME_DAYS = [1, 3, 5, 10, 20, 30]
+
 # ENGINE-043: System Info Status Panel V1
 # Owner/admin System Info contract for showing what is running, ready, preview-only,
 # prep-only, disabled, or blocked. This keeps internal technical state inside the
@@ -24678,7 +24691,7 @@ def _nexus_system_info_status_panel() -> dict:
             "blocked": 0 if not live_enabled else 1,
         },
         "displayGroups": [
-            {"title": "Running / Ready", "items": ready},
+            {"title": "Running / Ready", "items": ready + [{"module": "SHADOW_TEST_CONTROLLER", "badge": "READY", "severity": "ok", "running": True, "notes": NEXUS_SHADOW_TEST_CONTROLLER_MODE}]},
             {"title": "Preview Only", "items": preview_only},
             {"title": "Prep Only / Not Live", "items": prep_only},
             {"title": "Live Execution Guards", "items": [
@@ -24701,6 +24714,199 @@ def api_nexus_system_info_status_panel():
 @app.get("/api/nexus/system-info-owner-panel")
 def api_nexus_system_info_owner_panel():
     return jsonify(_nexus_system_info_status_panel())
+
+
+
+# ENGINE-046: Shadow Test Controller V1
+# Safe owner/admin controller for planning and reading a shadow test. It does not
+# start live execution and does not mutate vault state. The frontend/System Info
+# can call these endpoints to display test status and planned configuration.
+def _shadow_test_clean_assets(value):
+    if value is None or value == "":
+        return list(NEXUS_SHADOW_TEST_DEFAULT_ASSETS)
+    if isinstance(value, str):
+        parts = [x.strip().upper() for x in value.replace(";", ",").split(",") if x.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(x).strip().upper() for x in value if str(x).strip()]
+    else:
+        parts = []
+    allowed = {"ETH", "BNB", "POL", "BTC", "SOL", "XRP"}
+    out = []
+    for p in parts:
+        if p in allowed and p not in out:
+            out.append(p)
+    return out or list(NEXUS_SHADOW_TEST_DEFAULT_ASSETS)
+
+
+def _shadow_test_clean_days(value):
+    try:
+        n = int(float(value))
+    except Exception:
+        n = int(NEXUS_SHADOW_TEST_DEFAULT_DAYS)
+    if n <= 0:
+        n = int(NEXUS_SHADOW_TEST_DEFAULT_DAYS)
+    if n not in NEXUS_SHADOW_TEST_ALLOWED_RUNTIME_DAYS:
+        # keep custom values safe but bounded, so the UI can test e.g. 7 days later
+        n = max(1, min(30, n))
+    return n
+
+
+def _shadow_test_clean_mode(value, default):
+    raw = str(value or default or "").strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "DYNAMISCH": "DYNAMIC",
+        "DYNAMIC": "DYNAMIC",
+        "TACTICAL": "TACTICAL",
+        "AGGRESSIVE": "AGGRESSIVE",
+        "DEFENSIVE": "DEFENSIVE",
+    }
+    return aliases.get(raw, str(default or "TACTICAL").upper())
+
+
+def _shadow_test_controller_policy():
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_TEST_CONTROLLER_MODE,
+        "policy": NEXUS_SHADOW_TEST_CONTROLLER_POLICY,
+        "execution": NEXUS_SHADOW_TEST_CONTROLLER_EXECUTION,
+        "defaultDays": NEXUS_SHADOW_TEST_DEFAULT_DAYS,
+        "allowedRuntimeDays": NEXUS_SHADOW_TEST_ALLOWED_RUNTIME_DAYS,
+        "defaultAssets": NEXUS_SHADOW_TEST_DEFAULT_ASSETS,
+        "defaultNkrMode": NEXUS_SHADOW_TEST_DEFAULT_NKR_MODE,
+        "defaultTradingMode": NEXUS_SHADOW_TEST_DEFAULT_TRADING_MODE,
+        "hardGuards": {
+            "liveExecution": False,
+            "vaultMutation": False,
+            "privateKeysInBackend": False,
+            "onchainExecution": False,
+            "withdrawExecution": False,
+        },
+        "visibleIn": "SYSTEM_INFO_OWNER_PANEL",
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _shadow_test_controller_status(body=None):
+    body = body if isinstance(body, dict) else {}
+    days = _shadow_test_clean_days(body.get("testDays") or body.get("days") or body.get("runtimeDays"))
+    capital_usd = _safe_float(body.get("capitalUsd") or body.get("capital") or body.get("testCapitalUsd") or 0)
+    assets = _shadow_test_clean_assets(body.get("assets") or body.get("symbols") or body.get("chains"))
+    nkr_mode = _shadow_test_clean_mode(body.get("nkrMode") or body.get("nkr_mode"), NEXUS_SHADOW_TEST_DEFAULT_NKR_MODE)
+    trading_mode = _shadow_test_clean_mode(body.get("tradingMode") or body.get("trading_mode") or body.get("performanceMode"), NEXUS_SHADOW_TEST_DEFAULT_TRADING_MODE)
+    readiness = _nexus_shadow_readiness_check({"testDays": days, "capitalUsd": capital_usd, "chains": ["ETH", "BNB", "POL"]})
+    blockers = list(readiness.get("blockers") or [])
+    warnings = list(readiness.get("warnings") or [])
+    if capital_usd <= 0:
+        warnings.append("shadow_test_capital_not_set_preview_only")
+    if not assets:
+        blockers.append("no_assets_selected")
+    shadow_allowed = bool(readiness.get("shadowTestAllowed")) and not blockers
+    return {
+        "status": "ok" if shadow_allowed else "warning",
+        "mode": NEXUS_SHADOW_TEST_CONTROLLER_MODE,
+        "shadowTest": True if shadow_allowed else False,
+        "shadowTestAllowed": shadow_allowed,
+        "state": "READY_TO_START_SHADOW" if shadow_allowed else "PLAN_REVIEW_REQUIRED",
+        "liveExecution": False,
+        "vault": "PREP_ONLY",
+        "withdraw": "PREVIEW_ONLY",
+        "privateKeys": "NOT_IN_BACKEND",
+        "controller": {
+            "testDays": days,
+            "capitalUsd": capital_usd,
+            "assets": assets,
+            "nkrMode": nkr_mode,
+            "tradingMode": trading_mode,
+            "vaultDisabled": True,
+            "liveDisabled": True,
+        },
+        "checklist": [
+            {"item": "Trading logic", "status": "READY", "detail": NEXUS_EXIT_POLICY},
+            {"item": "NKR core", "status": "READY_PREVIEW", "detail": "Watchlist, capital, rules, payout, period and UI contract prepared."},
+            {"item": "Withdraw quote", "status": "PREVIEW_ONLY", "detail": NEXUS_WITHDRAW_EXECUTION_STATUS},
+            {"item": "Vault core", "status": "PREP_ONLY", "detail": NEXUS_VAULT_EXECUTION_STATUS},
+            {"item": "Live execution", "status": "DISABLED", "detail": "No real trades, no swaps, no bridges, no vault send."},
+        ],
+        "blockers": blockers,
+        "warnings": warnings,
+        "nextRecommendedStep": "Run a controlled shadow test after setting capital/assets, or connect this status to System Info if not visible yet.",
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _shadow_test_controller_plan(body=None):
+    body = body if isinstance(body, dict) else {}
+    status = _shadow_test_controller_status(body)
+    c = status.get("controller") or {}
+    days = int(c.get("testDays") or NEXUS_SHADOW_TEST_DEFAULT_DAYS)
+    assets = c.get("assets") or list(NEXUS_SHADOW_TEST_DEFAULT_ASSETS)
+    capital = _safe_float(c.get("capitalUsd") or 0)
+    per_asset = (capital / max(1, len(assets))) if capital > 0 else 0
+    milestones = []
+    for pct in [0, 25, 50, 75, 100]:
+        day = round((days * pct) / 100, 2)
+        milestones.append({"progressPct": pct, "day": day, "focus": "start" if pct == 0 else ("profit_lock_review" if pct >= 75 else "runtime_health_review")})
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_TEST_CONTROLLER_MODE,
+        "planType": "SHADOW_ONLY",
+        "runtimeDays": days,
+        "assets": assets,
+        "capitalUsd": capital,
+        "estimatedCapitalPerAssetUsd": round(per_asset, 2),
+        "nkrMode": c.get("nkrMode"),
+        "tradingMode": c.get("tradingMode"),
+        "milestones": milestones,
+        "guards": {
+            "liveExecution": False,
+            "vaultMutation": False,
+            "withdrawExecution": False,
+            "privateKeysInBackend": False,
+        },
+        "statusPreview": status,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+@app.get("/api/nexus/shadow-test-controller-policy")
+def api_nexus_shadow_test_controller_policy():
+    return jsonify(_shadow_test_controller_policy())
+
+
+@app.get("/api/nexus/shadow-test-controller-status")
+@app.post("/api/nexus/shadow-test-controller-status")
+def api_nexus_shadow_test_controller_status():
+    if request.method == "GET":
+        body = {
+            "testDays": request.args.get("testDays") or request.args.get("days"),
+            "capitalUsd": request.args.get("capitalUsd") or request.args.get("capital"),
+            "assets": request.args.getlist("assets") or request.args.get("assets") or request.args.get("symbols"),
+            "nkrMode": request.args.get("nkrMode") or request.args.get("nkr_mode"),
+            "tradingMode": request.args.get("tradingMode") or request.args.get("trading_mode"),
+        }
+    else:
+        body = request.get_json(silent=True) or {}
+    return jsonify(_shadow_test_controller_status(body))
+
+
+@app.get("/api/nexus/shadow-test-plan")
+@app.post("/api/nexus/shadow-test-plan")
+def api_nexus_shadow_test_plan():
+    if request.method == "GET":
+        body = {
+            "testDays": request.args.get("testDays") or request.args.get("days"),
+            "capitalUsd": request.args.get("capitalUsd") or request.args.get("capital"),
+            "assets": request.args.getlist("assets") or request.args.get("assets") or request.args.get("symbols"),
+            "nkrMode": request.args.get("nkrMode") or request.args.get("nkr_mode"),
+            "tradingMode": request.args.get("tradingMode") or request.args.get("trading_mode"),
+        }
+    else:
+        body = request.get_json(silent=True) or {}
+    return jsonify(_shadow_test_controller_plan(body))
+
 
 if __name__ == "__main__":
 
