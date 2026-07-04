@@ -184,12 +184,12 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-028-AGGRESSIVE-GUARD"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-029-DECISION-LOG"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-028-AGGRESSIVE-GUARD"
-SHADOW_BUILD_ID = "SH-ENGINE-028-AGGRESSIVE-GUARD"
+STRATEGIST_BUILD_ID = "S-ENGINE-029-DECISION-LOG"
+SHADOW_BUILD_ID = "SH-ENGINE-029-DECISION-LOG"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
-SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1"
+SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EDGE_INIT_FIX_V5"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
@@ -218,6 +218,8 @@ def api_build_info():
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
         "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
+        "decision_log": "DECISION_LOG_V1",
+        "outcome_tracking": "OUTCOME_TRACKING_V1",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -242,6 +244,8 @@ def api_version():
         "entry_mode": SHADOW_ENTRY_MODE,
         "promotion_mode": SHADOW_PROMOTION_MODE,
         "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
+        "decision_log": "DECISION_LOG_V1",
+        "outcome_tracking": "OUTCOME_TRACKING_V1",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -2136,6 +2140,44 @@ def init_db():
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_simulation_events_wallet_ts ON nexus_simulation_events(wallet_address, created_ts)")
+
+    # Decision Log V1 / Outcome Tracking V1.
+    # This stores Strategist/Shadow decisions without changing execution behavior.
+    # Outcome columns are filled later by the tick worker from the same slot/session state.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_decision_log (
+            decision_id TEXT PRIMARY KEY,
+            wallet_address TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            slot_id TEXT DEFAULT '',
+            asset TEXT DEFAULT '',
+            chain TEXT DEFAULT '',
+            decision_type TEXT DEFAULT '',
+            state_from TEXT DEFAULT '',
+            state_to TEXT DEFAULT '',
+            reason TEXT DEFAULT '',
+            market_regime TEXT DEFAULT '',
+            performance_mode TEXT DEFAULT '',
+            quality REAL,
+            confidence REAL,
+            risk_score REAL,
+            momentum_score REAL,
+            recovery_momentum_score REAL,
+            price REAL,
+            pnl_usd REAL,
+            pnl_pct REAL,
+            outcome_1h_usd REAL,
+            outcome_4h_usd REAL,
+            outcome_24h_usd REAL,
+            outcome_status TEXT DEFAULT 'pending',
+            outcome_checked_ts INTEGER,
+            meta_json TEXT DEFAULT '{}',
+            created_ts INTEGER NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_decision_log_wallet_ts ON nexus_decision_log(wallet_address, created_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_decision_log_session_ts ON nexus_decision_log(wallet_address, session_id, created_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nexus_decision_log_outcome ON nexus_decision_log(wallet_address, outcome_status, created_ts)")
 
     # AI memory schema migration + index (avoid 'ts' mismatch)
     try:
@@ -11076,6 +11118,159 @@ def _nexus_log_sim_event(cur, wallet_address, slot_id, asset, event_type, state_
         ("SIM-" + uuid.uuid4().hex[:12].upper(), wallet_address, str(slot_id or ""), str(asset or "").upper(), str(event_type or ""), str(state_from or ""), str(state_to or ""), str(reason or "")[:500], json.dumps(meta or {}, ensure_ascii=False), now_ts()),
     )
 
+def _nexus_log_decision(cur, wallet_address: str, item: dict | None = None, decision_type: str = "", state_from: str = "", state_to: str = "", reason: str = "", meta_extra: dict | None = None):
+    """Decision Log V1: persist Strategist/Shadow decisions for later learning.
+
+    This is intentionally passive: it does not change trading state. It only stores
+    why a state changed, with the scores and paper PnL available at that tick.
+    """
+    try:
+        item = item if isinstance(item, dict) else {}
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        extra = meta_extra if isinstance(meta_extra, dict) else {}
+        session_id = str(item.get("session_id") or item.get("sessionId") or item.get("trade_session_id") or meta.get("session_id") or meta.get("trade_session_id") or extra.get("session_id") or "").strip()
+        slot_id = str(item.get("slot") or item.get("slot_id") or meta.get("slot") or meta.get("slot_id") or extra.get("slot_id") or "").strip()
+        asset = str(item.get("asset") or item.get("symbol") or meta.get("asset") or meta.get("symbol") or extra.get("asset") or "").strip().upper()
+        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or meta.get("chain") or meta.get("chain_key") or extra.get("chain") or "")
+        def _num(*vals):
+            for v in vals:
+                try:
+                    if v is None or str(v).strip() == "":
+                        continue
+                    n = float(v)
+                    if math.isfinite(n):
+                        return n
+                except Exception:
+                    pass
+            return None
+        meta_json = {
+            "score_source": "shadow_runtime",
+            "entry_reason": meta.get("strategist_entry_reason"),
+            "exit_reason": meta.get("shadow_exit_reason"),
+            "promotion_policy": meta.get("strategist_promotion_policy"),
+            "price_source": meta.get("paper_price_source"),
+            "cost_model": meta.get("strategist_cost_model") or meta.get("paper_cost_model"),
+        }
+        meta_json.update(extra)
+        cur.execute(
+            "INSERT INTO nexus_decision_log(decision_id,wallet_address,session_id,slot_id,asset,chain,decision_type,state_from,state_to,reason,market_regime,performance_mode,quality,confidence,risk_score,momentum_score,recovery_momentum_score,price,pnl_usd,pnl_pct,meta_json,created_ts) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "DEC-" + uuid.uuid4().hex[:14].upper(),
+                wallet_address,
+                session_id,
+                slot_id,
+                asset,
+                chain,
+                str(decision_type or "")[:80],
+                str(state_from or "")[:40],
+                str(state_to or "")[:40],
+                str(reason or "")[:700],
+                str(meta.get("strategist_market_regime") or extra.get("market_regime") or "")[:60],
+                str(meta.get("performance_mode") or extra.get("performance_mode") or "")[:60],
+                _num(meta.get("shadow_quality"), meta.get("strategist_score"), item.get("shadow_quality"), item.get("strategist_score")),
+                _num(meta.get("shadow_confidence"), item.get("confidence"), item.get("confidence_score")),
+                _num(meta.get("shadow_risk_score"), item.get("risk_score")),
+                _num(meta.get("strategist_momentum_score"), item.get("momentum_score")),
+                _num(meta.get("strategist_recovery_momentum_score"), item.get("recovery_momentum_score")),
+                _num(meta.get("paper_mark_price"), item.get("paper_mark_price")),
+                _num(meta.get("paper_pnl_usd"), item.get("paper_pnl_usd")),
+                _num(meta.get("paper_pnl_pct"), item.get("paper_pnl_pct")),
+                json.dumps(meta_json, ensure_ascii=False, separators=(",", ":")),
+                now_ts(),
+            ),
+        )
+    except Exception as e:
+        try:
+            print("[WARN] nexus_decision_log insert failed:", e)
+        except Exception:
+            pass
+
+def _nexus_update_decision_outcomes(cur, wallet_address: str, queue_items: list | None = None, now_i: int | None = None):
+    """Outcome Tracking V1: fill 1h/4h/24h PnL snapshots for prior decisions.
+
+    This keeps learning passive. It reads current slot PnL from the runtime queue and
+    updates matching decision rows after each checkpoint.
+    """
+    try:
+        now_i = int(now_i or now_ts())
+        queue_items = queue_items if isinstance(queue_items, list) else []
+        state_by_key = {}
+        for item in queue_items:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            sid = str(item.get("session_id") or item.get("sessionId") or item.get("trade_session_id") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
+            slot = str(item.get("slot") or item.get("slot_id") or meta.get("slot") or meta.get("slot_id") or "").strip()
+            asset = str(item.get("asset") or item.get("symbol") or meta.get("asset") or meta.get("symbol") or "").strip().upper()
+            chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or meta.get("chain") or meta.get("chain_key") or "")
+            pnl = None
+            for v in (meta.get("paper_pnl_total_usd"), meta.get("paper_pnl_usd"), item.get("paper_pnl_total_usd"), item.get("paper_pnl_usd")):
+                try:
+                    if v is None or str(v).strip() == "":
+                        continue
+                    pnl = float(v)
+                    if math.isfinite(pnl):
+                        break
+                except Exception:
+                    pnl = None
+            if pnl is None:
+                continue
+            keys = [
+                (sid, slot, asset, chain),
+                (sid, slot, asset, ""),
+                (sid, slot, "", chain),
+                (sid, slot, "", ""),
+            ]
+            for k in keys:
+                state_by_key[k] = pnl
+        if not state_by_key:
+            return 0
+        cur.execute(
+            "SELECT decision_id, session_id, slot_id, asset, chain, created_ts, outcome_1h_usd, outcome_4h_usd, outcome_24h_usd FROM nexus_decision_log WHERE wallet_address=? AND outcome_status='pending' AND created_ts<=? ORDER BY created_ts ASC LIMIT 300",
+            (wallet_address, now_i - 3600),
+        )
+        rows = cur.fetchall()
+        updated = 0
+        for r in rows:
+            sid = str(r["session_id"] or "")
+            slot = str(r["slot_id"] or "")
+            asset = str(r["asset"] or "").upper()
+            chain = _normalize_chain_key(r["chain"] or "")
+            pnl = None
+            for k in ((sid, slot, asset, chain), (sid, slot, asset, ""), (sid, slot, "", chain), (sid, slot, "", "")):
+                if k in state_by_key:
+                    pnl = state_by_key[k]
+                    break
+            if pnl is None:
+                continue
+            age = now_i - int(r["created_ts"] or 0)
+            fields = []
+            params = []
+            if age >= 3600 and r["outcome_1h_usd"] is None:
+                fields.append("outcome_1h_usd=?")
+                params.append(round(float(pnl), 4))
+            if age >= 4 * 3600 and r["outcome_4h_usd"] is None:
+                fields.append("outcome_4h_usd=?")
+                params.append(round(float(pnl), 4))
+            if age >= 24 * 3600 and r["outcome_24h_usd"] is None:
+                fields.append("outcome_24h_usd=?")
+                params.append(round(float(pnl), 4))
+                fields.append("outcome_status=?")
+                params.append("complete")
+            if fields:
+                fields.append("outcome_checked_ts=?")
+                params.append(now_i)
+                params.append(r["decision_id"])
+                cur.execute(f"UPDATE nexus_decision_log SET {', '.join(fields)} WHERE decision_id=?", params)
+                updated += 1
+        return updated
+    except Exception as e:
+        try:
+            print("[WARN] nexus_outcome_tracking update failed:", e)
+        except Exception:
+            pass
+        return 0
+
 def _nexus_execution_summary(cur, wallet_address):
     """Backend-first execution summary with safe multi-session isolation.
 
@@ -13082,6 +13277,23 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_runtime_status"] = "running" if ns not in ("WAIT", "SIMULATED_EXIT") else meta.get("shadow_runtime_status", "running")
         set_meta(item, meta)
         item["shadow_transition"] = {"from": old, "to": ns, "reason": reason}
+        if old != ns:
+            _nexus_log_decision(
+                cur,
+                wallet_address,
+                item=item,
+                decision_type=event_type,
+                state_from=old,
+                state_to=ns,
+                reason=reason,
+                meta_extra={
+                    "session_id": selected_session_id,
+                    "chain": selected_chain,
+                    "performance_mode": performance_mode,
+                    "market_regime": meta.get("strategist_market_regime") or "",
+                    "build": BACKEND_BUILD_ID,
+                },
+            )
         return {"type": event_type, "session_id": selected_session_id, "chain": selected_chain, "performance_mode": performance_mode, "risk_mode": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""), "pacing_mode": "DISABLED" if aggressive_legacy_mode else "ACTIVE", "slot": item.get("slot"), "symbol": item.get("symbol"), "from": old, "to": ns, "message": reason}
 
     # User controls must be immediate and authoritative.
@@ -14314,6 +14526,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         ],
         "reason": ("Aggressive legacy mode: soft brakes, risk-engine throttling and trade pacing are disabled for this selected session; core safety, budget/runtime limits and net-profit exit guard remain active." if aggressive_legacy_mode else ("; ".join(strategist_reason) or "Strategist evaluated market regime, edge after costs, pacing, confidence, risk and slot lifecycle.")),
     }
+    try:
+        outcome_updates = _nexus_update_decision_outcomes(cur, wallet_address, normalized, ts)
+    except Exception:
+        outcome_updates = 0
+    strategist["decision_log"] = "DECISION_LOG_V1"
+    strategist["outcome_tracking"] = "OUTCOME_TRACKING_V1"
+    strategist["outcome_updates"] = int(outcome_updates or 0)
     _shadow_mark_tick(f"runtime_{action}")
     return {
         "runtime_status": "running" if action in ("start", "resume", "tick") else action,
@@ -14329,6 +14548,41 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     }
 
 
+
+@app.route("/api/nexus/decision-log", methods=["GET"])
+def api_nexus_decision_log():
+    wallet, error = _nexus_wallet_from_request()
+    if error:
+        return error
+    try:
+        limit = int(_clamp_float(request.args.get("limit") or 100, 100, 1, 500))
+    except Exception:
+        limit = 100
+    session_id = str(request.args.get("session_id") or request.args.get("sessionId") or "").strip()
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        if session_id:
+            cur.execute(
+                "SELECT * FROM nexus_decision_log WHERE wallet_address=? AND session_id=? ORDER BY created_ts DESC LIMIT ?",
+                (wallet, session_id, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM nexus_decision_log WHERE wallet_address=? ORDER BY created_ts DESC LIMIT ?",
+                (wallet, limit),
+            )
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            try:
+                d["meta"] = json.loads(d.pop("meta_json") or "{}")
+            except Exception:
+                d["meta"] = {}
+            rows.append(d)
+        return jsonify({"status": "ok", "wallet": wallet, "count": len(rows), "items": rows, "ts": now_ts()})
+    finally:
+        conn.close()
 
 def _nexus_shadow_autotick_running_sessions(cur, wallet_address: str, source: str = "state_autotick", min_interval_sec: int = 60) -> list:
     """Tick running Shadow sessions from state polling, not only from Start Shadow.
