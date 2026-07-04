@@ -184,13 +184,13 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-029-DECISION-LOG"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-030-RECOVERY-EXIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-029-DECISION-LOG"
-SHADOW_BUILD_ID = "SH-ENGINE-029-DECISION-LOG"
+STRATEGIST_BUILD_ID = "S-ENGINE-030-RECOVERY-EXIT"
+SHADOW_BUILD_ID = "SH-ENGINE-030-RECOVERY-EXIT"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
-SHADOW_EXIT_MODE = "SHADOW_NET_PROFIT_EDGE_INIT_FIX_V5"
+SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -220,6 +220,8 @@ def api_build_info():
         "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
         "decision_log": "DECISION_LOG_V1",
         "outcome_tracking": "OUTCOME_TRACKING_V1",
+        "recovery_exit": "BREAK_EVEN_RECOVERY_EXIT_V1",
+        "recovery_exit_policy": "RESCUED_DEEP_LOSS_CAN_EXIT_NEAR_BREAKEVEN",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -246,6 +248,8 @@ def api_version():
         "promotion_policy": "AGGRESSIVE_RED_REQUIRES_RECOVERY_MOMENTUM",
         "decision_log": "DECISION_LOG_V1",
         "outcome_tracking": "OUTCOME_TRACKING_V1",
+        "recovery_exit": "BREAK_EVEN_RECOVERY_EXIT_V1",
+        "recovery_exit_policy": "RESCUED_DEEP_LOSS_CAN_EXIT_NEAR_BREAKEVEN",
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -13203,6 +13207,25 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["paper_mark_price"] = round(mark, 10)
         meta["paper_pnl_pct"] = round(drift_pct, 4)
         meta["paper_pnl_usd"] = round(pnl_usd, 4)
+
+        # ENGINE-030: track adverse excursion for Break-even Recovery Exit.
+        # If a slot was deeply negative and later recovers close to 0, Nexus may
+        # free the capital with a small controlled loss instead of waiting for a
+        # perfect profit and risking another drawdown.
+        try:
+            prev_worst_usd = meta.get("paper_worst_pnl_usd")
+            prev_worst_pct = meta.get("paper_worst_pnl_pct")
+            if prev_worst_usd is None:
+                prev_worst_usd = pnl_usd
+            if prev_worst_pct is None:
+                prev_worst_pct = drift_pct
+            meta["paper_worst_pnl_usd"] = round(min(float(prev_worst_usd), float(pnl_usd)), 4)
+            meta["paper_worst_pnl_pct"] = round(min(float(prev_worst_pct), float(drift_pct)), 4)
+            meta["paper_best_pnl_usd"] = round(max(float(meta.get("paper_best_pnl_usd", pnl_usd)), float(pnl_usd)), 4)
+            meta["paper_best_pnl_pct"] = round(max(float(meta.get("paper_best_pnl_pct", drift_pct)), float(drift_pct)), 4)
+        except Exception:
+            pass
+
         if force_exit:
             meta["paper_exit_price"] = round(mark, 10)
             cost = _nexus_shadow_cost_model(amount, item.get("chain") or meta.get("chain") or cfg.get("chain") or cfg.get("chain_key") or "", cfg)
@@ -13893,6 +13916,44 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         small_profit_pct = max(0.004, shadow_take_profit_pct * 0.05)
         has_gross_positive_edge = current_pnl_usd > 0 and current_pnl_pct > 0 and current_pnl_usd >= min_harvest_usd
         has_net_positive_edge = has_gross_positive_edge and net_if_closed_usd >= min_net_harvest_usd
+
+        # ENGINE-030: Break-even Recovery Exit V1.
+        # A rescued trade is different from a normal profit trade: if the slot was
+        # deeply negative and recovers into a small-loss / near-breakeven zone,
+        # freeing capital can be better than waiting and falling back into drawdown.
+        recovery_exit_enabled = str(os.getenv("NEXUS_RECOVERY_EXIT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        worst_pnl_usd = _clamp_float(meta_now.get("paper_worst_pnl_usd", current_pnl_usd), current_pnl_usd, -1_000_000_000, 1_000_000_000)
+        worst_pnl_pct = _clamp_float(meta_now.get("paper_worst_pnl_pct", current_pnl_pct), current_pnl_pct, -100, 100)
+        recovery_deep_loss_usd = max(10.0, amount * 0.008)       # 0.8% or at least $10 per slot
+        recovery_deep_loss_pct = 1.20                            # arm only after real drawdown
+        recovery_exit_loss_usd = max(10.0, min(20.0, amount * 0.008))
+        recovery_exit_loss_pct = 0.35
+        recovery_was_deep_negative = bool(worst_pnl_usd <= -recovery_deep_loss_usd or worst_pnl_pct <= -recovery_deep_loss_pct)
+        recovery_near_breakeven = bool(current_pnl_usd >= -recovery_exit_loss_usd and current_pnl_pct >= -recovery_exit_loss_pct)
+        recovery_still_negative_or_flat = bool(current_pnl_usd <= max(2.0, amount * 0.001))
+        # Do not force a rescued exit immediately on the first bounce. Give the slot
+        # at least a few minutes to recover, but do not require net-positive costs.
+        recovery_min_hold_ok = elapsed >= max(180, min_hold_min * 60)
+        # If momentum/quality is still excellent in a green market, let normal profit
+        # exits handle it. If quality is fading or market is not strong, rescue exit can fire.
+        recovery_momentum_score_now = _clamp_float(row.get("recovery_momentum_score", meta_now.get("strategist_recovery_momentum_score", 0)), 0, 0, 100)
+        recovery_momentum_still_strong = bool(regime in ("GREEN", "STRONG_GREEN") and row["quality"] >= 70 and recovery_momentum_score_now >= 65 and current_pnl_usd > 0)
+        exit_due_to_break_even_recovery = bool(
+            recovery_exit_enabled
+            and recovery_was_deep_negative
+            and recovery_near_breakeven
+            and recovery_still_negative_or_flat
+            and recovery_min_hold_ok
+            and not recovery_momentum_still_strong
+            and not exit_due_to_hard_stop
+        )
+        meta_now["recovery_exit_mode"] = "BREAK_EVEN_RECOVERY_EXIT_V1"
+        meta_now["recovery_exit_armed"] = bool(recovery_was_deep_negative)
+        meta_now["recovery_exit_near_breakeven"] = bool(recovery_near_breakeven)
+        meta_now["recovery_exit_loss_usd"] = round(recovery_exit_loss_usd, 4)
+        meta_now["recovery_exit_worst_pnl_usd"] = round(worst_pnl_usd, 4)
+        meta_now["recovery_exit_worst_pnl_pct"] = round(worst_pnl_pct, 4)
+
         # ENGINE-025: define net-positive edge before every exit condition uses it.
         # ENGINE-023 evaluated the take-profit exit before this variable existed,
         # which raised UnboundLocalError and stalled Shadow decisions.
@@ -13921,7 +13982,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta_now["paper_estimated_exit_cost_usd_raw"] = round(estimated_exit_cost_usd_raw, 4)
         meta_now["paper_net_if_closed_usd"] = round(net_if_closed_usd, 4)
         meta_now["paper_min_net_harvest_usd"] = round(min_net_harvest_usd, 4)
-        meta_now["shadow_exit_guard_mode"] = "net_profit_after_costs_required_v4"
+        meta_now["shadow_exit_guard_mode"] = "net_profit_after_costs_or_break_even_recovery_v5"
         set_meta(item, meta_now)
 
         exit_reason = None
@@ -13931,6 +13992,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             exit_reason = "risk_exceeded"
         elif exit_due_to_hard_stop:
             exit_reason = "hard_stop"
+        elif exit_due_to_break_even_recovery:
+            exit_reason = "break_even_recovery_exit"
         elif exit_due_to_profit_lock:
             exit_reason = "user_profit_lock"
         elif exit_due_to_shadow_take_profit:
@@ -14407,7 +14470,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if old == "SIMULATED_EXIT":
             # Start a fresh paper position while keeping cumulative collected profit.
             realized_total = _clamp_float(meta.get("paper_realized_total_usd", meta.get("paper_collected_profit_usd", 0)), 0, -1_000_000_000, 1_000_000_000)
-            for k in ("paper_entry_price", "paper_entry_ts", "paper_mark_price", "paper_exit_price", "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd", "paper_cycle_realized_usd", "paper_gross_pnl_usd", "paper_net_pnl_usd"):
+            for k in ("paper_entry_price", "paper_entry_ts", "paper_mark_price", "paper_exit_price", "paper_pnl_pct", "paper_pnl_usd", "paper_pnl_total_usd", "paper_cycle_realized_usd", "paper_gross_pnl_usd", "paper_net_pnl_usd", "paper_worst_pnl_usd", "paper_worst_pnl_pct", "paper_best_pnl_usd", "paper_best_pnl_pct", "recovery_exit_armed", "recovery_exit_near_breakeven", "recovery_exit_worst_pnl_usd", "recovery_exit_worst_pnl_pct"):
                 meta.pop(k, None)
             meta["paper_realized_total_usd"] = realized_total
             meta["paper_collected_profit_usd"] = realized_total
