@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
-SHADOW_BUILD_ID = "SH-ENGINE-055-NKR-BACKEND-PERSISTENCE-LOCK"
+STRATEGIST_BUILD_ID = "S-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
+SHADOW_BUILD_ID = "SH-ENGINE-057-NKR-PORTFOLIO-ALLOCATION-LOCK"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -346,6 +346,8 @@ def api_build_info():
         "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
         "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
         "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
+        "nkr_portfolio_allocation": NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE,
+        "nkr_portfolio_policy": NEXUS_NKR_PORTFOLIO_POLICY,
         "withdraw_quote": NEXUS_WITHDRAW_QUOTE_MODE,
         "withdraw_quote_policy": NEXUS_WITHDRAW_QUOTE_POLICY,
         "withdraw_default_output_asset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
@@ -463,6 +465,8 @@ def api_version():
         "nkr_ui_default_observation_minutes": NEXUS_NKR_UI_DEFAULT_OBSERVATION_MINUTES,
         "nkr_ui_default_profit_mode": NEXUS_NKR_UI_DEFAULT_PROFIT_MODE,
         "nkr_ui_default_period_days": NEXUS_NKR_UI_DEFAULT_PERIOD_DAYS,
+        "nkr_portfolio_allocation": NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE,
+        "nkr_portfolio_policy": NEXUS_NKR_PORTFOLIO_POLICY,
         "withdraw_quote": NEXUS_WITHDRAW_QUOTE_MODE,
         "withdraw_quote_policy": NEXUS_WITHDRAW_QUOTE_POLICY,
         "withdraw_default_output_asset": NEXUS_WITHDRAW_DEFAULT_OUTPUT_ASSET,
@@ -26811,11 +26815,45 @@ def api_nexus_fee_policy():
     stable = str(request.args.get("feeStable") or request.args.get("fee_stable") or "").strip().upper()
     return jsonify({"status": "ok", "chain": chain, "feePolicy": _nexus_fee_preview(profit_usd, chain, stable), "ts": now_ts()})
 
+
+
+@app.route("/api/nkr/portfolio-policy", methods=["GET"])
+def api_nkr_portfolio_policy():
+    return jsonify({
+        "status": "ok",
+        "mode": NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE,
+        "policy": NEXUS_NKR_PORTFOLIO_POLICY,
+        "rules": {
+            "neverAllocateAllToOneAsset": True,
+            "minPortfolioSessionsWhenCandidatesAvailable": NEXUS_NKR_MIN_PORTFOLIO_SESSIONS,
+            "defaultMaxCapitalPerAssetPct": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
+            "cashReserveByModePct": {
+                "DYNAMIC": NEXUS_NKR_DYNAMIC_CASH_RESERVE_PCT,
+                "TACTICAL": NEXUS_NKR_TACTICAL_CASH_RESERVE_PCT,
+                "AGGRESSIVE": NEXUS_NKR_AGGRESSIVE_CASH_RESERVE_PCT,
+                "DEFENSIVE": NEXUS_NKR_DEFENSIVE_CASH_RESERVE_PCT,
+            },
+            "walletBound": True,
+            "deletedNeverReturns": True,
+            "liveExecution": False,
+            "vaultMutation": False,
+        },
+        "ts": now_ts(),
+    })
+
 # ============================================================================
 # ENGINE-055: NKR Backend Persistence Lock / Panic Control V1
 # ============================================================================
-NEXUS_NKR_BACKEND_PERSISTENCE_MODE = "NKR_BACKEND_PERSISTENCE_LOCK_V1"
+NEXUS_NKR_BACKEND_PERSISTENCE_MODE = "NKR_PORTFOLIO_BACKEND_ALLOCATION_LOCK_V1"
 NEXUS_NKR_PANIC_CONTROL_MODE = "NKR_AND_TRADER_PANIC_PROTECT_V1"
+NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE = "NKR_MULTI_SESSION_ALLOCATION_V1"
+NEXUS_NKR_PORTFOLIO_POLICY = "SPLIT_CAPITAL_ACROSS_BEST_TARGETS_WITH_STABLE_RESERVE_AND_PER_ASSET_CAP"
+NEXUS_NKR_MIN_PORTFOLIO_SESSIONS = 2
+NEXUS_NKR_DYNAMIC_CASH_RESERVE_PCT = 20
+NEXUS_NKR_TACTICAL_CASH_RESERVE_PCT = 25
+NEXUS_NKR_AGGRESSIVE_CASH_RESERVE_PCT = 10
+NEXUS_NKR_DEFENSIVE_CASH_RESERVE_PCT = 35
+
 
 
 def _nkr_is_session(sess: dict) -> bool:
