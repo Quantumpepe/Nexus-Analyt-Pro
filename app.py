@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-036-NKR-PAYOUT-REINVEST"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-037-NKR-PERIOD-OBSERVATION"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-036-NKR-PAYOUT-REINVEST"
-SHADOW_BUILD_ID = "SH-ENGINE-036-NKR-PAYOUT-REINVEST"
+STRATEGIST_BUILD_ID = "S-ENGINE-037-NKR-PERIOD-OBSERVATION"
+SHADOW_BUILD_ID = "SH-ENGINE-037-NKR-PERIOD-OBSERVATION"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -223,6 +223,12 @@ NEXUS_NKR_PAYOUT_MARKET_GUARD = "RED_MARKET_PAUSES_PAYOUT_GREEN_ALLOWS_HIGHER_PA
 NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_GREEN_PCT = 10
 NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_NEUTRAL_PCT = 5
 NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_RED_PCT = 0
+NEXUS_NKR_PERIOD_MODE = "NKR_PERIOD_OBSERVATION_V1"
+NEXUS_NKR_PERIOD_POLICY = "CAPITAL_ROUNDS_10D_20D_MONTHLY_WITH_WEEKLY_PAYOUT_AND_END_LOCK"
+NEXUS_NKR_DEFAULT_PERIOD_DAYS = 10
+NEXUS_NKR_PERIOD_OPTIONS_DAYS = [10, 20, 30]
+NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT = 85
+NEXUS_NKR_END_LOCK_POLICY = "NEAR_PERIOD_END_LOCK_PROFIT_TO_USDC_USDT_AND_REDUCE_NEW_RISK"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -280,6 +286,12 @@ def api_build_info():
         "nkr_default_profit_mode": NEXUS_NKR_DEFAULT_PROFIT_MODE,
         "nkr_payout_policy": NEXUS_NKR_PAYOUT_POLICY,
         "nkr_profit_basis": NEXUS_NKR_PROFIT_BASIS,
+        "nkr_period_observation": NEXUS_NKR_PERIOD_MODE,
+        "nkr_period_policy": NEXUS_NKR_PERIOD_POLICY,
+        "nkr_default_period_days": NEXUS_NKR_DEFAULT_PERIOD_DAYS,
+        "nkr_period_options_days": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
+        "nkr_profit_lock_window_pct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
+        "nkr_end_lock_policy": NEXUS_NKR_END_LOCK_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -334,6 +346,12 @@ def api_version():
         "nkr_default_profit_mode": NEXUS_NKR_DEFAULT_PROFIT_MODE,
         "nkr_payout_policy": NEXUS_NKR_PAYOUT_POLICY,
         "nkr_profit_basis": NEXUS_NKR_PROFIT_BASIS,
+        "nkr_period_observation": NEXUS_NKR_PERIOD_MODE,
+        "nkr_period_policy": NEXUS_NKR_PERIOD_POLICY,
+        "nkr_default_period_days": NEXUS_NKR_DEFAULT_PERIOD_DAYS,
+        "nkr_period_options_days": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
+        "nkr_profit_lock_window_pct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
+        "nkr_end_lock_policy": NEXUS_NKR_END_LOCK_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -1256,6 +1274,168 @@ def api_nexus_nkr_payout_decision():
         profit_mode=body.get("profitMode") or body.get("profit_mode") or request.args.get("profitMode") or NEXUS_NKR_DEFAULT_PROFIT_MODE,
         payout_pct=payout_pct,
         user_requested_payout=user_requested,
+    )
+    return jsonify({"status": "ok", "decision": decision})
+
+
+def _nkr_normalize_period_days(raw=None) -> int:
+    try:
+        val = int(float(raw))
+    except Exception:
+        val = int(NEXUS_NKR_DEFAULT_PERIOD_DAYS)
+    if val <= 10:
+        return 10
+    if val <= 20:
+        return 20
+    return 30
+
+
+def _nkr_weekly_payout_due(elapsed_days: float, last_payout_day: float = 0.0) -> bool:
+    elapsed = max(0.0, _safe_float(elapsed_days, 0.0))
+    last_day = max(0.0, _safe_float(last_payout_day, 0.0))
+    if elapsed < 7.0:
+        return False
+    return int(elapsed // 7) > int(last_day // 7)
+
+
+def _nkr_period_phase(elapsed_days: float, period_days: int) -> str:
+    elapsed = max(0.0, _safe_float(elapsed_days, 0.0))
+    total = max(1.0, float(period_days))
+    pct = (elapsed / total) * 100.0
+    if pct >= 100.0:
+        return "PERIOD_COMPLETE"
+    if pct >= float(NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT):
+        return "END_LOCK_WINDOW"
+    if pct >= 50.0:
+        return "ACTIVE_SECOND_HALF"
+    return "ACTIVE_FIRST_HALF"
+
+
+def _nkr_period_observation_decision(period_days: int = 10, elapsed_days: float = 0.0,
+                                     market_regime: str = "NEUTRAL", performance: str = "TACTICAL",
+                                     profit_usd: float = 0.0, working_capital_usd: float = 0.0,
+                                     base_capital_usd: float = 0.0, last_payout_day: float = 0.0,
+                                     profit_mode: str = "REINVEST") -> dict:
+    days = _nkr_normalize_period_days(period_days)
+    elapsed = max(0.0, _safe_float(elapsed_days, 0.0))
+    rg = _nkr_normalize_regime(market_regime)
+    mode = _nkr_normalize_performance_mode(performance)
+    profit = max(0.0, _safe_float(profit_usd, 0.0))
+    working = max(0.0, _safe_float(working_capital_usd, 0.0))
+    base_cap = max(0.0, _safe_float(base_capital_usd, 0.0))
+    phase = _nkr_period_phase(elapsed, days)
+    progress_pct = _nkr_clamp_pct((elapsed / max(1.0, float(days))) * 100.0, 0.0, 100.0)
+    payout_due = _nkr_weekly_payout_due(elapsed, last_payout_day)
+
+    period_complete = phase == "PERIOD_COMPLETE"
+    end_lock_window = phase in ("END_LOCK_WINDOW", "PERIOD_COMPLETE")
+    profit_lock_active = bool((end_lock_window and profit > 0) or rg == "RED")
+
+    new_entries_allowed = True
+    risk_posture = "NORMAL"
+    action = "CONTINUE_PERIOD"
+    reason = "period_active"
+
+    if period_complete:
+        new_entries_allowed = False
+        risk_posture = "LOCK_AND_ROLLOVER"
+        action = "COMPLETE_PERIOD_LOCK_RESULT"
+        reason = "period_duration_finished"
+    elif rg == "RED":
+        new_entries_allowed = False if mode != "AGGRESSIVE" else True
+        risk_posture = "PROTECT_CAPITAL_RED_MARKET"
+        action = "HOLD_STABLE_AND_WAIT_FOR_RECOVERY"
+        reason = "red_market_period_guard"
+    elif end_lock_window and profit > 0:
+        new_entries_allowed = mode == "AGGRESSIVE" and rg == "GREEN"
+        risk_posture = "PROFIT_LOCK"
+        action = "LOCK_PROFIT_REDUCE_NEW_RISK"
+        reason = "near_period_end_profit_lock"
+    elif phase == "ACTIVE_SECOND_HALF" and profit > 0 and rg == "GREEN":
+        risk_posture = "CONTROLLED_GROWTH"
+        action = "CONTINUE_WITH_PARTIAL_PROFIT_PROTECTION"
+        reason = "second_half_green_profit_available"
+
+    payout_decision = _nkr_payout_reinvest_decision(
+        profit_usd=profit,
+        working_capital_usd=working,
+        base_capital_usd=base_cap,
+        market_regime=rg,
+        performance=mode,
+        profit_mode=profit_mode,
+        payout_pct=None,
+        user_requested_payout=False,
+    )
+
+    return {
+        "mode": NEXUS_NKR_PERIOD_MODE,
+        "policy": NEXUS_NKR_PERIOD_POLICY,
+        "periodDays": days,
+        "elapsedDays": round(elapsed, 4),
+        "progressPct": round(progress_pct, 4),
+        "phase": phase,
+        "marketRegime": rg,
+        "performance": mode,
+        "profitUsd": round(profit, 2),
+        "workingCapitalUsd": round(working, 2),
+        "baseCapitalUsd": round(base_cap, 2),
+        "weeklyPayoutDue": bool(payout_due),
+        "periodComplete": bool(period_complete),
+        "endLockWindow": bool(end_lock_window),
+        "profitLockActive": bool(profit_lock_active),
+        "newEntriesAllowed": bool(new_entries_allowed),
+        "riskPosture": risk_posture,
+        "recommendedAction": action,
+        "reason": reason,
+        "payoutPreview": payout_decision,
+        "defaultCapitalState": NEXUS_DEFAULT_CAPITAL_STATE,
+        "endLockPolicy": NEXUS_NKR_END_LOCK_POLICY,
+        "executionEnabled": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nkr_period_policy() -> dict:
+    return {
+        "mode": NEXUS_NKR_PERIOD_MODE,
+        "policy": NEXUS_NKR_PERIOD_POLICY,
+        "defaultPeriodDays": NEXUS_NKR_DEFAULT_PERIOD_DAYS,
+        "periodOptionsDays": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
+        "profitLockWindowPct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
+        "endLockPolicy": NEXUS_NKR_END_LOCK_POLICY,
+        "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
+        "rules": [
+            "NKR can run capital rounds over 10 days, 20 days, or monthly periods.",
+            "Weekly payout checks are policy-only and use the NKR payout/reinvest rules.",
+            "Near the end of a profitable period, NKR should reduce new risk and lock profit to USDC/USDT.",
+            "In RED market, automatic payout and new risk are reduced or paused unless user explicitly requests action.",
+            "At period end, NKR prepares lock/rollover recommendations only; it does not move Vault funds.",
+        ],
+        "liveExecution": False,
+        "vaultMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/nkr-period-policy")
+def api_nexus_nkr_period_policy():
+    return jsonify({"status": "ok", **_nkr_period_policy()})
+
+
+@app.post("/api/nexus/nkr-period-decision")
+def api_nexus_nkr_period_decision():
+    body = request.get_json(silent=True) or {}
+    decision = _nkr_period_observation_decision(
+        period_days=body.get("periodDays") or body.get("period_days") or request.args.get("periodDays") or NEXUS_NKR_DEFAULT_PERIOD_DAYS,
+        elapsed_days=body.get("elapsedDays") or body.get("elapsed_days") or request.args.get("elapsedDays") or 0,
+        market_regime=body.get("marketRegime") or body.get("market_regime") or request.args.get("marketRegime") or "NEUTRAL",
+        performance=body.get("performance") or body.get("performanceMode") or request.args.get("performance") or "TACTICAL",
+        profit_usd=body.get("profitUsd") or body.get("profit_usd") or request.args.get("profitUsd") or 0,
+        working_capital_usd=body.get("workingCapitalUsd") or body.get("working_capital_usd") or request.args.get("workingCapitalUsd") or 0,
+        base_capital_usd=body.get("baseCapitalUsd") or body.get("base_capital_usd") or request.args.get("baseCapitalUsd") or 0,
+        last_payout_day=body.get("lastPayoutDay") or body.get("last_payout_day") or request.args.get("lastPayoutDay") or 0,
+        profit_mode=body.get("profitMode") or body.get("profit_mode") or request.args.get("profitMode") or NEXUS_NKR_DEFAULT_PROFIT_MODE,
     )
     return jsonify({"status": "ok", "decision": decision})
 
