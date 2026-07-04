@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-042-SHADOW-READINESS"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-043-SYSTEM-INFO-STATUS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-042-SHADOW-READINESS"
-SHADOW_BUILD_ID = "SH-ENGINE-042-SHADOW-READINESS"
+STRATEGIST_BUILD_ID = "S-ENGINE-043-SYSTEM-INFO-STATUS"
+SHADOW_BUILD_ID = "SH-ENGINE-043-SYSTEM-INFO-STATUS"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -270,6 +270,11 @@ NEXUS_SHADOW_READINESS_POLICY = "VERIFY_MODULE_STATUS_BEFORE_BIG_SHADOW_TEST"
 NEXUS_SHADOW_READINESS_STATUS = "SHADOW_TEST_ALLOWED_PREVIEW_ONLY_MODULES_LOCKED"
 NEXUS_SHADOW_READINESS_LIVE_EXECUTION = "DISABLED"
 NEXUS_SHADOW_READINESS_REQUIRED_MODULES = ["TRADING_LOGIC", "DECISION_LOG", "RECOVERY_EXIT", "STABLE_CAPITAL", "ASSET_ROUTER", "NKR_WATCHLIST", "NKR_CAPITAL_MANAGER", "NKR_RULES", "NKR_PAYOUT", "NKR_PERIOD", "NKR_UI_CONTRACT", "WITHDRAW_QUOTE", "VAULT_CORE_PREP", "ENGINE_BOUNDARY"]
+NEXUS_SYSTEM_INFO_STATUS_MODE = "SYSTEM_INFO_STATUS_PANEL_V1"
+NEXUS_SYSTEM_INFO_STATUS_POLICY = "OWNER_SYSTEM_INFO_WINDOW_SHOWS_RUNNING_READY_PREVIEW_PREP_AND_BLOCKED_MODULES"
+NEXUS_SYSTEM_INFO_VISIBILITY = "OWNER_ADMIN_SYSTEM_INFO_ONLY_NOT_NORMAL_USER_UI"
+NEXUS_SYSTEM_INFO_SECTIONS = ["BUILD_PROOF", "ENGINE_MODES", "SHADOW_RUNTIME_HEALTH", "MODULE_STATUS", "SHADOW_READINESS", "LIVE_EXECUTION_GUARDS"]
+NEXUS_SYSTEM_INFO_NORMAL_UI_POLICY = "NORMAL_UI_SHOWS_ONLY_USER_CONTROLS_NOT_INTERNAL_ENGINE_FLAGS"
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -375,6 +380,11 @@ def api_build_info():
         "shadow_readiness_status": NEXUS_SHADOW_READINESS_STATUS,
         "shadow_readiness_live_execution": NEXUS_SHADOW_READINESS_LIVE_EXECUTION,
         "shadow_readiness_required_modules": NEXUS_SHADOW_READINESS_REQUIRED_MODULES,
+        "system_info_status_panel": NEXUS_SYSTEM_INFO_STATUS_MODE,
+        "system_info_status_policy": NEXUS_SYSTEM_INFO_STATUS_POLICY,
+        "system_info_visibility": NEXUS_SYSTEM_INFO_VISIBILITY,
+        "system_info_sections": NEXUS_SYSTEM_INFO_SECTIONS,
+        "system_info_normal_ui_policy": NEXUS_SYSTEM_INFO_NORMAL_UI_POLICY,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -24597,6 +24607,84 @@ def api_nexus_system_module_status():
 def api_nexus_shadow_readiness_check():
     body = request.get_json(silent=True) or {}
     return jsonify(_nexus_shadow_readiness_check(body))
+
+
+# ENGINE-043: System Info Status Panel V1
+# Owner/admin System Info contract for showing what is running, ready, preview-only,
+# prep-only, disabled, or blocked. This keeps internal technical state inside the
+# System Info window and out of the normal user UI.
+def _nexus_status_badge(status: str) -> dict:
+    raw = str(status or "unknown").strip().lower()
+    if raw == "ready":
+        return {"label": "READY", "severity": "ok", "running": True}
+    if raw == "ready_preview":
+        return {"label": "READY / PREVIEW", "severity": "info", "running": True}
+    if raw == "prep_only":
+        return {"label": "PREP ONLY", "severity": "warn", "running": False}
+    if raw in ("disabled", "blocked", "not_ready"):
+        return {"label": raw.upper(), "severity": "danger", "running": False}
+    return {"label": raw.upper() if raw else "UNKNOWN", "severity": "neutral", "running": False}
+
+
+def _nexus_system_info_status_panel() -> dict:
+    modules = _nexus_shadow_readiness_modules()
+    rows = []
+    for m in modules:
+        badge = _nexus_status_badge(m.get("status"))
+        rows.append({
+            "module": m.get("id"),
+            "mode": m.get("mode"),
+            "status": m.get("status"),
+            "badge": badge["label"],
+            "severity": badge["severity"],
+            "running": badge["running"],
+            "liveExecution": bool(m.get("liveExecution")),
+            "notes": m.get("notes"),
+        })
+    live_enabled = any(bool(r.get("liveExecution")) for r in rows)
+    prep_only = [r for r in rows if r.get("status") == "prep_only"]
+    preview_only = [r for r in rows if r.get("status") == "ready_preview"]
+    ready = [r for r in rows if r.get("status") == "ready"]
+    return {
+        "status": "ok",
+        "mode": NEXUS_SYSTEM_INFO_STATUS_MODE,
+        "policy": NEXUS_SYSTEM_INFO_STATUS_POLICY,
+        "visibility": NEXUS_SYSTEM_INFO_VISIBILITY,
+        "normalUiPolicy": NEXUS_SYSTEM_INFO_NORMAL_UI_POLICY,
+        "sections": NEXUS_SYSTEM_INFO_SECTIONS,
+        "summary": {
+            "overall": "shadow_ready_live_disabled" if not live_enabled else "blocked_live_execution_detected",
+            "liveExecution": "DISABLED" if not live_enabled else "ENABLED_BLOCKED",
+            "modulesTotal": len(rows),
+            "ready": len(ready),
+            "previewOnly": len(preview_only),
+            "prepOnly": len(prep_only),
+            "blocked": 0 if not live_enabled else 1,
+        },
+        "displayGroups": [
+            {"title": "Running / Ready", "items": ready},
+            {"title": "Preview Only", "items": preview_only},
+            {"title": "Prep Only / Not Live", "items": prep_only},
+            {"title": "Live Execution Guards", "items": [
+                {"module": "LIVE_EXECUTION", "badge": "DISABLED", "severity": "ok", "running": False, "notes": "No live trades, no vault mutation, no private keys, no on-chain send."},
+                {"module": "VAULT_MUTATION", "badge": "DISABLED", "severity": "ok", "running": False, "notes": NEXUS_VAULT_EXECUTION_STATUS},
+                {"module": "WITHDRAW_EXECUTION", "badge": "PREVIEW ONLY", "severity": "warn", "running": False, "notes": NEXUS_WITHDRAW_EXECUTION_STATUS},
+            ]},
+        ],
+        "rawModules": rows,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+@app.get("/api/nexus/system-info-status-panel")
+def api_nexus_system_info_status_panel():
+    return jsonify(_nexus_system_info_status_panel())
+
+
+@app.get("/api/nexus/system-info-owner-panel")
+def api_nexus_system_info_owner_panel():
+    return jsonify(_nexus_system_info_status_panel())
 
 if __name__ == "__main__":
 
