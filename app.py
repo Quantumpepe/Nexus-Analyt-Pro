@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-039-WITHDRAW-QUOTE"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-040-VAULT-CORE-PREP"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-039-WITHDRAW-QUOTE"
-SHADOW_BUILD_ID = "SH-ENGINE-039-WITHDRAW-QUOTE"
+STRATEGIST_BUILD_ID = "S-ENGINE-040-VAULT-CORE-PREP"
+SHADOW_BUILD_ID = "SH-ENGINE-040-VAULT-CORE-PREP"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -247,6 +247,18 @@ NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD = 25.0
 NEXUS_WITHDRAW_ROUTING_BUFFER_DEFAULT_PCT = 0.20
 NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY = "UNUSED_BUFFER_RETURNS_TO_USER_STABLE_BALANCE"
 NEXUS_WITHDRAW_EXECUTION_STATUS = "PREVIEW_ONLY_NO_VAULT_MUTATION"
+NEXUS_VAULT_CORE_MODE = "VAULT_CORE_PREP_V1"
+NEXUS_VAULT_CORE_POLICY = "VALIDATE_CHAIN_TOKEN_ROUTE_LIMITS_BEFORE_ANY_LIVE_MUTATION"
+NEXUS_VAULT_EXECUTION_STATUS = "PREP_ONLY_NO_PRIVATE_KEY_NO_SIGNING_NO_ONCHAIN_SEND"
+NEXUS_VAULT_DEFAULT_BASE_ASSET = "USDC_USDT"
+NEXUS_VAULT_CORE_CHAIN = "ETH"
+NEXUS_VAULT_ALLOWED_CHAINS = ["ETH", "BNB", "POL"]
+NEXUS_VAULT_ALLOWED_STABLES = ["USDC", "USDT"]
+NEXUS_VAULT_ALLOWED_USER_ASSETS = ["ETH", "BNB", "POL", "BTC", "SOL", "XRP", "USDC", "USDT"]
+NEXUS_VAULT_SECURITY_MODULES = ["CHAIN_ALLOWLIST", "TOKEN_ALLOWLIST", "ROUTE_ALLOWLIST", "SPEND_LIMITS", "EMERGENCY_STOP", "NET_FIRST_WITHDRAW_QUOTE"]
+NEXUS_VAULT_EMERGENCY_STOP_DEFAULT = False
+NEXUS_VAULT_MAX_DAILY_WITHDRAW_USD_PREVIEW = 25000.0
+NEXUS_VAULT_MAX_SINGLE_TX_USD_PREVIEW = 10000.0
 
 # ENGINE-010: in-process tick proof. DB-derived /api/shadow/health is authoritative,
 # these globals are a fallback and a fast proof that a runtime cycle touched this worker.
@@ -327,6 +339,15 @@ def api_build_info():
         "withdraw_routing_buffer_max_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD,
         "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
         "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
+        "vault_core": NEXUS_VAULT_CORE_MODE,
+        "vault_core_policy": NEXUS_VAULT_CORE_POLICY,
+        "vault_execution_status": NEXUS_VAULT_EXECUTION_STATUS,
+        "vault_core_chain": NEXUS_VAULT_CORE_CHAIN,
+        "vault_allowed_chains": NEXUS_VAULT_ALLOWED_CHAINS,
+        "vault_allowed_stables": NEXUS_VAULT_ALLOWED_STABLES,
+        "vault_allowed_user_assets": NEXUS_VAULT_ALLOWED_USER_ASSETS,
+        "vault_security_modules": NEXUS_VAULT_SECURITY_MODULES,
+        "vault_emergency_stop_default": NEXUS_VAULT_EMERGENCY_STOP_DEFAULT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -404,6 +425,15 @@ def api_version():
         "withdraw_routing_buffer_max_usd": NEXUS_WITHDRAW_ROUTING_BUFFER_MAX_USD,
         "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
         "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
+        "vault_core": NEXUS_VAULT_CORE_MODE,
+        "vault_core_policy": NEXUS_VAULT_CORE_POLICY,
+        "vault_execution_status": NEXUS_VAULT_EXECUTION_STATUS,
+        "vault_core_chain": NEXUS_VAULT_CORE_CHAIN,
+        "vault_allowed_chains": NEXUS_VAULT_ALLOWED_CHAINS,
+        "vault_allowed_stables": NEXUS_VAULT_ALLOWED_STABLES,
+        "vault_allowed_user_assets": NEXUS_VAULT_ALLOWED_USER_ASSETS,
+        "vault_security_modules": NEXUS_VAULT_SECURITY_MODULES,
+        "vault_emergency_stop_default": NEXUS_VAULT_EMERGENCY_STOP_DEFAULT,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -1846,6 +1876,123 @@ def api_nexus_withdraw_quote_policy():
 def api_nexus_withdraw_quote_preview():
     body = request.get_json(silent=True) or {}
     return jsonify({"status": "ok", "quote": _nexus_withdraw_quote_preview(body)})
+
+
+# -------------------------
+# ENGINE-040: Vault Core Prep V1
+# -------------------------
+def _nexus_vault_core_policy() -> dict:
+    """Vault-readiness contract for later live execution.
+
+    This endpoint documents and previews the security checks that must pass
+    before any future Vault mutation. It does not hold keys, sign transactions,
+    approve allowances, swap, bridge, or send funds.
+    """
+    return {
+        "mode": NEXUS_VAULT_CORE_MODE,
+        "policy": NEXUS_VAULT_CORE_POLICY,
+        "executionStatus": NEXUS_VAULT_EXECUTION_STATUS,
+        "coreChain": NEXUS_VAULT_CORE_CHAIN,
+        "defaultBaseAsset": NEXUS_VAULT_DEFAULT_BASE_ASSET,
+        "allowedChains": list(NEXUS_VAULT_ALLOWED_CHAINS),
+        "allowedStables": list(NEXUS_VAULT_ALLOWED_STABLES),
+        "allowedUserAssets": list(NEXUS_VAULT_ALLOWED_USER_ASSETS),
+        "securityModules": list(NEXUS_VAULT_SECURITY_MODULES),
+        "limitsPreview": {
+            "maxSingleTxUsd": NEXUS_VAULT_MAX_SINGLE_TX_USD_PREVIEW,
+            "maxDailyWithdrawUsd": NEXUS_VAULT_MAX_DAILY_WITHDRAW_USD_PREVIEW,
+        },
+        "requiredBeforeLive": [
+            "Vault address binding per user session.",
+            "Chain allowlist validation.",
+            "Token allowlist validation.",
+            "Router/route allowlist validation.",
+            "Withdraw quote net-first preview accepted by user.",
+            "Spend-limit and daily-limit checks.",
+            "Emergency stop check.",
+            "Audit log entry before and after execution.",
+        ],
+        "privateKeyHandling": "NOT_PRESENT_IN_BACKEND_PREP",
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+def _nexus_normalize_vault_chain(chain) -> str:
+    c = str(chain or NEXUS_VAULT_CORE_CHAIN).strip().upper().replace(" ", "_").replace("-", "_")
+    if c in {"ETH", "ETHEREUM", "ERC20"}:
+        return "ETH"
+    if c in {"BNB", "BSC", "BEP20"}:
+        return "BNB"
+    if c in {"POL", "POLYGON", "MATIC"}:
+        return "POL"
+    return c[:24] or NEXUS_VAULT_CORE_CHAIN
+
+
+def _nexus_vault_asset_is_allowed(asset: str) -> bool:
+    a = _nexus_normalize_withdraw_asset(asset)
+    return a in set(NEXUS_VAULT_ALLOWED_USER_ASSETS) or a == "USDC_USDT"
+
+
+def _nexus_vault_validation_preview(body: dict) -> dict:
+    action = str(body.get("action") or body.get("type") or "WITHDRAW_PREVIEW").strip().upper()
+    chain = _nexus_normalize_vault_chain(body.get("chain") or body.get("targetChain") or body.get("target_chain"))
+    asset = _nexus_normalize_withdraw_asset(body.get("asset") or body.get("outputAsset") or body.get("output_asset") or NEXUS_VAULT_DEFAULT_BASE_ASSET)
+    amount_usd = _safe_float(body.get("amountUsd") or body.get("amount_usd") or body.get("grossUsd") or body.get("gross_usd"), 0.0)
+    route = str(body.get("route") or body.get("router") or "APPROVED_ROUTE_PREVIEW").strip().upper()[:80]
+    user_confirmed_quote = bool(body.get("userConfirmedQuote") or body.get("user_confirmed_quote") or False)
+    emergency_stop = bool(body.get("emergencyStop") if "emergencyStop" in body else NEXUS_VAULT_EMERGENCY_STOP_DEFAULT)
+
+    checks = []
+    def add_check(name, passed, detail):
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
+
+    add_check("emergency_stop", not emergency_stop, "Vault execution blocked when emergency stop is active.")
+    add_check("chain_allowlist", chain in set(NEXUS_VAULT_ALLOWED_CHAINS), f"Allowed chains: {', '.join(NEXUS_VAULT_ALLOWED_CHAINS)}")
+    add_check("asset_allowlist", _nexus_vault_asset_is_allowed(asset), f"Allowed user assets: {', '.join(NEXUS_VAULT_ALLOWED_USER_ASSETS)}")
+    add_check("amount_positive", amount_usd > 0, "Amount must be greater than zero for a future Vault action.")
+    add_check("single_tx_limit", amount_usd <= NEXUS_VAULT_MAX_SINGLE_TX_USD_PREVIEW, f"Preview single transaction limit: {NEXUS_VAULT_MAX_SINGLE_TX_USD_PREVIEW:.2f} USD")
+    add_check("net_first_quote", user_confirmed_quote or action in {"POLICY", "PREVIEW", "VAULT_PREP"}, "Future live withdraw requires accepted net-first quote.")
+    add_check("route_allowlist", bool(route), "Route/router must be present and later mapped to approved router allowlist.")
+    add_check("private_key_not_backend", True, "Backend prep does not store private keys or sign transactions.")
+
+    passed = all(c["passed"] for c in checks)
+    warnings = []
+    if action in {"SEND", "SWAP", "BRIDGE", "APPROVE", "WITHDRAW"}:
+        warnings.append("Requested action is treated as validation preview only; no live mutation is available in ENGINE-040.")
+    if asset in {"BTC", "SOL", "XRP"}:
+        warnings.append("User-facing asset may require internal approved EVM route later; no route execution here.")
+    return {
+        "mode": NEXUS_VAULT_CORE_MODE,
+        "policy": NEXUS_VAULT_CORE_POLICY,
+        "action": action,
+        "chain": chain,
+        "asset": asset,
+        "amountUsd": round(amount_usd, 6),
+        "route": route,
+        "passed": passed,
+        "checks": checks,
+        "warnings": warnings,
+        "executionStatus": NEXUS_VAULT_EXECUTION_STATUS,
+        "previewOnly": True,
+        "liveExecution": False,
+        "vaultMutation": False,
+        "tradingMutation": False,
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/nexus/vault-core-policy")
+def api_nexus_vault_core_policy():
+    return jsonify({"status": "ok", **_nexus_vault_core_policy()})
+
+
+@app.post("/api/nexus/vault-validation-preview")
+def api_nexus_vault_validation_preview():
+    body = request.get_json(silent=True) or {}
+    return jsonify({"status": "ok", "validation": _nexus_vault_validation_preview(body)})
 
 
 import traceback
