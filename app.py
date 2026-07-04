@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-046-SHADOW-TEST-CONTROLLER"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-047-SHADOW-TEST-REPORT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-046-SHADOW-TEST-CONTROLLER"
-SHADOW_BUILD_ID = "SH-ENGINE-046-SHADOW-TEST-CONTROLLER"
+STRATEGIST_BUILD_ID = "S-ENGINE-047-SHADOW-TEST-REPORT"
+SHADOW_BUILD_ID = "SH-ENGINE-047-SHADOW-TEST-REPORT"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -387,6 +387,14 @@ def api_build_info():
         "system_info_visibility": NEXUS_SYSTEM_INFO_VISIBILITY,
         "system_info_sections": NEXUS_SYSTEM_INFO_SECTIONS,
         "system_info_normal_ui_policy": NEXUS_SYSTEM_INFO_NORMAL_UI_POLICY,
+        "shadow_test_controller": NEXUS_SHADOW_TEST_CONTROLLER_MODE,
+        "shadow_test_report": NEXUS_SHADOW_TEST_REPORT_MODE,
+        "shadow_test_report_policy": NEXUS_SHADOW_TEST_REPORT_POLICY,
+        "shadow_test_result_states": NEXUS_SHADOW_TEST_RESULT_STATES,
+        "shadow_test_controller": NEXUS_SHADOW_TEST_CONTROLLER_MODE,
+        "shadow_test_report": NEXUS_SHADOW_TEST_REPORT_MODE,
+        "shadow_test_report_policy": NEXUS_SHADOW_TEST_REPORT_POLICY,
+        "shadow_test_result_states": NEXUS_SHADOW_TEST_RESULT_STATES,
         "aggressive_risk_mode": "LEGACY_PROTECTION",
         "aggressive_max_trades": "NO_LIMIT",
         "aggressive_ack_audit": "WALLET_SESSION_AUDIT_V1",
@@ -24906,6 +24914,184 @@ def api_nexus_shadow_test_plan():
     else:
         body = request.get_json(silent=True) or {}
     return jsonify(_shadow_test_controller_plan(body))
+
+
+# ENGINE-047: Shadow Test Report / Result Tracker V1
+# Safe reporting layer for the next 10-day session/shadow test. It summarizes
+# runtime, capital, NKR/trading modes, realized/unrealized result placeholders,
+# recovery events, break-even exits, guards, blockers and final PASS/WATCH/FAIL.
+# It never starts live execution and never mutates vault state.
+NEXUS_SHADOW_TEST_REPORT_MODE = "NEXUS_SHADOW_TEST_REPORT_TRACKER_V1"
+NEXUS_SHADOW_TEST_REPORT_POLICY = "REPORT_ONLY_RESULT_TRACKING_FOR_CONTROLLED_SHADOW_TEST"
+NEXUS_SHADOW_TEST_REPORT_EXECUTION = "READ_ONLY_NO_LIVE_EXECUTION"
+NEXUS_SHADOW_TEST_RESULT_STATES = ["PASS", "WATCH", "FAIL", "RUNNING", "NOT_STARTED"]
+NEXUS_SHADOW_TEST_DEFAULT_REPORT_DAYS = 10
+
+
+def _shadow_test_report_policy():
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_TEST_REPORT_MODE,
+        "policy": NEXUS_SHADOW_TEST_REPORT_POLICY,
+        "execution": NEXUS_SHADOW_TEST_REPORT_EXECUTION,
+        "defaultRuntimeDays": NEXUS_SHADOW_TEST_DEFAULT_REPORT_DAYS,
+        "resultStates": NEXUS_SHADOW_TEST_RESULT_STATES,
+        "trackedFields": [
+            "startCapitalUsd", "runtimeDays", "assets", "nkrMode", "tradingMode",
+            "realizedProfitUsd", "unrealizedProfitUsd", "openPositionsUsd",
+            "recoveryCases", "breakEvenExits", "guardBlocks", "errors", "finalStatus",
+        ],
+        "hardGuards": {
+            "liveExecution": False,
+            "vaultMutation": False,
+            "withdrawExecution": False,
+            "privateKeysInBackend": False,
+        },
+        "visibleIn": "SYSTEM_INFO_OWNER_PANEL_AND_TEST_REPORT",
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _shadow_test_result_grade(realized_profit, unrealized_profit, errors, guard_blocks, runtime_pct):
+    realized = _safe_float(realized_profit)
+    unrealized = _safe_float(unrealized_profit)
+    err_count = len(errors or [])
+    guard_count = len(guard_blocks or [])
+    progress = _safe_float(runtime_pct)
+    if progress <= 0:
+        return "NOT_STARTED"
+    if err_count >= 3:
+        return "FAIL"
+    if realized < 0 and unrealized < 0:
+        return "WATCH"
+    if guard_count >= 10 and realized <= 0:
+        return "WATCH"
+    if progress >= 95 and realized > 0 and err_count == 0:
+        return "PASS"
+    return "RUNNING"
+
+
+def _shadow_test_report_summary(body=None):
+    body = body if isinstance(body, dict) else {}
+    runtime_days = _shadow_test_clean_days(body.get("runtimeDays") or body.get("testDays") or NEXUS_SHADOW_TEST_DEFAULT_REPORT_DAYS)
+    start_capital = _safe_float(body.get("startCapitalUsd") or body.get("capitalUsd") or body.get("capital") or 0)
+    realized_profit = _safe_float(body.get("realizedProfitUsd") or body.get("profitUsd") or body.get("realized") or 0)
+    unrealized_profit = _safe_float(body.get("unrealizedProfitUsd") or body.get("openPnlUsd") or body.get("unrealized") or 0)
+    open_positions = _safe_float(body.get("openPositionsUsd") or body.get("openCapitalUsd") or 0)
+    elapsed_days = _safe_float(body.get("elapsedDays") or body.get("daysElapsed") or 0)
+    runtime_pct = 0 if runtime_days <= 0 else max(0, min(100, (elapsed_days / runtime_days) * 100))
+    assets = _shadow_test_clean_assets(body.get("assets") or body.get("symbols") or NEXUS_SHADOW_TEST_DEFAULT_ASSETS)
+    nkr_mode = _shadow_test_clean_mode(body.get("nkrMode") or body.get("nkr_mode"), NEXUS_SHADOW_TEST_DEFAULT_NKR_MODE)
+    trading_mode = _shadow_test_clean_mode(body.get("tradingMode") or body.get("trading_mode") or body.get("performanceMode"), NEXUS_SHADOW_TEST_DEFAULT_TRADING_MODE)
+    recovery_cases = int(_safe_float(body.get("recoveryCases") or body.get("recovery_cases") or 0))
+    break_even_exits = int(_safe_float(body.get("breakEvenExits") or body.get("break_even_exits") or 0))
+    guard_blocks = body.get("guardBlocks") or body.get("guard_blocks") or []
+    if isinstance(guard_blocks, str):
+        guard_blocks = [x.strip() for x in guard_blocks.split(",") if x.strip()]
+    if not isinstance(guard_blocks, list):
+        guard_blocks = []
+    errors = body.get("errors") or []
+    if isinstance(errors, str):
+        errors = [x.strip() for x in errors.split(",") if x.strip()]
+    if not isinstance(errors, list):
+        errors = []
+    final_status = _shadow_test_result_grade(realized_profit, unrealized_profit, errors, guard_blocks, runtime_pct)
+    total_pnl = realized_profit + unrealized_profit
+    roi_pct = (total_pnl / start_capital * 100) if start_capital > 0 else 0
+    readiness = _shadow_test_controller_status({
+        "testDays": runtime_days,
+        "capitalUsd": start_capital,
+        "assets": assets,
+        "nkrMode": nkr_mode,
+        "tradingMode": trading_mode,
+    })
+    return {
+        "status": "ok",
+        "mode": NEXUS_SHADOW_TEST_REPORT_MODE,
+        "reportType": "SHADOW_TEST_RESULT_TRACKER",
+        "finalStatus": final_status,
+        "shadowTestAllowed": bool(readiness.get("shadowTestAllowed")),
+        "liveExecution": False,
+        "vault": "PREP_ONLY",
+        "withdraw": "PREVIEW_ONLY",
+        "privateKeys": "NOT_IN_BACKEND",
+        "runtime": {
+            "runtimeDays": runtime_days,
+            "elapsedDays": round(elapsed_days, 4),
+            "runtimePct": round(runtime_pct, 2),
+            "phase": "not_started" if runtime_pct <= 0 else ("end_lock_review" if runtime_pct >= 75 else "running"),
+        },
+        "configuration": {
+            "assets": assets,
+            "nkrMode": nkr_mode,
+            "tradingMode": trading_mode,
+            "startCapitalUsd": round(start_capital, 2),
+        },
+        "performance": {
+            "realizedProfitUsd": round(realized_profit, 2),
+            "unrealizedProfitUsd": round(unrealized_profit, 2),
+            "totalPnlUsd": round(total_pnl, 2),
+            "roiPct": round(roi_pct, 4),
+            "openPositionsUsd": round(open_positions, 2),
+        },
+        "events": {
+            "recoveryCases": recovery_cases,
+            "breakEvenExits": break_even_exits,
+            "guardBlocks": guard_blocks,
+            "errors": errors,
+        },
+        "evaluationRules": {
+            "PASS": "Runtime near complete, positive realized result, no errors.",
+            "WATCH": "Negative combined result, repeated guards, or incomplete risk/recovery picture.",
+            "FAIL": "Repeated backend/runtime errors or unsafe live/vault state detected.",
+            "RUNNING": "Test is active or incomplete; keep observing.",
+        },
+        "readinessPreview": readiness,
+        "build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    }
+
+
+def _shadow_test_report_template():
+    return _shadow_test_report_summary({
+        "runtimeDays": 10,
+        "elapsedDays": 0,
+        "capitalUsd": 0,
+        "assets": ["ETH", "BNB", "POL"],
+        "nkrMode": "DYNAMIC",
+        "tradingMode": "TACTICAL",
+    })
+
+
+@app.get("/api/nexus/shadow-test-report-policy")
+def api_nexus_shadow_test_report_policy():
+    return jsonify(_shadow_test_report_policy())
+
+
+@app.get("/api/nexus/shadow-test-report-summary")
+@app.post("/api/nexus/shadow-test-report-summary")
+def api_nexus_shadow_test_report_summary():
+    if request.method == "GET":
+        body = {
+            "runtimeDays": request.args.get("runtimeDays") or request.args.get("testDays") or 10,
+            "elapsedDays": request.args.get("elapsedDays") or 0,
+            "capitalUsd": request.args.get("capitalUsd") or request.args.get("capital") or 0,
+            "assets": request.args.getlist("assets") or request.args.get("assets") or ["ETH", "BNB", "POL"],
+            "nkrMode": request.args.get("nkrMode") or "DYNAMIC",
+            "tradingMode": request.args.get("tradingMode") or "TACTICAL",
+            "realizedProfitUsd": request.args.get("realizedProfitUsd") or 0,
+            "unrealizedProfitUsd": request.args.get("unrealizedProfitUsd") or 0,
+            "openPositionsUsd": request.args.get("openPositionsUsd") or 0,
+        }
+    else:
+        body = request.get_json(silent=True) or {}
+    return jsonify(_shadow_test_report_summary(body))
+
+
+@app.get("/api/nexus/shadow-test-report-template")
+def api_nexus_shadow_test_report_template():
+    return jsonify(_shadow_test_report_template())
 
 
 if __name__ == "__main__":
