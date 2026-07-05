@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
-STRATEGIST_BUILD_ID = "S-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
-SHADOW_BUILD_ID = "SH-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-062-NKR-USER-SESSION-LIMIT"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-062-NKR-USER-SESSION-LIMIT"
+STRATEGIST_BUILD_ID = "S-ENGINE-062-NKR-USER-SESSION-LIMIT"
+SHADOW_BUILD_ID = "SH-ENGINE-062-NKR-USER-SESSION-LIMIT"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -202,6 +202,7 @@ NEXUS_DEFAULT_WITHDRAW_POLICY = "USDC_USDT_DEFAULT_ORIGINAL_ASSET_ONLY_ON_USER_R
 NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
 NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
 NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 3
+NEXUS_NKR_MAX_ACTIVE_SESSIONS_LIMIT = 0  # 0 = user-defined, no enforced hard cap
 NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
 NEXUS_NKR_CAPITAL_MANAGER_MODE = "NKR_CAPITAL_MANAGER_V1"
 NEXUS_NKR_CAPITAL_MANAGER_POLICY = "ALLOCATE_STABLE_CAPITAL_BY_STRATEGIST_SCORE_WITH_CASH_RESERVE"
@@ -317,6 +318,7 @@ def api_build_info():
         "nkr_watchlist_rotation": NEXUS_NKR_WATCHLIST_MODE,
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "nkr_max_active_sessions_limit": "USER_DEFINED_NO_HARD_CAP",
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
         "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
@@ -450,6 +452,7 @@ def api_version():
         "nkr_watchlist_rotation": NEXUS_NKR_WATCHLIST_MODE,
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
+        "nkr_max_active_sessions_limit": "USER_DEFINED_NO_HARD_CAP",
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
         "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
@@ -11099,7 +11102,7 @@ def _rotation_live_normalize_session(sess: dict, existing: dict | None = None, e
     risk = _rotation_float(src.get("riskLimitPct") or meta.get("risk_limit_pct") or existing.get("riskLimitPct"), 0.0)
     min_net = _rotation_float(src.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct") or existing.get("minNetAdvantagePct"), 0.0)
     max_slip = _rotation_float(src.get("maxSlippagePct") or meta.get("max_slippage_pct") or existing.get("maxSlippagePct"), 0.0)
-    max_active = int(max(1, min(12, _rotation_float(src.get("maxActiveRotations") or meta.get("max_active_rotations") or existing.get("maxActiveRotations"), 3))))
+    max_active = int(max(1, math.floor(_rotation_float(src.get("maxActiveRotations") or meta.get("max_active_rotations") or existing.get("maxActiveRotations"), 3))))
     execution_mode = str(src.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
     if execution_mode not in {"shadow", "live"}:
         execution_mode = "shadow"
@@ -11196,7 +11199,7 @@ def _rotation_session_to_db_tuple(wa: str, sess: dict, nowi: int):
     risk_limit_pct = _rotation_float(sess.get("riskLimitPct") or meta.get("risk_limit_pct"), 0.0)
     min_net_advantage_pct = _rotation_float(sess.get("minNetAdvantagePct") or meta.get("min_net_advantage_pct"), 0.0)
     max_slippage_pct = _rotation_float(sess.get("maxSlippagePct") or meta.get("max_slippage_pct"), 0.0)
-    max_active_rotations = int(max(1, min(12, _rotation_float(sess.get("maxActiveRotations") or meta.get("max_active_rotations"), 3))))
+    max_active_rotations = int(max(1, math.floor(_rotation_float(sess.get("maxActiveRotations") or meta.get("max_active_rotations"), 3))))
     execution_mode = str(sess.get("executionMode") or meta.get("execution_mode") or "shadow").strip().lower()
     position_state = str(sess.get("positionState") or sess.get("position_state") or "WAITING").strip().upper()
     lifecycle_state = str(sess.get("lifecycleState") or status or "WAITING").strip().upper()
