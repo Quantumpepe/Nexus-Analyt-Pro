@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-058-NKR-PROFIT-RUNNER"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-023"
-STRATEGIST_BUILD_ID = "S-ENGINE-058-NKR-PROFIT-RUNNER"
-SHADOW_BUILD_ID = "SH-ENGINE-058-NKR-PROFIT-RUNNER"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
+STRATEGIST_BUILD_ID = "S-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
+SHADOW_BUILD_ID = "SH-ENGINE-060-NKR-WATCH-POOL-PROMOTION"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -350,6 +350,9 @@ def api_build_info():
         "nkr_portfolio_policy": NEXUS_NKR_PORTFOLIO_POLICY,
         "nkr_profit_runner": NEXUS_NKR_PROFIT_RUNNER_MODE,
         "nkr_profit_runner_policy": NEXUS_NKR_PROFIT_RUNNER_POLICY,
+        "nkr_watch_pool": NEXUS_NKR_WATCH_POOL_MODE,
+        "nkr_watch_pool_policy": NEXUS_NKR_WATCH_POOL_POLICY,
+        "nkr_promotion_policy": NEXUS_NKR_PROMOTION_POLICY,
         "nkr_small_profit_no_close_usd": NEXUS_NKR_SMALL_PROFIT_NO_CLOSE_USD,
         "nkr_profit_lock_pct_by_mode": {
             "DYNAMIC": NEXUS_NKR_DYNAMIC_PROFIT_LOCK_PCT,
@@ -934,7 +937,17 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
 
     scored = [_nkr_asset_score_stub(sym, market.get(sym) if isinstance(market, dict) else {}) for sym in symbols]
     ranked = sorted(scored, key=lambda x: float(x.get("score") or 0.0), reverse=True)
-    selected = [x for x in ranked if x.get("recommendation") in ("candidate", "watch") and x.get("routeOk")][:max_active]
+    # Smart Dispatcher: max_active is only a ceiling, not a target.
+    # Select only assets that clear quality, then weight capital by conviction.
+    perf_mode = str(performance or "TACTICAL").strip().upper()
+    min_score_map = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
+    min_score = float(min_score_map.get(perf_mode, min_score_map.get("TACTICAL")))
+    route_ranked = [x for x in ranked if x.get("routeOk")]
+    best_score = max([_safe_float(x.get("score"), 0.0) for x in route_ranked] or [0.0])
+    dynamic_cut = max(min_score, best_score - 14.0)
+    quality = [x for x in route_ranked if _safe_float(x.get("score"), 0.0) >= dynamic_cut]
+    support = [x for x in route_ranked if min_score <= _safe_float(x.get("score"), 0.0) < dynamic_cut]
+    selected = (quality + support[:2])[:max_active]
 
     regime = _nkr_normalize_regime(market_regime)
     # NKR Rules V1: capital release is mode/regime/observation aware.
@@ -956,11 +969,12 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
 
     allocations = []
     if selected and investable > 0:
+        conviction_power = 1.45 if str(performance or "").upper() == "AGGRESSIVE" else (1.90 if str(performance or "").upper() == "DEFENSIVE" else 1.65)
         weights = []
         for item in selected:
-            # keep weights positive and favor strong scores, but don't over-concentrate
-            score = max(1.0, _safe_float(item.get("score"), 0.0))
-            weights.append(score)
+            # Weight by conviction above the mode threshold. This avoids equal split by session count.
+            score = _safe_float(item.get("score"), 0.0)
+            weights.append(max(1.0, score - min_score + 6.0) ** conviction_power)
         total_weight = sum(weights) or 1.0
         max_amt = capital * (max_pct / 100.0)
         remaining = investable
@@ -991,7 +1005,7 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
                 "capitalUsd": round(float(amt), 2),
                 "capitalPct": round((float(amt) / capital * 100.0), 2) if capital > 0 else 0,
                 "state": "ALLOCATE_PREVIEW",
-                "reason": "nkr_capital_manager_shadow_allocation",
+                "reason": "nkr_smart_dispatcher_conviction_allocation",
             })
 
     return {
@@ -1008,8 +1022,37 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
         "maxCapitalPerAssetPct": round(max_pct, 2),
         "ranked": ranked,
         "allocations": allocations,
+        "watchPool": [
+            {
+                "symbol": x.get("symbol"),
+                "displaySymbol": x.get("displaySymbol"),
+                "executionChain": x.get("selectedExecutionChain"),
+                "score": x.get("score"),
+                "recommendation": x.get("recommendation"),
+                "state": "WATCH_POOL" if x not in selected else "SELECTED",
+                "reason": "scanned_no_capital_until_quality_improves" if x not in selected else "selected_for_conviction_allocation",
+            }
+            for x in route_ranked
+        ],
+        "promotableCandidates": [
+            {
+                "symbol": x.get("symbol"),
+                "displaySymbol": x.get("displaySymbol"),
+                "executionChain": x.get("selectedExecutionChain"),
+                "score": x.get("score"),
+                "state": "PROMOTABLE",
+                "reason": "clears_min_quality_or_near_best_score",
+            }
+            for x in route_ranked
+            if x not in selected and _safe_float(x.get("score"), 0.0) >= min_score
+        ],
         "executionEnabled": False,
         "vaultMutation": False,
+        "smartDispatcher": True,
+        "maxActiveAssetsPolicy": "maximum_not_target",
+        "allocationPolicy": "conviction_weighted_not_equal_split",
+        "watchPoolPolicy": "weak_assets_no_capital_but_continuously_rescored",
+        "promotionPolicy": "promote_new_stronger_candidate_or_replace_weakest_active_session",
         "note": "Shadow allocation preview only. NKR V1 does not move funds or start live trades.",
         "ts": int(time.time()),
     }
@@ -26892,7 +26935,7 @@ def api_nkr_profit_runner_policy():
 NEXUS_NKR_BACKEND_PERSISTENCE_MODE = "NKR_PORTFOLIO_BACKEND_ALLOCATION_LOCK_V1"
 NEXUS_NKR_PANIC_CONTROL_MODE = "NKR_AND_TRADER_PANIC_PROTECT_V1"
 NEXUS_NKR_PORTFOLIO_ALLOCATION_MODE = "NKR_MULTI_SESSION_ALLOCATION_V1"
-NEXUS_NKR_PORTFOLIO_POLICY = "SPLIT_CAPITAL_ACROSS_BEST_TARGETS_WITH_STABLE_RESERVE_AND_PER_ASSET_CAP"
+NEXUS_NKR_PORTFOLIO_POLICY = "SMART_DISPATCH_ONLY_BEST_TARGETS_MAX_SESSIONS_IS_LIMIT_NOT_TARGET_WITH_STABLE_RESERVE"
 NEXUS_NKR_MIN_PORTFOLIO_SESSIONS = 2
 NEXUS_NKR_DYNAMIC_CASH_RESERVE_PCT = 20
 NEXUS_NKR_TACTICAL_CASH_RESERVE_PCT = 25
@@ -26908,6 +26951,11 @@ NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT = 1.2
 NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES = 45
 NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT = 6
 NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 50
+NEXUS_NKR_SMART_DISPATCHER_MODE = "NKR_SMART_DISPATCHER_V1"
+NEXUS_NKR_COST_ALIGNMENT_MODE = "ALIGNED_WITH_TRADER_SHADOW_COST_MODEL"
+NEXUS_NKR_WATCH_POOL_MODE = "NKR_WATCH_POOL_PROMOTION_V1"
+NEXUS_NKR_WATCH_POOL_POLICY = "SCAN_ALL_ALLOWED_ASSETS_KEEP_WEAK_ASSETS_IN_WATCH_POOL_PROMOTE_IMMEDIATELY_WHEN_SCORE_MOMENTUM_VOLUME_OR_NET_EDGE_IMPROVES"
+NEXUS_NKR_PROMOTION_POLICY = "WEAK_ASSETS_GET_NO_CAPITAL_BUT_REMAIN_SCANNED_AND_CAN_REPLACE_WEAKER_ACTIVE_SESSION"
 
 
 
