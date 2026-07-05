@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-067-NKR-ALLOCATION-PERCENT-SYNC"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-067-NKR-ALLOCATION-PERCENT-SYNC"
-STRATEGIST_BUILD_ID = "S-ENGINE-067-NKR-ALLOCATION-PERCENT-SYNC"
-SHADOW_BUILD_ID = "SH-ENGINE-067-NKR-ALLOCATION-PERCENT-SYNC"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
+STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
+SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -27216,5 +27216,259 @@ def api_nexus_panic_protect():
         "nkr": bundle,
         "trader": {"protected_sessions": len(protected_trading), "intent": "stop_or_sell_to_stable_when_live_executor_connected"},
         "message": "Panic protection stored in backend. In live mode the executor must prefer safe exit/sell-to-stable; this backend sends no private-key transaction.",
+        "ts": now_ts(),
+    })
+
+
+# -------------------------
+# ENGINE-072: Backend-owned NKR executor tick
+# -------------------------
+def _nkr_market_row_map(rows):
+    out = {}
+    if not isinstance(rows, list):
+        return out
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol") or r.get("sym") or r.get("asset") or "").strip().upper()
+        if sym:
+            out[sym] = r
+    return out
+
+
+def _nkr_row_change_pct(row):
+    if not isinstance(row, dict):
+        return 0.0
+    return _safe_float(row.get("change24h") or row.get("chg_24h") or row.get("usd_24h_change") or row.get("change_24h") or 0.0, 0.0)
+
+
+def _nkr_session_symbol(sess):
+    if not isinstance(sess, dict):
+        return "ASSET"
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    return str(sess.get("targetAsset") or sess.get("sourceSymbol") or sess.get("symbol") or meta.get("source_symbol") or meta.get("selected_symbol") or "ASSET").strip().upper() or "ASSET"
+
+
+def _nkr_session_score(sess, row=None):
+    row = row if isinstance(row, dict) else {}
+    score = _safe_float((sess or {}).get("score") or (sess or {}).get("confidence") or row.get("score") or row.get("systemScore") or 0, 0.0)
+    if score <= 0:
+        ch = _nkr_row_change_pct(row)
+        score = max(35.0, min(90.0, 55.0 + ch * 3.0))
+    return max(0.0, min(100.0, score))
+
+
+def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason):
+    return {
+        "id": f"NKR-BE-{symbol}-{nowi}",
+        "ts": nowi,
+        "mode": "shadow",
+        "status": status,
+        "action": action,
+        "executorState": "EXECUTOR_ACTIVE" if status in {"POSITION_TRACKING", "CLOSED_PROFIT"} else "READY_DISPATCHED",
+        "baseAsset": base_asset,
+        "fromAsset": base_asset,
+        "targetAsset": symbol,
+        "backToAsset": base_asset,
+        "chain": chain,
+        "buyUsd": round(float(budget), 4),
+        "sellUsd": round(float(budget + max(0.0, net)), 4) if status == "CLOSED_PROFIT" else None,
+        "grossUsd": round(float(gross), 4),
+        "costsUsd": round(float(costs), 4),
+        "netUsd": round(float(net), 4),
+        "netPct": round(float(net_pct), 4),
+        "confidence": round(float(score), 4),
+        "flow": f"{base_asset} → {symbol} → {base_asset}",
+        "reason": reason,
+        "source": "backend_executor_tick_072",
+        "liveVaultTx": None,
+    }
+
+
+def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None):
+    settings = settings if isinstance(settings, dict) else {}
+    market_by_sym = _nkr_market_row_map(market_rows)
+    nowi = int(time.time() * 1000)
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    min_score_by_mode = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
+    profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
+    dispatch_min = min_score_by_mode.get(mode, 62.0)
+    profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
+    total_budget = _safe_float(settings.get("totalNkrBudgetUsd") or settings.get("nkrBudgetUsd") or 0, 0.0)
+    active = []
+    changed = False
+    total_collected_delta = 0.0
+    messages = []
+
+    for sess in sessions if isinstance(sessions, list) else []:
+        if not isinstance(sess, dict) or not _nkr_is_session(sess):
+            active.append(sess)
+            continue
+        status_u = str(sess.get("status") or "").upper()
+        if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED"}:
+            active.append(sess)
+            continue
+        sym = _nkr_session_symbol(sess)
+        row = market_by_sym.get(sym, {})
+        change = _nkr_row_change_pct(row)
+        score = _nkr_session_score(sess, row)
+        budget = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0.0, 0.0)
+        if budget <= 0:
+            active.append(sess)
+            continue
+        chain = str(sess.get("chain") or "POL").upper()
+        base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
+        raw_edge_pct = max(-3.0, min(8.0, ((score - 50.0) * 0.055) + (change * 0.08)))
+        gas_cap = 0.20 if chain == "ETH" else 0.03 if chain == "BNB" else 0.01
+        costs_uncapped = gas_cap + budget * (3.0 / 10000.0)
+        costs = min(costs_uncapped, max(0.01, budget * 0.0005))
+        gross = budget * (raw_edge_pct / 100.0)
+        net = gross - costs
+        net_pct = (net / budget * 100.0) if budget > 0 else 0.0
+        approved = score >= dispatch_min and raw_edge_pct > -0.25
+        executable = approved and (net >= 0.0 or net_pct >= 0.2)
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        last_close = _safe_float(meta.get("nkr_last_profit_close_ts") or 0, 0.0)
+        cooldown_ok = (not last_close) or (nowi - last_close >= 20 * 60 * 1000)
+        min_collect = max(5.0, min(25.0, budget * 0.0025))
+        full_lock = executable and net_pct >= profit_lock_pct and net >= max(50.0, budget * (profit_lock_pct / 100.0))
+        net_collect = executable and cooldown_ok and net >= min_collect and net_pct >= 0.25
+        closes = bool(full_lock or net_collect)
+        holds = executable and net > max(5.0, min(20.0, budget * 0.006)) and not closes
+        if closes:
+            ev_status, action, pos_state, reason = "CLOSED_PROFIT", "CLOSED_PROFIT", "CLOSED_PROFIT", "backend_secured_net_profit_after_costs"
+        elif executable:
+            ev_status, action, pos_state, reason = "POSITION_TRACKING", "EXECUTOR_ACTIVE", "OPEN", "backend_multi_session_executor_tracking"
+        elif approved:
+            ev_status, action, pos_state, reason = "DISPATCHED", "READY_DISPATCHED", "READY_DISPATCHED", "backend_dispatched_waiting_executor_edge"
+        else:
+            ev_status, action, pos_state, reason = "WAIT_SCORE", "WAIT_SCORE", "WAITING", "backend_wait_score_or_market"
+
+        # Only create events when the backend has a real decision, not for pure WAIT noise.
+        event = None
+        if approved:
+            event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason)
+        prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+        events = ([event] + prev_events)[:50] if event else prev_events
+        prev_collected = _safe_float(sess.get("collectedProfitUsd") or meta.get("collectedProfitUsd") or sess.get("profitUsd") or 0.0, 0.0)
+        add_collected = max(0.0, net) if closes else 0.0
+        total_collected_delta += add_collected
+        next_collected = prev_collected + add_collected
+        next_sess = dict(sess)
+        next_sess.update({
+            "status": "ACTIVE" if approved else "WAITING",
+            "lifecycleState": "ACTIVE" if approved else "WAITING",
+            "positionState": pos_state,
+            "executionMode": "shadow",
+            "symbol": sym,
+            "sourceSymbol": sym,
+            "targetAsset": sym,
+            "chain": chain,
+            "baseAsset": base,
+            "payoutAsset": base,
+            "confidence": round(score, 4),
+            "score": round(score, 4),
+            "workingCapitalUsd": round(budget, 4),
+            "sessionCapitalUsd": round(budget, 4),
+            "reservedUsd": round(budget, 4),
+            "collectedProfitUsd": round(next_collected, 4),
+            "profitUsd": round(next_collected, 4),
+            "rotationProfitUsd": round(next_collected, 4),
+            "grossProfitUsd": round(gross if not closes else (_safe_float(sess.get("grossProfitUsd"), 0.0) + gross), 4),
+            "costsUsd": round(costs if not closes else (_safe_float(sess.get("costsUsd"), 0.0) + costs), 4),
+            "netProfitUsd": round(net if not closes else (_safe_float(sess.get("netProfitUsd"), 0.0) + net), 4),
+            "lastRotationEvent": event or sess.get("lastRotationEvent"),
+            "rotationEvents": events,
+            "openRotation": None if closes else ({
+                "openedAt": (sess.get("openRotation") or {}).get("openedAt") if isinstance(sess.get("openRotation"), dict) else nowi,
+                "baseAsset": base,
+                "targetAsset": sym,
+                "chain": chain,
+                "entryUsd": round(budget, 4),
+                "currentNetUsd": round(net, 4),
+                "currentNetPct": round(net_pct, 4),
+                "state": "POSITION_TRACKING" if executable else "READY_DISPATCHED",
+            } if approved else sess.get("openRotation")),
+            "updatedAt": nowi,
+        })
+        next_meta = dict(meta)
+        next_meta.update({
+            "nkr_backend_executor_logic": True,
+            "nkr_multi_session_executor": True,
+            "nkr_dispatcher_approved": bool(approved),
+            "nkr_executor_net_positive": bool(executable),
+            "nkr_cost_model": "backend_aligned_shadow_trader_cost_cap_0_05pct",
+            "nkr_last_profit_close_ts": nowi if closes else last_close,
+            "nkr_profit_close_reason": "full_profit_lock" if full_lock else ("net_profit_after_costs" if net_collect else next_meta.get("nkr_profit_close_reason", "")),
+            "raw_edge_pct": round(raw_edge_pct, 4),
+            "net_edge_pct": round(net_pct, 4),
+            "market_change_24h": round(change, 4),
+            "position_state": pos_state,
+            "lifecycle_state": "ACTIVE" if approved else "WAITING",
+            "collectedProfitUsd": round(next_collected, 4),
+        })
+        next_sess["meta"] = next_meta
+        active.append(next_sess)
+        changed = True
+        if event:
+            messages.append(f"{sym}: {action} net ${net:.2f}")
+
+    # Recalculate allocation percent after any backend change.
+    if total_budget <= 0:
+        total_budget = sum(_safe_float(x.get("workingCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active if isinstance(x, dict) and _nkr_is_session(x))
+    if total_budget > 0:
+        for sess in active:
+            if not isinstance(sess, dict) or not _nkr_is_session(sess):
+                continue
+            cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("budgetUsd") or 0.0, 0.0)
+            sess["totalNkrBudgetUsd"] = round(total_budget, 4)
+            sess["nkrAllocationPct"] = round((cap / total_budget) * 100.0, 2)
+            meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+            meta["total_nkr_budget_usd"] = round(total_budget, 4)
+            meta["nkr_allocation_pct"] = sess["nkrAllocationPct"]
+            sess["meta"] = meta
+    return active, {
+        "changed": changed,
+        "totalCollectedDeltaUsd": round(total_collected_delta, 4),
+        "messages": messages[:12],
+        "mode": mode,
+        "profitLockPct": profit_lock_pct,
+        "ts": nowi,
+    }
+
+
+@app.route("/api/nkr/executor-tick", methods=["POST"])
+def api_nkr_executor_tick():
+    """Backend-owned NKR shadow executor tick.
+
+    Frontend may provide current market rows for preview/shadow, but the decision,
+    event creation, profit closing and wallet-bound persistence happen here.
+    This keeps NKR behavior out of UI-only state and aligns it with Trader-style
+    backend session processing.
+    """
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    body = request.get_json(silent=True) or {}
+    incoming = body.get("sessions") if isinstance(body, dict) else None
+    market_rows = body.get("marketRows") or body.get("watchRows") or [] if isinstance(body, dict) else []
+    settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+    if not isinstance(incoming, list):
+        incoming, active_id, _ = _db_get_rotation_sessions(wa)
+    else:
+        _, active_id, _ = _db_get_rotation_sessions(wa)
+    nkr_sessions = [x for x in incoming if isinstance(x, dict) and _nkr_is_session(x)]
+    processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
+    _db_set_rotation_sessions(wa, processed, active_session_id=active_id, replace_missing=False)
+    bundle = _nkr_get_wallet_bundle(wa)
+    return jsonify({
+        "status": "ok",
+        "wallet": _norm_addr(wa),
+        "backend_build": BACKEND_BUILD_ID,
+        "mode": "NKR_BACKEND_EXECUTOR_LOGIC_V1",
+        "policy": "multi_session_executor_events_and_profit_close_are_backend_owned",
+        "summary": summary,
+        "sessions": bundle.get("sessions") or processed,
+        "updated_ts": bundle.get("updated_ts"),
         "ts": now_ts(),
     })
