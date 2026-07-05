@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-075-NKR-AGGRESSIVE-ACK-AUDIT"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-076-NKR-EVENT-COUNTER-UNLIMITED"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27005,7 +27005,7 @@ def api_nkr_profit_runner_policy():
         "smallProfitNoCloseUsd": NEXUS_NKR_SMALL_PROFIT_NO_CLOSE_USD,
         "cooldownMinutes": NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES,
         "maxRotationsPerDay": NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT,
-        "maxRotationsPer10Days": NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT,
+        "maxRotationsPer10Days": "UNLIMITED",
         "rules": {
             "smallProfitDoesNotClose": True,
             "runWinners": True,
@@ -27039,7 +27039,8 @@ NEXUS_NKR_AGGRESSIVE_PROFIT_LOCK_PCT = 2.8
 NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT = 1.2
 NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES = 45
 NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT = 6
-NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 50
+NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 0  # 0 = unlimited; history display is capped separately.
+NEXUS_NKR_EVENT_HISTORY_LIMIT = 50
 NEXUS_NKR_REBALANCE_MODE = "NKR_WEAK_SESSION_STOP_AND_REBALANCE_V2"
 NEXUS_NKR_REBALANCE_POLICY = "STOP_RED_NO_PROGRESS_SESSIONS_RELEASE_CAPITAL_AND_REDIRECT_TO_STRONGER_GREEN_ASSETS"
 NEXUS_NKR_LIVE_PRICE_CARD_MODE = "NKR_SESSION_CARDS_USE_TRADER_LIVE_PRICE_SOURCE"
@@ -27428,7 +27429,15 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if approved:
             event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason)
         prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
-        events = ([event] + prev_events)[:50] if event else prev_events
+        history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 50) or 50)
+        prev_total_events = int(_safe_float(
+            sess.get("totalEventCount") or sess.get("eventCount") or meta.get("nkr_total_event_count") or len(prev_events),
+            len(prev_events),
+        ))
+        total_event_count = prev_total_events + (1 if event else 0)
+        # Keep only the latest N events as history, but never use that history length as the real event counter.
+        # This avoids the UI appearing blocked at 50 while backend execution/profit continues.
+        events = ([event] + prev_events)[:history_limit] if event else prev_events[:history_limit]
         prev_collected = _safe_float(sess.get("collectedProfitUsd") or meta.get("collectedProfitUsd") or sess.get("profitUsd") or 0.0, 0.0)
         add_collected = max(0.0, net) if closes else 0.0
         total_collected_delta += add_collected
@@ -27458,6 +27467,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "netProfitUsd": round(net if not closes else (_safe_float(sess.get("netProfitUsd"), 0.0) + net), 4),
             "lastRotationEvent": event or sess.get("lastRotationEvent"),
             "rotationEvents": events,
+            "totalEventCount": int(total_event_count),
+            "eventCount": int(total_event_count),
+            "rotationEventHistoryCount": len(events),
             "openRotation": None if closes else ({
                 "openedAt": (sess.get("openRotation") or {}).get("openedAt") if isinstance(sess.get("openRotation"), dict) else nowi,
                 "baseAsset": base,
@@ -27485,6 +27497,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "position_state": pos_state,
             "lifecycle_state": "ACTIVE" if approved else "WAITING",
             "collectedProfitUsd": round(next_collected, 4),
+            "nkr_total_event_count": int(total_event_count),
+            "nkr_event_history_count": len(events),
+            "nkr_event_history_limit": history_limit,
         })
         next_sess["meta"] = next_meta
         active.append(next_sess)
