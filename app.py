@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-075-NKR-AGGRESSIVE-ACK-AUDIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -5672,6 +5672,85 @@ def api_nexus_trading_aggressive_ack():
         "wallet": wa,
         "session_id": sid,
         "scope": scope,
+        "warning_version": warning_version,
+        "backend_build": BACKEND_BUILD_ID,
+        "ts": ts,
+    })
+
+
+@app.route("/api/nexus/nkr/aggressive-ack", methods=["POST"])
+def api_nexus_nkr_aggressive_ack():
+    """Store wallet-bound audit proof for Nexus NKR Aggressive risk acceptance.
+
+    This mirrors the Trader Aggressive acknowledgement, but is scoped to NKR.
+    NKR Aggressive is a higher-velocity capital-management mode: it may rotate
+    faster, concentrate capital more strongly and stop weak sessions sooner.
+    The frontend must still reset consent for every new NKR budget/draft.
+    """
+    body = request.get_json(silent=True) or {}
+    wa = _require_auth() or _pick_wallet_from_request()
+    wa = _norm_addr(wa or body.get("wallet") or body.get("wallet_address") or body.get("walletAddress") or "")
+    if not _looks_like_evm_addr(wa):
+        return err("wallet required for Nexus NKR Aggressive acknowledgement", 400)
+
+    accepted = bool(body.get("accepted") or body.get("acknowledged") or body.get("consent"))
+    perf = str(body.get("performance_mode") or body.get("performanceMode") or body.get("performance") or "AGGRESSIVE").strip().upper()
+    if perf != "AGGRESSIVE":
+        return err("acknowledgement only applies to AGGRESSIVE NKR mode", 400)
+    if not accepted:
+        return err("Nexus NKR Aggressive acknowledgement must be accepted", 400)
+
+    scope = str(body.get("scope") or ("session" if body.get("session_id") or body.get("sessionId") else "draft")).strip().lower()
+    if scope not in ("draft", "session"):
+        scope = "draft"
+    sid = str(body.get("session_id") or body.get("sessionId") or body.get("nkr_session_id") or "").strip()
+    warning_version = str(body.get("warning_version") or body.get("warningVersion") or "AGGRESSIVE_WARNING_V1").strip()[:80]
+    frontend_build = str(body.get("frontend_build") or body.get("frontendBuild") or "").strip()[:80]
+    try:
+        budget_usd = float(str(body.get("budget_usd") or body.get("budgetUsd") or 0).replace(",", "."))
+    except Exception:
+        budget_usd = 0.0
+
+    ts = now_ts()
+    acceptance_id = f"NKR-AGR-{ts}-{uuid.uuid4().hex[:18]}"
+    ua = str(request.headers.get("User-Agent") or "")[:300]
+    origin = str(request.headers.get("Origin") or request.headers.get("Referer") or "")[:300]
+    ip_raw = str(request.headers.get("X-Forwarded-For") or request.remote_addr or "").split(",", 1)[0].strip()
+    ip_preview = ip_raw[:12] if ip_raw else ""
+    meta = {
+        "warning_text": "Nexus NKR Aggressive may rotate faster, concentrate capital more strongly, stop weak sessions sooner and increase costs, fluctuations and losses. Hard safety, reserve, net-cost and Vault validation remain active.",
+        "module": "NEXUS_NKR",
+        "performance_mode": perf,
+        "scope": scope,
+        "session_id": sid,
+        "wallet": wa,
+    }
+
+    conn = _db()
+    try:
+        cur = conn.cursor()
+        with DB_WRITE_LOCK:
+            cur.execute(
+                "INSERT INTO nexus_aggressive_risk_acceptances("
+                "acceptance_id,wallet_address,session_id,scope,performance_mode,warning_version,accepted,budget_usd,"
+                "frontend_build,backend_build,user_agent,origin,ip_preview,meta_json,created_ts"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    acceptance_id, wa, sid, f"nkr_{scope}", perf, warning_version, 1, float(budget_usd or 0.0),
+                    frontend_build, BACKEND_BUILD_ID, ua, origin, ip_preview,
+                    json.dumps(meta, ensure_ascii=False, separators=(",", ":")), ts,
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "acceptance_id": acceptance_id,
+        "wallet": wa,
+        "session_id": sid,
+        "scope": f"nkr_{scope}",
         "warning_version": warning_version,
         "backend_build": BACKEND_BUILD_ID,
         "ts": ts,
