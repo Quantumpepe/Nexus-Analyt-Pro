@@ -184,10 +184,10 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-062-NKR-USER-SESSION-LIMIT"
-FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-062-NKR-USER-SESSION-LIMIT"
-STRATEGIST_BUILD_ID = "S-ENGINE-062-NKR-USER-SESSION-LIMIT"
-SHADOW_BUILD_ID = "SH-ENGINE-062-NKR-USER-SESSION-LIMIT"
+BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-063-NKR-EXECUTOR-BRIDGE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-063-NKR-EXECUTOR-BRIDGE"
+STRATEGIST_BUILD_ID = "S-ENGINE-063-NKR-EXECUTOR-BRIDGE"
+SHADOW_BUILD_ID = "SH-ENGINE-063-NKR-EXECUTOR-BRIDGE"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
 SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
@@ -319,6 +319,8 @@ def api_build_info():
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
         "nkr_max_active_sessions_limit": "USER_DEFINED_NO_HARD_CAP",
+        "nkr_executor_bridge": "NKR_DISPATCHER_TO_EXECUTOR_BRIDGE_V1",
+        "nkr_executor_bridge_policy": "READY_DISPATCHED_MUST_CREATE_SHADOW_POSITION_EVENT_OR_EXPLICIT_BLOCK_REASON",
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
         "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
@@ -453,6 +455,8 @@ def api_version():
         "nkr_watchlist_policy": NEXUS_NKR_WATCHLIST_POLICY,
         "nkr_max_active_assets_default": NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT,
         "nkr_max_active_sessions_limit": "USER_DEFINED_NO_HARD_CAP",
+        "nkr_executor_bridge": "NKR_DISPATCHER_TO_EXECUTOR_BRIDGE_V1",
+        "nkr_executor_bridge_policy": "READY_DISPATCHED_MUST_CREATE_SHADOW_POSITION_EVENT_OR_EXPLICIT_BLOCK_REASON",
         "nkr_max_capital_per_asset_pct_default": NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT,
         "nkr_capital_manager": NEXUS_NKR_CAPITAL_MANAGER_MODE,
         "nkr_capital_policy": NEXUS_NKR_CAPITAL_MANAGER_POLICY,
