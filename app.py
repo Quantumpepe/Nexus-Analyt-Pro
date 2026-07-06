@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.06-ENGINE-079-NKR-FULL-EVENT-HISTORY"
+BACKEND_BUILD_ID = "B-2026.07.06-ENGINE-081-NKR-REAL-PRICE-PNL-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27436,27 +27436,38 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             continue
         chain = str(sess.get("chain") or "POL").upper()
         base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
+        # ENGINE-081 IMPORTANT:
+        # raw_edge_pct is only a decision/quality signal. It must NEVER be used as realized P&L.
+        # Real shadow P&L is calculated from the stored entry price versus the current live price.
         raw_edge_pct = max(-3.0, min(8.0, ((score - 50.0) * 0.055) + (change * 0.08)))
         gas_cap = 0.20 if chain == "ETH" else 0.03 if chain == "BNB" else 0.01
         costs_uncapped = gas_cap + budget * (3.0 / 10000.0)
         costs = min(costs_uncapped, max(0.01, budget * 0.0005))
-        gross = budget * (raw_edge_pct / 100.0)
-        net = gross - costs
-        net_pct = (net / budget * 100.0) if budget > 0 else 0.0
-        approved = score >= dispatch_min and raw_edge_pct > -0.25
-        executable = approved and (net >= 0.0 or net_pct >= 0.2)
         meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
+        has_open_trade = bool(open_rotation and open_rotation.get("tradeId"))
+        entry_price_usd = _safe_float(open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or 0.0, 0.0)
+        if entry_price_usd <= 0 and has_open_trade:
+            entry_price_usd = current_price_usd
+        price_pnl_pct = ((current_price_usd - entry_price_usd) / entry_price_usd * 100.0) if (has_open_trade and entry_price_usd > 0 and current_price_usd > 0) else 0.0
+        gross = budget * (price_pnl_pct / 100.0) if has_open_trade else 0.0
+        net = gross - costs if has_open_trade else 0.0
+        net_pct = (net / budget * 100.0) if budget > 0 else 0.0
+        approved = score >= dispatch_min and raw_edge_pct > -0.25 and current_price_usd > 0
+        executable = approved and has_open_trade
         last_close = _safe_float(meta.get("nkr_last_profit_close_ts") or 0, 0.0)
         cooldown_ok = (not last_close) or (nowi - last_close >= 20 * 60 * 1000)
         min_collect = max(5.0, min(25.0, budget * 0.0025))
         full_lock = executable and net_pct >= profit_lock_pct and net >= max(50.0, budget * (profit_lock_pct / 100.0))
         net_collect = executable and cooldown_ok and net >= min_collect and net_pct >= 0.25
         closes = bool(full_lock or net_collect)
-        holds = executable and net > max(5.0, min(20.0, budget * 0.006)) and not closes
+        opens_new_trade = bool(approved and not has_open_trade)
         if closes:
-            ev_status, action, pos_state, reason = "CLOSED_PROFIT", "CLOSED_PROFIT", "CLOSED_PROFIT", "backend_secured_net_profit_after_costs"
+            ev_status, action, pos_state, reason = "CLOSED_PROFIT", "CLOSED_PROFIT", "CLOSED_PROFIT", "backend_real_price_pnl_secured_after_costs"
         elif executable:
-            ev_status, action, pos_state, reason = "POSITION_TRACKING", "EXECUTOR_ACTIVE", "OPEN", "backend_multi_session_executor_tracking"
+            ev_status, action, pos_state, reason = "POSITION_TRACKING", "EXECUTOR_ACTIVE", "OPEN", "backend_real_price_pnl_tracking"
+        elif opens_new_trade:
+            ev_status, action, pos_state, reason = "OPEN_POSITION", "BUY_OPEN", "OPEN", "backend_open_trade_entry_price_locked"
         elif approved:
             ev_status, action, pos_state, reason = "DISPATCHED", "READY_DISPATCHED", "READY_DISPATCHED", "backend_dispatched_waiting_executor_edge"
         else:
@@ -27465,10 +27476,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         # Only create events when the backend has a real decision, not for pure WAIT noise.
         event = None
         if approved:
-            open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
-            entry_price_usd = _safe_float(open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or current_price_usd, current_price_usd)
+            event_entry_price = entry_price_usd if has_open_trade else current_price_usd
             exit_price_usd = current_price_usd if closes else 0.0
-            event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason, entry_price_usd=entry_price_usd, exit_price_usd=exit_price_usd)
+            event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs if has_open_trade else 0.0, net, net_pct, score, ev_status, action, reason, entry_price_usd=event_entry_price, exit_price_usd=exit_price_usd)
         prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
         history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
         prev_total_events = int(_safe_float(
@@ -27513,7 +27523,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "profitUsd": round(next_collected, 4),
             "rotationProfitUsd": round(next_collected, 4),
             "grossProfitUsd": round(gross if not closes else (_safe_float(sess.get("grossProfitUsd"), 0.0) + gross), 4),
-            "costsUsd": round(costs if not closes else (_safe_float(sess.get("costsUsd"), 0.0) + costs), 4),
+            "costsUsd": round((costs if has_open_trade else 0.0) if not closes else (_safe_float(sess.get("costsUsd"), 0.0) + costs), 4),
             "netProfitUsd": round(net if not closes else (_safe_float(sess.get("netProfitUsd"), 0.0) + net), 4),
             "lastRotationEvent": event or sess.get("lastRotationEvent"),
             "rotationEvents": events,
@@ -27521,17 +27531,19 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "eventCount": int(total_event_count),
             "rotationEventHistoryCount": len(events),
             "openRotation": None if closes else ({
-                "openedAt": (sess.get("openRotation") or {}).get("openedAt") if isinstance(sess.get("openRotation"), dict) else nowi,
-                "tradeId": (sess.get("openRotation") or {}).get("tradeId") if isinstance(sess.get("openRotation"), dict) and (sess.get("openRotation") or {}).get("tradeId") else f"NKR-TRADE-{str(sess.get('id') or sess.get('session_id') or '')}-{sym}-{nowi}",
+                "openedAt": open_rotation.get("openedAt") if has_open_trade else nowi,
+                "tradeId": open_rotation.get("tradeId") if has_open_trade else f"NKR-TRADE-{str(sess.get('id') or sess.get('session_id') or '')}-{sym}-{nowi}",
                 "baseAsset": base,
                 "targetAsset": sym,
                 "chain": chain,
                 "entryUsd": round(budget, 4),
                 "amountInUsd": round(budget, 4),
-                "entryPriceUsd": round(current_price_usd, 10) if current_price_usd > 0 else ((sess.get("openRotation") or {}).get("entryPriceUsd") if isinstance(sess.get("openRotation"), dict) else None),
+                "entryPriceUsd": round((entry_price_usd if has_open_trade and entry_price_usd > 0 else current_price_usd), 10) if current_price_usd > 0 or entry_price_usd > 0 else None,
+                "currentPriceUsd": round(current_price_usd, 10) if current_price_usd > 0 else None,
+                "currentGrossUsd": round(gross, 4),
                 "currentNetUsd": round(net, 4),
                 "currentNetPct": round(net_pct, 4),
-                "state": "POSITION_TRACKING" if executable else "READY_DISPATCHED",
+                "state": "POSITION_TRACKING" if executable else "OPEN_POSITION",
             } if approved else sess.get("openRotation")),
             "updatedAt": nowi,
         })
@@ -27545,6 +27557,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "nkr_last_profit_close_ts": nowi if closes else last_close,
             "nkr_profit_close_reason": "full_profit_lock" if full_lock else ("net_profit_after_costs" if net_collect else next_meta.get("nkr_profit_close_reason", "")),
             "raw_edge_pct": round(raw_edge_pct, 4),
+            "price_pnl_pct": round(price_pnl_pct, 4),
             "net_edge_pct": round(net_pct, 4),
             "market_change_24h": round(change, 4),
             "nkr_current_price_usd": round(current_price_usd, 10) if current_price_usd > 0 else None,
