@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.06.14-ENGINE-076-NKR-EVENT-COUNTER-UNLIMITED"
+BACKEND_BUILD_ID = "B-2026.07.06-ENGINE-079-NKR-FULL-EVENT-HISTORY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27040,7 +27040,7 @@ NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT = 1.2
 NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES = 45
 NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT = 6
 NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 0  # 0 = unlimited; history display is capped separately.
-NEXUS_NKR_EVENT_HISTORY_LIMIT = 50
+NEXUS_NKR_EVENT_HISTORY_LIMIT = 0  # 0 = unlimited persisted history; UI display cap is separate
 NEXUS_NKR_REBALANCE_MODE = "NKR_WEAK_SESSION_STOP_AND_REBALANCE_V2"
 NEXUS_NKR_REBALANCE_POLICY = "STOP_RED_NO_PROGRESS_SESSIONS_RELEASE_CAPITAL_AND_REDIRECT_TO_STRONGER_GREEN_ASSETS"
 NEXUS_NKR_LIVE_PRICE_CARD_MODE = "NKR_SESSION_CARDS_USE_TRADER_LIVE_PRICE_SOURCE"
@@ -27339,8 +27339,18 @@ def _nkr_session_score(sess, row=None):
 
 
 def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason):
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
+    session_id = str(sess.get("id") or sess.get("session_id") or meta.get("session_id") or "")
+    trade_opened_at = int(_safe_float(open_rotation.get("openedAt") or meta.get("nkr_trade_opened_at") or nowi, nowi))
+    trade_id = str(open_rotation.get("tradeId") or meta.get("nkr_active_trade_id") or f"NKR-TRADE-{session_id}-{symbol}-{trade_opened_at}")
+    event_id = f"NKR-BE-{session_id}-{symbol}-{status}-{nowi}"
+    is_closed_profit = status == "CLOSED_PROFIT"
     return {
-        "id": f"NKR-BE-{symbol}-{nowi}",
+        "id": event_id,
+        "event_id": event_id,
+        "trade_id": trade_id,
+        "session_id": session_id,
         "ts": nowi,
         "mode": "shadow",
         "status": status,
@@ -27351,16 +27361,27 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
         "targetAsset": symbol,
         "backToAsset": base_asset,
         "chain": chain,
+        "buyTime": trade_opened_at,
+        "openedAt": trade_opened_at,
+        "sellTime": nowi if is_closed_profit else None,
+        "closedAt": nowi if is_closed_profit else None,
         "buyUsd": round(float(budget), 4),
-        "sellUsd": round(float(budget + max(0.0, net)), 4) if status == "CLOSED_PROFIT" else None,
+        "amountInUsd": round(float(budget), 4),
+        "sellUsd": round(float(budget + max(0.0, net)), 4) if is_closed_profit else None,
+        "amountOutUsd": round(float(budget + max(0.0, net)), 4) if is_closed_profit else None,
         "grossUsd": round(float(gross), 4),
+        "grossProfitUsd": round(float(gross), 4),
         "costsUsd": round(float(costs), 4),
         "netUsd": round(float(net), 4),
+        "netProfitUsd": round(float(net), 4),
         "netPct": round(float(net_pct), 4),
         "confidence": round(float(score), 4),
         "flow": f"{base_asset} → {symbol} → {base_asset}",
+        "route": f"{base_asset} -> {symbol} -> {base_asset}",
+        "addedToCollectedProfit": False,
+        "alreadyCounted": False,
         "reason": reason,
-        "source": "backend_executor_tick_072",
+        "source": "backend_executor_tick_079_full_event_history",
         "liveVaultTx": None,
     }
 
@@ -27429,7 +27450,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if approved:
             event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason)
         prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
-        history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 50) or 50)
+        history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
         prev_total_events = int(_safe_float(
             sess.get("totalEventCount") or sess.get("eventCount") or meta.get("nkr_total_event_count") or len(prev_events),
             len(prev_events),
@@ -27437,9 +27458,18 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         total_event_count = prev_total_events + (1 if event else 0)
         # Keep only the latest N events as history, but never use that history length as the real event counter.
         # This avoids the UI appearing blocked at 50 while backend execution/profit continues.
-        events = ([event] + prev_events)[:history_limit] if event else prev_events[:history_limit]
+        events = ([event] + prev_events) if event else list(prev_events)
+        if history_limit > 0:
+            events = events[:history_limit]
         prev_collected = _safe_float(sess.get("collectedProfitUsd") or meta.get("collectedProfitUsd") or sess.get("profitUsd") or 0.0, 0.0)
-        add_collected = max(0.0, net) if closes else 0.0
+        counted_profit_ids = set(meta.get("nkr_counted_profit_trade_ids") or sess.get("countedProfitTradeIds") or [])
+        current_trade_id = str((event or {}).get("trade_id") or "")
+        add_collected = max(0.0, net) if closes and current_trade_id and current_trade_id not in counted_profit_ids else 0.0
+        if event and closes:
+            event["addedToCollectedProfit"] = bool(add_collected > 0)
+            event["alreadyCounted"] = bool(add_collected <= 0)
+        if add_collected > 0:
+            counted_profit_ids.add(current_trade_id)
         total_collected_delta += add_collected
         next_collected = prev_collected + add_collected
         next_sess = dict(sess)
@@ -27472,10 +27502,12 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "rotationEventHistoryCount": len(events),
             "openRotation": None if closes else ({
                 "openedAt": (sess.get("openRotation") or {}).get("openedAt") if isinstance(sess.get("openRotation"), dict) else nowi,
+                "tradeId": (sess.get("openRotation") or {}).get("tradeId") if isinstance(sess.get("openRotation"), dict) and (sess.get("openRotation") or {}).get("tradeId") else f"NKR-TRADE-{str(sess.get('id') or sess.get('session_id') or '')}-{sym}-{nowi}",
                 "baseAsset": base,
                 "targetAsset": sym,
                 "chain": chain,
                 "entryUsd": round(budget, 4),
+                "amountInUsd": round(budget, 4),
                 "currentNetUsd": round(net, 4),
                 "currentNetPct": round(net_pct, 4),
                 "state": "POSITION_TRACKING" if executable else "READY_DISPATCHED",
@@ -27499,8 +27531,10 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "collectedProfitUsd": round(next_collected, 4),
             "nkr_total_event_count": int(total_event_count),
             "nkr_event_history_count": len(events),
-            "nkr_event_history_limit": history_limit,
+            "nkr_event_history_limit": "UNLIMITED" if history_limit <= 0 else history_limit,
+            "nkr_counted_profit_trade_ids": sorted(counted_profit_ids)[-5000:],
         })
+        next_sess["countedProfitTradeIds"] = sorted(counted_profit_ids)[-5000:]
         next_sess["meta"] = next_meta
         active.append(next_sess)
         changed = True
