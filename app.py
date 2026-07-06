@@ -27322,6 +27322,16 @@ def _nkr_row_change_pct(row):
     return _safe_float(row.get("change24h") or row.get("chg_24h") or row.get("usd_24h_change") or row.get("change_24h") or 0.0, 0.0)
 
 
+def _nkr_row_price_usd(row):
+    if not isinstance(row, dict):
+        return 0.0
+    return _safe_float(
+        row.get("price") or row.get("current_price") or row.get("currentPrice") or
+        row.get("priceUsd") or row.get("price_usd") or row.get("usd") or 0.0,
+        0.0,
+    )
+
+
 def _nkr_session_symbol(sess):
     if not isinstance(sess, dict):
         return "ASSET"
@@ -27338,7 +27348,7 @@ def _nkr_session_score(sess, row=None):
     return max(0.0, min(100.0, score))
 
 
-def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason):
+def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason, entry_price_usd=0.0, exit_price_usd=0.0):
     meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
     open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
     session_id = str(sess.get("id") or sess.get("session_id") or meta.get("session_id") or "")
@@ -27346,6 +27356,8 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
     trade_id = str(open_rotation.get("tradeId") or meta.get("nkr_active_trade_id") or f"NKR-TRADE-{session_id}-{symbol}-{trade_opened_at}")
     event_id = f"NKR-BE-{session_id}-{symbol}-{status}-{nowi}"
     is_closed_profit = status == "CLOSED_PROFIT"
+    entry_px = _safe_float(entry_price_usd or open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or 0.0, 0.0)
+    exit_px = _safe_float(exit_price_usd or 0.0, 0.0) if is_closed_profit else 0.0
     return {
         "id": event_id,
         "event_id": event_id,
@@ -27367,8 +27379,12 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
         "closedAt": nowi if is_closed_profit else None,
         "buyUsd": round(float(budget), 4),
         "amountInUsd": round(float(budget), 4),
+        "buyPriceUsd": round(float(entry_px), 10) if entry_px > 0 else None,
+        "entryPriceUsd": round(float(entry_px), 10) if entry_px > 0 else None,
         "sellUsd": round(float(budget + max(0.0, net)), 4) if is_closed_profit else None,
         "amountOutUsd": round(float(budget + max(0.0, net)), 4) if is_closed_profit else None,
+        "sellPriceUsd": round(float(exit_px), 10) if exit_px > 0 else None,
+        "exitPriceUsd": round(float(exit_px), 10) if exit_px > 0 else None,
         "grossUsd": round(float(gross), 4),
         "grossProfitUsd": round(float(gross), 4),
         "costsUsd": round(float(costs), 4),
@@ -27412,6 +27428,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         sym = _nkr_session_symbol(sess)
         row = market_by_sym.get(sym, {})
         change = _nkr_row_change_pct(row)
+        current_price_usd = _nkr_row_price_usd(row)
         score = _nkr_session_score(sess, row)
         budget = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0.0, 0.0)
         if budget <= 0:
@@ -27448,7 +27465,10 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         # Only create events when the backend has a real decision, not for pure WAIT noise.
         event = None
         if approved:
-            event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason)
+            open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
+            entry_price_usd = _safe_float(open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or current_price_usd, current_price_usd)
+            exit_price_usd = current_price_usd if closes else 0.0
+            event = _nkr_backend_tick_event(nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, score, ev_status, action, reason, entry_price_usd=entry_price_usd, exit_price_usd=exit_price_usd)
         prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
         history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
         prev_total_events = int(_safe_float(
@@ -27508,6 +27528,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
                 "chain": chain,
                 "entryUsd": round(budget, 4),
                 "amountInUsd": round(budget, 4),
+                "entryPriceUsd": round(current_price_usd, 10) if current_price_usd > 0 else ((sess.get("openRotation") or {}).get("entryPriceUsd") if isinstance(sess.get("openRotation"), dict) else None),
                 "currentNetUsd": round(net, 4),
                 "currentNetPct": round(net_pct, 4),
                 "state": "POSITION_TRACKING" if executable else "READY_DISPATCHED",
@@ -27526,6 +27547,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "raw_edge_pct": round(raw_edge_pct, 4),
             "net_edge_pct": round(net_pct, 4),
             "market_change_24h": round(change, 4),
+            "nkr_current_price_usd": round(current_price_usd, 10) if current_price_usd > 0 else None,
+            "nkr_entry_price_usd": (event or {}).get("entryPriceUsd") or next_meta.get("nkr_entry_price_usd"),
+            "nkr_exit_price_usd": (event or {}).get("exitPriceUsd") if closes else next_meta.get("nkr_exit_price_usd"),
             "position_state": pos_state,
             "lifecycle_state": "ACTIVE" if approved else "WAITING",
             "collectedProfitUsd": round(next_collected, 4),
