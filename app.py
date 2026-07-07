@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-084-NKR-AGGRESSIVE-REPLACEMENT-UNBLOCKED"
+BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-086-NKR-CAPITAL-MOVEMENT-LEDGER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27408,7 +27408,7 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
         "addedToCollectedProfit": False,
         "alreadyCounted": False,
         "reason": reason,
-        "source": "backend_executor_tick_079_full_event_history",
+        "source": "backend_executor_tick_086_capital_movement_ledger",
         "liveVaultTx": None,
     }
 
@@ -27432,7 +27432,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         if not isinstance(sess, dict) or not _nkr_is_session(sess):
             continue
         status_u = str(sess.get("status") or "").upper()
-        if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED"}:
+        if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL"}:
             continue
         sym = _nkr_session_symbol(sess)
         row = market_by_sym.get(sym, {})
@@ -27506,13 +27506,44 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         close_event["addedToCollectedProfit"] = False
         close_event["alreadyCounted"] = True
         close_event["reallocationReleasedUsd"] = round(max(0.0, min(budget - NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD, budget * NEXUS_NKR_AGGRESSIVE_TRANSFER_PCT)), 4)
-        events = [close_event] + prev_events
-        history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
-        if history_limit > 0:
-            events = events[:history_limit]
         release_usd = close_event["reallocationReleasedUsd"]
         if release_usd <= 0:
             continue
+
+        # ENGINE-086: every capital shift must be documented separately from PnL.
+        # This is NOT profit and must never increase collectedProfit. It is a ledger/audit event.
+        movement_id = f"NKR-CAPITAL-MOVE-{str(sess.get('id') or sess.get('session_id') or '')}-{sym}-{nowi}"
+        movement_event = {
+            "id": movement_id,
+            "event_id": movement_id,
+            "trade_id": close_event.get("trade_id"),
+            "session_id": close_event.get("session_id"),
+            "ts": nowi,
+            "mode": "shadow",
+            "status": "CAPITAL_MOVEMENT",
+            "action": "CAPITAL_RELEASED_TO_STABLE",
+            "capitalMovementType": "REBALANCE_RELEASE",
+            "fromAsset": sym,
+            "toAsset": base,
+            "baseAsset": base,
+            "targetAsset": sym,
+            "chain": chain,
+            "capitalBeforeUsd": round(float(budget), 4),
+            "capitalMovedUsd": round(float(release_usd), 4),
+            "capitalAfterUsd": round(float(max(NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD, budget - release_usd)), 4),
+            "availableStableDeltaUsd": round(float(release_usd), 4),
+            "grossUsd": 0.0,
+            "costsUsd": 0.0,
+            "netUsd": 0.0,
+            "addedToCollectedProfit": False,
+            "alreadyCounted": True,
+            "reason": "aggressive_reallocation_released_capital_to_available_stable_not_profit",
+            "source": "backend_capital_movement_ledger_086",
+        }
+        events = [movement_event, close_event] + prev_events
+        history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
+        if history_limit > 0:
+            events = events[:history_limit]
 
         sess["workingCapitalUsd"] = round(max(NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD, budget - release_usd), 4)
         sess["sessionCapitalUsd"] = sess["workingCapitalUsd"]
@@ -27542,30 +27573,12 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         events_added += 1
 
     if released_total > 0:
-        # Add released capital to the strongest available sessions. Weak sessions are marked REBALANCED_OUT, so 10 is a maximum, not a fixed hold list.
-        targets = [x for x in strong if isinstance(next_active[x["i"]], dict) and str(next_active[x["i"]].get("positionState") or "").upper() not in {"WAITING_REALLOCATION", "REBALANCED_OUT"}]
-        if not targets:
-            targets = strong[:1]
-        weights = [max(1.0, t["score"] - dispatch_min + max(0.0, t["change"])) for t in targets]
-        wsum = sum(weights) or 1.0
-        for target, weight in zip(targets, weights):
-            add = released_total * (weight / wsum)
-            tsess = next_active[target["i"]]
-            if not isinstance(tsess, dict):
-                continue
-            cap = _safe_float(tsess.get("workingCapitalUsd") or tsess.get("sessionCapitalUsd") or tsess.get("budgetUsd") or 0.0, 0.0)
-            tsess["workingCapitalUsd"] = round(cap + add, 4)
-            tsess["sessionCapitalUsd"] = tsess["workingCapitalUsd"]
-            tsess["reservedUsd"] = tsess["workingCapitalUsd"]
-            tmeta = tsess.get("meta") if isinstance(tsess.get("meta"), dict) else {}
-            tmeta.update({
-                "nkr_aggressive_reallocation_in": True,
-                "nkr_reallocation_received_usd": round(add, 4),
-                "nkr_reallocation_policy": NEXUS_NKR_AGGRESSIVE_REALLOCATION_POLICY,
-            })
-            tsess["meta"] = tmeta
-            target_symbols.append(target["sym"])
-            changed = True
+        # ENGINE-085: do NOT auto-fill back to the max session count and do NOT force
+        # released capital into another active card. 10 is a ceiling, not a target.
+        # Released capital stays in stable/available capital until a new candidate clears
+        # the quality gate. This prevents the old 8 -> 10 / 9 -> 10 refill behavior.
+        target_symbols = []
+        changed = True
 
     return next_active, {
         "changed": changed,
@@ -27595,7 +27608,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             active.append(sess)
             continue
         status_u = str(sess.get("status") or "").upper()
-        if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED"}:
+        if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL"}:
             active.append(sess)
             continue
         sym = _nkr_session_symbol(sess)
