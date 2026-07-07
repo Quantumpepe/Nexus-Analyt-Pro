@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-083-NKR-AGGRESSIVE-REALLOCATION"
+BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-084-NKR-AGGRESSIVE-REPLACEMENT-UNBLOCKED"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27042,17 +27042,17 @@ NEXUS_NKR_DEFENSIVE_PROFIT_LOCK_PCT = 1.2
 NEXUS_NKR_DEFAULT_COOLDOWN_MINUTES = 45
 NEXUS_NKR_MAX_ROTATIONS_PER_DAY_DEFAULT = 6
 NEXUS_NKR_MAX_ROTATIONS_PER_10D_DEFAULT = 0  # 0 = unlimited; history display is capped separately.
-NEXUS_NKR_AGGRESSIVE_REALLOCATION_MODE = "NKR_AGGRESSIVE_WEAK_SESSION_REALLOCATION_V3"
-NEXUS_NKR_AGGRESSIVE_REALLOCATION_POLICY = "CUT_WEAK_NO_RECOVERY_SESSIONS_AND_SHIFT_CAPITAL_TO_BEST_STRONG_ACTIVE_ASSETS"
-NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN = 180
-NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT = -0.35
-NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT = -1.20
-NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP = 8.0
-NEXUS_NKR_AGGRESSIVE_TRANSFER_PCT = 0.50
-NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD = 150.0
+NEXUS_NKR_AGGRESSIVE_REALLOCATION_MODE = "NKR_AGGRESSIVE_REPLACEMENT_UNBLOCKED_V4"
+NEXUS_NKR_AGGRESSIVE_REALLOCATION_POLICY = "CUT_OR_REPLACE_WEAK_OPEN_SESSIONS_AFTER_75MIN_AND_SHIFT_CAPITAL_TO_STRONGER_GREEN_ASSETS"
+NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN = 75
+NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT = -0.12
+NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT = -0.75
+NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP = 5.0
+NEXUS_NKR_AGGRESSIVE_TRANSFER_PCT = 1.00
+NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD = 0.0
 NEXUS_NKR_EVENT_HISTORY_LIMIT = 0  # 0 = unlimited persisted history; UI display cap is separate
-NEXUS_NKR_REBALANCE_MODE = "NKR_AGGRESSIVE_WEAK_SESSION_REALLOCATION_V3"
-NEXUS_NKR_REBALANCE_POLICY = "AGGRESSIVE_REDUCES_WEAK_SESSIONS_EARLIER_AND_REALLOCATES_RELEASED_CAPITAL_TO_STRONGER_ASSETS_WITH_HARD_SAFETY"
+NEXUS_NKR_REBALANCE_MODE = "NKR_AGGRESSIVE_REPLACEMENT_UNBLOCKED_V4"
+NEXUS_NKR_REBALANCE_POLICY = "AGGRESSIVE_REPLACES_WEAK_OPEN_SESSIONS_EARLIER_AND_REALLOCATES_RELEASED_CAPITAL_TO_STRONGER_GREEN_ASSETS_WITH_HARD_SAFETY"
 NEXUS_NKR_LIVE_PRICE_CARD_MODE = "NKR_SESSION_CARDS_USE_TRADER_LIVE_PRICE_SOURCE"
 NEXUS_NKR_SMART_DISPATCHER_MODE = "NKR_SMART_DISPATCHER_V1"
 NEXUS_NKR_COST_ALIGNMENT_MODE = "ALIGNED_WITH_TRADER_SHADOW_COST_MODEL"
@@ -27444,7 +27444,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
 
     best_score = max(x["score"] for x in ranked)
     strong = [x for x in sorted(ranked, key=lambda z: (z["score"], z["change"]), reverse=True)
-              if x["score"] >= max(dispatch_min + 6.0, 68.0) and x["change"] >= -0.25]
+              if x["score"] >= max(dispatch_min + 2.0, 62.0) and x["change"] >= 0.0]
     if not strong:
         return active, {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": []}
 
@@ -27481,12 +27481,14 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         net = gross - costs
         net_pct = (net / budget * 100.0) if budget > 0 else 0.0
         score_gap = best_score - item["score"]
+        top_green_exists = any((t.get("sym") != sym and t.get("change", 0) >= 0.0) for t in strong)
         weak = (
             age_min >= NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN and
             score_gap >= NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP and
-            (net_pct <= NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT or item["change"] <= -2.0 or item["score"] < dispatch_min)
+            top_green_exists and
+            (net_pct <= NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT or item["change"] < 0.0 or item["score"] < dispatch_min)
         )
-        hard_cut = age_min >= (NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN * 2) and net_pct <= NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT
+        hard_cut = age_min >= 120 and net_pct <= NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT
         if not (weak or hard_cut):
             continue
 
@@ -27494,10 +27496,11 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
         prev_events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
         prev_total_events = int(_safe_float(sess.get("totalEventCount") or sess.get("eventCount") or meta.get("nkr_total_event_count") or len(prev_events), len(prev_events)))
+        close_status = "REBALANCED_OUT" if weak else "CLOSED_LOSS_REALLOCATE"
         close_event = _nkr_backend_tick_event(
             nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, item["score"],
-            "CLOSED_LOSS_REALLOCATE", "CLOSED_LOSS_REALLOCATE",
-            "aggressive_reallocation_weak_no_recovery_release_capital",
+            close_status, close_status,
+            "aggressive_replacement_weak_session_released_to_stronger_green_asset",
             entry_price_usd=entry_price, exit_price_usd=current_price,
         )
         close_event["addedToCollectedProfit"] = False
@@ -27515,8 +27518,8 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         sess["sessionCapitalUsd"] = sess["workingCapitalUsd"]
         sess["reservedUsd"] = sess["workingCapitalUsd"]
         sess["openRotation"] = None
-        sess["positionState"] = "WAITING_REALLOCATION"
-        sess["status"] = "WAITING"
+        sess["positionState"] = "REBALANCED_OUT"
+        sess["status"] = "REBALANCED_OUT"
         sess["grossProfitUsd"] = round(gross, 4)
         sess["costsUsd"] = round(costs, 4)
         sess["netProfitUsd"] = round(net, 4)
@@ -27531,7 +27534,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
             "nkr_reallocation_released_usd": round(release_usd, 4),
             "nkr_reallocation_net_pct": round(net_pct, 4),
             "nkr_reallocation_score_gap": round(score_gap, 4),
-            "position_state": "WAITING_REALLOCATION",
+            "position_state": "REBALANCED_OUT",
         })
         sess["meta"] = meta
         released_total += release_usd
@@ -27539,8 +27542,8 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         events_added += 1
 
     if released_total > 0:
-        # Add released capital to the strongest available sessions, but never to a session that was just reduced.
-        targets = [x for x in strong if isinstance(next_active[x["i"]], dict) and str(next_active[x["i"]].get("positionState") or "").upper() != "WAITING_REALLOCATION"]
+        # Add released capital to the strongest available sessions. Weak sessions are marked REBALANCED_OUT, so 10 is a maximum, not a fixed hold list.
+        targets = [x for x in strong if isinstance(next_active[x["i"]], dict) and str(next_active[x["i"]].get("positionState") or "").upper() not in {"WAITING_REALLOCATION", "REBALANCED_OUT"}]
         if not targets:
             targets = strong[:1]
         weights = [max(1.0, t["score"] - dispatch_min + max(0.0, t["change"])) for t in targets]
