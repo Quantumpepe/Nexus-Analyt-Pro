@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.06-ENGINE-081-NKR-REAL-PRICE-PNL-FIX"
+BACKEND_BUILD_ID = "B-2026.07.06-ENGINE-082-NKR-BACKEND-ONLY-PROFIT-AUDIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27491,8 +27491,21 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         events = ([event] + prev_events) if event else list(prev_events)
         if history_limit > 0:
             events = events[:history_limit]
-        prev_collected = _safe_float(sess.get("collectedProfitUsd") or meta.get("collectedProfitUsd") or sess.get("profitUsd") or 0.0, 0.0)
+        # ENGINE-082: backend is the only source of truth for collected profit.
+        # Do not trust incoming client-side collectedProfitUsd, because the old UI shadow loop
+        # could already add the same close before the backend executor tick added it again.
         counted_profit_ids = set(meta.get("nkr_counted_profit_trade_ids") or sess.get("countedProfitTradeIds") or [])
+        prev_collected_from_events = 0.0
+        for _ev in prev_events:
+            if not isinstance(_ev, dict):
+                continue
+            _st = str(_ev.get("status") or "").upper()
+            _tid = str(_ev.get("trade_id") or _ev.get("tradeId") or "")
+            if _st == "CLOSED_PROFIT" and _tid and bool(_ev.get("addedToCollectedProfit", False)):
+                if _tid not in counted_profit_ids:
+                    counted_profit_ids.add(_tid)
+                prev_collected_from_events += max(0.0, _safe_float(_ev.get("netUsd") or _ev.get("netProfitUsd") or 0.0, 0.0))
+        prev_collected = round(prev_collected_from_events, 4)
         current_trade_id = str((event or {}).get("trade_id") or "")
         add_collected = max(0.0, net) if closes and current_trade_id and current_trade_id not in counted_profit_ids else 0.0
         if event and closes:
