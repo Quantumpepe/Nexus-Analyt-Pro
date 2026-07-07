@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-086-NKR-CAPITAL-MOVEMENT-LEDGER"
+BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-087-NKR-ACTIVE-ONLY-REBALANCE-AUDIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27408,7 +27408,7 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
         "addedToCollectedProfit": False,
         "alreadyCounted": False,
         "reason": reason,
-        "source": "backend_executor_tick_086_capital_movement_ledger",
+        "source": "backend_executor_tick_087_active_only_rebalance_audit",
         "liveVaultTx": None,
     }
 
@@ -27538,7 +27538,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
             "addedToCollectedProfit": False,
             "alreadyCounted": True,
             "reason": "aggressive_reallocation_released_capital_to_available_stable_not_profit",
-            "source": "backend_capital_movement_ledger_086",
+            "source": "backend_capital_movement_ledger_087_active_only_audit",
         }
         events = [movement_event, close_event] + prev_events
         history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
@@ -27556,8 +27556,8 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         sess["netProfitUsd"] = round(net, 4)
         sess["lastRotationEvent"] = close_event
         sess["rotationEvents"] = events
-        sess["totalEventCount"] = prev_total_events + 1
-        sess["eventCount"] = prev_total_events + 1
+        sess["totalEventCount"] = prev_total_events + 2
+        sess["eventCount"] = prev_total_events + 2
         sess["rotationEventHistoryCount"] = len(events)
         meta.update({
             "nkr_aggressive_reallocation": True,
