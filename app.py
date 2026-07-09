@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-092-TRADING-MULTI-SESSION-RUNTIME-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-094-TRADING-ROOT-RUNTIME-PRICE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -282,6 +282,47 @@ NEXUS_SYSTEM_INFO_NORMAL_UI_POLICY = "NORMAL_UI_SHOWS_ONLY_USER_CONTROLS_NOT_INT
 SHADOW_LAST_TICK_TS = 0
 SHADOW_TICK_COUNT = 0
 SHADOW_LAST_TICK_SOURCE = "boot"
+
+
+# ENGINE-093: regime hysteresis / anti-flicker memory.
+# Market Regime must not jump red/yellow/green on every small tick. The first
+# different raw reading is kept as a pending candidate; the visible regime changes
+# only after repeated confirmation. This is UI/decision stability only and does
+# not disable hard safety checks.
+_SHADOW_REGIME_MEMORY: dict[str, dict] = {}
+
+def _nexus_shadow_smooth_regime(memory_key: str, raw_regime: str, now_i: int | None = None, confirm_ticks: int = 2) -> str:
+    raw = str(raw_regime or "NEUTRAL").strip().upper().replace("-", "_").replace(" ", "_")
+    if raw not in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
+        raw = "NEUTRAL"
+    key = str(memory_key or "global")[:160]
+    now_v = int(now_i or time.time())
+    mem = _SHADOW_REGIME_MEMORY.get(key) or {}
+    stable = str(mem.get("stable") or raw).upper()
+    pending = str(mem.get("pending") or "").upper()
+    pending_count = int(mem.get("pending_count") or 0)
+    if stable not in ("RED", "NEUTRAL", "GREEN", "STRONG_GREEN"):
+        stable = raw
+
+    if raw == stable:
+        _SHADOW_REGIME_MEMORY[key] = {"stable": stable, "pending": "", "pending_count": 0, "raw": raw, "updated_ts": now_v}
+        return stable
+
+    if raw == pending:
+        pending_count += 1
+    else:
+        pending = raw
+        pending_count = 1
+
+    # Require confirmation before changing visible regime. Moving into RED should
+    # also be confirmed, unless RED repeats. Hard safety blocks still run separately.
+    if pending_count >= max(1, int(confirm_ticks or 2)):
+        stable = raw
+        pending = ""
+        pending_count = 0
+
+    _SHADOW_REGIME_MEMORY[key] = {"stable": stable, "pending": pending, "pending_count": pending_count, "raw": raw, "updated_ts": now_v}
+    return stable
 
 def _shadow_mark_tick(source: str = "runtime"):
     global SHADOW_LAST_TICK_TS, SHADOW_TICK_COUNT, SHADOW_LAST_TICK_SOURCE
@@ -9705,9 +9746,18 @@ _STATIC_CG_IDS = {
     "BNB": "binancecoin",
     "SOL": "solana",
     "XRP": "ripple",
-    # Polygon token on CoinGecko is commonly 'matic-network' (POL rebrand)
-    "POL": "matic-network",
-    "MATIC": "matic-network",
+    # POL/MATIC: prefer the current Polygon Ecosystem Token ID, keep MATIC alias.
+    "POL": "polygon-ecosystem-token",
+    "MATIC": "polygon-ecosystem-token",
+    "ARB": "arbitrum",
+    "LINK": "chainlink",
+    "TON": "the-open-network",
+    "QNT": "quant-network",
+    "XLM": "stellar",
+    "ROSE": "oasis-network",
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
 }
 COINGECKO_KNOWN = {
     "BTC": "bitcoin",
@@ -9717,6 +9767,15 @@ COINGECKO_KNOWN = {
     "SOL": "solana",
     "MATIC": "polygon-ecosystem-token",
     "POL": "polygon-ecosystem-token",
+    "ARB": "arbitrum",
+    "LINK": "chainlink",
+    "TON": "the-open-network",
+    "QNT": "quant-network",
+    "XLM": "stellar",
+    "ROSE": "oasis-network",
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "DOT": "polkadot",
 }
 
 # Cache TTL in seconds (default 180s). You can set CG_TTL_SEC in env.
@@ -15029,10 +15088,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             if ":" in s:
                 s = s.split(":")[-1].strip().upper()
             s = re.sub(r"[^A-Z0-9]", "", s)
-            if s in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON"):
+            if s in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON", "ARB", "QNT", "XLM", "ROSE", "ADA", "DOT"):
                 return "POL" if s == "MATIC" else s
         sid = str(item.get("session_id") or item.get("sessionId") or item.get("trade_session_id") or meta.get("session_id") or "").upper()
-        for sym in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON"):
+        for sym in ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON", "ARB", "QNT", "XLM", "ROSE", "ADA", "DOT"):
             if re.search(rf"(^|[^A-Z0-9]){sym}([^A-Z0-9]|$)", sid):
                 return "POL" if sym == "MATIC" else sym
         return ""
@@ -15048,7 +15107,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         """
         sym = _paper_asset_symbol(item, meta)
 
-        major_syms = ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON")
+        major_syms = ("ETH", "BNB", "POL", "MATIC", "BTC", "SOL", "XRP", "LINK", "AVAX", "TON", "ARB", "QNT", "XLM", "ROSE", "ADA", "DOT")
 
         if allow_network and sym:
             try:
@@ -15732,7 +15791,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             return "RED"
         return "NEUTRAL"
 
-    regime = _shadow_market_regime()
+    regime_raw = _shadow_market_regime()
+    regime_key = f"{wallet_address}:{selected_session_id or selected_chain or 'trading'}"
+    regime = _nexus_shadow_smooth_regime(regime_key, regime_raw, ts, confirm_ticks=2)
+    if regime != regime_raw:
+        strategist_reason.append(f"Market Regime smoothed: raw {regime_raw} pending, visible stays {regime} until confirmed.")
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
     started_ts = _shadow_session_started_ts()
     elapsed_ratio = max(0.0, min(1.0, (ts - started_ts) / max(1.0, runtime_hours * 3600.0)))
@@ -16391,6 +16454,49 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             candidates.append(row)
     candidates.sort(key=lambda r: (r["quality"], r["confidence"], -r["slot_no"]), reverse=True)
 
+    # ENGINE-093: explicit READY_CHECK trace. If a Trading session remains READY
+    # (for example POL), the UI/Event stream must show exactly why it was not
+    # activated: hard block, risk, edge/cost gate, capacity, or pacing. This avoids
+    # silent READY forever states.
+    candidate_ids = {id(r["item"]) for r in candidates}
+    ready_trace_count = 0
+    for row in scored:
+        item = row["item"]
+        st = str(item.get("status") or item.get("state") or "WAIT").upper()
+        if st not in ("READY", "WAIT"):
+            continue
+        if id(item) in candidate_ids:
+            continue
+        meta = get_meta(item)
+        if row["hard_block"]:
+            block_reason = "hard_safety_or_liquidity_block"
+        elif (not aggressive_legacy_mode) and row["risk"] >= 60:
+            block_reason = f"risk_above_limit_{row['risk']:.1f}"
+        elif active_count >= max_active:
+            block_reason = f"session_capacity_full_{active_count}/{max_active}"
+        else:
+            block_reason = str(meta.get("strategist_entry_reason") or "edge_or_cost_gate_not_cleared")
+        meta["ready_check_last_ts"] = ts
+        meta["ready_check_result"] = "READY_BLOCKED"
+        meta["ready_blocked_reason"] = block_reason
+        meta["ready_check_regime"] = regime
+        set_meta(item, meta)
+        if ready_trace_count < 12:
+            asset_label = _paper_asset_symbol(item, meta) or str(item.get("symbol") or item.get("chain") or "slot")
+            events.append({
+                "type": "READY_CHECK",
+                "status": "READY_BLOCKED_REASON",
+                "asset": asset_label,
+                "slot": item.get("slot") or item.get("slot_id"),
+                "message": f"{asset_label} READY not activated: {block_reason}. Regime={regime}, quality={row['quality']:.1f}, confidence={row['confidence']:.1f}, risk={row['risk']:.1f}.",
+                "reason": block_reason,
+                "regime": regime,
+                "quality": round(float(row.get("quality") or 0), 4),
+                "confidence": round(float(row.get("confidence") or 0), 4),
+                "risk": round(float(row.get("risk") or 0), 4),
+            })
+            ready_trace_count += 1
+
     promoted = 0
     for row in candidates:
         if active_count >= max_active:
@@ -16423,6 +16529,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         meta["shadow_strategy"] = "quality_priority_rotation"
         set_meta(item, meta)
         events.append(set_state(item, "ACTIVE", (f"Session {selected_session_id or selected_chain or 'selected'} · {performance_mode}: Aggressive mode promoted this slot; core safety passed, pacing is disabled, and RED entries require recovery momentum." if aggressive_legacy_mode else f"Session {selected_session_id or selected_chain or 'selected'} · Strategist promoted slot after Market Regime={regime}, positive net edge after costs, pacing {used_trade_slots + promoted + 1}/{max_trades} soft / {hard_trade_limit} hard."), "SHADOW_ACTIVE"))
+        events.append({"type": "READY_CHECK", "status": "ACTIVATED", "asset": _paper_asset_symbol(item, meta) or str(item.get("symbol") or item.get("chain") or "slot"), "slot": item.get("slot") or item.get("slot_id"), "message": "READY_CHECK -> ACTIVATED: slot cleared edge/cost/risk gate and was promoted to ACTIVE.", "regime": regime, "quality": round(float(row.get("quality") or 0), 4), "confidence": round(float(row.get("confidence") or 0), 4), "risk": round(float(row.get("risk") or 0), 4)})
         update_paper_accounting(item, row["quality"], force_exit=False)
         active_count += 1
         promoted += 1
@@ -16489,6 +16596,8 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "promoted": promoted,
         "tick_sec": tick_sec,
         "market_regime": regime,
+        "market_regime_raw": regime_raw,
+        "market_regime_smoothing": "ENGINE_093_CONFIRM_2_TICKS",
         "max_trades": 0 if aggressive_legacy_mode else max_trades,
         "max_trades_label": "No Limit" if aggressive_legacy_mode else str(max_trades),
         "risk_mode_label": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""),
@@ -16828,6 +16937,86 @@ def api_nexus_shadow_executor():
                 (wa,),
             )
             recent_runs = [_shadow_row_to_dict(r) for r in cur.fetchall()]
+
+            # ENGINE-094 ROOT FIX:
+            # GET polling must tick the authoritative persisted queue groups, not only
+            # the last selected UI runtime row. The old loop could keep ETH/BNB alive
+            # while POL or another approved Trading session stayed READY forever.
+            # If there is any running runtime and it is due, tick ALL open session
+            # groups once and then skip the legacy per-run loop for this request.
+            try:
+                execution_auto = _nexus_execution_summary(cur, wa)
+                persisted_auto_queue = execution_auto.get("queue", []) if isinstance(execution_auto.get("queue", []), list) else []
+                auto_groups = _nexus_shadow_group_queue_runtime_keys(persisted_auto_queue)
+                running_rows = []
+                newest_ts = 0
+                tick_sec_auto = int(_clamp_float(os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"), 300, 30, 3600))
+                for rr_auto in recent_runs:
+                    summary_auto = rr_auto.get("summary") if isinstance(rr_auto.get("summary"), dict) else {}
+                    runtime_auto = summary_auto.get("runtime") if isinstance(summary_auto.get("runtime"), dict) else {}
+                    status_auto = str(runtime_auto.get("status") or summary_auto.get("runtime_status") or rr_auto.get("status") or "").lower()
+                    cfg_auto = rr_auto.get("config") if isinstance(rr_auto.get("config"), dict) else {}
+                    if status_auto == "running":
+                        running_rows.append(rr_auto)
+                        tick_sec_auto = int(_clamp_float(cfg_auto.get("tick_sec", cfg_auto.get("tickSec", os.getenv("NEXUS_SHADOW_RUNTIME_TICK_SEC", "300"))), 300, 30, 3600))
+                    newest_ts = max(newest_ts, int(runtime_auto.get("last_tick_ts") or runtime_auto.get("updated_ts") or rr_auto.get("updated_ts") or rr_auto.get("created_ts") or 0))
+                due_all = bool(get_autotick_enabled and auto_groups and running_rows and (not newest_ts or (now_i - newest_ts) >= tick_sec_auto))
+                if due_all:
+                    cfg_all = {}
+                    for rr_auto in running_rows[:1]:
+                        if isinstance(rr_auto.get("config"), dict):
+                            cfg_all.update(rr_auto.get("config") or {})
+                    cfg_all.update({"run_all_sessions": True, "runAllSessions": True, "multi_session_runtime": True, "multiSessionRuntime": True})
+                    tick_result = _nexus_shadow_runtime_tick_all_sessions(cur, wa, cfg_all, action="tick")
+                    events_tick = tick_result.get("events") if isinstance(tick_result.get("events"), list) else []
+                    is_no_queue = str(tick_result.get("runtime_status") or "").lower() == "idle" and any(isinstance(e, dict) and str(e.get("type") or "").upper() == "NO_QUEUE" for e in events_tick)
+                    if not is_no_queue:
+                        run_id = "NSH-" + uuid.uuid4().hex[:12].upper()
+                        result_summary = {
+                            "shadow_only": True,
+                            "live_execution_triggered": False,
+                            "status": "running",
+                            "runtime_status": tick_result.get("runtime_status"),
+                            "runtime": {
+                                "status": tick_result.get("runtime_status"),
+                                "action": "tick_all_sessions_get",
+                                "tick_sec": tick_result.get("tick_sec"),
+                                "active_count": tick_result.get("active_count", 0),
+                                "ready_count": tick_result.get("ready_count", 0),
+                                "simulated_exits": tick_result.get("simulated_exits", 0),
+                                "promoted": tick_result.get("promoted", 0),
+                                "strategist": tick_result.get("strategist") or {},
+                                "last_tick_ts": now_i,
+                                "updated_ts": now_i,
+                            },
+                            "readiness": "SHADOW_RUNTIME_ACTIVE" if tick_result.get("runtime_status") == "running" else str(tick_result.get("runtime_status") or "idle").upper(),
+                            "message": "Shadow runtime auto-ticked all open Trading sessions by backend GET polling. No Vault execution was triggered.",
+                        }
+                        cur.execute(
+                            """
+                            INSERT INTO nexus_shadow_executor_runs(run_id,wallet_address,mode,source,status,summary_json,events_json,queue_json,config_json,created_ts,updated_ts)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                run_id, wa, "SHADOW", "auto_get_tick_all_sessions", "running",
+                                json.dumps(result_summary, ensure_ascii=False),
+                                json.dumps(events_tick, ensure_ascii=False),
+                                json.dumps(tick_result.get("queue") or [], ensure_ascii=False),
+                                json.dumps({**cfg_all, "action": "tick_all_sessions_get"}, ensure_ascii=False),
+                                now_i, now_i,
+                            ),
+                        )
+                        recent_runs = []
+                elif auto_groups:
+                    # Do not fall back to old selected-session-only GET loop. It was
+                    # the root of silent READY sessions in multi-session Trading.
+                    recent_runs = []
+            except Exception as e:
+                try:
+                    _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "AUTOTICK_ALL_SESSIONS_ERROR", "", "error", "GET all-session autotick failed; dashboard continues without crashing.", {"error": str(e)[:220], "source": "ENGINE-094"})
+                except Exception:
+                    pass
+
             seen_runtime_keys = set()
             for rr in (recent_runs if get_autotick_enabled else []):
                 summary = rr.get("summary") if isinstance(rr.get("summary"), dict) else {}
