@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.07-ENGINE-087-NKR-ACTIVE-ONLY-REBALANCE-AUDIT"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-088-NKR-WATCHLIST-GREEN-PROMOTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.06.14-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27059,6 +27059,14 @@ NEXUS_NKR_COST_ALIGNMENT_MODE = "ALIGNED_WITH_TRADER_SHADOW_COST_MODEL"
 NEXUS_NKR_WATCH_POOL_MODE = "NKR_WATCH_POOL_PROMOTION_V1"
 NEXUS_NKR_WATCH_POOL_POLICY = "SCAN_ALL_ALLOWED_ASSETS_KEEP_WEAK_ASSETS_IN_WATCH_POOL_PROMOTE_IMMEDIATELY_WHEN_SCORE_MOMENTUM_VOLUME_OR_NET_EDGE_IMPROVES"
 NEXUS_NKR_PROMOTION_POLICY = "WEAK_ASSETS_GET_NO_CAPITAL_BUT_REMAIN_SCANNED_AND_CAN_REPLACE_WEAKER_ACTIVE_SESSION"
+NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_MODE = "NKR_WATCHLIST_GREEN_PROMOTION_FIX_V1"
+NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_POLICY = "MAX_SESSIONS_IS_CEILING_PROMOTE_MULTIPLE_STRONG_WATCHLIST_ASSETS_WHEN_AVAILABLE_STABLE_EXISTS"
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT = 0.30
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SCORE = 60.0
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_ACTIVE_DEFAULT = 6
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SESSION_USD = 250.0
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_SESSION_PCT = 0.30
+
 
 
 
@@ -27408,7 +27416,7 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
         "addedToCollectedProfit": False,
         "alreadyCounted": False,
         "reason": reason,
-        "source": "backend_executor_tick_087_active_only_rebalance_audit",
+        "source": "backend_executor_tick_088_watchlist_green_promotion_fix",
         "liveVaultTx": None,
     }
 
@@ -27538,7 +27546,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
             "addedToCollectedProfit": False,
             "alreadyCounted": True,
             "reason": "aggressive_reallocation_released_capital_to_available_stable_not_profit",
-            "source": "backend_capital_movement_ledger_087_active_only_audit",
+            "source": "backend_capital_movement_ledger_088_watchlist_green_promotion_fix",
         }
         events = [movement_event, close_event] + prev_events
         history_limit = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
@@ -27587,6 +27595,260 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         "targets": target_symbols[:5],
     }
 
+
+
+def _nkr_active_session_status_ok(sess):
+    status_u = str((sess or {}).get("status") or "").upper()
+    pos_u = str((sess or {}).get("positionState") or (sess or {}).get("position_state") or "").upper()
+    if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL", "PAUSED", "INACTIVE"}:
+        return False
+    if pos_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WATCH_POOL", "PAUSED", "INACTIVE"}:
+        return False
+    return status_u in {"ACTIVE", "OPEN", "EXECUTOR", "EXECUTOR_ACTIVE", "WAITING", "READY_DISPATCHED"} or bool((sess or {}).get("openRotation"))
+
+
+def _nkr_make_promoted_session(nowi, symbol, row, capital_usd, total_budget, score, base="USDT", chain="POL"):
+    sym = str(symbol or "").strip().upper()
+    price = _nkr_row_price_usd(row)
+    sid = f"NKR-PROMO-{sym}-{nowi}"
+    trade_id = f"NKR-TRADE-{sid}-{sym}-{nowi}"
+    cap = round(float(max(0.0, capital_usd)), 4)
+    allocation_pct = round((cap / total_budget * 100.0), 2) if total_budget > 0 else 0.0
+    movement_id = f"NKR-CAPITAL-MOVE-{sid}-STABLE-TO-{sym}-{nowi}"
+    open_event = {
+        "id": f"NKR-BE-{sid}-{sym}-OPEN_POSITION-{nowi}",
+        "event_id": f"NKR-BE-{sid}-{sym}-OPEN_POSITION-{nowi}",
+        "trade_id": trade_id,
+        "session_id": sid,
+        "ts": nowi,
+        "status": "OPEN_POSITION",
+        "action": "REBALANCED_IN",
+        "executorState": "EXECUTOR_ACTIVE",
+        "baseAsset": base,
+        "fromAsset": base,
+        "targetAsset": sym,
+        "backToAsset": base,
+        "chain": chain,
+        "buyTime": nowi,
+        "openedAt": nowi,
+        "buyUsd": cap,
+        "amountInUsd": cap,
+        "buyPriceUsd": round(float(price), 10) if price > 0 else None,
+        "entryPriceUsd": round(float(price), 10) if price > 0 else None,
+        "grossUsd": 0.0,
+        "costsUsd": 0.0,
+        "netUsd": 0.0,
+        "netPct": 0.0,
+        "confidence": round(float(score), 4),
+        "flow": f"{base} → {sym} → {base}",
+        "route": f"{base} -> {sym} -> {base}",
+        "addedToCollectedProfit": False,
+        "alreadyCounted": True,
+        "reason": "watchlist_green_candidate_promoted_with_available_stable",
+        "source": "backend_watchlist_green_promotion_088",
+        "liveVaultTx": None,
+    }
+    movement_event = {
+        "id": movement_id,
+        "event_id": movement_id,
+        "trade_id": trade_id,
+        "session_id": sid,
+        "ts": nowi,
+        "mode": "shadow",
+        "status": "CAPITAL_MOVEMENT",
+        "action": "CAPITAL_ALLOCATED_FROM_STABLE",
+        "capitalMovementType": "REBALANCE_IN",
+        "fromAsset": base,
+        "toAsset": sym,
+        "baseAsset": base,
+        "targetAsset": sym,
+        "chain": chain,
+        "capitalBeforeUsd": 0.0,
+        "capitalMovedUsd": cap,
+        "capitalAfterUsd": cap,
+        "availableStableDeltaUsd": round(-cap, 4),
+        "grossUsd": 0.0,
+        "costsUsd": 0.0,
+        "netUsd": 0.0,
+        "addedToCollectedProfit": False,
+        "alreadyCounted": True,
+        "reason": "aggressive_watchlist_green_promotion_allocated_available_stable_not_profit",
+        "source": "backend_capital_movement_ledger_088_watchlist_green_promotion_fix",
+    }
+    return {
+        "id": sid,
+        "session_id": sid,
+        "type": "NKR",
+        "sessionType": "NKR",
+        "engineType": "NKR",
+        "status": "ACTIVE",
+        "lifecycleState": "ACTIVE",
+        "positionState": "OPEN",
+        "executionMode": "shadow",
+        "symbol": sym,
+        "sourceSymbol": sym,
+        "targetAsset": sym,
+        "chain": chain,
+        "baseAsset": base,
+        "payoutAsset": base,
+        "route": f"{base} -> {sym} -> {base}",
+        "confidence": round(float(score), 4),
+        "score": round(float(score), 4),
+        "workingCapitalUsd": cap,
+        "sessionCapitalUsd": cap,
+        "reservedUsd": cap,
+        "totalNkrBudgetUsd": round(float(total_budget), 4),
+        "nkrAllocationPct": allocation_pct,
+        "collectedProfitUsd": 0.0,
+        "profitUsd": 0.0,
+        "rotationProfitUsd": 0.0,
+        "grossProfitUsd": 0.0,
+        "costsUsd": 0.0,
+        "netProfitUsd": 0.0,
+        "openRotation": {
+            "openedAt": nowi,
+            "tradeId": trade_id,
+            "baseAsset": base,
+            "targetAsset": sym,
+            "chain": chain,
+            "entryUsd": cap,
+            "amountInUsd": cap,
+            "entryPriceUsd": round(float(price), 10) if price > 0 else None,
+            "currentPriceUsd": round(float(price), 10) if price > 0 else None,
+            "currentGrossUsd": 0.0,
+            "currentNetUsd": 0.0,
+            "currentNetPct": 0.0,
+            "state": "OPEN_POSITION",
+        },
+        "lastRotationEvent": open_event,
+        "rotationEvents": [movement_event, open_event],
+        "totalEventCount": 2,
+        "eventCount": 2,
+        "rotationEventHistoryCount": 2,
+        "createdAt": nowi,
+        "updatedAt": nowi,
+        "meta": {
+            "nkr_session": True,
+            "wallet_bound": True,
+            "nkr_backend_executor_logic": True,
+            "nkr_watchlist_promoted": True,
+            "nkr_promotion_mode": NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_MODE,
+            "nkr_promotion_reason": "green_watchlist_candidate_with_available_stable",
+            "position_state": "OPEN",
+            "lifecycle_state": "ACTIVE",
+            "execution_mode": "shadow",
+            "reserved_usd": cap,
+            "total_nkr_budget_usd": round(float(total_budget), 4),
+            "nkr_allocation_pct": allocation_pct,
+            "nkr_current_price_usd": round(float(price), 10) if price > 0 else None,
+            "nkr_entry_price_usd": round(float(price), 10) if price > 0 else None,
+            "nkr_active_trade_id": trade_id,
+            "nkr_trade_opened_at": nowi,
+            "nkr_total_event_count": 2,
+            "nkr_event_history_count": 2,
+            "nkr_event_history_limit": "UNLIMITED",
+        },
+    }
+
+
+def _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=None):
+    """Promote multiple strong watchlist candidates when NKR has available stable capital.
+
+    ENGINE-088 fixes the single-winner bug: after weak sessions are removed, NKR must keep
+    scanning the whole watchlist. Max sessions is still only a ceiling, but in a green market
+    it may add several high-quality candidates instead of staying stuck in one coin.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    if not isinstance(active, list) or not isinstance(market_by_sym, dict) or not market_by_sym:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "no_market_rows"}
+    total_budget = _safe_float(total_budget, 0.0)
+    if total_budget <= 0:
+        total_budget = sum(_safe_float((x or {}).get("workingCapitalUsd") or (x or {}).get("budgetUsd") or 0.0, 0.0) for x in active if isinstance(x, dict) and _nkr_is_session(x))
+    if total_budget <= 0:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "missing_budget"}
+
+    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or (total_budget * 0.10), total_budget * 0.10)
+    investable_usd = max(0.0, total_budget - protected_usd)
+    live_sessions = [x for x in active if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
+    active_symbols = {_nkr_session_symbol(x) for x in live_sessions}
+    active_alloc = sum(_safe_float((x or {}).get("workingCapitalUsd") or (x or {}).get("sessionCapitalUsd") or (x or {}).get("reservedUsd") or 0.0, 0.0) for x in live_sessions)
+    available_usd = max(0.0, investable_usd - active_alloc)
+    min_session_usd = _safe_float(settings.get("minNkrSessionUsd") or NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SESSION_USD, NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SESSION_USD)
+    if available_usd < min_session_usd:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "available_below_min_session"}
+
+    # Candidate score uses watchlist row score when present, otherwise change/momentum-derived fallback.
+    candidates = []
+    for sym, row in market_by_sym.items():
+        sym = str(sym or "").strip().upper()
+        if not sym or sym in active_symbols:
+            continue
+        price = _nkr_row_price_usd(row)
+        change = _nkr_row_change_pct(row)
+        if price <= 0:
+            continue
+        pseudo = {"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}
+        score = _nkr_session_score(pseudo, row)
+        # Strong green override: large momentum may deserve promotion even if rating labels are conservative.
+        if change >= 5.0:
+            score = max(score, 78.0)
+        elif change >= 2.0:
+            score = max(score, 70.0)
+        elif change >= NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT:
+            score = max(score, 62.0)
+        min_score = max(NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SCORE, dispatch_min)
+        if change < NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT or score < min_score:
+            continue
+        candidates.append({"sym": sym, "row": row, "score": score, "change": change})
+    candidates.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    if not candidates:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "no_green_candidate_cleared_gate"}
+
+    green_count = len(candidates) + sum(1 for x in live_sessions if _nkr_row_change_pct(market_by_sym.get(_nkr_session_symbol(x), {})) >= NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT)
+    max_session_ceiling = int(_safe_float(settings.get("maxActiveNkrSessions") or settings.get("maxActiveSessions") or 10, 10))
+    max_session_ceiling = max(1, min(15, max_session_ceiling))
+    # Not a target: desired grows only with actual market breadth. Broad green => 4-6 active sessions, not automatic 10.
+    desired_active = min(max_session_ceiling, NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_ACTIVE_DEFAULT, max(1, green_count))
+    slots_to_add = max(0, desired_active - len(live_sessions))
+    if slots_to_add <= 0:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "active_count_already_matches_quality_breadth"}
+    chosen = candidates[:slots_to_add]
+    if not chosen:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "no_slots_chosen"}
+
+    max_per_session = max(min_session_usd, total_budget * _safe_float(NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_SESSION_PCT, 0.30))
+    # Use a meaningful part of available stable, but keep reserve. More green breadth -> deploy more.
+    deploy_pct = 0.45 if green_count >= 3 else 0.30
+    if green_count >= 6:
+        deploy_pct = 0.65
+    deploy_usd = min(available_usd, max(min_session_usd, available_usd * deploy_pct))
+    weights = [max(1.0, (c["score"] - dispatch_min + 4.0)) * max(1.0, 1.0 + c["change"] / 5.0) for c in chosen]
+    weight_sum = sum(weights) or 1.0
+    new_sessions = []
+    allocated = 0.0
+    base = str(settings.get("baseAsset") or settings.get("payoutAsset") or "USDT").upper()
+    chain = str(settings.get("chain") or "POL").upper()
+    for c, w in zip(chosen, weights):
+        cap = min(max_per_session, deploy_usd * (w / weight_sum))
+        if cap < min_session_usd:
+            continue
+        cap = min(cap, available_usd - allocated)
+        if cap < min_session_usd:
+            continue
+        new_sessions.append(_nkr_make_promoted_session(nowi, c["sym"], c["row"], cap, total_budget, c["score"], base=base, chain=chain))
+        allocated += cap
+    if not new_sessions:
+        return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "allocation_too_small"}
+    return active + new_sessions, {
+        "changed": True,
+        "events": len(new_sessions) * 2,
+        "allocatedUsd": round(float(allocated), 4),
+        "promoted": [x.get("targetAsset") for x in new_sessions],
+        "availableBeforeUsd": round(float(available_usd), 4),
+        "desiredActive": desired_active,
+        "greenBreadth": green_count,
+        "reason": "watchlist_green_candidates_promoted",
+    }
 
 def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None):
     settings = settings if isinstance(settings, dict) else {}
@@ -27787,6 +28049,18 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
                 f"AGGRESSIVE_REALLOCATION released ${_safe_float(reallocation_summary.get('releasedUsd'), 0.0):.2f} to {','.join(reallocation_summary.get('targets') or [])}"
             )
 
+    # ENGINE-088: after weak sessions are released, continue scanning the entire watchlist.
+    # Do not auto-fill to 10, but do promote multiple strong green candidates when
+    # there is available stable capital and market breadth supports it.
+    promotion_summary = {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": []}
+    if mode == "AGGRESSIVE":
+        active, promotion_summary = _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=settings)
+        if promotion_summary.get("changed"):
+            changed = True
+            messages.append(
+                f"WATCHLIST_GREEN_PROMOTION allocated ${_safe_float(promotion_summary.get('allocatedUsd'), 0.0):.2f} to {','.join(promotion_summary.get('promoted') or [])}"
+            )
+
     # Recalculate allocation percent after any backend change.
     if total_budget <= 0:
         total_budget = sum(_safe_float(x.get("workingCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active if isinstance(x, dict) and _nkr_is_session(x))
@@ -27808,6 +28082,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         "mode": mode,
         "profitLockPct": profit_lock_pct,
         "aggressiveReallocation": reallocation_summary,
+        "watchlistGreenPromotion": promotion_summary if 'promotion_summary' in locals() else {"changed": False},
         "ts": nowi,
     }
 
