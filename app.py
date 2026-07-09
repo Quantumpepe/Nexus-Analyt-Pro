@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-091-NKR-PROMOTION-HARD-CAP-6-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-092-TRADING-MULTI-SESSION-RUNTIME-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16690,6 +16690,124 @@ def _nexus_shadow_autotick_running_sessions(cur, wallet_address: str, source: st
             pass
     return events_out
 
+
+
+def _nexus_shadow_group_queue_runtime_keys(queue: list) -> list[dict]:
+    """Return distinct Trading/Shadow runtime groups from the persisted queue.
+
+    ENGINE-092: Nexus Trading can hold multiple approved budget sessions at the
+    same time (ETH, BNB, POL, etc.). The Shadow runtime must tick every open
+    session group, not only the currently selected UI card. Otherwise a session
+    such as POL can stay READY forever while ETH/BNB continue to trade.
+    """
+    groups = []
+    seen = set()
+    for item in queue if isinstance(queue, list) else []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        sid = str(item.get("session_id") or item.get("sessionId") or item.get("trade_session_id") or meta.get("session_id") or meta.get("trade_session_id") or "").strip()
+        chain = _normalize_chain_key(item.get("chain") or item.get("chain_key") or item.get("network") or meta.get("chain") or meta.get("chain_key") or "")
+        # Use a real session id when available. For older rows without one, chain is
+        # still enough to keep the legacy queue moving without mixing chains.
+        key = (sid or "__legacy__", chain or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.append({"session_id": sid, "chain": chain})
+    return groups
+
+
+def _nexus_shadow_runtime_tick_all_sessions(cur, wallet_address: str, cfg: dict, action: str = "tick") -> dict:
+    """Tick all active Trading Shadow runtime groups for this wallet.
+
+    This is intentionally backend-owned. The frontend may be focused on one card,
+    but the Strategist must continue ETH/BNB/POL and any other approved sessions.
+    """
+    execution = _nexus_execution_summary(cur, wallet_address)
+    persisted_queue = execution.get("queue", []) if isinstance(execution.get("queue", []), list) else []
+    groups = _nexus_shadow_group_queue_runtime_keys(persisted_queue)
+    if not groups:
+        return _nexus_shadow_runtime_tick(cur, wallet_address, cfg, action=action)
+
+    merged_events = []
+    merged_changed = []
+    merged_strategists = []
+    runtime_status = "idle"
+    active_count = 0
+    ready_count = 0
+    exit_count = 0
+    promoted_count = 0
+    tick_sec = None
+
+    for g in groups:
+        sid = str(g.get("session_id") or "").strip()
+        chain = _normalize_chain_key(g.get("chain") or "")
+        if _nexus_shadow_is_session_stopped(cur, wallet_address, sid, chain):
+            continue
+        cfg_g = dict(cfg or {})
+        if sid:
+            cfg_g["session_id"] = sid
+            cfg_g["sessionId"] = sid
+        else:
+            cfg_g.pop("session_id", None)
+            cfg_g.pop("sessionId", None)
+        if chain:
+            cfg_g["chain"] = chain
+            cfg_g["chain_key"] = chain
+        try:
+            res = _nexus_shadow_runtime_tick(cur, wallet_address, cfg_g, action=action)
+        except Exception as e:
+            err = str(e)[:220]
+            merged_events.append({
+                "type": "MULTI_SESSION_TICK_ERROR",
+                "message": f"Shadow runtime skipped one session group after error: {err}",
+                "session_id": sid,
+                "chain": chain,
+            })
+            continue
+        if str(res.get("runtime_status") or "").lower() == "running":
+            runtime_status = "running"
+        elif runtime_status != "running" and res.get("runtime_status"):
+            runtime_status = str(res.get("runtime_status") or runtime_status)
+        merged_events.extend(res.get("events") if isinstance(res.get("events"), list) else [])
+        merged_changed.extend(res.get("changed") if isinstance(res.get("changed"), list) else [])
+        strat = res.get("strategist") if isinstance(res.get("strategist"), dict) else {}
+        if strat:
+            merged_strategists.append({"session_id": sid, "chain": chain, **strat})
+        active_count += int(res.get("active_count") or strat.get("active_slots") or 0)
+        ready_count += int(res.get("ready_count") or strat.get("ready_slots") or 0)
+        exit_count += int(res.get("simulated_exits") or strat.get("simulated_exits") or 0)
+        promoted_count += int(res.get("promoted") or strat.get("promoted") or 0)
+        tick_sec = res.get("tick_sec") or tick_sec
+
+    execution_after = _nexus_execution_summary(cur, wallet_address)
+    queue_after = execution_after.get("queue", []) if isinstance(execution_after.get("queue", []), list) else []
+    if not merged_events:
+        merged_events.append({"type": "MULTI_SESSION_HOLD", "message": "All Trading shadow sessions were checked; no state change was required."})
+
+    return {
+        "runtime_status": runtime_status,
+        "events": merged_events,
+        "queue": queue_after,
+        "changed": merged_changed,
+        "tick_sec": tick_sec,
+        "active_count": active_count,
+        "ready_count": ready_count,
+        "simulated_exits": exit_count,
+        "promoted": promoted_count,
+        "strategist": {
+            "status": "ok",
+            "driver": "shadow_multi_session_runtime_v1",
+            "groups": merged_strategists,
+            "active_slots": active_count,
+            "ready_slots": ready_count,
+            "simulated_exits": exit_count,
+            "promoted": promoted_count,
+            "multi_session": True,
+        },
+    }
+
 @app.route("/api/nexus/shadow/executor", methods=["GET", "POST"])
 def api_nexus_shadow_executor():
     wa, error_resp = _nexus_wallet_from_request()
@@ -16925,7 +17043,10 @@ def api_nexus_shadow_executor():
                             _meta["strategist_entry_reason"] = "start_requires_regime_edge_cost_gate"
                             _seed_item["meta"] = _meta
                     _nexus_shadow_persist_queue_preview(cur, wa, normalized_seed)
-            runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action_for_tick)
+            if bool(cfg.get("run_all_sessions") or cfg.get("runAllSessions") or cfg.get("multi_session_runtime") or cfg.get("multiSessionRuntime")) and action_for_tick in ("start", "resume", "tick"):
+                runtime_result = _nexus_shadow_runtime_tick_all_sessions(cur, wa, cfg, action=action_for_tick)
+            else:
+                runtime_result = _nexus_shadow_runtime_tick(cur, wa, cfg, action=action_for_tick)
             result = {
                 "summary": {
                     "shadow_only": True,
