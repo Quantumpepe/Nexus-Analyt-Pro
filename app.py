@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-090-NKR-DEPLOY-AVAILABLE-CAPITAL-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27850,6 +27850,208 @@ def _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_mi
         "reason": "watchlist_green_candidates_promoted",
     }
 
+
+def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=None):
+    """Deploy idle available stable capital across already-active NKR sessions.
+
+    ENGINE-090 fixes the capital allocator gap after ENGINE-088/089: promotion can
+    create the right active sessions, but free stable capital must then be
+    redistributed to those active sessions. Max sessions remains a ceiling; this
+    function does NOT auto-create sessions. It only tops up current active winners
+    and writes CAPITAL_MOVEMENT events for audit/history.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    if not isinstance(active, list):
+        return active, {"changed": False, "allocatedUsd": 0.0, "reason": "invalid_sessions"}
+    total_budget = _safe_float(total_budget, 0.0)
+    if total_budget <= 0:
+        total_budget = sum(_safe_float((x or {}).get("workingCapitalUsd") or (x or {}).get("sessionCapitalUsd") or (x or {}).get("budgetUsd") or 0.0, 0.0) for x in active if isinstance(x, dict) and _nkr_is_session(x))
+    if total_budget <= 0:
+        return active, {"changed": False, "allocatedUsd": 0.0, "reason": "missing_budget"}
+
+    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or (total_budget * 0.10), total_budget * 0.10)
+    investable_usd = max(0.0, total_budget - protected_usd)
+    live_sessions = [x for x in active if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
+    if not live_sessions:
+        return active, {"changed": False, "allocatedUsd": 0.0, "reason": "no_active_sessions"}
+
+    current_alloc = sum(_safe_float((x or {}).get("workingCapitalUsd") or (x or {}).get("sessionCapitalUsd") or (x or {}).get("reservedUsd") or 0.0, 0.0) for x in live_sessions)
+    available_usd = max(0.0, investable_usd - current_alloc)
+    min_move_usd = max(50.0, _safe_float(settings.get("minNkrCapitalMoveUsd") or 100.0, 100.0))
+    if available_usd < min_move_usd:
+        return active, {"changed": False, "allocatedUsd": 0.0, "availableUsd": round(available_usd, 4), "reason": "available_below_min_move"}
+
+    # Determine market breadth from the full watchlist. When the market is broadly green,
+    # Aggressive should not leave large stable capital idle after selecting active winners.
+    green_rows = 0
+    total_rows = 0
+    for _sym, _row in (market_by_sym or {}).items():
+        if _nkr_row_price_usd(_row) > 0:
+            total_rows += 1
+            if _nkr_row_change_pct(_row) >= NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT:
+                green_rows += 1
+    green_breadth = (green_rows / total_rows) if total_rows > 0 else 0.0
+    active_green = sum(1 for s in live_sessions if _nkr_row_change_pct((market_by_sym or {}).get(_nkr_session_symbol(s), {})) >= NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT)
+
+    # Reserve inside investable capital (protected reserve was already removed above).
+    # Broad green: deploy nearly all investable capital. Mixed market: keep more free stable.
+    if green_breadth >= 0.60 or active_green >= 4:
+        deploy_ratio = 0.95
+    elif green_breadth >= 0.35 or active_green >= 2:
+        deploy_ratio = 0.88
+    else:
+        deploy_ratio = 0.75
+    target_alloc = min(investable_usd, investable_usd * deploy_ratio)
+    deploy_usd = max(0.0, min(available_usd, target_alloc - current_alloc))
+    if deploy_usd < min_move_usd:
+        return active, {"changed": False, "allocatedUsd": 0.0, "availableUsd": round(available_usd, 4), "targetAllocatedUsd": round(target_alloc, 4), "reason": "target_allocation_already_reached"}
+
+    max_per_session = max(250.0, total_budget * _safe_float(NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_SESSION_PCT, 0.30))
+    eligible = []
+    for sess in live_sessions:
+        sym = _nkr_session_symbol(sess)
+        row = (market_by_sym or {}).get(sym, {})
+        score = _nkr_session_score(sess, row)
+        change = _nkr_row_change_pct(row)
+        cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("reservedUsd") or 0.0, 0.0)
+        if cap >= max_per_session - 0.01:
+            continue
+        # Active sessions can receive top-up when they are not obviously broken.
+        # Strong green assets are preferred, but positive score/quality also counts.
+        if change < -1.0 and score < max(dispatch_min, 62.0):
+            continue
+        weight = max(1.0, score - dispatch_min + 5.0) * max(0.5, 1.0 + max(-2.0, change) / 5.0)
+        eligible.append({"session": sess, "sym": sym, "row": row, "score": score, "change": change, "cap": cap, "room": max(0.0, max_per_session - cap), "weight": weight})
+    if not eligible:
+        return active, {"changed": False, "allocatedUsd": 0.0, "availableUsd": round(available_usd, 4), "reason": "no_eligible_active_session_for_topup"}
+
+    # Allocate by weighted room, retrying once for cap-limited sessions.
+    remaining = deploy_usd
+    additions = {id(e["session"]): 0.0 for e in eligible}
+    for _pass in range(2):
+        open_eligible = [e for e in eligible if e["room"] - additions[id(e["session"])] > 0.01]
+        if not open_eligible or remaining <= 0.01:
+            break
+        wsum = sum(e["weight"] for e in open_eligible) or 1.0
+        for e in open_eligible:
+            sid_key = id(e["session"])
+            room_left = max(0.0, e["room"] - additions[sid_key])
+            add = min(room_left, remaining * (e["weight"] / wsum))
+            if add <= 0:
+                continue
+            additions[sid_key] += add
+        used = sum(additions.values())
+        remaining = max(0.0, deploy_usd - used)
+
+    total_added = sum(additions.values())
+    if total_added < min_move_usd:
+        return active, {"changed": False, "allocatedUsd": 0.0, "availableUsd": round(available_usd, 4), "reason": "topup_allocation_too_small"}
+
+    updated = []
+    moved_events = 0
+    moved_symbols = []
+    for sess in active:
+        if not isinstance(sess, dict) or not _nkr_is_session(sess) or not _nkr_active_session_status_ok(sess):
+            updated.append(sess)
+            continue
+        add = additions.get(id(sess), 0.0)
+        if add <= 0.01:
+            updated.append(sess)
+            continue
+        sym = _nkr_session_symbol(sess)
+        row = (market_by_sym or {}).get(sym, {})
+        price = _nkr_row_price_usd(row)
+        old_cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("reservedUsd") or 0.0, 0.0)
+        new_cap = old_cap + add
+        base = str(sess.get("baseAsset") or sess.get("payoutAsset") or settings.get("baseAsset") or "USDT").upper()
+        chain = str(sess.get("chain") or settings.get("chain") or "POL").upper()
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
+        old_entry = _safe_float(open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or price, price)
+        # Weighted entry for additional buy at current price.
+        if old_entry > 0 and price > 0 and old_cap > 0:
+            old_qty = old_cap / old_entry
+            add_qty = add / price
+            new_entry = new_cap / max(1e-12, old_qty + add_qty)
+        else:
+            new_entry = price if price > 0 else old_entry
+        move_id = f"NKR-CAPITAL-MOVE-{sess.get('id') or sess.get('session_id')}-{sym}-STABLE-TOPUP-{nowi}"
+        move_event = {
+            "id": move_id,
+            "event_id": move_id,
+            "trade_id": str(open_rotation.get("tradeId") or meta.get("nkr_active_trade_id") or f"NKR-TRADE-{sess.get('id') or sess.get('session_id')}-{sym}-{nowi}"),
+            "session_id": str(sess.get("id") or sess.get("session_id") or ""),
+            "ts": nowi,
+            "mode": "shadow",
+            "status": "CAPITAL_MOVEMENT",
+            "action": "CAPITAL_TOPUP_FROM_STABLE",
+            "capitalMovementType": "ACTIVE_SESSION_TOPUP",
+            "fromAsset": base,
+            "toAsset": sym,
+            "baseAsset": base,
+            "targetAsset": sym,
+            "chain": chain,
+            "capitalBeforeUsd": round(old_cap, 4),
+            "capitalMovedUsd": round(add, 4),
+            "capitalAfterUsd": round(new_cap, 4),
+            "availableStableDeltaUsd": round(-add, 4),
+            "buyPriceUsd": round(price, 10) if price > 0 else None,
+            "entryPriceUsd": round(new_entry, 10) if new_entry > 0 else None,
+            "grossUsd": 0.0,
+            "costsUsd": 0.0,
+            "netUsd": 0.0,
+            "addedToCollectedProfit": False,
+            "alreadyCounted": True,
+            "reason": "aggressive_available_capital_deployed_to_active_sessions_not_profit",
+            "source": "backend_capital_allocator_090_deploy_available_capital",
+        }
+        events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+        next_sess = dict(sess)
+        next_sess.update({
+            "workingCapitalUsd": round(new_cap, 4),
+            "sessionCapitalUsd": round(new_cap, 4),
+            "reservedUsd": round(new_cap, 4),
+            "lastRotationEvent": move_event,
+            "rotationEvents": [move_event] + events,
+            "totalEventCount": int(_safe_float(sess.get("totalEventCount") or sess.get("eventCount") or len(events), len(events))) + 1,
+            "eventCount": int(_safe_float(sess.get("totalEventCount") or sess.get("eventCount") or len(events), len(events))) + 1,
+            "updatedAt": nowi,
+        })
+        next_open = dict(open_rotation) if open_rotation else {}
+        if next_open:
+            next_open.update({
+                "entryUsd": round(new_cap, 4),
+                "amountInUsd": round(new_cap, 4),
+                "entryPriceUsd": round(new_entry, 10) if new_entry > 0 else next_open.get("entryPriceUsd"),
+                "currentPriceUsd": round(price, 10) if price > 0 else next_open.get("currentPriceUsd"),
+            })
+            next_sess["openRotation"] = next_open
+        next_meta = dict(meta)
+        next_meta.update({
+            "reserved_usd": round(new_cap, 4),
+            "nkr_entry_price_usd": round(new_entry, 10) if new_entry > 0 else next_meta.get("nkr_entry_price_usd"),
+            "nkr_current_price_usd": round(price, 10) if price > 0 else next_meta.get("nkr_current_price_usd"),
+            "nkr_last_capital_topup_ts": nowi,
+            "nkr_capital_allocator_mode": "ENGINE_090_DEPLOY_AVAILABLE_CAPITAL_TO_ACTIVE_WINNERS",
+            "nkr_total_event_count": next_sess["totalEventCount"],
+        })
+        next_sess["meta"] = next_meta
+        updated.append(next_sess)
+        moved_events += 1
+        moved_symbols.append(sym)
+    return updated, {
+        "changed": bool(moved_events > 0),
+        "events": moved_events,
+        "allocatedUsd": round(float(total_added), 4),
+        "availableBeforeUsd": round(float(available_usd), 4),
+        "targetAllocatedUsd": round(float(target_alloc), 4),
+        "deployRatio": round(float(deploy_ratio), 4),
+        "greenBreadth": round(float(green_breadth), 4),
+        "activeGreen": int(active_green),
+        "targets": moved_symbols,
+        "reason": "available_stable_deployed_to_active_sessions",
+    }
+
 def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None):
     settings = settings if isinstance(settings, dict) else {}
     market_by_sym = _nkr_market_row_map(market_rows)
@@ -28061,6 +28263,18 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
                 f"WATCHLIST_GREEN_PROMOTION allocated ${_safe_float(promotion_summary.get('allocatedUsd'), 0.0):.2f} to {','.join(promotion_summary.get('promoted') or [])}"
             )
 
+    # ENGINE-090: if stable capital is still idle after reallocation/promotion,
+    # deploy it across the already-active winner sessions. This does NOT auto-fill
+    # session count; it only fixes the capital allocator gap.
+    deploy_summary = {"changed": False, "allocatedUsd": 0.0}
+    if mode == "AGGRESSIVE":
+        active, deploy_summary = _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=settings)
+        if deploy_summary.get("changed"):
+            changed = True
+            messages.append(
+                f"AVAILABLE_CAPITAL_DEPLOYED ${_safe_float(deploy_summary.get('allocatedUsd'), 0.0):.2f} to {','.join(deploy_summary.get('targets') or [])}"
+            )
+
     # Recalculate allocation percent after any backend change.
     if total_budget <= 0:
         total_budget = sum(_safe_float(x.get("workingCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active if isinstance(x, dict) and _nkr_is_session(x))
@@ -28083,6 +28297,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         "profitLockPct": profit_lock_pct,
         "aggressiveReallocation": reallocation_summary,
         "watchlistGreenPromotion": promotion_summary if 'promotion_summary' in locals() else {"changed": False},
+        "availableCapitalDeployment": deploy_summary if 'deploy_summary' in locals() else {"changed": False},
         "ts": nowi,
     }
 
