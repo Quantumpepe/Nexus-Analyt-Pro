@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-090-NKR-DEPLOY-AVAILABLE-CAPITAL-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-091-NKR-PROMOTION-HARD-CAP-6-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27059,11 +27059,11 @@ NEXUS_NKR_COST_ALIGNMENT_MODE = "ALIGNED_WITH_TRADER_SHADOW_COST_MODEL"
 NEXUS_NKR_WATCH_POOL_MODE = "NKR_WATCH_POOL_PROMOTION_V1"
 NEXUS_NKR_WATCH_POOL_POLICY = "SCAN_ALL_ALLOWED_ASSETS_KEEP_WEAK_ASSETS_IN_WATCH_POOL_PROMOTE_IMMEDIATELY_WHEN_SCORE_MOMENTUM_VOLUME_OR_NET_EDGE_IMPROVES"
 NEXUS_NKR_PROMOTION_POLICY = "WEAK_ASSETS_GET_NO_CAPITAL_BUT_REMAIN_SCANNED_AND_CAN_REPLACE_WEAKER_ACTIVE_SESSION"
-NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_MODE = "NKR_WATCHLIST_GREEN_PROMOTION_FIX_V1"
-NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_POLICY = "MAX_SESSIONS_IS_CEILING_PROMOTE_MULTIPLE_STRONG_WATCHLIST_ASSETS_WHEN_AVAILABLE_STABLE_EXISTS"
+NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_MODE = "NKR_PROMOTION_HARD_CAP_6_FIX_V1"
+NEXUS_NKR_WATCHLIST_GREEN_PROMOTION_POLICY = "MAX_SESSIONS_IS_CEILING_NO_INTERNAL_6_CAP_PROMOTE_ALL_QUALITY_GREEN_ASSETS"
 NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT = 0.30
 NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SCORE = 60.0
-NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_ACTIVE_DEFAULT = 6
+NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_ACTIVE_DEFAULT = 15  # ceiling only; quality/green breadth decides actual active count
 NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_SESSION_USD = 250.0
 NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_SESSION_PCT = 0.30
 
@@ -27807,8 +27807,10 @@ def _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_mi
     green_count = len(candidates) + sum(1 for x in live_sessions if _nkr_row_change_pct(market_by_sym.get(_nkr_session_symbol(x), {})) >= NEXUS_NKR_AGGRESSIVE_PROMOTE_MIN_CHANGE_PCT)
     max_session_ceiling = int(_safe_float(settings.get("maxActiveNkrSessions") or settings.get("maxActiveSessions") or 10, 10))
     max_session_ceiling = max(1, min(15, max_session_ceiling))
-    # Not a target: desired grows only with actual market breadth. Broad green => 4-6 active sessions, not automatic 10.
-    desired_active = min(max_session_ceiling, NEXUS_NKR_AGGRESSIVE_PROMOTE_MAX_ACTIVE_DEFAULT, max(1, green_count))
+    # ENGINE-091: remove hidden 6-session hard cap.
+    # Max sessions is still only a ceiling; actual active count follows quality-cleared green breadth.
+    # If 8-10 watchlist coins are strong, Aggressive may promote 8-10. If only 3 clear, it stays at 3.
+    desired_active = min(max_session_ceiling, max(1, green_count))
     slots_to_add = max(0, desired_active - len(live_sessions))
     if slots_to_add <= 0:
         return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "active_count_already_matches_quality_breadth"}
@@ -28003,7 +28005,7 @@ def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, d
             "addedToCollectedProfit": False,
             "alreadyCounted": True,
             "reason": "aggressive_available_capital_deployed_to_active_sessions_not_profit",
-            "source": "backend_capital_allocator_090_deploy_available_capital",
+            "source": "backend_capital_allocator_091_promotion_cap_removed",
         }
         events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
         next_sess = dict(sess)
@@ -28032,7 +28034,7 @@ def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, d
             "nkr_entry_price_usd": round(new_entry, 10) if new_entry > 0 else next_meta.get("nkr_entry_price_usd"),
             "nkr_current_price_usd": round(price, 10) if price > 0 else next_meta.get("nkr_current_price_usd"),
             "nkr_last_capital_topup_ts": nowi,
-            "nkr_capital_allocator_mode": "ENGINE_090_DEPLOY_AVAILABLE_CAPITAL_TO_ACTIVE_WINNERS",
+            "nkr_capital_allocator_mode": "ENGINE_091_PROMOTION_HARD_CAP_6_REMOVED_DEPLOY_AVAILABLE_CAPITAL",
             "nkr_total_event_count": next_sess["totalEventCount"],
         })
         next_sess["meta"] = next_meta
