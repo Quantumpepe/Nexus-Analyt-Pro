@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-095-TRADING-REGIME-PRICE-SINGLE-SOURCE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-095-TRADING-REGIME-PRICE-SINGLE-SOURCE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-097-NKR-ACTIVE-HOT-PRICE-CACHE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-097-NKR-ACTIVE-HOT-PRICE-CACHE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -203,6 +203,18 @@ NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
 NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
 NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 3
 NEXUS_NKR_MAX_ACTIVE_SESSIONS_LIMIT = 0  # 0 = user-defined, no enforced hard cap
+
+# ENGINE-097: Central backend price-cache tiers.
+# Market/UI remains slow to protect external API quota; active trading/NKR symbols
+# refresh faster from the same shared backend snapshot so Trader, NKR and Watchlist
+# read one source of truth without per-card/per-user API calls.
+NEXUS_PRICE_CACHE_MODE = "GLOBAL_MARKET_ACTIVE_HOT_CACHE_V1"
+NEXUS_PRICE_MARKET_TTL_SEC = int(os.getenv("NEXUS_PRICE_MARKET_TTL_SEC", "60"))
+NEXUS_PRICE_ACTIVE_TTL_SEC = int(os.getenv("NEXUS_PRICE_ACTIVE_TTL_SEC", "15"))
+NEXUS_PRICE_HOT_TTL_SEC = int(os.getenv("NEXUS_PRICE_HOT_TTL_SEC", "5"))
+NEXUS_PRICE_HOT_IDLE_SEC = int(os.getenv("NEXUS_PRICE_HOT_IDLE_SEC", "180"))
+NEXUS_PRICE_ACTIVE_POLICY = "ACTIVE_TRADER_AND_NKR_SYMBOLS_REFRESH_10_TO_15_SECONDS_FROM_SHARED_BACKEND_CACHE"
+NEXUS_PRICE_HOT_POLICY = "ENTRY_EXIT_REBALANCE_AND_STRONG_MOMENTUM_SYMBOLS_REFRESH_5_SECONDS_TEMPORARILY"
 NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
 NEXUS_NKR_CAPITAL_MANAGER_MODE = "NKR_CAPITAL_MANAGER_V1"
 NEXUS_NKR_CAPITAL_MANAGER_POLICY = "ALLOCATE_STABLE_CAPITAL_BY_STRATEGIST_SCORE_WITH_CASH_RESERVE"
@@ -314,9 +326,18 @@ def _nexus_shadow_smooth_regime(memory_key: str, raw_regime: str, now_i: int | N
         pending = raw
         pending_count = 1
 
-    # Require confirmation before changing visible regime. Moving into RED should
-    # also be confirmed, unless RED repeats. Hard safety blocks still run separately.
-    if pending_count >= max(1, int(confirm_ticks or 2)):
+    # ENGINE-096: asymmetric hysteresis. A stale RED must not stick while the
+    # current global market context is already neutral/green, but entering RED
+    # requires stronger confirmation to avoid red/yellow flicker. Hard safety
+    # still runs separately and is not disabled by this UI/strategy stabilizer.
+    base_confirm = max(1, int(confirm_ticks or 2))
+    if raw == "RED" and stable != "RED":
+        needed = max(base_confirm + 1, 4)
+    elif stable == "RED" and raw in ("NEUTRAL", "GREEN", "STRONG_GREEN"):
+        needed = 1
+    else:
+        needed = base_confirm
+    if pending_count >= needed:
         stable = raw
         pending = ""
         pending_count = 0
@@ -338,6 +359,9 @@ def api_build_info():
     return {
         "status": "ok",
         "backend_build": BACKEND_BUILD_ID,
+        "price_cache_mode": NEXUS_PRICE_CACHE_MODE,
+        "price_cache_ttl_sec": {"market": NEXUS_PRICE_MARKET_TTL_SEC, "active": NEXUS_PRICE_ACTIVE_TTL_SEC, "hot": NEXUS_PRICE_HOT_TTL_SEC},
+        "price_cache_policy": NEXUS_PRICE_ACTIVE_POLICY,
         "frontend_target": FRONTEND_TARGET_BUILD_ID,
         "strategist_version": STRATEGIST_BUILD_ID,
         "shadow_version": SHADOW_BUILD_ID,
@@ -3547,6 +3571,48 @@ def coingecko_simple_price():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
+
+
+@app.get("/api/nexus/price-cache/status")
+def api_nexus_price_cache_status():
+    symbols_raw = request.args.get("symbols") or request.args.get("assets") or ""
+    symbols = [_price_symbol_key(x) for x in re.split(r"[,;\s]+", symbols_raw) if _price_symbol_key(x)]
+    if not symbols:
+        # keep response compact: most recently marked tier symbols + most recent snapshots
+        symbols = list(dict.fromkeys(list(NEXUS_PRICE_CACHE_TIERS.keys())[:80] + list(SNAPSHOTS.keys())[:80]))[:120]
+    rows = []
+    for sym in symbols:
+        row = _nexus_snapshot_price(sym)
+        tier_rec = NEXUS_PRICE_CACHE_TIERS.get(_price_symbol_key(sym)) or {}
+        row["tierMarkedReason"] = tier_rec.get("reason") or ""
+        row["tierExpiresTs"] = tier_rec.get("expires_ts") or 0
+        rows.append(row)
+    return jsonify({
+        "status": "ok",
+        "mode": NEXUS_PRICE_CACHE_MODE,
+        "policy": {
+            "market": "watchlist_and_general_ui",
+            "active": NEXUS_PRICE_ACTIVE_POLICY,
+            "hot": NEXUS_PRICE_HOT_POLICY,
+        },
+        "ttlSec": {"market": NEXUS_PRICE_MARKET_TTL_SEC, "active": NEXUS_PRICE_ACTIVE_TTL_SEC, "hot": NEXUS_PRICE_HOT_TTL_SEC},
+        "stats": NEXUS_PRICE_CACHE_STATS,
+        "symbols": rows,
+        "ts": now_ts(),
+    })
+
+@app.post("/api/nexus/price-cache/mark")
+def api_nexus_price_cache_mark():
+    body = request.get_json(silent=True) or {}
+    raw = body.get("symbols") or body.get("assets") or request.args.get("symbols") or ""
+    if isinstance(raw, list):
+        symbols = [_price_symbol_key(x) for x in raw if _price_symbol_key(x)]
+    else:
+        symbols = [_price_symbol_key(x) for x in re.split(r"[,;\s]+", str(raw or "")) if _price_symbol_key(x)]
+    tier = body.get("tier") or request.args.get("tier") or "active"
+    reason = body.get("reason") or request.args.get("reason") or "manual_mark"
+    marked = [_nexus_price_cache_mark(sym, tier=tier, reason=reason) for sym in symbols]
+    return jsonify({"status": "ok", "mode": NEXUS_PRICE_CACHE_MODE, "marked": marked, "ts": now_ts()})
 
 @app.route("/api/coingecko/global", methods=["GET"])
 def coingecko_global_market():
@@ -9119,6 +9185,69 @@ def _ledger_record_pnl_event(
 # In-memory state
 # -------------------------
 SNAPSHOTS: Dict[str, Dict[str, Any]] = {}   # key: item_id -> {"ts":..., "data": {...}}
+
+# ENGINE-097: shared price cache tier metadata.
+# Keyed by normalized symbol. This does not create extra user/API calls; it only
+# decides whether the next backend runtime read may refresh the shared SNAPSHOTS entry.
+NEXUS_PRICE_CACHE_TIERS: Dict[str, Dict[str, Any]] = {}
+NEXUS_PRICE_CACHE_STATS: Dict[str, Any] = {"refreshes": 0, "hits": 0, "last_refresh_ts": 0, "last_refresh_symbol": ""}
+
+def _price_symbol_key(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(symbol or "").strip().upper())[:24]
+
+def _nexus_price_cache_mark(symbol: str, tier: str = "active", reason: str = "", ttl_sec: int | None = None) -> dict:
+    sym = _price_symbol_key(symbol)
+    if not sym:
+        return {}
+    tier_u = str(tier or "active").strip().lower()
+    if tier_u not in ("market", "active", "hot"):
+        tier_u = "active"
+    if ttl_sec is None:
+        ttl_sec = NEXUS_PRICE_HOT_IDLE_SEC if tier_u == "hot" else max(NEXUS_PRICE_ACTIVE_TTL_SEC * 4, 60)
+    rec = NEXUS_PRICE_CACHE_TIERS.get(sym) or {}
+    nowi = now_ts() if "now_ts" in globals() else int(time.time())
+    rec.update({"symbol": sym, "tier": tier_u, "reason": str(reason or "")[:120], "marked_ts": nowi, "expires_ts": nowi + int(ttl_sec or 0)})
+    NEXUS_PRICE_CACHE_TIERS[sym] = rec
+    return rec
+
+def _nexus_price_cache_tier(symbol: str) -> str:
+    sym = _price_symbol_key(symbol)
+    if not sym:
+        return "market"
+    rec = NEXUS_PRICE_CACHE_TIERS.get(sym) or {}
+    nowi = now_ts() if "now_ts" in globals() else int(time.time())
+    if rec and int(rec.get("expires_ts") or 0) >= nowi:
+        tier = str(rec.get("tier") or "active").lower()
+        if tier in ("hot", "active", "market"):
+            return tier
+    return "market"
+
+def _nexus_price_cache_ttl_for_symbol(symbol: str) -> int:
+    tier = _nexus_price_cache_tier(symbol)
+    if tier == "hot":
+        return max(1, int(NEXUS_PRICE_HOT_TTL_SEC))
+    if tier == "active":
+        return max(2, int(NEXUS_PRICE_ACTIVE_TTL_SEC))
+    return max(10, int(NEXUS_PRICE_MARKET_TTL_SEC))
+
+def _nexus_snapshot_price(symbol: str) -> dict:
+    sym = _price_symbol_key(symbol)
+    if not sym:
+        return {"symbol": "", "price": 0.0, "ageSec": None, "source": "missing"}
+    nowi = now_ts() if "now_ts" in globals() else int(time.time())
+    for key in (sym, sym.lower(), sym.upper()):
+        snap = SNAPSHOTS.get(key) if isinstance(globals().get("SNAPSHOTS"), dict) else None
+        data = snap.get("data") if isinstance(snap, dict) else None
+        if isinstance(data, dict):
+            px = _safe_float(data.get("price") or data.get("current_price") or 0.0, 0.0) if "_safe_float" in globals() else float(data.get("price") or data.get("current_price") or 0.0)
+            ts0 = int(snap.get("ts") or data.get("ts") or 0)
+            return {"symbol": sym, "price": px, "ts": ts0, "ageSec": max(0, nowi - ts0) if ts0 else None, "source": data.get("source") or "snapshot", "tier": _nexus_price_cache_tier(sym), "ttlSec": _nexus_price_cache_ttl_for_symbol(sym)}
+        if isinstance(snap, dict):
+            px = _safe_float(snap.get("price") or snap.get("current_price") or 0.0, 0.0) if "_safe_float" in globals() else float(snap.get("price") or snap.get("current_price") or 0.0)
+            ts0 = int(snap.get("ts") or 0)
+            return {"symbol": sym, "price": px, "ts": ts0, "ageSec": max(0, nowi - ts0) if ts0 else None, "source": snap.get("source") or "snapshot", "tier": _nexus_price_cache_tier(sym), "ttlSec": _nexus_price_cache_ttl_for_symbol(sym)}
+    return {"symbol": sym, "price": 0.0, "ageSec": None, "source": "missing", "tier": _nexus_price_cache_tier(sym), "ttlSec": _nexus_price_cache_ttl_for_symbol(sym)}
+
 GRID_SESSIONS: Dict[str, Dict[str, Any]] = {}    # key: item_id -> GridState
 GRID_CONFIGS: Dict[str, GridConfig] = {}    # key: item_id -> GridConfig
 GRID_AUTORUN: Dict[str, Dict[str, Any]] = {}  # item_id -> autorun worker state
@@ -15777,10 +15906,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             br *= 100.0
         if -1 <= mc <= 1 and abs(mc) < 0.20:
             mc *= 100.0
-        # ENGINE-095: do not turn the market RED from a low score alone when
-        # breadth/MCap are positive. RED needs confirmed weak breadth or negative
-        # market-cap pressure; otherwise it stays NEUTRAL.
-        if ((score < 30 and (br < 55 or mc < 0.2)) or mc <= -1.0 or br <= 20):
+        # ENGINE-096: RED cannot be produced while market breadth is broad and
+        # market cap is positive. This fixes red/neutral flicker from stale/old
+        # explicit RED context.
+        broad_positive_market = bool(br >= 70 and mc >= 0.2)
+        if not broad_positive_market and ((score < 30 and br < 35 and mc <= 0.0) or mc <= -1.2 or br <= 15):
             return "RED"
         if score >= 75 and br >= 60 and mc >= 1.5 and liquidity >= 45:
             return "STRONG_GREEN"
@@ -15790,7 +15920,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             return "GREEN"
         if explicit == "STRONG_GREEN":
             return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
-        if explicit == "RED" and ((score < 35 and br < 55) or mc < -0.3 or br < 30):
+        if explicit == "RED" and not broad_positive_market and ((score < 35 and br < 40 and mc <= 0.0) or mc < -0.5 or br < 25):
             return "RED"
         return "NEUTRAL"
 
@@ -16177,10 +16307,12 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if -1 <= mc <= 1 and abs(mc) < 0.20:
             mc *= 100.0
 
-        # ENGINE-095: do not turn the market RED from a low score alone when
-        # breadth/MCap are positive. RED needs confirmed weak breadth or negative
-        # market-cap pressure; otherwise it stays NEUTRAL.
-        if ((score < 30 and (br < 55 or mc < 0.2)) or mc <= -1.0 or br <= 20):
+        # ENGINE-096: RED cannot be produced while market breadth is broad and
+        # market cap is positive. This fixes the red/neutral flicker seen when
+        # the dashboard shows 100% green / positive MCap but an old explicit RED
+        # value or low score is still present in runtime context.
+        broad_positive_market = bool(br >= 70 and mc >= 0.2)
+        if not broad_positive_market and ((score < 30 and br < 35 and mc <= 0.0) or mc <= -1.2 or br <= 15):
             return "RED"
 
         # Strong green must be broad and confirmed. Example: score 56, breadth 38,
@@ -16199,7 +16331,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             # Explicit STRONG_GREEN may only downgrade to GREEN unless the hard
             # strong-green confirmation above is actually met.
             return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
-        if explicit == "RED" and ((score < 35 and br < 55) or mc < -0.3 or br < 30):
+        if explicit == "RED" and not broad_positive_market and ((score < 35 and br < 40 and mc <= 0.0) or mc < -0.5 or br < 25):
             return "RED"
 
         return "NEUTRAL"
@@ -24564,8 +24696,12 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
     s = (symbol or "").strip().upper()
     if not s:
         return None
+    try:
+        _nexus_price_cache_mark(s, tier="active", reason="trader_or_runtime_price_read")
+    except Exception:
+        pass
 
-    # ENGINE-095: Single-source display policy.
+    # ENGINE-097: tiered central cache policy.
     # Prefer the central backend watchlist/snapshot cache if it is fresh. This keeps
     # Trader Live, slot Current and Watchlist prices aligned. If the cache is stale
     # or missing, fall back to fresh upstream lookup and update the snapshot cache.
@@ -24580,8 +24716,13 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
                 px0 = float(snap.get("price") or snap.get("current_price") or 0)
             else:
                 px0 = 0.0
-            if math.isfinite(px0) and px0 > 0 and (not ts_snap or now_ts() - ts_snap <= 90):
-                return {"symbol": s, "price": px0, "source": "central_snapshot", "ts": ts_snap or now_ts()}
+            ttl_sec = _nexus_price_cache_ttl_for_symbol(s) if "_nexus_price_cache_ttl_for_symbol" in globals() else 90
+            if math.isfinite(px0) and px0 > 0 and (not ts_snap or now_ts() - ts_snap <= ttl_sec):
+                try:
+                    NEXUS_PRICE_CACHE_STATS["hits"] = int(NEXUS_PRICE_CACHE_STATS.get("hits") or 0) + 1
+                except Exception:
+                    pass
+                return {"symbol": s, "price": px0, "source": "central_snapshot", "ts": ts_snap or now_ts(), "cacheTier": (_nexus_price_cache_tier(s) if "_nexus_price_cache_tier" in globals() else "market"), "cacheTtlSec": ttl_sec}
     except Exception:
         pass
 
@@ -24602,6 +24743,12 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
                     SNAPSHOTS[s] = snap_data
                     SNAPSHOTS[s.lower()] = snap_data
                     SNAPSHOTS[s.upper()] = snap_data
+                except Exception:
+                    pass
+                try:
+                    NEXUS_PRICE_CACHE_STATS["refreshes"] = int(NEXUS_PRICE_CACHE_STATS.get("refreshes") or 0) + 1
+                    NEXUS_PRICE_CACHE_STATS["last_refresh_ts"] = now_ts()
+                    NEXUS_PRICE_CACHE_STATS["last_refresh_symbol"] = s
                 except Exception:
                     pass
                 return {
@@ -24632,6 +24779,12 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
                     SNAPSHOTS[s] = snap_data
                     SNAPSHOTS[s.lower()] = snap_data
                     SNAPSHOTS[s.upper()] = snap_data
+                except Exception:
+                    pass
+                try:
+                    NEXUS_PRICE_CACHE_STATS["refreshes"] = int(NEXUS_PRICE_CACHE_STATS.get("refreshes") or 0) + 1
+                    NEXUS_PRICE_CACHE_STATS["last_refresh_ts"] = now_ts()
+                    NEXUS_PRICE_CACHE_STATS["last_refresh_symbol"] = s
                 except Exception:
                     pass
                 return {
@@ -27698,6 +27851,19 @@ def _nkr_row_change_pct(row):
 def _nkr_row_price_usd(row):
     if not isinstance(row, dict):
         return 0.0
+    sym = str(row.get("symbol") or row.get("sym") or row.get("asset") or "").strip().upper()
+    # ENGINE-097: NKR active/rebalance decisions need faster-than-watchlist prices,
+    # but still from the shared backend cache. Mark the symbol active and let
+    # _price_multi_fresh_shadow refresh only when its active/hot TTL expires.
+    if sym and "_price_multi_fresh_shadow" in globals():
+        try:
+            _nexus_price_cache_mark(sym, tier="active", reason="nkr_active_price_read")
+            px = _price_multi_fresh_shadow(sym)
+            p = _safe_float((px or {}).get("price"), 0.0) if isinstance(px, dict) else 0.0
+            if p > 0:
+                return p
+        except Exception:
+            pass
     return _safe_float(
         row.get("price") or row.get("current_price") or row.get("currentPrice") or
         row.get("priceUsd") or row.get("price_usd") or row.get("usd") or 0.0,
