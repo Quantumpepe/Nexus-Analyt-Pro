@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-094-TRADING-ROOT-RUNTIME-PRICE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-089-NKR-ALLOCATED-OVERVIEW-SUM-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-095-TRADING-REGIME-PRICE-SINGLE-SOURCE-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-095-TRADING-REGIME-PRICE-SINGLE-SOURCE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -15777,7 +15777,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             br *= 100.0
         if -1 <= mc <= 1 and abs(mc) < 0.20:
             mc *= 100.0
-        if score < 35 or mc <= -1.0 or br <= 30:
+        # ENGINE-095: do not turn the market RED from a low score alone when
+        # breadth/MCap are positive. RED needs confirmed weak breadth or negative
+        # market-cap pressure; otherwise it stays NEUTRAL.
+        if ((score < 30 and (br < 55 or mc < 0.2)) or mc <= -1.0 or br <= 20):
             return "RED"
         if score >= 75 and br >= 60 and mc >= 1.5 and liquidity >= 45:
             return "STRONG_GREEN"
@@ -15787,13 +15790,13 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             return "GREEN"
         if explicit == "STRONG_GREEN":
             return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
-        if explicit == "RED" and (score < 50 or mc < 0 or br < 45):
+        if explicit == "RED" and ((score < 35 and br < 55) or mc < -0.3 or br < 30):
             return "RED"
         return "NEUTRAL"
 
     regime_raw = _shadow_market_regime()
-    regime_key = f"{wallet_address}:{selected_session_id or selected_chain or 'trading'}"
-    regime = _nexus_shadow_smooth_regime(regime_key, regime_raw, ts, confirm_ticks=2)
+    regime_key = f"{wallet_address}:trading_global_market_regime"
+    regime = _nexus_shadow_smooth_regime(regime_key, regime_raw, ts, confirm_ticks=3)
     if regime != regime_raw:
         strategist_reason.append(f"Market Regime smoothed: raw {regime_raw} pending, visible stays {regime} until confirmed.")
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
@@ -16174,7 +16177,10 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         if -1 <= mc <= 1 and abs(mc) < 0.20:
             mc *= 100.0
 
-        if score < 35 or mc <= -1.0 or br <= 30:
+        # ENGINE-095: do not turn the market RED from a low score alone when
+        # breadth/MCap are positive. RED needs confirmed weak breadth or negative
+        # market-cap pressure; otherwise it stays NEUTRAL.
+        if ((score < 30 and (br < 55 or mc < 0.2)) or mc <= -1.0 or br <= 20):
             return "RED"
 
         # Strong green must be broad and confirmed. Example: score 56, breadth 38,
@@ -16193,12 +16199,16 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
             # Explicit STRONG_GREEN may only downgrade to GREEN unless the hard
             # strong-green confirmation above is actually met.
             return "GREEN" if br >= 45 and mc >= 0.3 else "NEUTRAL"
-        if explicit == "RED" and (score < 50 or mc < 0 or br < 45):
+        if explicit == "RED" and ((score < 35 and br < 55) or mc < -0.3 or br < 30):
             return "RED"
 
         return "NEUTRAL"
 
-    regime = _shadow_market_regime()
+    regime_raw = _shadow_market_regime()
+    regime_key = f"{wallet_address}:trading_global_market_regime"
+    regime = _nexus_shadow_smooth_regime(regime_key, regime_raw, ts, confirm_ticks=3)
+    if regime != regime_raw:
+        strategist_reason.append(f"Market Regime smoothed: raw {regime_raw} pending, visible stays {regime} until confirmed.")
     # Entry thresholds are intentionally realistic for Shadow trading.
     # The previous values were too strict: slots became READY, but almost never ACTIVE,
     # even after the time-pacing budget allowed entries and the market recovered.
@@ -16597,7 +16607,7 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
         "tick_sec": tick_sec,
         "market_regime": regime,
         "market_regime_raw": regime_raw,
-        "market_regime_smoothing": "ENGINE_093_CONFIRM_2_TICKS",
+        "market_regime_smoothing": "ENGINE_095_GLOBAL_CONFIRM_3_TICKS",
         "max_trades": 0 if aggressive_legacy_mode else max_trades,
         "max_trades_label": "No Limit" if aggressive_legacy_mode else str(max_trades),
         "risk_mode_label": "LEGACY_PROTECTION" if aggressive_legacy_mode else str(cfg.get("risk_mode") or cfg.get("riskMode") or ""),
@@ -17013,7 +17023,7 @@ def api_nexus_shadow_executor():
                     recent_runs = []
             except Exception as e:
                 try:
-                    _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "AUTOTICK_ALL_SESSIONS_ERROR", "", "error", "GET all-session autotick failed; dashboard continues without crashing.", {"error": str(e)[:220], "source": "ENGINE-094"})
+                    _nexus_log_sim_event(cur, wa, "shadow_executor", "SHADOW", "AUTOTICK_ALL_SESSIONS_ERROR", "", "error", "GET all-session autotick failed; dashboard continues without crashing.", {"error": str(e)[:220], "source": "ENGINE-095"})
                 except Exception:
                     pass
 
@@ -24555,7 +24565,28 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
     if not s:
         return None
 
-    # 1) Fresh Binance ticker, no cache.
+    # ENGINE-095: Single-source display policy.
+    # Prefer the central backend watchlist/snapshot cache if it is fresh. This keeps
+    # Trader Live, slot Current and Watchlist prices aligned. If the cache is stale
+    # or missing, fall back to fresh upstream lookup and update the snapshot cache.
+    try:
+        for key in (s, s.lower(), s.upper()):
+            snap = SNAPSHOTS.get(key) if isinstance(globals().get("SNAPSHOTS"), dict) else None
+            data = snap.get("data") if isinstance(snap, dict) else None
+            ts_snap = int(snap.get("ts") or data.get("ts") or 0) if isinstance(data, dict) else int(snap.get("ts") or 0) if isinstance(snap, dict) else 0
+            if isinstance(data, dict):
+                px0 = float(data.get("price") or data.get("current_price") or 0)
+            elif isinstance(snap, dict):
+                px0 = float(snap.get("price") or snap.get("current_price") or 0)
+            else:
+                px0 = 0.0
+            if math.isfinite(px0) and px0 > 0 and (not ts_snap or now_ts() - ts_snap <= 90):
+                return {"symbol": s, "price": px0, "source": "central_snapshot", "ts": ts_snap or now_ts()}
+    except Exception:
+        pass
+
+    # 1) Fresh Binance ticker, no long cache. After fetch, publish it into the
+    # central snapshot cache so subsequent Watchlist/Trader reads can agree.
     for pair in _binance_symbol_candidates(s):
         try:
             url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
@@ -24566,6 +24597,13 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
             j = r.json() or {}
             price = float(j.get("price"))
             if math.isfinite(price) and price > 0:
+                try:
+                    snap_data = {"ts": now_ts(), "data": {"symbol": s, "price": price, "source": "fresh_binance", "pair": pair}}
+                    SNAPSHOTS[s] = snap_data
+                    SNAPSHOTS[s.lower()] = snap_data
+                    SNAPSHOTS[s.upper()] = snap_data
+                except Exception:
+                    pass
                 return {
                     "symbol": s,
                     "pair": pair,
@@ -24589,6 +24627,13 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
             raw = (j.get(coin_id) or {}).get("usd") if isinstance(j, dict) else None
             price = float(raw)
             if math.isfinite(price) and price > 0:
+                try:
+                    snap_data = {"ts": now_ts(), "data": {"id": coin_id, "symbol": s, "price": price, "source": "fresh_coingecko_simple"}}
+                    SNAPSHOTS[s] = snap_data
+                    SNAPSHOTS[s.lower()] = snap_data
+                    SNAPSHOTS[s.upper()] = snap_data
+                except Exception:
+                    pass
                 return {
                     "symbol": s,
                     "price": price,
