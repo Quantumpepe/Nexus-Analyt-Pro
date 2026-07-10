@@ -1549,15 +1549,16 @@ def api_nexus_nkr_payout_decision():
 
 
 def _nkr_normalize_period_days(raw=None) -> int:
+    """User-defined NKR period without touching capital/reserve logic.
+
+    One wallet still has one active NKR run. The period is an independent
+    runtime setting and may be any whole number of days from 1 to 3650.
+    """
     try:
         val = int(float(raw))
     except Exception:
         val = int(NEXUS_NKR_DEFAULT_PERIOD_DAYS)
-    if val <= 10:
-        return 10
-    if val <= 20:
-        return 20
-    return 30
+    return max(1, min(3650, val))
 
 
 def _nkr_weekly_payout_due(elapsed_days: float, last_payout_day: float = 0.0) -> bool:
@@ -1676,7 +1677,7 @@ def _nkr_period_policy() -> dict:
         "endLockPolicy": NEXUS_NKR_END_LOCK_POLICY,
         "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
         "rules": [
-            "NKR can run capital rounds over 10 days, 20 days, or monthly periods.",
+            "NKR period is user-defined in whole days and is independent from budget, mode and observation window.",
             "Weekly payout checks are policy-only and use the NKR payout/reinvest rules.",
             "Near the end of a profitable period, NKR should reduce new risk and lock profit to USDC/USDT.",
             "In RED market, automatic payout and new risk are reduced or paused unless user explicitly requests action.",
@@ -27773,6 +27774,109 @@ def api_nkr_control():
     out = jsonify(bundle)
     out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return out
+
+
+@app.route("/api/nkr/capital-topup", methods=["POST"])
+def api_nkr_capital_topup():
+    """Increase the single active wallet-bound NKR budget safely.
+
+    This endpoint intentionally does not create another portfolio, change the
+    running mode, change the period, or replace the existing allocation logic.
+    It only adds user-approved capital to the current NKR run, keeps the
+    running mode's reserve ratio, distributes the investable part across the
+    existing active sessions, and records auditable CAPITAL_TOPUP events.
+    """
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    body = request.get_json(silent=True) or {}
+    add_usd = _safe_float(body.get("amountUsd") or body.get("amount_usd") or body.get("addCapitalUsd") or 0, 0.0)
+    if add_usd <= 0:
+        return err("positive top-up amount required", 400)
+
+    sessions, active_id, _ = _db_get_rotation_sessions(wa)
+    nkr_sessions = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x)]
+    active_sessions = [x for x in nkr_sessions if _nkr_active_session_status_ok(x)]
+    if not active_sessions:
+        return err("no active NKR run to top up", 409)
+
+    first = active_sessions[0]
+    mode = _nkr_normalize_performance_mode(
+        first.get("nkrCapitalMode") or (first.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC"
+    )
+    reserve_pct_by_mode = {"AGGRESSIVE": 10.0, "DYNAMIC": 20.0, "TACTICAL": 25.0, "DEFENSIVE": 35.0}
+    reserve_pct = reserve_pct_by_mode.get(mode, 20.0)
+
+    old_total = max([_safe_float(x.get("totalNkrBudgetUsd") or (x.get("meta") or {}).get("total_nkr_budget_usd") or 0, 0.0) for x in active_sessions] or [0.0])
+    if old_total <= 0:
+        old_total = sum(_safe_float(x.get("workingCapitalUsd") or x.get("sessionCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active_sessions)
+        old_total += max([_safe_float(x.get("nkrCashReserveUsd") or 0, 0.0) for x in active_sessions] or [0.0])
+    new_total = old_total + add_usd
+    reserve_add = add_usd * reserve_pct / 100.0
+    deploy_add = max(0.0, add_usd - reserve_add)
+
+    caps = [_safe_float(x.get("workingCapitalUsd") or x.get("sessionCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active_sessions]
+    cap_sum = sum(caps)
+    weights = [(c / cap_sum if cap_sum > 0 else 1.0 / len(active_sessions)) for c in caps]
+    nowi = _nkr_now_ms()
+    updated_by_id = {}
+    deployed_total = 0.0
+    for sess, weight in zip(active_sessions, weights):
+        sid = str(sess.get("id") or sess.get("session_id") or "")
+        sym = _nkr_session_symbol(sess)
+        old_cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0, 0.0)
+        add_to_session = deploy_add * weight
+        new_cap = old_cap + add_to_session
+        deployed_total += add_to_session
+        old_cash = _safe_float(sess.get("nkrCashReserveUsd") or 0, 0.0)
+        meta = dict(sess.get("meta") if isinstance(sess.get("meta"), dict) else {})
+        event_id = f"NKR-MANUAL-TOPUP-{sid}-{nowi}"
+        event = {
+            "id": event_id, "event_id": event_id, "session_id": sid, "ts": nowi,
+            "status": "CAPITAL_MOVEMENT", "action": "CAPITAL_TOPUP",
+            "capitalMovementType": "USER_BUDGET_INCREASE",
+            "fromAsset": str(sess.get("baseAsset") or "USDC").upper(), "toAsset": sym,
+            "capitalBeforeUsd": round(old_cap, 4), "capitalMovedUsd": round(add_to_session, 4),
+            "capitalAfterUsd": round(new_cap, 4), "oldTotalBudgetUsd": round(old_total, 4),
+            "addedBudgetUsd": round(add_usd, 4), "newTotalBudgetUsd": round(new_total, 4),
+            "reserveAddedUsd": round(reserve_add, 4), "reservePct": reserve_pct,
+            "grossUsd": 0.0, "costsUsd": 0.0, "netUsd": 0.0,
+            "addedToCollectedProfit": False, "alreadyCounted": True,
+            "reason": "manual_capital_topup_single_active_nkr", "source": "backend_engine100",
+        }
+        events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+        next_sess = dict(sess)
+        next_sess.update({
+            "budgetUsd": round(new_cap, 4), "workingCapitalUsd": round(new_cap, 4),
+            "sessionCapitalUsd": round(new_cap, 4), "reservedUsd": round(new_cap, 4),
+            "totalNkrBudgetUsd": round(new_total, 4),
+            "nkrCashReserveUsd": round(old_cash + reserve_add, 4),
+            "lastRotationEvent": event, "rotationEvents": [event] + events,
+            "eventCount": int(_safe_float(sess.get("eventCount") or len(events), len(events))) + 1,
+            "totalEventCount": int(_safe_float(sess.get("totalEventCount") or len(events), len(events))) + 1,
+            "updatedAt": nowi,
+        })
+        meta.update({
+            "total_nkr_budget_usd": round(new_total, 4),
+            "cash_reserve_pct": reserve_pct,
+            "nkr_last_manual_topup_ts": nowi,
+            "nkr_last_manual_topup_usd": round(add_usd, 4),
+        })
+        next_sess["meta"] = meta
+        updated_by_id[sid] = next_sess
+
+    merged = [updated_by_id.get(str(x.get("id") or x.get("session_id") or ""), x) if isinstance(x, dict) else x for x in nkr_sessions]
+    _db_set_rotation_sessions(wa, merged, active_session_id=active_id, replace_missing=False)
+    _db_set_user_app_state(wa, {"ui": {"rotationBudgetRelease": str(round(new_total, 4))}})
+    bundle = _nkr_get_wallet_bundle(wa)
+    return jsonify({
+        "status": "ok", "wallet": _norm_addr(wa), "action": "CAPITAL_TOPUP",
+        "oldBudgetUsd": round(old_total, 4), "addedUsd": round(add_usd, 4),
+        "newBudgetUsd": round(new_total, 4), "reserveAddedUsd": round(reserve_add, 4),
+        "deployedUsd": round(deployed_total, 4), "mode": mode,
+        "sessions": bundle.get("sessions") or merged, "message": "Capital added to the existing NKR run.",
+        "ts": now_ts(),
+    })
 
 
 @app.route("/api/nexus/panic-protect", methods=["POST"])
