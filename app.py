@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.10-ENGINE-099-NKR-PERIOD-ISOLATED-CAPITAL-STATE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.10-ENGINE-099-NKR-PERIOD-ISOLATED-CAPITAL-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.09-ENGINE-097-NKR-ACTIVE-HOT-PRICE-CACHE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.09-ENGINE-097-NKR-ACTIVE-HOT-PRICE-CACHE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -239,7 +239,7 @@ NEXUS_NKR_DEFAULT_WEEKLY_PAYOUT_RED_PCT = 0
 NEXUS_NKR_PERIOD_MODE = "NKR_PERIOD_OBSERVATION_V1"
 NEXUS_NKR_PERIOD_POLICY = "CAPITAL_ROUNDS_10D_20D_MONTHLY_WITH_WEEKLY_PAYOUT_AND_END_LOCK"
 NEXUS_NKR_DEFAULT_PERIOD_DAYS = 10
-NEXUS_NKR_PERIOD_OPTIONS_DAYS = []  # User-defined integer days; UI suggestions are optional only.
+NEXUS_NKR_PERIOD_OPTIONS_DAYS = [10, 20, 30]
 NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT = 85
 NEXUS_NKR_END_LOCK_POLICY = "NEAR_PERIOD_END_LOCK_PROFIT_TO_USDC_USDT_AND_REDUCE_NEW_RISK"
 NEXUS_NKR_UI_CONTRACT_MODE = "NKR_FRONTEND_CONTRACT_V1"
@@ -1549,17 +1549,15 @@ def api_nexus_nkr_payout_decision():
 
 
 def _nkr_normalize_period_days(raw=None) -> int:
-    """Return the exact user-selected NKR period in whole days.
-
-    Earlier revisions silently rounded every value to 10, 20 or 30 days. That
-    made values such as 7, 14 or 45 impossible even when the client sent them.
-    The only invariant here is a positive whole-day duration.
-    """
     try:
         val = int(float(raw))
     except Exception:
         val = int(NEXUS_NKR_DEFAULT_PERIOD_DAYS)
-    return max(1, val)
+    if val <= 10:
+        return 10
+    if val <= 20:
+        return 20
+    return 30
 
 
 def _nkr_weekly_payout_due(elapsed_days: float, last_payout_day: float = 0.0) -> bool:
@@ -1674,8 +1672,6 @@ def _nkr_period_policy() -> dict:
         "policy": NEXUS_NKR_PERIOD_POLICY,
         "defaultPeriodDays": NEXUS_NKR_DEFAULT_PERIOD_DAYS,
         "periodOptionsDays": NEXUS_NKR_PERIOD_OPTIONS_DAYS,
-        "periodInputMode": "USER_DEFINED_DAYS",
-        "minimumPeriodDays": 1,
         "profitLockWindowPct": NEXUS_NKR_PROFIT_LOCK_WINDOW_PCT,
         "endLockPolicy": NEXUS_NKR_END_LOCK_POLICY,
         "capitalBasis": NEXUS_DEFAULT_CAPITAL_STATE,
