@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-111-SHADOW-DRAWER-EVENT-HISTORY-CLEANUP"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-111-SHADOW-DRAWER-EVENT-HISTORY-CLEANUP"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-112-CORE-VAULT-MULTI-EVM"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-112-CORE-VAULT-MULTI-EVM"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -3681,8 +3681,19 @@ def api_contracts():
     # Expose the active chain contract addresses (Vault/Executor/Router).
     # This helps the frontend/bot stay in sync with Render ENV after deploys.
     out = {
+        "vaultType": "NEXUS_CORE_VAULT",
+        "vaultVersion": "CORE_VAULT_MULTI_EVM_V1",
+        "vaultModel": "ONE_STANDARD_INSTANCE_PER_EVM_CHAIN",
         "enabledEvmChains": list(_ENABLED_EVM_CHAINS),
-        "chains": {}
+        "chains": {},
+        "nonEvmAssetRoutes": _nexus_non_evm_asset_routes_public() if "_nexus_non_evm_asset_routes_public" in globals() else {},
+        "registryPolicy": {
+            "chainKey": "CHAIN_ID_PLUS_CONTRACT_ADDRESS",
+            "tokenSelection": "ALLOWLIST_ONLY",
+            "routerSelection": "ALLOWLIST_ONLY",
+            "defaultExitAsset": "USDC_USDT",
+            "nativeNonEvmWithdraw": False,
+        },
     }
 
     # For UI/UX: explicit native symbols, and a backward-compatible "native" field.
@@ -3697,6 +3708,8 @@ def api_contracts():
             "usdc": (_USDC_BY_CHAIN.get(cid) or ""),
             "usdt": (_USDT_BY_CHAIN.get(cid) or ""),
             "vault": (_VAULT_BY_CHAIN.get(cid) or ""),
+            "coreVault": (_VAULT_BY_CHAIN.get(cid) or ""),
+            "vaultConfigured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
             "executor": (_EXECUTOR_BY_CHAIN.get(cid) or ""),
             "router": (_ROUTER_BY_CHAIN.get(cid) or ""),
             "routerV3": (_ROUTER_V3_BY_CHAIN.get(cid) or ""),
@@ -3706,6 +3719,42 @@ def api_contracts():
             "nativeSymbol": native_symbol_by_chain_id.get(cid, key),
         }
     return jsonify(out)
+
+
+@app.get("/api/nexus/core-vault-registry")
+def api_nexus_core_vault_registry():
+    chains = {}
+    native_symbol_by_chain_id = {1: "ETH", 56: "BNB", 137: "POL", 10: "ETH", 42161: "ETH", 8453: "ETH", 43114: "AVAX", 250: "FTM"}
+    for key in list(_ENABLED_EVM_CHAINS):
+        cid = int(_CHAIN_ID_BY_KEY.get(key, 0) or 0)
+        if cid <= 0:
+            continue
+        chains[key] = {
+            "chainId": cid,
+            "nativeSymbol": native_symbol_by_chain_id.get(cid, key),
+            "coreVault": (_VAULT_BY_CHAIN.get(cid) or ""),
+            "executor": (_EXECUTOR_BY_CHAIN.get(cid) or ""),
+            "routers": _nexus_allowed_routers_for_chain(cid) if "_nexus_allowed_routers_for_chain" in globals() else [],
+            "stablecoins": {"USDC": (_USDC_BY_CHAIN.get(cid) or ""), "USDT": (_USDT_BY_CHAIN.get(cid) or "")},
+            "enabled": True,
+            "configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
+        }
+    return jsonify({
+        "status": "ok",
+        "vaultType": "NEXUS_CORE_VAULT",
+        "vaultVersion": "CORE_VAULT_MULTI_EVM_V1",
+        "model": "ONE_STANDARD_INSTANCE_PER_EVM_CHAIN",
+        "chains": chains,
+        "nonEvmAssetRoutes": _nexus_non_evm_asset_routes_public(),
+        "rules": [
+            "Only enabled EVM chains may host a Core Vault instance.",
+            "Only exact allowlisted token contracts may represent non-EVM assets.",
+            "Only allowlisted routers may receive temporary token approvals.",
+            "Default exit and withdrawal assets are USDC/USDT.",
+            "Native BTC/SOL/XRP withdrawal requires a separate future native-chain module.",
+        ],
+        "ts": int(time.time()),
+    })
 
 
 def _hex_to_bool(h: str) -> bool:
@@ -6871,10 +6920,13 @@ _USDT_BY_CHAIN = {
 # Nexus Vault / Executor (Trading Contracts)
 # -------------------------
 # Phase 1: Polygon only (137). Later add other chains by ENV.
+# Nexus Core Vault registry. One audited Core Vault implementation is deployed
+# separately on every enabled EVM chain. Old VAULT_ADDRESS_* names remain as a
+# migration fallback so current deployments do not break while addresses change.
 _VAULT_BY_CHAIN = {
-    1: (os.getenv("VAULT_ADDRESS_ETH") or os.getenv("VAULT_ADDRESS_1") or "").strip(),
-    56: (os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
-    137: (os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
+    1: (os.getenv("CORE_VAULT_ADDRESS_ETH") or os.getenv("CORE_VAULT_ADDRESS_1") or os.getenv("VAULT_ADDRESS_ETH") or os.getenv("VAULT_ADDRESS_1") or "").strip(),
+    56: (os.getenv("CORE_VAULT_ADDRESS_BNB") or os.getenv("CORE_VAULT_ADDRESS_56") or os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
+    137: (os.getenv("CORE_VAULT_ADDRESS_POL") or os.getenv("CORE_VAULT_ADDRESS_POLYGON") or os.getenv("CORE_VAULT_ADDRESS_137") or os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
 }
 
 _EXECUTOR_BY_CHAIN = {
@@ -6903,6 +6955,70 @@ _WNATIVE_BY_CHAIN = {
     56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "").strip(),  # WBNB expected
     137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "").strip(),  # WMATIC expected
 }
+
+# Owner-managed execution routes for non-EVM display assets such as BTC, SOL and XRP.
+# Configure through Render ENV NEXUS_NON_EVM_ASSET_ROUTES_JSON. Example:
+# {"BTC":[{"chain":"ETH","tokenSymbol":"WBTC","tokenAddress":"0x...","decimals":8,"entryAssets":["USDC","USDT"],"exitAssets":["USDC","USDT"],"status":"ACTIVE","wrappedWithdraw":true,"nativeWithdraw":false}]}
+# Nexus never selects a wrapped token by symbol alone: chain ID + exact contract address are required.
+def _nexus_non_evm_asset_routes_raw() -> dict:
+    raw = str(os.getenv("NEXUS_NON_EVM_ASSET_ROUTES_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _nexus_non_evm_asset_routes_public() -> dict:
+    out: dict[str, list[dict]] = {}
+    for display_asset, routes in _nexus_non_evm_asset_routes_raw().items():
+        asset = re.sub(r"[^A-Z0-9]", "", str(display_asset or "").upper())[:16]
+        if not asset or not isinstance(routes, list):
+            continue
+        clean_routes = []
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            chain = _normalize_chain_key(route.get("chain") or route.get("executionChain") or "")
+            cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
+            token_address = str(route.get("tokenAddress") or route.get("contractAddress") or route.get("address") or "").strip()
+            token_symbol = re.sub(r"[^A-Z0-9]", "", str(route.get("tokenSymbol") or route.get("symbol") or "").upper())[:20]
+            status = str(route.get("status") or "PAUSED").upper()
+            address_ok = bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", token_address))
+            chain_ok = bool(cid > 0 and chain in _ENABLED_EVM_CHAINS)
+            active = bool(status == "ACTIVE" and address_ok and chain_ok)
+            clean_routes.append({
+                "displayAsset": asset,
+                "chain": chain,
+                "chainId": cid,
+                "tokenSymbol": token_symbol,
+                "tokenAddress": token_address,
+                "decimals": int(route.get("decimals") or 18),
+                "entryAssets": [str(x).upper() for x in (route.get("entryAssets") or ["USDC", "USDT"]) if str(x).upper() in ("USDC", "USDT")],
+                "exitAssets": [str(x).upper() for x in (route.get("exitAssets") or ["USDC", "USDT"]) if str(x).upper() in ("USDC", "USDT")],
+                "maxPositionUsd": max(0.0, float(route.get("maxPositionUsd") or 0.0)),
+                "wrappedWithdraw": bool(route.get("wrappedWithdraw", False)),
+                "nativeWithdraw": bool(route.get("nativeWithdraw", False)),
+                "status": status,
+                "active": active,
+                "validation": {
+                    "chainEnabled": chain_ok,
+                    "contractAddressValid": address_ok,
+                    "allowlistKey": f"{cid}:{token_address.lower()}" if cid and address_ok else "",
+                },
+            })
+        if clean_routes:
+            out[asset] = clean_routes
+    return out
+
+def _nexus_allowed_route_for_asset(display_asset: str, chain: str = "") -> list[dict]:
+    asset = re.sub(r"[^A-Z0-9]", "", str(display_asset or "").upper())[:16]
+    routes = list(_nexus_non_evm_asset_routes_public().get(asset) or [])
+    if chain:
+        ck = _normalize_chain_key(chain)
+        routes = [r for r in routes if r.get("chain") == ck]
+    return [r for r in routes if r.get("active")]
 
 
 _USDC_DECIMALS = int(os.getenv("USDC_DECIMALS", "6"))
