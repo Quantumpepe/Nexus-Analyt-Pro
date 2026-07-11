@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-117-INTELLIGENCE-ONLY-REMOVED"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-117-INTELLIGENCE-ONLY-REMOVED"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-118-SHADOW-LIVE-PAYMENT-RULES"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-118-SHADOW-LIVE-PAYMENT-RULES"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -4599,6 +4599,16 @@ def init_db():
             updated_ts INTEGER
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_shadow_vault_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet_address TEXT NOT NULL,
+            activation_tx_hash TEXT DEFAULT '',
+            snapshot_json TEXT NOT NULL DEFAULT '{}',
+            created_ts INTEGER NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_shadow_vault_history_wallet_ts ON nexus_shadow_vault_history(wallet_address, created_ts)")
 
     # Support tickets captured in-app. This is intentionally simple now,
     # so it can later be connected to email, Discord, CRM, or a ticket system.
@@ -7143,6 +7153,12 @@ def _stable_decimals(chain_id: int, symbol: str, token_address: str | None = Non
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "25")))
 PRICE_STRATEGIST_WEEKLY_USD = float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20"))
 PRICE_STRATEGIST_MONTHLY_USD = float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50"))
+# NKR is a utility payment asset for Strategist Weekly only.
+NKR_PAYMENT_CHAIN_ID = int(os.getenv("NEXUS_NKR_PAYMENT_CHAIN_ID", "1"))
+NKR_TOKEN_ADDRESS = (os.getenv("NEXUS_NKR_TOKEN_ADDRESS") or "").strip().lower()
+NKR_PAYMENT_ADDRESS = (os.getenv("NEXUS_NKR_PAYMENT_ADDRESS") or os.getenv("CORE_VAULT_ADDRESS_ETH") or "").strip().lower()
+NKR_TOKEN_DECIMALS = int(os.getenv("NEXUS_NKR_TOKEN_DECIMALS", "18"))
+NKR_PRICE_USD = float(os.getenv("NEXUS_NKR_PRICE_USD", "0"))
 
 def _subscription_plan_meta(plan: str) -> dict:
     """Plan pricing/expiry metadata for on-chain USDC/USDT payments."""
@@ -7153,6 +7169,7 @@ def _subscription_plan_meta(plan: str) -> dict:
             "kind": "core",
             "price_usd": float(PRICE_PRO_USD),
             "seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
+            "payment_assets": ["USDT", "USDC"],
         }
     if p in ("strategist_weekly", "strategist-weekly", "strategist_7d", "strategist7d"):
         return {
@@ -7160,6 +7177,7 @@ def _subscription_plan_meta(plan: str) -> dict:
             "kind": "strategist",
             "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD),
             "seconds": 60 * 60 * 24 * 7,
+            "payment_assets": ["NKR"],
         }
     if p in ("strategist_monthly", "strategist-monthly", "strategist_30d", "strategist30d", "strategist"):
         return {
@@ -7167,6 +7185,7 @@ def _subscription_plan_meta(plan: str) -> dict:
             "kind": "strategist",
             "price_usd": float(PRICE_STRATEGIST_MONTHLY_USD),
             "seconds": 60 * 60 * 24 * 30,
+            "payment_assets": ["USDT", "USDC"],
         }
     raise RuntimeError("unsupported subscription plan")
 
@@ -7377,95 +7396,85 @@ def _hex_to_int(h: str) -> int:
         return 0
 
 def _verify_erc20_payment(chain_id: int, tx_hash: str, payer: str, plan: str):
-    """
-    Verify an onchain USDC/USDT payment to TREASURY_ADDRESS.
+    """Verify a plan payment with strict plan-to-token rules.
 
-    We now use a single subscription plan ("pro") priced by PRICE_PRO_USD.
-    For backwards compatibility, we accept plan values like "silver"/"gold" but
-    always enforce PRICE_PRO_USD.
+    Core and Strategist Monthly: USDT/USDC -> Treasury.
+    Strategist Weekly: NKR only -> configured NKR payment/Core Vault address.
     """
-    if not TREASURY_ADDRESS:
-        raise RuntimeError("missing NEXUS_TREASURY_ADDRESS")
-
     meta = _subscription_plan_meta(plan)
     plan_l = meta["plan"]
     price = float(meta["price_usd"])
+    allowed_assets = list(meta.get("payment_assets") or [])
 
     txh = (tx_hash or "").strip().lower()
     if not txh.startswith("0x") or len(txh) < 20:
         raise RuntimeError("invalid tx_hash")
-
     payer = _norm_addr(payer)
+    cid = int(chain_id)
 
-    rcpt = _rpc_call(int(chain_id), "eth_getTransactionReceipt", [txh])
+    rcpt = _rpc_call(cid, "eth_getTransactionReceipt", [txh])
     if not rcpt:
         raise RuntimeError("tx not found")
-
     status_hex = rcpt.get("status")
     if status_hex is not None and _hex_to_int(status_hex) != 1:
         raise RuntimeError("tx failed")
-
     logs = rcpt.get("logs") or []
 
-    # accept USDC/USDT on that chain, including known alternates (Polygon native + bridged USDC)
-    usdc_main = (_USDC_BY_CHAIN.get(int(chain_id)) or "").strip().lower()
-    usdc_alts = [str(x or "").strip().lower() for x in (_USDC_ALT_BY_CHAIN.get(int(chain_id)) or []) if str(x or "").strip()]
-    usdt = (_USDT_BY_CHAIN.get(int(chain_id)) or "").strip().lower()
-
     candidates = []
-    seen = set()
-    for addr in [usdc_main, *usdc_alts]:
-        if addr and addr not in seen:
-            candidates.append((addr, _stable_decimals(chain_id, "USDC", addr), "USDC"))
-            seen.add(addr)
-    if usdt and usdt not in seen:
-        candidates.append((usdt, _stable_decimals(chain_id, "USDT", usdt), "USDT"))
-        seen.add(usdt)
-    if not candidates:
-        raise RuntimeError("token addresses not configured for this chain")
+    recipient = ""
+    if allowed_assets == ["NKR"]:
+        if cid != int(NKR_PAYMENT_CHAIN_ID):
+            raise RuntimeError("Strategist Weekly must be paid on the configured NKR network")
+        if not _looks_like_evm_addr(NKR_TOKEN_ADDRESS):
+            raise RuntimeError("NEXUS_NKR_TOKEN_ADDRESS is not configured")
+        if not _looks_like_evm_addr(NKR_PAYMENT_ADDRESS):
+            raise RuntimeError("NEXUS_NKR_PAYMENT_ADDRESS is not configured")
+        if NKR_PRICE_USD <= 0:
+            raise RuntimeError("NEXUS_NKR_PRICE_USD must be greater than zero")
+        required_units = int(round((price / NKR_PRICE_USD) * (10 ** NKR_TOKEN_DECIMALS)))
+        candidates = [(NKR_TOKEN_ADDRESS, NKR_TOKEN_DECIMALS, "NKR", required_units)]
+        recipient = NKR_PAYMENT_ADDRESS
+    else:
+        if not TREASURY_ADDRESS:
+            raise RuntimeError("missing NEXUS_TREASURY_ADDRESS")
+        recipient = TREASURY_ADDRESS
+        usdc_main = (_USDC_BY_CHAIN.get(cid) or "").strip().lower()
+        usdc_alts = [str(x or "").strip().lower() for x in (_USDC_ALT_BY_CHAIN.get(cid) or []) if str(x or "").strip()]
+        usdt = (_USDT_BY_CHAIN.get(cid) or "").strip().lower()
+        seen = set()
+        for addr in [usdc_main, *usdc_alts]:
+            if addr and addr not in seen:
+                dec = _stable_decimals(cid, "USDC", addr)
+                candidates.append((addr, dec, "USDC", int(round(price * (10 ** dec)))))
+                seen.add(addr)
+        if usdt and usdt not in seen:
+            dec = _stable_decimals(cid, "USDT", usdt)
+            candidates.append((usdt, dec, "USDT", int(round(price * (10 ** dec)))))
+        if not candidates:
+            raise RuntimeError("USDT/USDC addresses not configured for this chain")
 
-    min_units_by_token = {}
-    token_symbol_by_addr = {}
-    for _addr, _dec, _sym in candidates:
-        units = int(round(price * (10 ** int(_dec))))
-        min_units_by_token[_addr] = units
-        token_symbol_by_addr[_addr] = _sym
-
-    # scan logs for Transfer(from=payer, to=treasury) on accepted token
+    by_addr = {addr: (dec, sym, req) for addr, dec, sym, req in candidates}
     for lg in logs:
         try:
             addr = (lg.get("address") or "").strip().lower()
             topics = lg.get("topics") or []
-            if not addr or not isinstance(topics, list) or len(topics) < 3:
+            if addr not in by_addr or len(topics) < 3 or str(topics[0]).lower() != ERC20_TRANSFER_TOPIC0:
                 continue
-            if str(topics[0]).lower() != ERC20_TRANSFER_TOPIC0:
+            if _topic_to_addr(str(topics[1])) != payer:
                 continue
-            if addr not in min_units_by_token:
+            if _topic_to_addr(str(topics[2])) != recipient:
                 continue
-
-            frm = _topic_to_addr(str(topics[1]))
-            to = _topic_to_addr(str(topics[2]))
-            if frm != payer:
-                continue
-            if to != TREASURY_ADDRESS:
-                continue
-
             value = _hex_to_int(lg.get("data") or "0x0")
-            if value >= int(min_units_by_token[addr]):
-                # ok
-                sym = token_symbol_by_addr.get(addr, "USDT")
+            dec, sym, required = by_addr[addr]
+            if value >= int(required):
                 return {
-                    "token": sym,
-                    "token_address": addr,
-                    "amount_units": int(value),
-                    "required_units": int(min_units_by_token[addr]),
-                    "plan": plan_l,
-                    "price_usd": price,
+                    "token": sym, "token_address": addr, "amount_units": int(value),
+                    "required_units": int(required), "plan": plan_l, "price_usd": price,
+                    "recipient": recipient, "payment_policy": allowed_assets,
                 }
         except Exception:
             continue
-
-    raise RuntimeError("no matching USDC/USDT transfer found")
+    raise RuntimeError(f"required {'/'.join(allowed_assets)} payment transfer not found")
 
 def _access_state_get(wallet_address: str) -> dict | None:
     wa = _norm_addr(wallet_address or "")
@@ -10323,11 +10332,24 @@ def api_access_subscribe_config():
         "plan": "pro",
         "price_usd": float(PRICE_PRO_USD),
         "plans": {
-            "core": {"plan": "pro", "price_usd": float(PRICE_PRO_USD), "days": 30},
-            "strategist_weekly": {"plan": "strategist_weekly", "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD), "days": 7},
-            "strategist_monthly": {"plan": "strategist_monthly", "price_usd": float(PRICE_STRATEGIST_MONTHLY_USD), "days": 30},
+            "core": {"plan": "pro", "price_usd": float(PRICE_PRO_USD), "days": 30, "payment_assets": ["USDT", "USDC"]},
+            "strategist_weekly": {"plan": "strategist_weekly", "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD), "days": 7, "payment_assets": ["NKR"]},
+            "strategist_monthly": {"plan": "strategist_monthly", "price_usd": float(PRICE_STRATEGIST_MONTHLY_USD), "days": 30, "payment_assets": ["USDT", "USDC"]},
         },
         "treasury": TREASURY_ADDRESS,
+        "nkr": {
+            "symbol": "NKR", "chain_id": NKR_PAYMENT_CHAIN_ID,
+            "chain": _chain_key_from_id(NKR_PAYMENT_CHAIN_ID),
+            "address": NKR_TOKEN_ADDRESS, "recipient": NKR_PAYMENT_ADDRESS,
+            "decimals": NKR_TOKEN_DECIMALS, "price_usd": NKR_PRICE_USD,
+            "configured": bool(_looks_like_evm_addr(NKR_TOKEN_ADDRESS) and _looks_like_evm_addr(NKR_PAYMENT_ADDRESS) and NKR_PRICE_USD > 0),
+        },
+        "payment_policy": {
+            "core": ["USDT", "USDC"],
+            "strategist_weekly": ["NKR"],
+            "strategist_monthly": ["USDT", "USDC"],
+            "bundle": ["USDT", "USDC"],
+        },
         "tokens": tokens,
         "subscription_seconds": int(os.getenv("NEXUS_SUBSCRIPTION_SECONDS", str(60 * 60 * 24 * 30))),
         "ts": now_ts(),
@@ -10441,6 +10463,16 @@ def api_access_subscribe_verify():
             ),
         )
     else:
+        # Archive the final Shadow accounting snapshot before Core activation.
+        # Shadow figures never become live funds; the live Core Vault starts at zero.
+        try:
+            shadow_snapshot = _shadow_core_vault_accounting(wa)
+            cur.execute(
+                "INSERT INTO nexus_shadow_vault_history(wallet_address, activation_tx_hash, snapshot_json, created_ts) VALUES (?,?,?,?)",
+                (wa, tx_hash.lower(), json.dumps(shadow_snapshot, separators=(",", ":"), ensure_ascii=False), now_ts()),
+            )
+        except Exception:
+            pass
         # activate Core/PRO subscription (default 30 days; configurable)
         chains_allowed = list(_CHAINS_PRO_EFFECTIVE)
         ai_limit = _AI_LIMIT_UNLIMITED
@@ -14803,6 +14835,75 @@ def _nexus_reserve_capital(cur, wallet_address, body):
     _nexus_log_sim_event(cur, wallet_address, slot_id, asset, "CAPITAL_RESERVED", "", "RESERVED", reason, {"reservation_id": reservation_id, "amount_usd": amount})
     cur.execute("SELECT * FROM nexus_capital_reservations WHERE reservation_id=? AND wallet_address=?", (reservation_id, wallet_address))
     return _nexus_reservation_row_to_dict(cur.fetchone())
+
+def _first_number(obj: dict, keys: list[str], default: float = 0.0) -> float:
+    for key in keys:
+        value = obj.get(key) if isinstance(obj, dict) else None
+        try:
+            n = float(value)
+            if math.isfinite(n):
+                return n
+        except Exception:
+            pass
+    return float(default)
+
+
+def _shadow_core_vault_accounting(wallet_address: str) -> dict:
+    """Build a wallet-bound Shadow accounting view without representing real funds."""
+    wa = _norm_addr(wallet_address or "")
+    access = _compute_access_status(wa) if wa else _access_defaults()
+    live = bool(access.get("active"))
+    if live:
+        return {
+            "mode": "LIVE", "isLive": True, "isShadow": False,
+            "stableBalanceUsd": 0.0, "baseCapitalUsd": 0.0, "allocatedUsd": 0.0,
+            "reserveUsd": 0.0, "securedProfitUsd": 0.0, "availableForWithdrawUsd": 0.0,
+            "shadowArchived": True,
+            "note": "Core access is active. Live accounting starts at zero and increases only from real audited Core Vault deposits.",
+        }
+
+    sessions, _, _ = _db_get_rotation_sessions(wa) if wa else ([], "", 0)
+    total_budget = allocated = reserve = secured_profit = 0.0
+    for sess in sessions:
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        merged = {**meta, **sess}
+        budget = max(0.0, _first_number(merged, ["budgetUsd", "budget_usd", "capitalUsd", "capital_usd", "inputCapitalUsd", "totalBudgetUsd"]))
+        alloc = max(0.0, _first_number(merged, ["allocatedUsd", "allocated_usd", "workingCapitalUsd", "working_capital_usd", "activeCapitalUsd"]))
+        res = max(0.0, _first_number(merged, ["reserveUsd", "reserve_usd", "cashReserveUsd", "cash_reserve_usd", "protectedReserveUsd"]))
+        profit = max(0.0, _first_number(merged, ["collectedProfitUsd", "collected_profit_usd", "securedProfitUsd", "secured_profit_usd", "realizedProfitUsd", "realized_profit_usd", "netProfitUsd"]))
+        total_budget += budget
+        allocated += alloc
+        reserve += res
+        secured_profit += profit
+    if total_budget <= 0:
+        state, _ = _db_get_user_app_state(wa) if wa else ({}, 0)
+        ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+        total_budget = max(0.0, _first_number(ui, ["shadowCapitalUsd", "nkrBudgetUsd", "tradingBudgetUsd"]))
+        allocated = max(0.0, _first_number(ui, ["shadowAllocatedUsd", "nkrAllocatedUsd", "tradingAllocatedUsd"]))
+        reserve = max(0.0, _first_number(ui, ["shadowReserveUsd", "nkrReserveUsd"]))
+        secured_profit = max(0.0, _first_number(ui, ["shadowSecuredProfitUsd", "vaultSecuredProfitUsd"]))
+    if reserve <= 0 and total_budget > 0:
+        reserve = max(0.0, total_budget - allocated)
+    base = max(0.0, total_budget)
+    return {
+        "mode": "SHADOW", "isLive": False, "isShadow": True,
+        "stableBalanceUsd": round(base + secured_profit, 2),
+        "baseCapitalUsd": round(base, 2), "allocatedUsd": round(min(base, allocated), 2),
+        "reserveUsd": round(min(base, reserve), 2), "securedProfitUsd": round(secured_profit, 2),
+        "availableForWithdrawUsd": round(secured_profit, 2),
+        "shadowArchived": False,
+        "note": "Simulation only. These values are not on-chain funds and cannot be withdrawn.",
+    }
+
+
+@app.route("/api/nexus/core-vault/accounting", methods=["GET"])
+def api_nexus_core_vault_accounting():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    accounting = _shadow_core_vault_accounting(wa)
+    return jsonify({"status": "ok", "accounting": accounting, **accounting, "ts": now_ts()})
+
 
 @app.route("/api/nexus/trading/state", methods=["GET"])
 def api_nexus_trading_state():
