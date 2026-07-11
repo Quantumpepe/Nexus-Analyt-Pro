@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-108-BINANCE-DYNAMIC-TIERED-BATCH-CACHE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-108-BINANCE-DYNAMIC-TIERED-BATCH-CACHE"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-109-STRATEGIST-BRIDGE-NKR-CLOCK-ROTATION-HISTORY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-109-STRATEGIST-BRIDGE-NKR-CLOCK-ROTATION-HISTORY"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -2567,7 +2567,18 @@ def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
             live_change = _safe_float(row.get("pct") or row.get("change24h") or row.get("change_24h_pct") or row.get("change_pct"), 0.0)
             signal = _binance_futures_signal(fut, live_change)
             row["binanceFutures"] = {**fut, **signal}
-            row["futures_score_adjustment"] = signal.get("futuresScoreAdjustment", 0.0)
+            futures_adj = max(-8.0, min(8.0, _safe_float(signal.get("futuresScoreAdjustment"), 0.0)))
+            row["futures_score_adjustment"] = futures_adj
+            core_score = _safe_float(row.get("score") or row.get("systemScore") or row.get("confidence") or 0.0, 0.0)
+            if core_score > 0:
+                strategist_score = max(0.0, min(100.0, core_score + futures_adj))
+                row["coreScoreBeforeStrategist"] = round(core_score, 4)
+                row["strategistPerformanceScore"] = round(strategist_score, 4)
+                row["strategistScoreAdjustment"] = round(futures_adj, 4)
+                if "score" in row:
+                    row["score"] = round(strategist_score, 4)
+                if "systemScore" in row:
+                    row["systemScore"] = round(strategist_score, 4)
         out.append(row)
     return out
 
@@ -28048,11 +28059,42 @@ def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
     return src
 
 
+def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[dict], dict]:
+    rows = [dict(x) for x in (sessions or []) if isinstance(x, dict)]
+    active = [x for x in rows if str(x.get("status") or "").upper() not in {"STOPPED","CLOSED","EXPIRED","CANCELLED","DELETED","ARCHIVED","REBALANCED_OUT"}]
+    try:
+        days = max(1, min(3650, int(float(period_days or 10))))
+    except Exception:
+        days = 10
+    starts=[]; explicit=[]
+    for x in active:
+        m=x.get("meta") if isinstance(x.get("meta"),dict) else {}
+        pos=_rotation_ms(x.get("positionOpenedAt") or m.get("position_opened_at") or x.get("startedAt") or x.get("createdAt"),0)
+        camp=_rotation_ms(x.get("campaignStartedAt") or m.get("campaign_started_at"),0)
+        if pos>0: starts.append(pos)
+        if camp>0: explicit.append(camp)
+    campaign_start=min(explicit or starts or [int(time.time()*1000)])
+    campaign_expires=campaign_start + days*86400000
+    out=[]
+    for x in rows:
+        m=dict(x.get("meta") if isinstance(x.get("meta"),dict) else {})
+        pos=_rotation_ms(x.get("positionOpenedAt") or m.get("position_opened_at") or x.get("startedAt") or x.get("createdAt"),campaign_start)
+        x["positionOpenedAt"]=pos
+        x["campaignStartedAt"]=campaign_start
+        x["campaignExpiresAt"]=campaign_expires
+        x["periodDays"]=days
+        m.update({"position_opened_at":pos,"campaign_started_at":campaign_start,"campaign_expires_at":campaign_expires,"nkr_period_days":days})
+        x["meta"]=m
+        out.append(x)
+    return out,{"startedAt":campaign_start,"expiresAt":campaign_expires,"periodDays":days}
+
+
 def _nkr_get_wallet_bundle(wa: str) -> dict:
     state, state_ts = _db_get_user_app_state(wa)
     sessions, active, sess_ts = _db_get_rotation_sessions(wa)
     nkr_sessions = [x for x in (sessions or []) if _nkr_is_session(x)]
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    nkr_sessions, campaign_clock = _nkr_apply_campaign_clock(nkr_sessions, ui.get("nkrPeriodDays", "10"))
     control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
     if any(str((x or {}).get("status") or "").upper() == "PAUSED" for x in nkr_sessions):
         control = "PAUSED"
@@ -28073,6 +28115,7 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
             "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
         },
         "sessions": nkr_sessions,
+        "campaignClock": campaign_clock,
         "activeNkrSessionId": active if any(str((x or {}).get("id") or x.get("session_id") or "") == str(active) for x in nkr_sessions) else "",
         "rules": {
             "wallet_bound_backend": True,
