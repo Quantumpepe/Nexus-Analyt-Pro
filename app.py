@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.10-ENGINE-101-NKR-TOPUP-STATE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.10-ENGINE-101-NKR-TOPUP-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-103-NKR-LIVE-MODE-SWITCH"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-103-NKR-LIVE-MODE-SWITCH"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27560,8 +27560,8 @@ NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP = 5.0
 NEXUS_NKR_AGGRESSIVE_TRANSFER_PCT = 1.00
 NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD = 0.0
 NEXUS_NKR_EVENT_HISTORY_LIMIT = 0  # 0 = unlimited persisted history; UI display cap is separate
-NEXUS_NKR_REBALANCE_MODE = "NKR_AGGRESSIVE_REPLACEMENT_UNBLOCKED_V4"
-NEXUS_NKR_REBALANCE_POLICY = "AGGRESSIVE_REPLACES_WEAK_OPEN_SESSIONS_EARLIER_AND_REALLOCATES_RELEASED_CAPITAL_TO_STRONGER_GREEN_ASSETS_WITH_HARD_SAFETY"
+NEXUS_NKR_REBALANCE_MODE = "NKR_DYNAMIC_AND_AGGRESSIVE_PROFIT_ROTATION_V1"
+NEXUS_NKR_REBALANCE_POLICY = "DYNAMIC_AND_AGGRESSIVE_REALLOCATE_AGING_WEAK_CAPITAL_TO_CURRENT_LIVE_WINNERS_WITH_MODE_SPECIFIC_THRESHOLDS"
 NEXUS_NKR_LIVE_PRICE_CARD_MODE = "NKR_SESSION_CARDS_USE_TRADER_LIVE_PRICE_SOURCE"
 NEXUS_NKR_SMART_DISPATCHER_MODE = "NKR_SMART_DISPATCHER_V1"
 NEXUS_NKR_COST_ALIGNMENT_MODE = "ALIGNED_WITH_TRADER_SHADOW_COST_MODEL"
@@ -27771,6 +27771,114 @@ def api_nkr_control():
         "STOP": "NKR stopped/protected. It will not resume unless user explicitly resumes or deletes.",
         "PANIC_STOP": "NKR panic-protected. Paper/live-intent is stopped and capital should be secured by live executor when connected.",
     }.get(action, "NKR control updated.")
+    out = jsonify(bundle)
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
+
+
+@app.route("/api/nkr/mode", methods=["POST"])
+def api_nkr_mode_update():
+    """Change the mode of the single active NKR run without creating a new run.
+
+    The total budget, period, profit history and session identities remain unchanged.
+    A stricter mode may move excess allocated capital back to stable reserve
+    proportionally. A more aggressive mode exposes additional available capital,
+    which the existing NKR allocator may deploy on the next executor tick.
+    """
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    body = request.get_json(silent=True) or {}
+    new_mode = _nkr_normalize_performance_mode(body.get("mode") or body.get("nkrCapitalMode") or body.get("performance"))
+    if new_mode not in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
+        return err("invalid NKR mode", 400)
+
+    sessions, active_id, _ = _db_get_rotation_sessions(wa)
+    nkr_sessions = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x)]
+    active_sessions = [x for x in nkr_sessions if _nkr_active_session_status_ok(x)]
+    if not active_sessions:
+        return err("no active NKR run", 409)
+
+    first = active_sessions[0]
+    old_mode = _nkr_normalize_performance_mode(first.get("nkrCapitalMode") or (first.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC")
+    reserve_pct_by_mode = {"AGGRESSIVE": 10.0, "DYNAMIC": 20.0, "TACTICAL": 25.0, "DEFENSIVE": 35.0}
+    target_reserve_pct = reserve_pct_by_mode[new_mode]
+    total_budget = max([_safe_float(x.get("totalNkrBudgetUsd") or (x.get("meta") or {}).get("total_nkr_budget_usd") or 0, 0.0) for x in active_sessions] or [0.0])
+    current_allocated = sum(_safe_float(x.get("workingCapitalUsd") or x.get("sessionCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active_sessions)
+    if total_budget <= 0:
+        total_budget = current_allocated + max([_safe_float(x.get("nkrCashReserveUsd") or 0, 0.0) for x in active_sessions] or [0.0])
+    target_allocated = max(0.0, total_budget * (1.0 - target_reserve_pct / 100.0))
+    reduction_needed = max(0.0, current_allocated - target_allocated)
+    ratio = (target_allocated / current_allocated) if current_allocated > 0 and reduction_needed > 0 else 1.0
+    nowi = _nkr_now_ms()
+    updated_by_id = {}
+
+    for sess in active_sessions:
+        sid = str(sess.get("id") or sess.get("session_id") or "")
+        sym = _nkr_session_symbol(sess)
+        old_cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0, 0.0)
+        new_cap = old_cap * ratio if reduction_needed > 0 else old_cap
+        moved_to_reserve = max(0.0, old_cap - new_cap)
+        meta = dict(sess.get("meta") if isinstance(sess.get("meta"), dict) else {})
+        events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+        event_id = f"NKR-MODE-CHANGE-{sid}-{nowi}"
+        event = {
+            "id": event_id, "event_id": event_id, "session_id": sid, "ts": nowi,
+            "status": "CAPITAL_MOVEMENT" if moved_to_reserve > 0 else "MODE_CHANGE",
+            "action": "NKR_MODE_CHANGED",
+            "capitalMovementType": "MODE_RESERVE_REBALANCE" if moved_to_reserve > 0 else "MODE_POLICY_CHANGE",
+            "fromMode": old_mode, "toMode": new_mode,
+            "targetReservePct": target_reserve_pct,
+            "capitalBeforeUsd": round(old_cap, 4), "capitalMovedUsd": round(moved_to_reserve, 4),
+            "capitalAfterUsd": round(new_cap, 4),
+            "fromAsset": sym if moved_to_reserve > 0 else str(sess.get("baseAsset") or "USDC").upper(),
+            "toAsset": str(sess.get("baseAsset") or "USDC").upper(),
+            "grossUsd": 0.0, "costsUsd": 0.0, "netUsd": 0.0,
+            "addedToCollectedProfit": False, "alreadyCounted": True,
+            "reason": "user_changed_running_nkr_mode", "source": "backend_engine103",
+        }
+        nxt = dict(sess)
+        nxt.update({
+            "nkrCapitalMode": new_mode,
+            "workingCapitalUsd": round(new_cap, 4),
+            "sessionCapitalUsd": round(new_cap, 4),
+            "budgetUsd": round(new_cap, 4),
+            "reservedUsd": round(new_cap, 4),
+            "totalNkrBudgetUsd": round(total_budget, 4),
+            "nkrCashReserveUsd": round(total_budget * target_reserve_pct / 100.0, 4),
+            "lastRotationEvent": event,
+            "rotationEvents": [event] + events,
+            "eventCount": int(_safe_float(sess.get("eventCount") or len(events), len(events))) + 1,
+            "totalEventCount": int(_safe_float(sess.get("totalEventCount") or len(events), len(events))) + 1,
+            "updatedAt": nowi,
+        })
+        if isinstance(nxt.get("openRotation"), dict) and moved_to_reserve > 0:
+            op = dict(nxt.get("openRotation") or {})
+            op["entryUsd"] = round(new_cap, 4)
+            op["amountInUsd"] = round(new_cap, 4)
+            nxt["openRotation"] = op
+        meta.update({
+            "nkr_capital_mode": new_mode,
+            "cash_reserve_pct": target_reserve_pct,
+            "total_nkr_budget_usd": round(total_budget, 4),
+            "nkr_last_mode_change_ts": nowi,
+            "nkr_previous_mode": old_mode,
+        })
+        nxt["meta"] = meta
+        updated_by_id[sid] = nxt
+
+    merged = [updated_by_id.get(str(x.get("id") or x.get("session_id") or ""), x) if isinstance(x, dict) else x for x in nkr_sessions]
+    _db_set_rotation_sessions(wa, merged, active_session_id=active_id, replace_missing=False)
+    _db_set_user_app_state(wa, {"ui": {"nkrCapitalMode": new_mode}})
+    bundle = _nkr_get_wallet_bundle(wa)
+    bundle.update({
+        "status": "ok", "action": "NKR_MODE_CHANGED", "oldMode": old_mode, "newMode": new_mode,
+        "totalBudgetUsd": round(total_budget, 4), "targetReservePct": target_reserve_pct,
+        "targetReserveUsd": round(total_budget * target_reserve_pct / 100.0, 4),
+        "releasedToReserveUsd": round(reduction_needed, 4),
+        "availableForDeploymentUsd": round(max(0.0, target_allocated - current_allocated), 4),
+        "message": f"NKR mode changed from {old_mode} to {new_mode} for the active run.",
+    })
     out = jsonify(bundle)
     out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return out
@@ -28046,10 +28154,12 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
     }
 
 
-def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min):
-    """Aggressive-mode capital recycling for NKR.
+def _nkr_mode_reallocation_pass(active, market_by_sym, nowi, dispatch_min, mode="AGGRESSIVE"):
+    """Mode-aware capital recycling for NKR.
 
-    This pass does not touch collected profit. It only:
+    Dynamic and Aggressive may both rotate capital. Dynamic uses slower,
+    stricter thresholds; Aggressive reacts earlier. This pass does not touch
+    collected profit. It only:
     - closes deeply weak open shadow positions as CLOSED_LOSS_REALLOCATE,
     - reduces capital in weak/no-recovery sessions,
     - adds released shadow capital to the strongest active candidates.
@@ -28059,7 +28169,20 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
     if not isinstance(active, list) or not active:
         return active, {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": []}
 
-    # Rank current sessions by live score/change so weak assets can be compared to the best alternative.
+    mode_u = _nkr_normalize_performance_mode(mode)
+    if mode_u == "DYNAMIC":
+        weak_min_age = 105.0
+        weak_net_pct = -0.18
+        hard_cut_net_pct = -0.90
+        score_gap_min = 6.0
+    else:
+        weak_min_age = float(NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN)
+        weak_net_pct = float(NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT)
+        hard_cut_net_pct = float(NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT)
+        score_gap_min = float(NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP)
+
+    # Rank current sessions by live score + live momentum. Stored confidence alone
+    # must not freeze capital while another active asset becomes clearly stronger.
     ranked = []
     for i, sess in enumerate(active):
         if not isinstance(sess, dict) or not _nkr_is_session(sess):
@@ -28069,9 +28192,10 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
             continue
         sym = _nkr_session_symbol(sess)
         row = market_by_sym.get(sym, {})
-        score = _nkr_session_score(sess, row)
+        base_score = _nkr_session_score(sess, row)
         change = _nkr_row_change_pct(row)
-        ranked.append({"i": i, "sym": sym, "score": score, "change": change})
+        live_score = max(0.0, min(100.0, base_score + max(-12.0, min(18.0, change * 3.0))))
+        ranked.append({"i": i, "sym": sym, "score": live_score, "baseScore": base_score, "change": change})
     if len(ranked) < 2:
         return active, {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": []}
 
@@ -28116,12 +28240,12 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         score_gap = best_score - item["score"]
         top_green_exists = any((t.get("sym") != sym and t.get("change", 0) >= 0.0) for t in strong)
         weak = (
-            age_min >= NEXUS_NKR_AGGRESSIVE_WEAK_MIN_AGE_MIN and
-            score_gap >= NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP and
+            age_min >= weak_min_age and
+            score_gap >= score_gap_min and
             top_green_exists and
-            (net_pct <= NEXUS_NKR_AGGRESSIVE_WEAK_NET_PCT or item["change"] < 0.0 or item["score"] < dispatch_min)
+            (net_pct <= weak_net_pct or item["change"] < 0.0 or item["score"] < dispatch_min)
         )
-        hard_cut = age_min >= 120 and net_pct <= NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT
+        hard_cut = age_min >= max(120.0, weak_min_age) and net_pct <= hard_cut_net_pct
         if not (weak or hard_cut):
             continue
 
@@ -28133,7 +28257,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         close_event = _nkr_backend_tick_event(
             nowi, sess, sym, base, chain, budget, gross, costs, net, net_pct, item["score"],
             close_status, close_status,
-            "aggressive_replacement_weak_session_released_to_stronger_green_asset",
+            f"{mode_u.lower()}_replacement_weak_session_released_to_stronger_green_asset",
             entry_price_usd=entry_price, exit_price_usd=current_price,
         )
         close_event["addedToCollectedProfit"] = False
@@ -28170,7 +28294,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
             "netUsd": 0.0,
             "addedToCollectedProfit": False,
             "alreadyCounted": True,
-            "reason": "aggressive_reallocation_released_capital_to_available_stable_not_profit",
+            "reason": f"{mode_u.lower()}_reallocation_released_capital_to_available_stable_not_profit",
             "source": "backend_capital_movement_ledger_088_watchlist_green_promotion_fix",
         }
         events = [movement_event, close_event] + prev_events
@@ -28193,7 +28317,7 @@ def _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
         sess["eventCount"] = prev_total_events + 2
         sess["rotationEventHistoryCount"] = len(events)
         meta.update({
-            "nkr_aggressive_reallocation": True,
+            "nkr_mode_reallocation": mode_u,
             "nkr_reallocation_reason": "weak_no_recovery_capital_released",
             "nkr_reallocation_released_usd": round(release_usd, 4),
             "nkr_reallocation_net_pct": round(net_pct, 4),
@@ -28392,7 +28516,10 @@ def _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_mi
     if total_budget <= 0:
         return active, {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "reason": "missing_budget"}
 
-    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or (total_budget * 0.10), total_budget * 0.10)
+    deploy_mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    reserve_pct_map = {"AGGRESSIVE": 10.0, "DYNAMIC": 20.0, "TACTICAL": 25.0, "DEFENSIVE": 35.0}
+    fallback_reserve = total_budget * (reserve_pct_map.get(deploy_mode, 20.0) / 100.0)
+    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or fallback_reserve, fallback_reserve)
     investable_usd = max(0.0, total_budget - protected_usd)
     live_sessions = [x for x in active if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
     active_symbols = {_nkr_session_symbol(x) for x in live_sessions}
@@ -28868,14 +28995,15 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if event:
             messages.append(f"{sym}: {action} net ${net:.2f}")
 
-    # ENGINE-083: In Aggressive mode, recycle weak/no-recovery capital earlier.
+    # ENGINE-102: Dynamic must also rotate capital when a live winner clearly
+    # outranks an aging weak session. Aggressive remains faster; Dynamic is stricter.
     reallocation_summary = {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": []}
-    if mode == "AGGRESSIVE":
-        active, reallocation_summary = _nkr_aggressive_reallocation_pass(active, market_by_sym, nowi, dispatch_min)
+    if mode in {"AGGRESSIVE", "DYNAMIC"}:
+        active, reallocation_summary = _nkr_mode_reallocation_pass(active, market_by_sym, nowi, dispatch_min, mode=mode)
         if reallocation_summary.get("changed"):
             changed = True
             messages.append(
-                f"AGGRESSIVE_REALLOCATION released ${_safe_float(reallocation_summary.get('releasedUsd'), 0.0):.2f} to {','.join(reallocation_summary.get('targets') or [])}"
+                f"{mode}_REALLOCATION released ${_safe_float(reallocation_summary.get('releasedUsd'), 0.0):.2f}"
             )
 
     # ENGINE-088: after weak sessions are released, continue scanning the entire watchlist.
@@ -28894,8 +29022,8 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     # deploy it across the already-active winner sessions. This does NOT auto-fill
     # session count; it only fixes the capital allocator gap.
     deploy_summary = {"changed": False, "allocatedUsd": 0.0}
-    if mode == "AGGRESSIVE":
-        active, deploy_summary = _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=settings)
+    if mode in {"AGGRESSIVE", "DYNAMIC"}:
+        active, deploy_summary = _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings={**settings, "nkrCapitalMode": mode})
         if deploy_summary.get("changed"):
             changed = True
             messages.append(
