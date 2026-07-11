@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-119-REDEEM-VAULT-STATUS-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-119-REDEEM-VAULT-STATUS-FIX"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-120-SHADOW-VAULT-ALL-SYSTEMS"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-120-SHADOW-VAULT-ALL-SYSTEMS"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -14848,16 +14848,120 @@ def _first_number(obj: dict, keys: list[str], default: float = 0.0) -> float:
     return float(default)
 
 
+def _shadow_grid_vault_accounting(wallet_address: str) -> dict:
+    """Return live-like Shadow accounting for Nexus Grid only."""
+    wa = _norm_addr(wallet_address or "")
+    base = allocated = 0.0
+    try:
+        for item_id, sess in (GRID_SESSIONS or {}).items():
+            if not isinstance(sess, dict):
+                continue
+            if _norm_addr(sess.get("wallet_address") or "") != wa:
+                continue
+            initial = max(0.0, _first_number(sess, ["initial_capital_usd", "initial_capital", "wallet_total_usd", "budget_usd"]))
+            locked = max(0.0, _first_number(sess, ["wallet_locked_usd", "locked_usd", "reserved_usd"]))
+            if initial <= 0:
+                initial = max(0.0, locked + _first_number(sess, ["wallet_available_usd", "available_usd"]))
+            base += initial
+            allocated += min(initial if initial > 0 else locked, locked)
+    except Exception:
+        pass
+
+    realized_net = 0.0
+    if wa:
+        try:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("SELECT COALESCE(SUM(pnl_delta_usd),0) AS pnl FROM pnl_events WHERE wallet_address=?", (wa,))
+            row = cur.fetchone()
+            realized_net = float((row["pnl"] if row is not None else 0) or 0)
+            conn.close()
+        except Exception:
+            realized_net = 0.0
+    return {
+        "baseCapitalUsd": round(base, 2),
+        "allocatedUsd": round(allocated, 2),
+        "reserveUsd": round(max(0.0, base - allocated), 2),
+        "realizedNetUsd": round(realized_net, 2),
+        "securedProfitUsd": round(max(0.0, realized_net), 2),
+    }
+
+
+def _shadow_trader_vault_accounting(wallet_address: str) -> dict:
+    """Return live-like Shadow accounting for Nexus Trading only."""
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return {"baseCapitalUsd": 0.0, "allocatedUsd": 0.0, "reserveUsd": 0.0, "realizedNetUsd": 0.0, "securedProfitUsd": 0.0}
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        summary = _nexus_execution_summary(cur, wa)
+        conn.close()
+    except Exception:
+        summary = {}
+    queue = summary.get("queue") if isinstance(summary.get("queue"), list) else []
+    active_states = {"WAIT", "READY", "ACTIVE", "PAUSED", "PROTECT", "EXIT_RISK", "HOLD", "OBSERVE", "RELEASE_REQUIRED", "SIMULATED_EXIT"}
+    allocated = 0.0
+    for item in queue:
+        state = str(item.get("state") or item.get("status") or "").upper()
+        if state and state not in active_states:
+            continue
+        allocated += max(0.0, _first_number(item, ["reserved_capital_usd", "amountUsd", "amount_usd", "budgetUsd"]))
+    allocated = max(allocated, max(0.0, _first_number(summary, ["reserved_capital_usd"])))
+    realized_net = _first_number(summary, ["collected_profit_usd", "paper_collected_profit_usd"], 0.0)
+    return {
+        "baseCapitalUsd": round(allocated, 2),
+        "allocatedUsd": round(allocated, 2),
+        "reserveUsd": 0.0,
+        "realizedNetUsd": round(realized_net, 2),
+        "securedProfitUsd": round(max(0.0, realized_net), 2),
+    }
+
+
+def _shadow_nkr_vault_accounting(wallet_address: str) -> dict:
+    """Return live-like Shadow accounting for Nexus NKR only."""
+    wa = _norm_addr(wallet_address or "")
+    sessions, _, _ = _db_get_rotation_sessions(wa) if wa else ([], "", 0)
+    base = allocated = reserve = realized_net = 0.0
+    for sess in sessions:
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        merged = {**meta, **sess}
+        budget = max(0.0, _first_number(merged, ["budgetUsd", "budget_usd", "capitalUsd", "capital_usd", "inputCapitalUsd", "totalBudgetUsd"]))
+        alloc = max(0.0, _first_number(merged, ["allocatedUsd", "allocated_usd", "workingCapitalUsd", "working_capital_usd", "activeCapitalUsd"]))
+        res = max(0.0, _first_number(merged, ["reserveUsd", "reserve_usd", "cashReserveUsd", "cash_reserve_usd", "protectedReserveUsd"]))
+        profit = _first_number(merged, ["collectedProfitUsd", "collected_profit_usd", "securedProfitUsd", "secured_profit_usd", "realizedProfitUsd", "realized_profit_usd", "netProfitUsd"], 0.0)
+        base += budget
+        allocated += alloc
+        reserve += res
+        realized_net += profit
+    if base <= 0:
+        state, _ = _db_get_user_app_state(wa) if wa else ({}, 0)
+        ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+        base = max(0.0, _first_number(ui, ["shadowCapitalUsd", "nkrBudgetUsd"]))
+        allocated = max(0.0, _first_number(ui, ["shadowAllocatedUsd", "nkrAllocatedUsd"]))
+        reserve = max(0.0, _first_number(ui, ["shadowReserveUsd", "nkrReserveUsd"]))
+        realized_net = _first_number(ui, ["shadowSecuredProfitUsd", "vaultSecuredProfitUsd"], 0.0)
+    if reserve <= 0 and base > 0:
+        reserve = max(0.0, base - allocated)
+    return {
+        "baseCapitalUsd": round(base, 2),
+        "allocatedUsd": round(min(base, allocated) if base > 0 else allocated, 2),
+        "reserveUsd": round(min(base, reserve) if base > 0 else reserve, 2),
+        "realizedNetUsd": round(realized_net, 2),
+        "securedProfitUsd": round(max(0.0, realized_net), 2),
+    }
+
+
 def _shadow_core_vault_accounting(wallet_address: str) -> dict:
-    """Build a wallet-bound Shadow accounting view without representing real funds."""
+    """Build one wallet-bound Shadow ledger for Grid, NKR and Trading.
+
+    The accounting rules mirror later live behavior: only closed/net realized
+    USDT/USDC-equivalent results become secured profit. Open PnL never counts.
+    Shadow values remain non-withdrawable.
+    """
     wa = _norm_addr(wallet_address or "")
     access = _compute_access_status(wa) if wa else _access_defaults()
 
-    # Full application access (including lifetime redeem access) is not the same
-    # as an active on-chain Core Vault. LIVE accounting is shown only when the
-    # audited Core Vault execution switch is enabled and at least one explicit
-    # CORE_VAULT_ADDRESS_* is configured. Legacy VAULT_ADDRESS_* values must not
-    # make the new Core Vault appear live.
     explicit_core_vault_configured = any(
         bool(str(os.getenv(name) or "").strip())
         for name in (
@@ -14868,55 +14972,65 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
     )
     live_execution_enabled = bool(globals().get("_NEXUS_VAULT_EXECUTION_LIVE", False))
     live = bool(access.get("active") and explicit_core_vault_configured and live_execution_enabled)
+    empty_breakdown = {
+        "NKR": {"baseCapitalUsd": 0.0, "allocatedUsd": 0.0, "reserveUsd": 0.0, "realizedNetUsd": 0.0, "securedProfitUsd": 0.0},
+        "TRADER": {"baseCapitalUsd": 0.0, "allocatedUsd": 0.0, "reserveUsd": 0.0, "realizedNetUsd": 0.0, "securedProfitUsd": 0.0},
+        "GRID": {"baseCapitalUsd": 0.0, "allocatedUsd": 0.0, "reserveUsd": 0.0, "realizedNetUsd": 0.0, "securedProfitUsd": 0.0},
+    }
     if live:
         return {
             "mode": "LIVE", "isLive": True, "isShadow": False,
             "stableBalanceUsd": 0.0, "baseCapitalUsd": 0.0, "allocatedUsd": 0.0,
             "reserveUsd": 0.0, "securedProfitUsd": 0.0, "availableForWithdrawUsd": 0.0,
-            "shadowArchived": True,
-            "accessActive": bool(access.get("active")),
-            "coreVaultConfigured": True,
-            "liveExecutionEnabled": True,
+            "profitBreakdown": {"nkrUsd": 0.0, "traderUsd": 0.0, "gridUsd": 0.0, "totalUsd": 0.0},
+            "allocationBreakdown": {"nkrUsd": 0.0, "traderUsd": 0.0, "gridUsd": 0.0, "totalUsd": 0.0},
+            "systems": empty_breakdown,
+            "shadowArchived": True, "accessActive": bool(access.get("active")),
+            "coreVaultConfigured": True, "liveExecutionEnabled": True,
             "note": "Full access is active and the audited Core Vault is connected. Live accounting starts at zero and increases only from real deposits.",
         }
 
-    sessions, _, _ = _db_get_rotation_sessions(wa) if wa else ([], "", 0)
-    total_budget = allocated = reserve = secured_profit = 0.0
-    for sess in sessions:
-        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
-        merged = {**meta, **sess}
-        budget = max(0.0, _first_number(merged, ["budgetUsd", "budget_usd", "capitalUsd", "capital_usd", "inputCapitalUsd", "totalBudgetUsd"]))
-        alloc = max(0.0, _first_number(merged, ["allocatedUsd", "allocated_usd", "workingCapitalUsd", "working_capital_usd", "activeCapitalUsd"]))
-        res = max(0.0, _first_number(merged, ["reserveUsd", "reserve_usd", "cashReserveUsd", "cash_reserve_usd", "protectedReserveUsd"]))
-        profit = max(0.0, _first_number(merged, ["collectedProfitUsd", "collected_profit_usd", "securedProfitUsd", "secured_profit_usd", "realizedProfitUsd", "realized_profit_usd", "netProfitUsd"]))
-        total_budget += budget
-        allocated += alloc
-        reserve += res
-        secured_profit += profit
-    if total_budget <= 0:
-        state, _ = _db_get_user_app_state(wa) if wa else ({}, 0)
-        ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-        total_budget = max(0.0, _first_number(ui, ["shadowCapitalUsd", "nkrBudgetUsd", "tradingBudgetUsd"]))
-        allocated = max(0.0, _first_number(ui, ["shadowAllocatedUsd", "nkrAllocatedUsd", "tradingAllocatedUsd"]))
-        reserve = max(0.0, _first_number(ui, ["shadowReserveUsd", "nkrReserveUsd"]))
-        secured_profit = max(0.0, _first_number(ui, ["shadowSecuredProfitUsd", "vaultSecuredProfitUsd"]))
-    if reserve <= 0 and total_budget > 0:
-        reserve = max(0.0, total_budget - allocated)
-    base = max(0.0, total_budget)
+    nkr = _shadow_nkr_vault_accounting(wa)
+    trader = _shadow_trader_vault_accounting(wa)
+    grid = _shadow_grid_vault_accounting(wa)
+    systems = {"NKR": nkr, "TRADER": trader, "GRID": grid}
+    total_base = sum(float(x.get("baseCapitalUsd") or 0) for x in systems.values())
+    total_allocated = sum(float(x.get("allocatedUsd") or 0) for x in systems.values())
+    total_reserve = sum(float(x.get("reserveUsd") or 0) for x in systems.values())
+    total_realized_net = sum(float(x.get("realizedNetUsd") or 0) for x in systems.values())
+    total_secured = sum(float(x.get("securedProfitUsd") or 0) for x in systems.values())
+    protected_base = max(0.0, total_base + min(0.0, total_realized_net))
+    stable_balance = max(0.0, protected_base + total_secured)
+
     return {
         "mode": "SHADOW", "isLive": False, "isShadow": True,
-        "stableBalanceUsd": round(base + secured_profit, 2),
-        "baseCapitalUsd": round(base, 2), "allocatedUsd": round(min(base, allocated), 2),
-        "reserveUsd": round(min(base, reserve), 2), "securedProfitUsd": round(secured_profit, 2),
-        "availableForWithdrawUsd": round(secured_profit, 2),
+        "stableBalanceUsd": round(stable_balance, 2),
+        "baseCapitalUsd": round(protected_base, 2),
+        "allocatedUsd": round(total_allocated, 2),
+        "reserveUsd": round(total_reserve, 2),
+        "securedProfitUsd": round(total_secured, 2),
+        "availableForWithdrawUsd": 0.0,
+        "profitBreakdown": {
+            "nkrUsd": round(float(nkr.get("securedProfitUsd") or 0), 2),
+            "traderUsd": round(float(trader.get("securedProfitUsd") or 0), 2),
+            "gridUsd": round(float(grid.get("securedProfitUsd") or 0), 2),
+            "totalUsd": round(total_secured, 2),
+        },
+        "allocationBreakdown": {
+            "nkrUsd": round(float(nkr.get("allocatedUsd") or 0), 2),
+            "traderUsd": round(float(trader.get("allocatedUsd") or 0), 2),
+            "gridUsd": round(float(grid.get("allocatedUsd") or 0), 2),
+            "totalUsd": round(total_allocated, 2),
+        },
+        "systems": systems,
         "shadowArchived": False,
         "accessActive": bool(access.get("active")),
         "coreVaultConfigured": bool(explicit_core_vault_configured),
         "liveExecutionEnabled": bool(live_execution_enabled),
         "note": (
-            "Full lifetime access is active. The audited Core Vault is not connected yet, so these values remain Shadow simulation and cannot be withdrawn."
+            "Full lifetime access is active. Grid, NKR and Trading use live-like Shadow accounting; only closed net results count as secured profit. Shadow funds cannot be withdrawn."
             if access.get("active") else
-            "Simulation only. These values are not on-chain funds and cannot be withdrawn."
+            "Simulation only. Grid, NKR and Trading use live-like accounting, but these values are not on-chain funds and cannot be withdrawn."
         ),
     }
 
