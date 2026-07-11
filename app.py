@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-113-CORE-VAULT-WALLET-UX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-113-CORE-VAULT-WALLET-UX"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-114-PRIVY-ASSET-VAULT-GATE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-114-PRIVY-ASSET-VAULT-GATE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -4083,6 +4083,53 @@ def api_debug_rpc_balance():
     return jsonify(out)
 
 
+@app.route("/api/wallet/discover-tokens", methods=["POST"])
+def api_wallet_discover_tokens():
+    """Best-effort ERC-20 discovery for wallet display only.
+
+    Uses Alchemy enhanced RPC when the configured chain endpoint supports it.
+    Failure on one chain never hides native/stable balances and never changes
+    Vault admission policy.
+    """
+    body = request.get_json(silent=True) or {}
+    wallet = body.get("wallet") or body.get("wallet_address") or request.headers.get("X-Wallet-Address") or ""
+    wa = _norm_addr(wallet)
+    if not _looks_like_evm_addr(wa):
+        return jsonify({"status": "error", "error": "invalid wallet", "ts": now_ts()}), 400
+    raw_chains = body.get("chains") or list(_ENABLED_EVM_CHAINS)
+    if not isinstance(raw_chains, list): raw_chains = [raw_chains]
+    out = {}
+    errors = {}
+    for raw_chain in raw_chains[:20]:
+        chain = _normalize_chain_key(raw_chain)
+        cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
+        if cid <= 0: continue
+        found = []
+        try:
+            result = _rpc_call(cid, "alchemy_getTokenBalances", [wa, "erc20"])
+            balances = (result or {}).get("tokenBalances") if isinstance(result, dict) else []
+            for item in (balances or [])[:200]:
+                addr = _norm_addr((item or {}).get("contractAddress"))
+                raw_balance = str((item or {}).get("tokenBalance") or "0x0")
+                if not _looks_like_evm_addr(addr) or _hex_to_int(raw_balance) <= 0: continue
+                metadata = {}
+                try:
+                    metadata = _rpc_call(cid, "alchemy_getTokenMetadata", [addr]) or {}
+                except Exception:
+                    metadata = {}
+                decimals = metadata.get("decimals")
+                try: decimals = int(decimals if decimals is not None else 18)
+                except Exception: decimals = 18
+                symbol = str(metadata.get("symbol") or "TOKEN").strip().upper()[:24]
+                name = str(metadata.get("name") or "ERC-20 token").strip()[:120]
+                found.append({"address": addr, "symbol": symbol, "name": name, "decimals": decimals})
+            out[chain] = found
+        except Exception as exc:
+            out[chain] = []
+            errors[chain] = str(exc)[:240]
+    return jsonify({"status": "ok", "wallet": wa, "tokens_by_chain": out, "errors": errors, "display_only": True, "ts": now_ts()})
+
+
 @app.route("/api/wallet/token-balances", methods=["POST"])
 def api_wallet_token_balances():
     body = request.get_json(silent=True) or {}
@@ -5939,10 +5986,54 @@ def _looks_like_evm_addr(s: str) -> bool:
 GOPLUS_APP_KEY = (os.getenv("GOPLUS_APP_KEY") or "").strip()
 GOPLUS_APP_SECRET = (os.getenv("GOPLUS_APP_SECRET") or "").strip()
 GOPLUS_TIMEOUT_SEC = float(os.getenv("GOPLUS_TIMEOUT_SEC", "8") or 8)
-GOPLUS_BLOCK_HONEYPOT = str(os.getenv("GOPLUS_BLOCK_HONEYPOT", "false")).strip().lower() in ("1", "true", "yes", "on")
+GOPLUS_BLOCK_HONEYPOT = str(os.getenv("GOPLUS_BLOCK_HONEYPOT", "true")).strip().lower() in ("1", "true", "yes", "on")
 _GOPLUS_TOKEN_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 _GOPLUS_AUTH_URL = "https://api.gopluslabs.io/api/v1/token"
 _GOPLUS_TOKEN_CACHE = {"token": None, "expires_at": 0}
+
+def _vault_approved_token_contracts() -> set[tuple[int, str]]:
+    """Exact token contracts approved for Core Vault admission.
+
+    Includes official configured USDC/USDT contracts, explicit GOPLUS_ALLOWLIST
+    entries and ACTIVE owner-configured wrapped routes. Wallet display is never
+    restricted by this list; it gates Vault admission only.
+    """
+    out: set[tuple[int, str]] = set()
+    stable_env = {
+        1: [os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+        56: [os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83F1Ad97B32Cd580d",
+             os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955"],
+        137: [os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+              os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xC2132D05D31c914a87C6611C10748AEb04B58e8F"],
+    }
+    for cid, addresses in stable_env.items():
+        for address in addresses:
+            addr = _norm_addr(address)
+            if _looks_like_evm_addr(addr): out.add((int(cid), addr))
+    raw = str(os.getenv("GOPLUS_ALLOWLIST", "") or "").strip()
+    for part in raw.split(",") if raw else []:
+        if ":" not in part: continue
+        cid_s, address = part.split(":", 1)
+        try: cid = int(cid_s.strip())
+        except Exception: continue
+        addr = _norm_addr(address)
+        if cid > 0 and _looks_like_evm_addr(addr): out.add((cid, addr))
+    try:
+        routes_raw = str(os.getenv("NEXUS_NON_EVM_ASSET_ROUTES_JSON") or "").strip()
+        routes = json.loads(routes_raw) if routes_raw else {}
+        if isinstance(routes, dict):
+            for route_list in routes.values():
+                if not isinstance(route_list, list): continue
+                for route in route_list:
+                    if not isinstance(route, dict): continue
+                    if str(route.get("status") or "ACTIVE").upper() != "ACTIVE": continue
+                    cid = _goplus_chain_id(route.get("chainId") or route.get("chain_id") or route.get("chain"))
+                    addr = _norm_addr(route.get("tokenAddress") or route.get("token_address") or route.get("address"))
+                    if cid > 0 and _looks_like_evm_addr(addr): out.add((cid, addr))
+    except Exception:
+        pass
+    return out
 
 def _goplus_allowlist() -> set[tuple[int, str]]:
     raw = str(os.getenv("GOPLUS_ALLOWLIST", "") or "").strip()
@@ -6082,6 +6173,7 @@ def _goplus_check_token(chain_id: int, token_address: str, symbol: str = "") -> 
         return {
             "ok": True,
             "allowed": True,
+            "approved": True,
             "native": True,
             "override": False,
             "blocked_by": None,
@@ -6096,6 +6188,7 @@ def _goplus_check_token(chain_id: int, token_address: str, symbol: str = "") -> 
         return {
             "ok": False,
             "allowed": False,
+            "approved": False,
             "native": False,
             "override": False,
             "blocked_by": "validation",
@@ -6106,17 +6199,20 @@ def _goplus_check_token(chain_id: int, token_address: str, symbol: str = "") -> 
             "raw": {},
         }
 
-    if (cid, addr) in _goplus_allowlist():
+    approved = (cid, addr) in _vault_approved_token_contracts()
+    if not approved:
         return {
             "ok": True,
-            "allowed": True,
+            "allowed": False,
+            "approved": False,
             "native": False,
-            "override": True,
-            "blocked_by": None,
-            "reason": "allowlist override",
+            "override": False,
+            "blocked_by": "owner_approval",
+            "reason": "wallet asset only: exact contract is not approved for Core Vault admission",
             "chain_id": cid,
             "address": addr,
             "symbol": str(symbol or "").strip().upper(),
+            "checks": {},
             "raw": {},
         }
 
@@ -6126,15 +6222,25 @@ def _goplus_check_token(chain_id: int, token_address: str, symbol: str = "") -> 
     sell_tax = _goplus_to_float(raw.get("sell_tax"))
 
     blocked_by = None
-    reason = "ok"
+    reason = "approved contract passed GoPlus security gate"
     if GOPLUS_BLOCK_HONEYPOT and is_honeypot:
         blocked_by = "honeypot"
         reason = "blocked by GoPlus honeypot check"
+    elif _goplus_is_truthy(raw.get("is_blacklisted")):
+        blocked_by = "blacklisted"
+        reason = "blocked by GoPlus blacklist signal"
+    elif _goplus_is_truthy(raw.get("cannot_sell_all")):
+        blocked_by = "sell_restriction"
+        reason = "blocked by GoPlus sell restriction"
+    elif sell_tax is not None and sell_tax > 0.10:
+        blocked_by = "high_sell_tax"
+        reason = "blocked because sell tax exceeds 10%"
 
-    allowed = blocked_by is None
+    allowed = bool(approved and blocked_by is None)
     return {
         "ok": True,
         "allowed": allowed,
+        "approved": approved,
         "native": False,
         "override": False,
         "blocked_by": blocked_by,
