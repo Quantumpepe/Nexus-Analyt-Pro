@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-120-SHADOW-VAULT-ALL-SYSTEMS"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-120-SHADOW-VAULT-ALL-SYSTEMS"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-122-VAULT-LIVE-REFRESH-SECURED-PROFIT"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-122-VAULT-LIVE-REFRESH-SECURED-PROFIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -14849,15 +14849,37 @@ def _first_number(obj: dict, keys: list[str], default: float = 0.0) -> float:
 
 
 def _shadow_grid_vault_accounting(wallet_address: str) -> dict:
-    """Return live-like Shadow accounting for Nexus Grid only."""
+    """Return live-like Shadow accounting for Nexus Grid only.
+
+    Grid capital is counted only while a Grid session is explicitly running.
+    Prepared, stopped, restored, stale, or duplicated item-id variants must not
+    create a Vault allocation. Historical realized Grid PnL remains independent
+    from whether a Grid session is currently active.
+    """
     wa = _norm_addr(wallet_address or "")
     base = allocated = 0.0
+    seen_sessions: set[int] = set()
     try:
-        for item_id, sess in (GRID_SESSIONS or {}).items():
+        for _item_id, sess in (GRID_SESSIONS or {}).items():
             if not isinstance(sess, dict):
                 continue
+            session_identity = id(sess)
+            if session_identity in seen_sessions:
+                continue
+            seen_sessions.add(session_identity)
             if _norm_addr(sess.get("wallet_address") or "") != wa:
                 continue
+
+            # Fail closed: only an explicitly running, non-stopped Grid session
+            # may bind capital in the Core Vault accounting.
+            is_running = sess.get("running") is True
+            is_stopped = sess.get("stopped") is True
+            state = str(sess.get("state") or sess.get("status") or "").strip().upper()
+            if state in {"STOPPED", "CANCELLED", "CLOSED", "ENDED", "INACTIVE", "PREPARED", "DRAFT"}:
+                is_stopped = True
+            if not is_running or is_stopped:
+                continue
+
             initial = max(0.0, _first_number(sess, ["initial_capital_usd", "initial_capital", "wallet_total_usd", "budget_usd"]))
             locked = max(0.0, _first_number(sess, ["wallet_locked_usd", "locked_usd", "reserved_usd"]))
             if initial <= 0:
@@ -14952,6 +14974,67 @@ def _shadow_nkr_vault_accounting(wallet_address: str) -> dict:
     }
 
 
+
+def _shadow_vault_secured_profit(wallet_address: str, system_key: str, realized_net_usd: float) -> float:
+    """Persist the live-like secured-profit ledger for one Shadow system.
+
+    Realized Net P&L may rise or fall. Secured Profit only receives positive
+    realized deltas and is never reduced by a later losing trade. This mirrors
+    the future live flow where a positive close returns to USDC/USDT and is
+    moved into the protected profit account, while later losses hit active/base
+    capital instead of already secured profit.
+    """
+    wa = _norm_addr(wallet_address or "")
+    system = str(system_key or "").strip().upper()
+    current = round(_safe_float(realized_net_usd, 0.0), 8)
+    if not wa or system not in ("NKR", "TRADER", "GRID"):
+        return round(max(0.0, current), 2)
+
+    try:
+        with DB_WRITE_LOCK:
+            conn = _db()
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_shadow_vault_profit_ledger (
+                    wallet_address TEXT NOT NULL,
+                    system_key TEXT NOT NULL,
+                    last_realized_net_usd REAL NOT NULL DEFAULT 0,
+                    secured_profit_usd REAL NOT NULL DEFAULT 0,
+                    updated_ts INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (wallet_address, system_key)
+                )
+            """)
+            cur.execute(
+                "SELECT last_realized_net_usd, secured_profit_usd FROM nexus_shadow_vault_profit_ledger WHERE wallet_address=? AND system_key=?",
+                (wa, system),
+            )
+            row = cur.fetchone()
+            if row is None:
+                secured = max(0.0, current)
+                cur.execute(
+                    "INSERT INTO nexus_shadow_vault_profit_ledger (wallet_address, system_key, last_realized_net_usd, secured_profit_usd, updated_ts) VALUES (?,?,?,?,?)",
+                    (wa, system, current, secured, int(time.time())),
+                )
+            else:
+                try:
+                    previous = float(row[0] or 0.0)
+                    secured = max(0.0, float(row[1] or 0.0))
+                except Exception:
+                    previous, secured = 0.0, 0.0
+                positive_delta = max(0.0, current - previous)
+                secured = round(secured + positive_delta, 8)
+                cur.execute(
+                    "UPDATE nexus_shadow_vault_profit_ledger SET last_realized_net_usd=?, secured_profit_usd=?, updated_ts=? WHERE wallet_address=? AND system_key=?",
+                    (current, secured, int(time.time()), wa, system),
+                )
+            conn.commit()
+            conn.close()
+            return round(max(0.0, secured), 2)
+    except Exception:
+        # Fail safely for display continuity. The next successful refresh will
+        # persist the ledger again.
+        return round(max(0.0, current), 2)
+
 def _shadow_core_vault_accounting(wallet_address: str) -> dict:
     """Build one wallet-bound Shadow ledger for Grid, NKR and Trading.
 
@@ -14983,6 +15066,7 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
             "stableBalanceUsd": 0.0, "baseCapitalUsd": 0.0, "allocatedUsd": 0.0,
             "reserveUsd": 0.0, "securedProfitUsd": 0.0, "availableForWithdrawUsd": 0.0,
             "profitBreakdown": {"nkrUsd": 0.0, "traderUsd": 0.0, "gridUsd": 0.0, "totalUsd": 0.0},
+            "realizedNetBreakdown": {"nkrUsd": 0.0, "traderUsd": 0.0, "gridUsd": 0.0, "totalUsd": 0.0},
             "allocationBreakdown": {"nkrUsd": 0.0, "traderUsd": 0.0, "gridUsd": 0.0, "totalUsd": 0.0},
             "systems": empty_breakdown,
             "shadowArchived": True, "accessActive": bool(access.get("active")),
@@ -14993,6 +15077,14 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
     nkr = _shadow_nkr_vault_accounting(wa)
     trader = _shadow_trader_vault_accounting(wa)
     grid = _shadow_grid_vault_accounting(wa)
+
+    # Keep Realized Net P&L dynamic, but move every positive realized delta to
+    # a separate protected ledger. A later loss therefore changes realized P&L
+    # and base capital, but never removes profit that was already secured.
+    for system_key, values in (("NKR", nkr), ("TRADER", trader), ("GRID", grid)):
+        values["securedProfitUsd"] = _shadow_vault_secured_profit(
+            wa, system_key, float(values.get("realizedNetUsd") or 0.0)
+        )
     systems = {"NKR": nkr, "TRADER": trader, "GRID": grid}
     total_base = sum(float(x.get("baseCapitalUsd") or 0) for x in systems.values())
     total_allocated = sum(float(x.get("allocatedUsd") or 0) for x in systems.values())
@@ -15015,6 +15107,12 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
             "traderUsd": round(float(trader.get("securedProfitUsd") or 0), 2),
             "gridUsd": round(float(grid.get("securedProfitUsd") or 0), 2),
             "totalUsd": round(total_secured, 2),
+        },
+        "realizedNetBreakdown": {
+            "nkrUsd": round(float(nkr.get("realizedNetUsd") or 0), 2),
+            "traderUsd": round(float(trader.get("realizedNetUsd") or 0), 2),
+            "gridUsd": round(float(grid.get("realizedNetUsd") or 0), 2),
+            "totalUsd": round(total_realized_net, 2),
         },
         "allocationBreakdown": {
             "nkrUsd": round(float(nkr.get("allocatedUsd") or 0), 2),
