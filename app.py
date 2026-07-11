@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-114-PRIVY-ASSET-VAULT-GATE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-114-PRIVY-ASSET-VAULT-GATE"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-116-STRATEGIST-UI-REMOVED"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-116-STRATEGIST-UI-REMOVED"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -12062,7 +12062,11 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
             "rotationMaxSlippage", "rotationMinNetAdvantage", "rotationMode",
             "rotationNetworkScope", "rotationBudgetRelease",
             "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays",
-            "nkrControlState", "rotationShadowSnapshot", "rotationShadowEvents"
+            "nkrControlState", "rotationShadowSnapshot", "rotationShadowEvents",
+            "profitPayoutEnabled", "profitPayoutSchedule", "profitPayoutEveryDays",
+            "profitPayoutPct", "profitPayoutAsset", "profitPayoutMinimumUsd",
+            "profitPayoutDestination", "profitPayoutSource", "profitPayoutUpdatedTs",
+            "profitPayoutLastTs", "vaultSecuredProfitUsd"
         }
         clean_ui = {}
         for k, v in ui_state.items():
@@ -12533,6 +12537,117 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
         conn.close()
 
 
+
+
+
+def _profit_payout_settings_for_wallet(wallet_address: str) -> dict:
+    state, updated_ts = _db_get_user_app_state(wallet_address)
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    schedule = str(ui.get("profitPayoutSchedule") or "EVERY_DAYS").strip().upper()
+    if schedule not in {"IMMEDIATE", "EVERY_DAYS", "MANUAL_ONLY"}:
+        schedule = "EVERY_DAYS"
+    try:
+        every_days = max(1, min(365, int(float(ui.get("profitPayoutEveryDays") or 7))))
+    except Exception:
+        every_days = 7
+    try:
+        payout_pct = max(0.0, min(100.0, float(ui.get("profitPayoutPct") or 50.0)))
+    except Exception:
+        payout_pct = 50.0
+    try:
+        minimum_usd = max(0.0, min(1_000_000.0, float(ui.get("profitPayoutMinimumUsd") or 25.0)))
+    except Exception:
+        minimum_usd = 25.0
+    try:
+        secured_profit_usd = max(0.0, float(ui.get("vaultSecuredProfitUsd") or 0.0))
+    except Exception:
+        secured_profit_usd = 0.0
+    asset = str(ui.get("profitPayoutAsset") or "USDT").strip().upper()
+    if asset not in {"USDT", "USDC"}:
+        asset = "USDT"
+    enabled = bool(ui.get("profitPayoutEnabled", False)) and schedule != "MANUAL_ONLY"
+    last_ts = int(ui.get("profitPayoutLastTs") or 0)
+    now_i = int(time.time())
+    next_ts = 0
+    if enabled and schedule == "EVERY_DAYS":
+        base_ts = last_ts if last_ts > 0 else int((ui.get("profitPayoutUpdatedTs") or updated_ts or now_i * 1000) / 1000)
+        next_ts = base_ts + every_days * 86400
+    eligible_gross = secured_profit_usd * payout_pct / 100.0
+    eligible_now = bool(enabled and schedule == "IMMEDIATE" and eligible_gross >= minimum_usd)
+    if schedule == "IMMEDIATE":
+        next_label = "On the next eligible secured-profit event"
+    elif schedule == "EVERY_DAYS":
+        next_label = datetime.fromtimestamp(next_ts).strftime("%d.%m.%Y %H:%M") if next_ts else f"Every {every_days} day(s)"
+    else:
+        next_label = "Manual only"
+    return {
+        "enabled": enabled,
+        "schedule": schedule,
+        "frequency": schedule,
+        "everyDays": every_days,
+        "intervalDays": every_days,
+        "payoutPct": round(payout_pct, 4),
+        "asset": asset,
+        "minimumPayoutUsd": round(minimum_usd, 2),
+        "minPayoutUsd": round(minimum_usd, 2),
+        "destination": str(ui.get("profitPayoutDestination") or "CONNECTED_WALLET"),
+        "source": "SECURED_PROFIT_ONLY",
+        "lastPayoutTs": last_ts,
+        "nextPayoutTs": next_ts,
+        "nextPayoutLabel": next_label,
+        "securedProfitUsd": round(secured_profit_usd, 2),
+        "eligibleGrossUsd": round(eligible_gross, 2),
+        "estimatedNetToWalletUsd": round(eligible_gross, 2),
+        "eligibleNow": eligible_now,
+        "executionEnabled": False,
+        "executionStatus": "SETTINGS_AND_PREVIEW_ONLY",
+    }
+
+
+@app.route("/api/vault/profit-payout-settings", methods=["GET", "POST"])
+def api_vault_profit_payout_settings():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        schedule = str(body.get("schedule") or body.get("frequency") or "EVERY_DAYS").strip().upper()
+        if schedule not in {"IMMEDIATE", "EVERY_DAYS", "MANUAL_ONLY"}:
+            return err("invalid payout schedule", 400)
+        try:
+            every_days = max(1, min(365, int(float(body.get("everyDays") or body.get("intervalDays") or 7))))
+        except Exception:
+            return err("invalid payout interval", 400)
+        try:
+            payout_pct = max(0.0, min(100.0, float(body.get("payoutPct") or 0.0)))
+            minimum_usd = max(0.0, min(1_000_000.0, float(body.get("minimumPayoutUsd") or body.get("minPayoutUsd") or 0.0)))
+        except Exception:
+            return err("invalid payout amount setting", 400)
+        asset = str(body.get("asset") or "USDT").strip().upper()
+        if asset not in {"USDT", "USDC"}:
+            return err("unsupported payout asset", 400)
+        enabled = bool(body.get("enabled", False)) and schedule != "MANUAL_ONLY"
+        _db_set_user_app_state(wa, {"ui": {
+            "profitPayoutEnabled": enabled,
+            "profitPayoutSchedule": schedule,
+            "profitPayoutEveryDays": every_days,
+            "profitPayoutPct": payout_pct,
+            "profitPayoutAsset": asset,
+            "profitPayoutMinimumUsd": minimum_usd,
+            "profitPayoutDestination": "CONNECTED_WALLET",
+            "profitPayoutSource": "SECURED_PROFIT_ONLY",
+            "profitPayoutUpdatedTs": int(time.time() * 1000),
+        }})
+    settings = _profit_payout_settings_for_wallet(wa)
+    response = jsonify({
+        "status": "ok",
+        "settings": settings,
+        **settings,
+        "note": "Payout scheduling is stored wallet-by-wallet. On-chain automatic execution stays disabled until the audited Core Vault contracts and ABI are connected.",
+        "ts": int(time.time()),
+    })
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
 
 
 @app.route("/api/rotation-sessions/<session_id>", methods=["DELETE"])
