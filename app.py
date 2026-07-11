@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-109-STRATEGIST-BRIDGE-NKR-CLOCK-ROTATION-HISTORY"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-109-STRATEGIST-BRIDGE-NKR-CLOCK-ROTATION-HISTORY"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-110-EFFICIENT-GLOBAL-AI-STRATEGIST-CACHE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-110-EFFICIENT-GLOBAL-AI-STRATEGIST-CACHE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -2619,6 +2619,217 @@ def api_nexus_binance_public_intelligence():
         force=str(request.args.get("force") or "").lower() in {"1", "true", "yes"},
         default_tier=tier,
     ))
+
+
+# -------------------------
+# Efficient Global AI Strategist Cache (ENGINE110)
+# -------------------------
+# GPT is a shared, cached market interpreter. It never executes trades and is
+# not called per user, per coin, or per runtime tick. NKR and Trader continue to
+# run from local deterministic scores even when OpenAI is unavailable.
+GLOBAL_STRATEGIST_ENABLED = str(os.getenv("GLOBAL_STRATEGIST_ENABLED", "1")).lower() not in {"0", "false", "no"}
+GLOBAL_STRATEGIST_TTL_SEC = max(1800, int(os.getenv("GLOBAL_STRATEGIST_TTL_SEC", "2700")))  # default 45m
+GLOBAL_STRATEGIST_MIN_REFRESH_SEC = max(600, int(os.getenv("GLOBAL_STRATEGIST_MIN_REFRESH_SEC", "1200")))
+GLOBAL_STRATEGIST_MAX_SYMBOLS = max(6, min(40, int(os.getenv("GLOBAL_STRATEGIST_MAX_SYMBOLS", "18"))))
+GLOBAL_STRATEGIST_MODEL = str(os.getenv("GLOBAL_STRATEGIST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+_GLOBAL_STRATEGIST_LOCK = threading.RLock()
+_GLOBAL_STRATEGIST_CACHE = {"generated_at": 0.0, "payload": None, "last_attempt_at": 0.0, "request_count": 0, "last_error": ""}
+
+
+def _global_strategist_local_snapshot(symbols=None):
+    clean = _binance_public_parse_symbols(symbols or ["BTC", "ETH", "BNB", "SOL", "POL", "XRP", "LINK", "TON"])
+    clean = clean[:GLOBAL_STRATEGIST_MAX_SYMBOLS]
+    intel = _binance_public_intelligence(clean, default_tier="active")
+    rows = []
+    src = intel.get("symbols") if isinstance(intel, dict) and isinstance(intel.get("symbols"), dict) else {}
+    for sym, row in src.items():
+        if not isinstance(row, dict) or not row.get("available"):
+            continue
+        rows.append({
+            "symbol": sym,
+            "funding_rate": round(_safe_float(row.get("fundingRate"), 0.0), 8),
+            "open_interest_change_pct": round(_safe_float(row.get("openInterestChangePct"), 0.0), 4),
+            "long_short_ratio": round(_safe_float(row.get("globalLongShortRatio"), 0.0), 4),
+            "basis_pct": round(_safe_float(row.get("basisPct"), 0.0), 5),
+            "local_futures_adjustment": round(_safe_float(row.get("futuresScoreAdjustment"), 0.0), 3),
+            "stale": bool(row.get("stale")),
+        })
+    rows.sort(key=lambda x: abs(_safe_float(x.get("local_futures_adjustment"), 0.0)), reverse=True)
+    avg_adj = sum(_safe_float(x.get("local_futures_adjustment"), 0.0) for x in rows) / max(1, len(rows))
+    positive = sum(1 for x in rows if _safe_float(x.get("local_futures_adjustment"), 0.0) > 0.5)
+    negative = sum(1 for x in rows if _safe_float(x.get("local_futures_adjustment"), 0.0) < -0.5)
+    local_regime = "RISK_ON" if avg_adj >= 1.5 and positive > negative else ("RISK_OFF" if avg_adj <= -1.5 and negative > positive else "NEUTRAL")
+    return {
+        "source": "local_market_intelligence",
+        "regime": local_regime,
+        "average_adjustment": round(avg_adj, 3),
+        "positive_symbols": positive,
+        "negative_symbols": negative,
+        "symbols": rows,
+        "binance_status": intel.get("status") if isinstance(intel, dict) else "unavailable",
+        "stale": bool(intel.get("stale")) if isinstance(intel, dict) else True,
+        "updated_at": int(time.time() * 1000),
+    }
+
+
+def _global_strategist_fallback(snapshot, reason="local_only"):
+    rows = snapshot.get("symbols") if isinstance(snapshot, dict) else []
+    leaders = [x.get("symbol") for x in rows[:3] if isinstance(x, dict) and x.get("symbol")]
+    return {
+        "status": "local_only",
+        "mode": "LOCAL_STRATEGIST",
+        "regime": snapshot.get("regime") or "NEUTRAL",
+        "confidence": 55,
+        "risk_score": 50,
+        "rotation_score": max(0, min(100, 50 + int(round(_safe_float(snapshot.get("average_adjustment"), 0.0) * 4)))),
+        "summary": "Local score engine is active. GPT interpretation is unavailable or not due; NKR and Trader continue normally.",
+        "focus_symbols": leaders,
+        "warnings": [str(reason)] if reason else [],
+        "advisory_only": True,
+    }
+
+
+def _global_strategist_extract_text(data):
+    if not isinstance(data, dict):
+        return ""
+    if isinstance(data.get("output_text"), str):
+        return data.get("output_text").strip()
+    parts = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for c in item.get("content") or []:
+            if isinstance(c, dict) and isinstance(c.get("text"), str):
+                parts.append(c.get("text"))
+    return "\n".join(parts).strip()
+
+
+def _global_strategist_parse_json(text, snapshot):
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.replace("```json", "", 1).replace("```", "").strip()
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        obj = None
+    if not isinstance(obj, dict):
+        fallback = _global_strategist_fallback(snapshot, "invalid_ai_json")
+        fallback["summary"] = raw[:800] or fallback["summary"]
+        fallback["status"] = "ai_text_fallback"
+        fallback["mode"] = "GLOBAL_AI_STRATEGIST"
+        return fallback
+    obj["status"] = "ok"
+    obj["mode"] = "GLOBAL_AI_STRATEGIST"
+    obj["advisory_only"] = True
+    obj["regime"] = str(obj.get("regime") or snapshot.get("regime") or "NEUTRAL").upper()[:24]
+    for key, default in (("confidence", 50), ("risk_score", 50), ("rotation_score", 50)):
+        obj[key] = max(0, min(100, int(round(_safe_float(obj.get(key), default)))))
+    obj["summary"] = str(obj.get("summary") or "Global market interpretation available.")[:1200]
+    obj["focus_symbols"] = [str(x).upper()[:16] for x in (obj.get("focus_symbols") or [])[:6]]
+    obj["warnings"] = [str(x)[:240] for x in (obj.get("warnings") or [])[:6]]
+    return obj
+
+
+def _global_strategist_generate(symbols=None, force=False):
+    now = time.time()
+    with _GLOBAL_STRATEGIST_LOCK:
+        cached = _GLOBAL_STRATEGIST_CACHE.get("payload")
+        generated = _safe_float(_GLOBAL_STRATEGIST_CACHE.get("generated_at"), 0.0)
+        last_attempt = _safe_float(_GLOBAL_STRATEGIST_CACHE.get("last_attempt_at"), 0.0)
+        if cached and not force and now - generated < GLOBAL_STRATEGIST_TTL_SEC:
+            return dict(cached)
+        if force and now - last_attempt < GLOBAL_STRATEGIST_MIN_REFRESH_SEC and cached:
+            limited = dict(cached)
+            limited["refresh_limited"] = True
+            return limited
+        _GLOBAL_STRATEGIST_CACHE["last_attempt_at"] = now
+
+    snapshot = _global_strategist_local_snapshot(symbols)
+    key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not GLOBAL_STRATEGIST_ENABLED or not key:
+        report = _global_strategist_fallback(snapshot, "global_ai_disabled" if not GLOBAL_STRATEGIST_ENABLED else "missing_openai_key")
+        model = "local"
+    else:
+        system = """You are the shared Nexus Global AI Strategist. Interpret a compact crypto futures snapshot for all users.
+Return ONLY valid JSON with keys: regime, confidence, risk_score, rotation_score, summary, focus_symbols, warnings.
+Do not provide buy/sell instructions, prices, position sizes, or direct trade commands. Do not invent data.
+Your output is advisory only; deterministic local engines execute independently."""
+        user = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        payload = {
+            "model": GLOBAL_STRATEGIST_MODEL,
+            "input": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            "temperature": 0.1,
+            "max_output_tokens": 420,
+        }
+        try:
+            r = requests.post("https://api.openai.com/v1/responses", headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, json=payload, timeout=40)
+            r.raise_for_status()
+            report = _global_strategist_parse_json(_global_strategist_extract_text(r.json()), snapshot)
+            model = GLOBAL_STRATEGIST_MODEL
+            with _GLOBAL_STRATEGIST_LOCK:
+                _GLOBAL_STRATEGIST_CACHE["request_count"] = int(_GLOBAL_STRATEGIST_CACHE.get("request_count") or 0) + 1
+                _GLOBAL_STRATEGIST_CACHE["last_error"] = ""
+        except Exception as e:
+            report = _global_strategist_fallback(snapshot, f"openai_unavailable:{str(e)[:180]}")
+            model = "local_fallback"
+            with _GLOBAL_STRATEGIST_LOCK:
+                _GLOBAL_STRATEGIST_CACHE["last_error"] = str(e)[:500]
+
+    expires_at = now + GLOBAL_STRATEGIST_TTL_SEC
+    output = {
+        "status": "ok",
+        "report": report,
+        "local_snapshot": snapshot,
+        "generated_at": int(now * 1000),
+        "valid_until": int(expires_at * 1000),
+        "ttl_sec": GLOBAL_STRATEGIST_TTL_SEC,
+        "model": model,
+        "shared_cache": True,
+        "per_user_requests": False,
+        "automatic_trade_execution": False,
+        "core_fallback_active": True,
+        "backend_build": BACKEND_BUILD_ID,
+    }
+    with _GLOBAL_STRATEGIST_LOCK:
+        _GLOBAL_STRATEGIST_CACHE["generated_at"] = now
+        _GLOBAL_STRATEGIST_CACHE["payload"] = output
+    return dict(output)
+
+
+@app.get("/api/nexus/global-strategist")
+def api_nexus_global_strategist():
+    raw = request.args.get("symbols") or "BTC,ETH,BNB,SOL,POL,XRP,LINK,TON"
+    symbols = _binance_public_parse_symbols(raw)
+    force = str(request.args.get("refresh") or "").lower() in {"1", "true", "yes"}
+    return jsonify(_global_strategist_generate(symbols, force=force))
+
+
+@app.get("/api/nexus/global-strategist/status")
+def api_nexus_global_strategist_status():
+    now = time.time()
+    with _GLOBAL_STRATEGIST_LOCK:
+        cached = _GLOBAL_STRATEGIST_CACHE.get("payload")
+        generated = _safe_float(_GLOBAL_STRATEGIST_CACHE.get("generated_at"), 0.0)
+        requests_used = int(_GLOBAL_STRATEGIST_CACHE.get("request_count") or 0)
+        last_error = str(_GLOBAL_STRATEGIST_CACHE.get("last_error") or "")
+    return jsonify({
+        "status": "ok",
+        "enabled": GLOBAL_STRATEGIST_ENABLED,
+        "cached": bool(cached),
+        "cache_age_sec": max(0, int(now - generated)) if generated else None,
+        "ttl_sec": GLOBAL_STRATEGIST_TTL_SEC,
+        "min_refresh_sec": GLOBAL_STRATEGIST_MIN_REFRESH_SEC,
+        "model": GLOBAL_STRATEGIST_MODEL,
+        "openai_configured": bool(str(os.getenv("OPENAI_API_KEY") or "").strip()),
+        "shared_cache": True,
+        "per_user_requests": False,
+        "automatic_trade_execution": False,
+        "core_fallback_active": True,
+        "openai_request_count_since_boot": requests_used,
+        "last_error": last_error,
+        "backend_build": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    })
 
 
 # -------------------------
