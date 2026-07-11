@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-106-BILLING-MENU-WALLET-HEADER"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-106-BILLING-MENU-WALLET-HEADER"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-108-BINANCE-DYNAMIC-TIERED-BATCH-CACHE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-108-BINANCE-DYNAMIC-TIERED-BATCH-CACHE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -362,6 +362,9 @@ def api_build_info():
         "price_cache_mode": NEXUS_PRICE_CACHE_MODE,
         "price_cache_ttl_sec": {"market": NEXUS_PRICE_MARKET_TTL_SEC, "active": NEXUS_PRICE_ACTIVE_TTL_SEC, "hot": NEXUS_PRICE_HOT_TTL_SEC},
         "price_cache_policy": NEXUS_PRICE_ACTIVE_POLICY,
+        "binance_batch_size": BINANCE_PUBLIC_BATCH_SIZE,
+        "binance_no_artificial_symbol_limit": True,
+        "binance_tier_ttl_sec": {"hot": BINANCE_PUBLIC_HOT_TTL_SEC, "active": BINANCE_PUBLIC_ACTIVE_TTL_SEC, "watchlist": BINANCE_PUBLIC_WATCHLIST_TTL_SEC, "market": BINANCE_PUBLIC_MARKET_TTL_SEC},
         "frontend_target": FRONTEND_TARGET_BUILD_ID,
         "strategist_version": STRATEGIST_BUILD_ID,
         "shadow_version": SHADOW_BUILD_ID,
@@ -2219,6 +2222,393 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY") or os.getenv("CG_PRO_API_KEY"
 COINGECKO_BASE = os.getenv("COINGECKO_BASE_URL") or (
     "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY else "https://api.coingecko.com/api/v3"
 )
+
+# -------------------------
+# Binance public futures intelligence (no API key, backend-wide cache)
+# -------------------------
+# One shared backend cache serves every user. Browser/user traffic never calls
+# Binance directly, so upstream load is based on the number of tracked symbols,
+# not on the number of Nexus users.
+BINANCE_PUBLIC_ENABLED = str(os.getenv("BINANCE_PUBLIC_ENABLED", "true")).strip().lower() not in {"0", "false", "no", "off"}
+BINANCE_FUTURES_BASE = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+# ENGINE-108: 40 is a technical processing batch size, never a global coin cap.
+# Unique symbols are cached backend-wide and refreshed according to importance.
+BINANCE_PUBLIC_BATCH_SIZE = max(5, min(100, int(os.getenv("BINANCE_PUBLIC_BATCH_SIZE", "40"))))
+BINANCE_PUBLIC_HOT_TTL_SEC = max(5, int(os.getenv("BINANCE_PUBLIC_HOT_TTL_SEC", "5")))
+BINANCE_PUBLIC_ACTIVE_TTL_SEC = max(BINANCE_PUBLIC_HOT_TTL_SEC, int(os.getenv("BINANCE_PUBLIC_ACTIVE_TTL_SEC", "10")))
+BINANCE_PUBLIC_WATCHLIST_TTL_SEC = max(BINANCE_PUBLIC_ACTIVE_TTL_SEC, int(os.getenv("BINANCE_PUBLIC_WATCHLIST_TTL_SEC", "25")))
+BINANCE_PUBLIC_MARKET_TTL_SEC = max(BINANCE_PUBLIC_WATCHLIST_TTL_SEC, int(os.getenv("BINANCE_PUBLIC_MARKET_TTL_SEC", "180")))
+# Compatibility value for old diagnostics; tier-specific TTLs are authoritative.
+BINANCE_PUBLIC_TTL_SEC = BINANCE_PUBLIC_WATCHLIST_TTL_SEC
+BINANCE_PUBLIC_STALE_TTL_SEC = max(BINANCE_PUBLIC_MARKET_TTL_SEC, int(os.getenv("BINANCE_PUBLIC_STALE_TTL_SEC", "900")))
+BINANCE_PUBLIC_TIMEOUT_SEC = max(2.0, float(os.getenv("BINANCE_PUBLIC_TIMEOUT_SEC", "8")))
+_BINANCE_PUBLIC_CACHE: dict[str, tuple[float, dict]] = {}
+_BINANCE_PUBLIC_SYMBOL_CACHE: dict[str, tuple[float, dict]] = {}
+_BINANCE_PUBLIC_PREMIUM_CACHE: tuple[float, dict] | None = None
+_BINANCE_PUBLIC_PREVIOUS_OI: dict[str, tuple[float, float]] = {}
+_BINANCE_PUBLIC_LOCK = threading.RLock()
+_BINANCE_PUBLIC_INFLIGHT: dict[str, threading.Event] = {}
+_BINANCE_PUBLIC_COOLDOWN_UNTIL = 0.0
+
+
+def _binance_public_symbol(symbol: str) -> str:
+    sym = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    aliases = {"MATIC": "POL", "WETH": "ETH", "WBTC": "BTC"}
+    sym = aliases.get(sym, sym)
+    if sym.endswith("USDT"):
+        return sym
+    return f"{sym}USDT" if sym else ""
+
+
+def _binance_public_parse_symbols(raw) -> list[str]:
+    """Normalize all requested symbols without an artificial total limit."""
+    parts = raw if isinstance(raw, (list, tuple, set)) else re.split(r"[,;\s]+", str(raw or ""))
+    out = []
+    seen = set()
+    for value in parts:
+        sym = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())[:24]
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
+def _binance_public_chunks(values: list[str], size: int | None = None):
+    step = max(1, int(size or BINANCE_PUBLIC_BATCH_SIZE))
+    for i in range(0, len(values), step):
+        yield values[i:i + step]
+
+
+def _binance_public_normalize_tier(raw: str) -> str:
+    tier = str(raw or "watchlist").strip().lower()
+    aliases = {
+        "trading": "active", "trader": "active", "nkr": "active",
+        "candidate": "watchlist", "watch": "watchlist", "general": "market",
+    }
+    tier = aliases.get(tier, tier)
+    return tier if tier in {"hot", "active", "watchlist", "market"} else "watchlist"
+
+
+def _binance_public_tier_for_symbol(symbol: str, default_tier: str = "watchlist", overrides: dict | None = None) -> str:
+    sym = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())[:24]
+    if isinstance(overrides, dict):
+        direct = overrides.get(sym) or overrides.get(sym.lower())
+        if direct:
+            return _binance_public_normalize_tier(direct)
+    # Reuse the central Nexus active/hot price registry when available.
+    try:
+        central = _nexus_price_cache_tier(sym) if "_nexus_price_cache_tier" in globals() else ""
+        if central in {"hot", "active"}:
+            return central
+    except Exception:
+        pass
+    return _binance_public_normalize_tier(default_tier)
+
+
+def _binance_public_ttl_for_tier(tier: str) -> int:
+    normalized = _binance_public_normalize_tier(tier)
+    if normalized == "hot":
+        return BINANCE_PUBLIC_HOT_TTL_SEC
+    if normalized == "active":
+        return BINANCE_PUBLIC_ACTIVE_TTL_SEC
+    if normalized == "market":
+        return BINANCE_PUBLIC_MARKET_TTL_SEC
+    return BINANCE_PUBLIC_WATCHLIST_TTL_SEC
+
+
+def _binance_public_get(path: str, params: dict | None = None):
+    global _BINANCE_PUBLIC_COOLDOWN_UNTIL
+    if not BINANCE_PUBLIC_ENABLED:
+        raise RuntimeError("binance public feed disabled")
+    if time.time() < _BINANCE_PUBLIC_COOLDOWN_UNTIL:
+        raise RuntimeError("binance public feed cooldown")
+    url = f"{BINANCE_FUTURES_BASE}{path}"
+    r = requests.get(url, params=params or {}, timeout=BINANCE_PUBLIC_TIMEOUT_SEC, headers={"User-Agent": "Nexus-Analyt/1.0"})
+    if r.status_code in (418, 429):
+        retry_after = 30
+        try:
+            retry_after = max(10, int(float(r.headers.get("Retry-After") or 30)))
+        except Exception:
+            pass
+        _BINANCE_PUBLIC_COOLDOWN_UNTIL = time.time() + min(600, retry_after)
+        raise RuntimeError(f"binance rate limited ({r.status_code})")
+    r.raise_for_status()
+    return r.json(), {
+        "usedWeight1m": r.headers.get("X-MBX-USED-WEIGHT-1M"),
+        "statusCode": r.status_code,
+    }
+
+
+def _binance_futures_signal(row: dict, market_change_pct: float = 0.0) -> dict:
+    """Small advisory score only; never a direct buy/sell instruction."""
+    funding = _safe_float(row.get("fundingRate"), 0.0)
+    oi_change = _safe_float(row.get("openInterestChangePct"), 0.0)
+    long_short = _safe_float(row.get("globalLongShortRatio"), 1.0)
+    basis = _safe_float(row.get("basisPct"), 0.0)
+    px_change = _safe_float(market_change_pct, 0.0)
+    score = 0.0
+    reasons = []
+    if oi_change >= 2.0 and px_change > 0:
+        score += min(4.0, oi_change * 0.5)
+        reasons.append("open_interest_confirms_price")
+    elif oi_change >= 2.0 and px_change < 0:
+        score -= min(4.0, oi_change * 0.5)
+        reasons.append("open_interest_confirms_downside")
+    elif oi_change <= -2.0:
+        score -= 1.0
+        reasons.append("open_interest_contracting")
+    if funding > 0.0010:
+        score -= 3.0
+        reasons.append("crowded_positive_funding")
+    elif funding < -0.0005 and px_change >= 0:
+        score += 2.0
+        reasons.append("negative_funding_with_strength")
+    if long_short >= 1.8:
+        score -= 2.0
+        reasons.append("long_side_crowded")
+    elif 0.75 <= long_short <= 1.35:
+        score += 0.5
+        reasons.append("balanced_positioning")
+    if abs(basis) > 0.60:
+        score -= 1.5
+        reasons.append("wide_mark_index_basis")
+    score = max(-8.0, min(8.0, score))
+    return {
+        "futuresScoreAdjustment": round(score, 4),
+        "futuresSignalQuality": "strong" if abs(score) >= 4 else "moderate" if abs(score) >= 2 else "neutral",
+        "futuresReasons": reasons[:6],
+    }
+
+
+def _binance_public_intelligence(symbols: list[str], force: bool = False,
+                                  default_tier: str = "watchlist",
+                                  tier_overrides: dict | None = None) -> dict:
+    """Return shared public futures intelligence for any number of symbols.
+
+    ENGINE-108 removes the former total-symbol cap. Symbols are processed in
+    technical batches only, while the persistent per-symbol cache and tier TTLs
+    keep upstream load independent from the number of Nexus users.
+    """
+    global _BINANCE_PUBLIC_PREMIUM_CACHE
+    clean = _binance_public_parse_symbols(symbols)
+    now = time.time()
+    if not clean:
+        return {
+            "status": "ok", "source": "binance_public_usdm", "authRequired": False,
+            "symbols": {}, "symbolCount": 0, "requestedSymbolCount": 0,
+            "batchSize": BINANCE_PUBLIC_BATCH_SIZE, "batchCount": 0,
+            "cached": True, "stale": False, "updatedAt": int(now * 1000),
+        }
+
+    # Premium index is already one upstream request containing every USD-M pair.
+    # Refresh it at the fastest configured tier so hot assets remain responsive.
+    premium_map = {}
+    premium_meta = {}
+    premium_ttl = BINANCE_PUBLIC_HOT_TTL_SEC
+    with _BINANCE_PUBLIC_LOCK:
+        premium_hit = _BINANCE_PUBLIC_PREMIUM_CACHE
+    if premium_hit and not force and now - premium_hit[0] <= premium_ttl:
+        premium_map = dict(premium_hit[1])
+    else:
+        try:
+            premium_all, premium_meta = _binance_public_get("/fapi/v1/premiumIndex")
+            premium_map = {str(x.get("symbol") or "").upper(): x for x in premium_all if isinstance(x, dict)} if isinstance(premium_all, list) else {}
+            with _BINANCE_PUBLIC_LOCK:
+                _BINANCE_PUBLIC_PREMIUM_CACHE = (now, dict(premium_map))
+        except Exception:
+            if premium_hit:
+                premium_map = dict(premium_hit[1])
+
+    result = {}
+    fetched = 0
+    stale_count = 0
+    max_weight = premium_meta.get("usedWeight1m") if isinstance(premium_meta, dict) else None
+    tier_counts = {"hot": 0, "active": 0, "watchlist": 0, "market": 0}
+    batches = list(_binance_public_chunks(clean))
+
+    for batch_index, batch in enumerate(batches, start=1):
+        for sym in batch:
+            tier = _binance_public_tier_for_symbol(sym, default_tier=default_tier, overrides=tier_overrides)
+            ttl_sec = _binance_public_ttl_for_tier(tier)
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            pair = _binance_public_symbol(sym)
+            with _BINANCE_PUBLIC_LOCK:
+                cached_row = _BINANCE_PUBLIC_SYMBOL_CACHE.get(sym)
+            if cached_row and not force and now - cached_row[0] <= ttl_sec:
+                row = dict(cached_row[1])
+                row.update({"cached": True, "stale": False, "cacheTier": tier, "cacheTtlSec": ttl_sec})
+                result[sym] = row
+                continue
+
+            p = premium_map.get(pair)
+            if not isinstance(p, dict):
+                row = {
+                    "symbol": sym, "pair": pair, "available": False,
+                    "reason": "not_listed_on_binance_usdm", "source": "binance_public_usdm",
+                    "cacheTier": tier, "cacheTtlSec": ttl_sec,
+                    "batchIndex": batch_index, "updatedAt": int(now * 1000),
+                }
+                with _BINANCE_PUBLIC_LOCK:
+                    _BINANCE_PUBLIC_SYMBOL_CACHE[sym] = (now, row)
+                result[sym] = row
+                continue
+
+            oi = None
+            ls = None
+            fetch_error = None
+            try:
+                oi, oi_meta = _binance_public_get("/fapi/v1/openInterest", {"symbol": pair})
+                max_weight = oi_meta.get("usedWeight1m") or max_weight
+            except Exception as e:
+                fetch_error = str(e)
+            try:
+                ls_rows, ls_meta = _binance_public_get(
+                    "/futures/data/globalLongShortAccountRatio",
+                    {"symbol": pair, "period": "5m", "limit": 1},
+                )
+                max_weight = ls_meta.get("usedWeight1m") or max_weight
+                if isinstance(ls_rows, list) and ls_rows:
+                    ls = ls_rows[-1]
+            except Exception as e:
+                fetch_error = fetch_error or str(e)
+
+            if fetch_error and cached_row and now - cached_row[0] <= BINANCE_PUBLIC_STALE_TTL_SEC:
+                row = dict(cached_row[1])
+                row.update({
+                    "cached": True, "stale": True, "staleReason": fetch_error,
+                    "cacheTier": tier, "cacheTtlSec": ttl_sec, "batchIndex": batch_index,
+                })
+                result[sym] = row
+                stale_count += 1
+                continue
+
+            cached_data = cached_row[1] if cached_row and isinstance(cached_row[1], dict) else {}
+            oi_value = _safe_float((oi or {}).get("openInterest"), _safe_float(cached_data.get("openInterest"), 0.0))
+            oi_change_pct = 0.0
+            with _BINANCE_PUBLIC_LOCK:
+                prev = _BINANCE_PUBLIC_PREVIOUS_OI.get(pair)
+                if prev and prev[1] > 0 and now - prev[0] <= 900:
+                    oi_change_pct = ((oi_value - prev[1]) / prev[1]) * 100.0
+                if oi_value > 0:
+                    _BINANCE_PUBLIC_PREVIOUS_OI[pair] = (now, oi_value)
+            mark = _safe_float(p.get("markPrice"), 0.0)
+            index = _safe_float(p.get("indexPrice"), 0.0)
+            basis_pct = ((mark - index) / index * 100.0) if mark > 0 and index > 0 else 0.0
+            row = {
+                "symbol": sym, "pair": pair, "available": True,
+                "markPrice": mark, "indexPrice": index, "basisPct": round(basis_pct, 6),
+                "fundingRate": _safe_float(p.get("lastFundingRate"), 0.0),
+                "nextFundingTime": int(_safe_float(p.get("nextFundingTime"), 0.0)),
+                "openInterest": oi_value, "openInterestChangePct": round(oi_change_pct, 6),
+                "globalLongShortRatio": _safe_float((ls or {}).get("longShortRatio"), _safe_float(cached_data.get("globalLongShortRatio"), 0.0)),
+                "globalLongAccountPct": _safe_float((ls or {}).get("longAccount"), 0.0),
+                "globalShortAccountPct": _safe_float((ls or {}).get("shortAccount"), 0.0),
+                "source": "binance_public_usdm", "updatedAt": int(now * 1000),
+                "cached": False, "stale": bool(fetch_error),
+                "cacheTier": tier, "cacheTtlSec": ttl_sec, "batchIndex": batch_index,
+            }
+            row.update(_binance_futures_signal(row, 0.0))
+            with _BINANCE_PUBLIC_LOCK:
+                _BINANCE_PUBLIC_SYMBOL_CACHE[sym] = (now, row)
+            result[sym] = row
+            fetched += 1
+            if fetch_error:
+                stale_count += 1
+
+    payload = {
+        "status": "ok" if result else "unavailable",
+        "source": "binance_public_usdm", "authRequired": False,
+        "symbols": result, "symbolCount": len(result),
+        "requestedSymbolCount": len(clean), "fetchedSymbolCount": fetched,
+        "batchSize": BINANCE_PUBLIC_BATCH_SIZE, "batchCount": len(batches),
+        "tierCounts": tier_counts,
+        "tierTtlSec": {
+            "hot": BINANCE_PUBLIC_HOT_TTL_SEC,
+            "active": BINANCE_PUBLIC_ACTIVE_TTL_SEC,
+            "watchlist": BINANCE_PUBLIC_WATCHLIST_TTL_SEC,
+            "market": BINANCE_PUBLIC_MARKET_TTL_SEC,
+        },
+        "usedWeight1m": max_weight,
+        "cached": fetched == 0, "stale": stale_count > 0,
+        "noArtificialSymbolLimit": True,
+        "updatedAt": int(now * 1000),
+    }
+    # Diagnostics only. This cache stores request shapes; per-symbol cache is authoritative.
+    with _BINANCE_PUBLIC_LOCK:
+        _BINANCE_PUBLIC_CACHE[",".join(sorted(clean))] = (now, payload)
+        # Keep diagnostics bounded without affecting tracked-symbol logic.
+        if len(_BINANCE_PUBLIC_CACHE) > 100:
+            oldest = sorted(_BINANCE_PUBLIC_CACHE.items(), key=lambda kv: kv[1][0])[:25]
+            for key, _ in oldest:
+                _BINANCE_PUBLIC_CACHE.pop(key, None)
+    return payload
+
+
+def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
+    if not isinstance(rows, list) or not rows:
+        return rows if isinstance(rows, list) else []
+    symbols = []
+    for r in rows:
+        if isinstance(r, dict):
+            s = str(r.get("symbol") or r.get("coin") or r.get("asset") or "").upper()
+            if s:
+                symbols.append(s)
+    intel = _binance_public_intelligence(symbols, default_tier="watchlist")
+    by_sym = intel.get("symbols") if isinstance(intel, dict) and isinstance(intel.get("symbols"), dict) else {}
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            out.append(r); continue
+        row = dict(r)
+        sym = str(row.get("symbol") or row.get("coin") or row.get("asset") or "").upper()
+        fut = by_sym.get(sym) if isinstance(by_sym.get(sym), dict) else None
+        if fut and fut.get("available"):
+            live_change = _safe_float(row.get("pct") or row.get("change24h") or row.get("change_24h_pct") or row.get("change_pct"), 0.0)
+            signal = _binance_futures_signal(fut, live_change)
+            row["binanceFutures"] = {**fut, **signal}
+            row["futures_score_adjustment"] = signal.get("futuresScoreAdjustment", 0.0)
+        out.append(row)
+    return out
+
+
+@app.get("/api/nexus/binance-public/status")
+def api_nexus_binance_public_status():
+    with _BINANCE_PUBLIC_LOCK:
+        cache_entries = len(_BINANCE_PUBLIC_CACHE)
+    return jsonify({
+        "status": "ok" if BINANCE_PUBLIC_ENABLED else "disabled",
+        "enabled": BINANCE_PUBLIC_ENABLED,
+        "source": "Binance public USD-M futures market data",
+        "apiKeyRequired": False,
+        "batchSize": BINANCE_PUBLIC_BATCH_SIZE,
+        "noArtificialSymbolLimit": True,
+        "tierTtlSec": {
+            "hot": BINANCE_PUBLIC_HOT_TTL_SEC,
+            "active": BINANCE_PUBLIC_ACTIVE_TTL_SEC,
+            "watchlist": BINANCE_PUBLIC_WATCHLIST_TTL_SEC,
+            "market": BINANCE_PUBLIC_MARKET_TTL_SEC,
+        },
+        "staleTtlSec": BINANCE_PUBLIC_STALE_TTL_SEC,
+        "cacheEntries": cache_entries,
+        "symbolCacheEntries": len(_BINANCE_PUBLIC_SYMBOL_CACHE),
+        "cooldownUntil": int(_BINANCE_PUBLIC_COOLDOWN_UNTIL * 1000) if _BINANCE_PUBLIC_COOLDOWN_UNTIL else 0,
+        "backendBuild": BACKEND_BUILD_ID,
+        "ts": now_ts(),
+    })
+
+
+@app.get("/api/nexus/binance-public/intelligence")
+def api_nexus_binance_public_intelligence():
+    raw = request.args.get("symbols") or "BTC,ETH,BNB,POL"
+    symbols = _binance_public_parse_symbols(raw)
+    tier = _binance_public_normalize_tier(request.args.get("tier") or "watchlist")
+    return jsonify(_binance_public_intelligence(
+        symbols,
+        force=str(request.args.get("force") or "").lower() in {"1", "true", "yes"},
+        default_tier=tier,
+    ))
+
 
 # -------------------------
 # Bitquery Whale Engine
@@ -22700,14 +23090,20 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
             pass
         return default
 
+    strategist_symbols = [str(c.get("symbol") or "").upper() for c in coins[:12] if isinstance(c, dict) and c.get("symbol")]
+    binance_bundle = _binance_public_intelligence(strategist_symbols, default_tier="active") if strategist_symbols else {"symbols": {}}
+    binance_by_sym = binance_bundle.get("symbols") if isinstance(binance_bundle, dict) and isinstance(binance_bundle.get("symbols"), dict) else {}
+
     coin_digest = []
     for c in coins[:12]:
         if not isinstance(c, dict):
             continue
         mc = c.get("market_condition") if isinstance(c.get("market_condition"), dict) else {}
         ex = c.get("exchange_intelligence") if isinstance(c.get("exchange_intelligence"), dict) else {}
+        _sym = str(c.get("symbol") or "").upper()
+        _fut = binance_by_sym.get(_sym) if isinstance(binance_by_sym.get(_sym), dict) else {}
         coin_digest.append({
-            "symbol": str(c.get("symbol") or "").upper(),
+            "symbol": _sym,
             "score": nf(c.get("score")),
             "rating": c.get("rating"),
             "change_24h_pct": nf(c.get("change_24h_pct")),
@@ -22732,6 +23128,15 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
                 ex.get("top_exchange_volume_share_pct") or ex.get("volume_share_pct"),
                 "de" if str(ctx.get("user_language") or "").lower() == "de" else "en",
             ),
+            "binance_usdm_available": bool(_fut.get("available")),
+            "funding_rate": nf(_fut.get("fundingRate")),
+            "open_interest": nf(_fut.get("openInterest")),
+            "open_interest_change_pct": nf(_fut.get("openInterestChangePct")),
+            "global_long_short_ratio": nf(_fut.get("globalLongShortRatio")),
+            "mark_index_basis_pct": nf(_fut.get("basisPct")),
+            "futures_score_adjustment": nf(_fut.get("futuresScoreAdjustment")),
+            "futures_signal_quality": _fut.get("futuresSignalQuality") or "",
+            "futures_reasons": _fut.get("futuresReasons") or [],
         })
 
     pair_digest = []
@@ -22756,6 +23161,10 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
         "coins": coin_digest,
         "pairs": pair_digest,
         "has_exchange_intelligence": any(bool(x.get("exchange_cheapest") or x.get("exchange_highest") or x.get("exchange_premium_pct") is not None) for x in coin_digest),
+        "has_binance_futures_intelligence": any(bool(x.get("binance_usdm_available")) for x in coin_digest),
+        "binance_futures_source": "public_usdm_no_api_key",
+        "binance_futures_cached": bool(binance_bundle.get("cached")) if isinstance(binance_bundle, dict) else False,
+        "binance_futures_stale": bool(binance_bundle.get("stale")) if isinstance(binance_bundle, dict) else False,
     }
 
 
@@ -28096,6 +28505,10 @@ def _nkr_session_score(sess, row=None):
     if score <= 0:
         ch = _nkr_row_change_pct(row)
         score = max(35.0, min(90.0, 55.0 + ch * 3.0))
+    # Binance futures intelligence is advisory only. Core NKR logic remains the
+    # primary score and this overlay is deliberately capped to avoid overreaction.
+    futures_adj = _safe_float(row.get("futures_score_adjustment") or ((row.get("binanceFutures") or {}).get("futuresScoreAdjustment") if isinstance(row.get("binanceFutures"), dict) else 0), 0.0)
+    score += max(-8.0, min(8.0, futures_adj))
     return max(0.0, min(100.0, score))
 
 
@@ -29072,6 +29485,7 @@ def api_nkr_executor_tick():
     body = request.get_json(silent=True) or {}
     incoming = body.get("sessions") if isinstance(body, dict) else None
     market_rows = body.get("marketRows") or body.get("watchRows") or [] if isinstance(body, dict) else []
+    market_rows = _binance_enrich_market_rows(market_rows)
     settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
     if not isinstance(incoming, list):
         incoming, active_id, _ = _db_get_rotation_sessions(wa)
