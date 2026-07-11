@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-118-SHADOW-LIVE-PAYMENT-RULES"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-118-SHADOW-LIVE-PAYMENT-RULES"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-119-REDEEM-VAULT-STATUS-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-119-REDEEM-VAULT-STATUS-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -14852,14 +14852,32 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
     """Build a wallet-bound Shadow accounting view without representing real funds."""
     wa = _norm_addr(wallet_address or "")
     access = _compute_access_status(wa) if wa else _access_defaults()
-    live = bool(access.get("active"))
+
+    # Full application access (including lifetime redeem access) is not the same
+    # as an active on-chain Core Vault. LIVE accounting is shown only when the
+    # audited Core Vault execution switch is enabled and at least one explicit
+    # CORE_VAULT_ADDRESS_* is configured. Legacy VAULT_ADDRESS_* values must not
+    # make the new Core Vault appear live.
+    explicit_core_vault_configured = any(
+        bool(str(os.getenv(name) or "").strip())
+        for name in (
+            "CORE_VAULT_ADDRESS_ETH", "CORE_VAULT_ADDRESS_1",
+            "CORE_VAULT_ADDRESS_BNB", "CORE_VAULT_ADDRESS_56",
+            "CORE_VAULT_ADDRESS_POL", "CORE_VAULT_ADDRESS_POLYGON", "CORE_VAULT_ADDRESS_137",
+        )
+    )
+    live_execution_enabled = bool(globals().get("_NEXUS_VAULT_EXECUTION_LIVE", False))
+    live = bool(access.get("active") and explicit_core_vault_configured and live_execution_enabled)
     if live:
         return {
             "mode": "LIVE", "isLive": True, "isShadow": False,
             "stableBalanceUsd": 0.0, "baseCapitalUsd": 0.0, "allocatedUsd": 0.0,
             "reserveUsd": 0.0, "securedProfitUsd": 0.0, "availableForWithdrawUsd": 0.0,
             "shadowArchived": True,
-            "note": "Core access is active. Live accounting starts at zero and increases only from real audited Core Vault deposits.",
+            "accessActive": bool(access.get("active")),
+            "coreVaultConfigured": True,
+            "liveExecutionEnabled": True,
+            "note": "Full access is active and the audited Core Vault is connected. Live accounting starts at zero and increases only from real deposits.",
         }
 
     sessions, _, _ = _db_get_rotation_sessions(wa) if wa else ([], "", 0)
@@ -14892,7 +14910,14 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
         "reserveUsd": round(min(base, reserve), 2), "securedProfitUsd": round(secured_profit, 2),
         "availableForWithdrawUsd": round(secured_profit, 2),
         "shadowArchived": False,
-        "note": "Simulation only. These values are not on-chain funds and cannot be withdrawn.",
+        "accessActive": bool(access.get("active")),
+        "coreVaultConfigured": bool(explicit_core_vault_configured),
+        "liveExecutionEnabled": bool(live_execution_enabled),
+        "note": (
+            "Full lifetime access is active. The audited Core Vault is not connected yet, so these values remain Shadow simulation and cannot be withdrawn."
+            if access.get("active") else
+            "Simulation only. These values are not on-chain funds and cannot be withdrawn."
+        ),
     }
 
 
