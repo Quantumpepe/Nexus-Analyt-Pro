@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-123-NKR-OVERVIEW-RUNTIME"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-123-NKR-OVERVIEW-RUNTIME"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-124-ETH-CORE-VAULT-READ-ONLY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-124-ETH-CORE-VAULT-READ-ONLY"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -15131,6 +15131,202 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
             "Simulation only. Grid, NKR and Trading use live-like accounting, but these values are not on-chain funds and cannot be withdrawn."
         ),
     }
+
+
+
+# -----------------------------------------------------------------------------
+# Ethereum Core Vault V1 - read-only on-chain bridge
+# -----------------------------------------------------------------------------
+# This bridge intentionally exposes only eth_call results. It never signs, sends,
+# approves, deposits, withdraws, grants roles, or mutates the deployed Vault.
+_CORE_VAULT_SELECTORS = {
+    "paused": "0x5c975abb",
+    "totalFeeBps": "0xf1210187",
+    "liquidityFeeBps": "0x7e5689a3",
+    "reserveFeeBps": "0x65db6579",
+    "liquidityTreasury": "0xb918e5f9",
+    "tokenConfig": "0xfe136c4e",
+    "accountOf": "0x9ed55403",
+    "solvency": "0x5d1554cd",
+    "totalUserLiability": "0x173ee801",
+    "protocolReserve": "0xff9081a8",
+}
+
+
+def _core_vault_words(raw: str) -> list[int]:
+    h = str(raw or "").lower().removeprefix("0x")
+    if not h:
+        return []
+    if len(h) % 64:
+        h = h.ljust(((len(h) + 63) // 64) * 64, "0")
+    out = []
+    for i in range(0, len(h), 64):
+        try:
+            out.append(int(h[i:i + 64] or "0", 16))
+        except Exception:
+            out.append(0)
+    return out
+
+
+def _core_vault_address_word(raw: str) -> str:
+    h = str(raw or "").lower().removeprefix("0x")
+    if len(h) < 40:
+        return ""
+    addr = "0x" + h[-40:]
+    return addr if _looks_like_evm_addr(addr) else ""
+
+
+def _core_vault_call(chain_id: int, vault: str, selector: str, *address_args: str) -> str:
+    data = selector + "".join(_addr_to_32(a) for a in address_args)
+    return _eth_call(chain_id, vault, data)
+
+
+def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dict:
+    wa = _norm_addr(wallet_address)
+    ck = _normalize_chain_key(chain_key or "ETH")
+    cid = int(_CHAIN_ID_BY_KEY.get(ck, 0) or 0)
+    vault = str(_VAULT_BY_CHAIN.get(cid) or "").strip()
+    rpc_ready = bool(_rpc_url_for_chain(cid))
+    base = {
+        "chain": ck,
+        "chainId": cid,
+        "wallet": wa,
+        "contractAddress": vault,
+        "configured": bool(_looks_like_evm_addr(vault)),
+        "rpcConfigured": rpc_ready,
+        "connected": False,
+        "readOnly": True,
+        "executionEnabled": False,
+        "tokens": {},
+        "ts": now_ts(),
+    }
+    if not _looks_like_evm_addr(wa):
+        return {**base, "status": "error", "error": "invalid wallet"}
+    if cid <= 0 or not _looks_like_evm_addr(vault):
+        return {**base, "status": "not_configured", "error": "Core Vault address is not configured"}
+    if not rpc_ready:
+        return {**base, "status": "rpc_missing", "error": "RPC is not configured"}
+
+    try:
+        paused = bool((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+        total_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["totalFeeBps"])) or [0])[0])
+        liquidity_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityFeeBps"])) or [0])[0])
+        reserve_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["reserveFeeBps"])) or [0])[0])
+        treasury = _core_vault_address_word(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityTreasury"]))
+    except Exception as exc:
+        return {**base, "status": "error", "error": f"Core Vault read failed: {exc}"}
+
+    stable_specs = [
+        ("USDC", str(_USDC_BY_CHAIN.get(cid) or ""), 6),
+        ("USDT", str(_USDT_BY_CHAIN.get(cid) or ""), 6),
+    ]
+    total_base = total_secured = total_allocated = total_assets = total_liabilities = total_reserve = 0.0
+    tokens = {}
+    for symbol, token, decimals in stable_specs:
+        if not _looks_like_evm_addr(token):
+            continue
+        scale = float(10 ** int(decimals))
+        try:
+            cfg = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token))
+            acct = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["accountOf"], wa, token))
+            solv = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["solvency"], token))
+            liability_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["totalUserLiability"], token))
+            reserve_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["protocolReserve"], token))
+            cfg += [0] * (3 - len(cfg))
+            acct += [0] * (7 - len(acct))
+            solv += [0] * (3 - len(solv))
+            base_capital, secured_nkr, secured_trader, secured_grid, allocated_nkr, allocated_trader, allocated_grid = acct[:7]
+            secured = secured_nkr + secured_trader + secured_grid
+            allocated = allocated_nkr + allocated_trader + allocated_grid
+            assets = solv[0]
+            liabilities = (liability_words or [solv[1]])[0]
+            protocol_reserve = (reserve_words or [0])[0]
+            token_state = {
+                "symbol": symbol,
+                "address": token,
+                "decimals": decimals,
+                "config": {
+                    "depositEnabled": bool(cfg[0]),
+                    "withdrawEnabled": bool(cfg[1]),
+                    "executionEnabled": bool(cfg[2]),
+                },
+                "account": {
+                    "baseCapital": base_capital / scale,
+                    "securedNkrProfit": secured_nkr / scale,
+                    "securedTraderProfit": secured_trader / scale,
+                    "securedGridProfit": secured_grid / scale,
+                    "totalSecuredProfit": secured / scale,
+                    "allocatedNkr": allocated_nkr / scale,
+                    "allocatedTrader": allocated_trader / scale,
+                    "allocatedGrid": allocated_grid / scale,
+                    "totalAllocated": allocated / scale,
+                },
+                "solvency": {
+                    "assets": assets / scale,
+                    "obligations": solv[1] / scale,
+                    "totalUserLiability": liabilities / scale,
+                    "protocolReserve": protocol_reserve / scale,
+                    "solvent": bool(solv[2]),
+                },
+            }
+            tokens[symbol] = token_state
+            total_base += base_capital / scale
+            total_secured += secured / scale
+            total_allocated += allocated / scale
+            total_assets += assets / scale
+            total_liabilities += liabilities / scale
+            total_reserve += protocol_reserve / scale
+        except Exception as exc:
+            tokens[symbol] = {
+                "symbol": symbol,
+                "address": token,
+                "decimals": decimals,
+                "status": "error",
+                "error": str(exc),
+            }
+
+    return {
+        **base,
+        "status": "ok",
+        "connected": True,
+        "paused": paused,
+        "fees": {
+            "totalBps": total_fee,
+            "liquidityBps": liquidity_fee,
+            "reserveBps": reserve_fee,
+            "totalPct": total_fee / 100.0,
+            "liquidityPct": liquidity_fee / 100.0,
+            "reservePct": reserve_fee / 100.0,
+        },
+        "liquidityTreasury": treasury,
+        "tokens": tokens,
+        "totals": {
+            "baseCapital": round(total_base, 6),
+            "securedProfit": round(total_secured, 6),
+            "allocated": round(total_allocated, 6),
+            "contractAssets": round(total_assets, 6),
+            "userLiabilities": round(total_liabilities, 6),
+            "protocolReserve": round(total_reserve, 6),
+        },
+        "allConfiguredTokensSolvent": all(
+            bool((v.get("solvency") or {}).get("solvent"))
+            for v in tokens.values()
+            if not v.get("error")
+        ),
+        "liveMutationAllowed": False,
+        "note": "Read-only Ethereum Core Vault connection. No approve, deposit, withdraw, role, or executor transaction is sent by this endpoint.",
+    }
+
+
+@app.get("/api/nexus/core-vault/onchain-state")
+def api_nexus_core_vault_onchain_state():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    chain = request.args.get("chain") or "ETH"
+    state = _core_vault_read_onchain(wa, chain)
+    code = 200 if state.get("status") in ("ok", "not_configured", "rpc_missing") else 502
+    return jsonify({"status": state.get("status"), "onchain": state, **state}), code
 
 
 @app.route("/api/nexus/core-vault/accounting", methods=["GET"])
