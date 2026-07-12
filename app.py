@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.12-ENGINE-127-NKR-PERIOD-CAPITAL-REUSE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.12-ENGINE-127-NKR-PERIOD-CAPITAL-REUSE"
+BACKEND_BUILD_ID = "B-2026.07.12-ENGINE-128-SHADOW-GOPLUS-OWNER-GUARD"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.12-ENGINE-128-SHADOW-GOPLUS-OWNER-GUARD"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -26885,9 +26885,55 @@ def api_nexus_system_info_status_panel():
     return jsonify(_nexus_system_info_status_panel())
 
 
+def _owner_system_info_wallet() -> str:
+    return _norm_addr(
+        os.getenv("NEXUS_OWNER_WALLET")
+        or os.getenv("OWNER_WALLET_ADDRESS")
+        or "0x150270ac191ba7caee8f098add651fa9db38b028"
+    )
+
+def _request_bearer_wallet() -> str:
+    auth = str(request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return ""
+    token = auth.split(None, 1)[1].strip() if " " in auth else ""
+    return _norm_addr(_try_extract_wallet_from_jwt(token) or "")
+
+def _require_owner_system_info():
+    owner = _owner_system_info_wallet()
+    requested = _norm_addr(
+        request.args.get("wallet")
+        or request.args.get("wallet_address")
+        or request.headers.get("X-Wallet-Address")
+        or ""
+    )
+    bearer_wallet = _request_bearer_wallet()
+    # Require both the explicit wallet context and an authenticated bearer identity.
+    # A hidden frontend button alone is never considered authorization.
+    if not owner or not requested or not bearer_wallet or requested != owner or bearer_wallet != owner:
+        return None, (jsonify({"status": "error", "error": "owner_only", "ts": now_ts()}), 403)
+    return owner, None
+
 @app.get("/api/nexus/system-info-owner-panel")
 def api_nexus_system_info_owner_panel():
-    return jsonify(_nexus_system_info_status_panel())
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    payload = _nexus_system_info_status_panel()
+    liquidity_vault = _norm_addr(os.getenv("NKR_LIQUIDITY_VAULT_ADDRESS_ETH") or "")
+    payload["ownerAuthenticated"] = True
+    payload["ownerWallet"] = owner
+    payload["nkrLiquidityVault"] = {
+        "status": "READY" if _looks_like_evm_addr(liquidity_vault) else "PREP_ONLY",
+        "chain": "ETH",
+        "contractAddress": liquidity_vault if _looks_like_evm_addr(liquidity_vault) else "",
+        "nkrReserveTarget": 200000000,
+        "usdtFundingEnabled": bool(_looks_like_evm_addr(liquidity_vault)),
+        "executeLiquidityEnabled": False,
+        "poolAddress": _norm_addr(os.getenv("NKR_USDT_POOL_ADDRESS_ETH") or ""),
+        "note": "Owner-only control surface prepared. Add USDT and Execute Liquidity stay locked until the dedicated audited liquidity vault is deployed and configured.",
+    }
+    return jsonify(payload)
 
 
 
