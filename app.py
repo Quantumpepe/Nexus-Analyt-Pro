@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.12-ENGINE-127-NKR-PERIOD-CAPITAL-REUSE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.12-ENGINE-127-NKR-PERIOD-CAPITAL-REUSE"
+BACKEND_BUILD_ID = "B-2026.07.11-ENGINE-126-CORE-VAULT-DEPOSIT"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.11-ENGINE-126-CORE-VAULT-DEPOSIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -29161,24 +29161,12 @@ def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[d
     for x in rows:
         m=dict(x.get("meta") if isinstance(x.get("meta"),dict) else {})
         pos=_rotation_ms(x.get("positionOpenedAt") or m.get("position_opened_at") or x.get("startedAt") or x.get("createdAt"),campaign_start)
-        x["positionOpenedAt"] = pos
-        x["campaignStartedAt"] = campaign_start
-        x["campaignExpiresAt"] = campaign_expires
-        x["periodDays"] = days
-        # ENGINE-127: NKR Period is the single hard runtime clock. Legacy 24h
-        # expiresAt/runtimeHours values are normalized to the selected campaign.
-        x["runtimeHours"] = days * 24
-        x["expiresAt"] = campaign_expires
-        m.update({
-            "position_opened_at": pos,
-            "campaign_started_at": campaign_start,
-            "campaign_expires_at": campaign_expires,
-            "nkr_period_days": days,
-            "runtime_hours": days * 24,
-            "expires_at": campaign_expires,
-            "nkr_runtime_source": "PERIOD_DAYS_ONLY",
-        })
-        x["meta"] = m
+        x["positionOpenedAt"]=pos
+        x["campaignStartedAt"]=campaign_start
+        x["campaignExpiresAt"]=campaign_expires
+        x["periodDays"]=days
+        m.update({"position_opened_at":pos,"campaign_started_at":campaign_start,"campaign_expires_at":campaign_expires,"nkr_period_days":days})
+        x["meta"]=m
         out.append(x)
     return out,{"startedAt":campaign_start,"expiresAt":campaign_expires,"periodDays":days}
 
@@ -30173,10 +30161,7 @@ def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, d
     if total_budget <= 0:
         return active, {"changed": False, "allocatedUsd": 0.0, "reason": "missing_budget"}
 
-    deploy_mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
-    reserve_pct_map = {"AGGRESSIVE": 10.0, "DYNAMIC": 20.0, "TACTICAL": 25.0, "DEFENSIVE": 35.0}
-    fallback_protected = total_budget * (reserve_pct_map.get(deploy_mode, 20.0) / 100.0)
-    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or fallback_protected, fallback_protected)
+    protected_usd = _safe_float(settings.get("protectedReserveUsd") or settings.get("protected_reserve_usd") or (total_budget * 0.10), total_budget * 0.10)
     investable_usd = max(0.0, total_budget - protected_usd)
     live_sessions = [x for x in active if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
     if not live_sessions:
@@ -30363,14 +30348,6 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     settings = settings if isinstance(settings, dict) else {}
     market_by_sym = _nkr_market_row_map(market_rows)
     nowi = int(time.time() * 1000)
-    # ENGINE-127: normalize every NKR session to the selected NKR Period before
-    # any status or executor decision. Observation windows never expire a run.
-    period_days = settings.get("nkrPeriodDays") or settings.get("periodDays") or NEXUS_NKR_DEFAULT_PERIOD_DAYS
-    sessions, campaign_clock = _nkr_apply_campaign_clock(
-        [dict(x) for x in (sessions or []) if isinstance(x, dict)],
-        period_days,
-    )
-    campaign_expires = int((campaign_clock or {}).get("expiresAt") or 0)
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
     min_score_by_mode = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
@@ -30387,25 +30364,6 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             active.append(sess)
             continue
         status_u = str(sess.get("status") or "").upper()
-        if campaign_expires and nowi >= campaign_expires and status_u not in {"STOPPED", "CLOSED", "CANCELLED", "DELETED", "ARCHIVED"}:
-            expired = dict(sess)
-            expired.update({
-                "status": "EXPIRED",
-                "lifecycleState": "EXPIRED",
-                "positionState": "CLOSED",
-                "expiredAt": nowi,
-                "reservedUsd": 0.0,
-                "workingCapitalUsd": 0.0,
-                "sessionCapitalUsd": 0.0,
-                "openRotation": None,
-                "updatedAt": nowi,
-            })
-            em = dict(expired.get("meta") if isinstance(expired.get("meta"), dict) else {})
-            em.update({"lifecycle_state": "EXPIRED", "position_state": "CLOSED", "reserved_usd": 0.0, "nkr_expiry_reason": "selected_period_completed"})
-            expired["meta"] = em
-            active.append(expired)
-            changed = True
-            continue
         if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL"}:
             active.append(sess)
             continue
@@ -30500,14 +30458,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         total_collected_delta += add_collected
         next_collected = prev_collected + add_collected
         next_sess = dict(sess)
-        # On a completed trade the base capital returns to available stable.
-        # HOLD_STABLE affects only the realized profit; it must never trap the
-        # original capital inside the closed session.
-        next_status = "WAITING_REALLOCATION" if closes else ("ACTIVE" if approved else "WAITING")
-        next_working_capital = 0.0 if closes else budget
         next_sess.update({
-            "status": next_status,
-            "lifecycleState": next_status,
+            "status": "ACTIVE" if approved else "WAITING",
+            "lifecycleState": "ACTIVE" if approved else "WAITING",
             "positionState": pos_state,
             "executionMode": "shadow",
             "symbol": sym,
@@ -30518,11 +30471,9 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "payoutAsset": base,
             "confidence": round(score, 4),
             "score": round(score, 4),
-            "workingCapitalUsd": round(next_working_capital, 4),
-            "sessionCapitalUsd": round(next_working_capital, 4),
-            "reservedUsd": round(next_working_capital, 4),
-            "availableStableUsd": round(budget, 4) if closes else round(_safe_float(sess.get("availableStableUsd"), 0.0), 4),
-            "releasedBaseCapitalUsd": round(budget, 4) if closes else round(_safe_float(sess.get("releasedBaseCapitalUsd"), 0.0), 4),
+            "workingCapitalUsd": round(budget, 4),
+            "sessionCapitalUsd": round(budget, 4),
+            "reservedUsd": round(budget, 4),
             "collectedProfitUsd": round(next_collected, 4),
             "profitUsd": round(next_collected, 4),
             "rotationProfitUsd": round(next_collected, 4),
@@ -30568,11 +30519,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "nkr_entry_price_usd": (event or {}).get("entryPriceUsd") or next_meta.get("nkr_entry_price_usd"),
             "nkr_exit_price_usd": (event or {}).get("exitPriceUsd") if closes else next_meta.get("nkr_exit_price_usd"),
             "position_state": pos_state,
-            "lifecycle_state": next_status,
-            "reserved_usd": round(next_working_capital, 4),
-            "available_stable_usd": round(budget, 4) if closes else round(_safe_float(next_meta.get("available_stable_usd"), 0.0), 4),
-            "released_base_capital_usd": round(budget, 4) if closes else round(_safe_float(next_meta.get("released_base_capital_usd"), 0.0), 4),
-            "nkr_capital_release_reason": "closed_trade_base_returned_to_stable" if closes else next_meta.get("nkr_capital_release_reason", ""),
+            "lifecycle_state": "ACTIVE" if approved else "WAITING",
             "collectedProfitUsd": round(next_collected, 4),
             "nkr_total_event_count": int(total_event_count),
             "nkr_event_history_count": len(events),
@@ -30601,8 +30548,8 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     # Do not auto-fill to 10, but do promote multiple strong green candidates when
     # there is available stable capital and market breadth supports it.
     promotion_summary = {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": []}
-    if mode in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
-        active, promotion_summary = _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings={**settings, "nkrCapitalMode": mode})
+    if mode == "AGGRESSIVE":
+        active, promotion_summary = _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings=settings)
         if promotion_summary.get("changed"):
             changed = True
             messages.append(
@@ -30613,7 +30560,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     # deploy it across the already-active winner sessions. This does NOT auto-fill
     # session count; it only fixes the capital allocator gap.
     deploy_summary = {"changed": False, "allocatedUsd": 0.0}
-    if mode in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
+    if mode in {"AGGRESSIVE", "DYNAMIC"}:
         active, deploy_summary = _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings={**settings, "nkrCapitalMode": mode})
         if deploy_summary.get("changed"):
             changed = True
@@ -30640,10 +30587,6 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         "totalCollectedDeltaUsd": round(total_collected_delta, 4),
         "messages": messages[:12],
         "mode": mode,
-        "periodDays": int((campaign_clock or {}).get("periodDays") or 0),
-        "campaignStartedAt": int((campaign_clock or {}).get("startedAt") or 0),
-        "campaignExpiresAt": int((campaign_clock or {}).get("expiresAt") or 0),
-        "runtimeSource": "NKR_PERIOD_DAYS_ONLY",
         "profitLockPct": profit_lock_pct,
         "aggressiveReallocation": reallocation_summary,
         "watchlistGreenPromotion": promotion_summary if 'promotion_summary' in locals() else {"changed": False},
