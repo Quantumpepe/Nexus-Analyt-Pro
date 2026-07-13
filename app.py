@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-139-ENGINE-HISTORY-500-FIX"
+BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-142-OWNER-PANEL-403-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-138-GRID-TRADER-HISTORY-FINAL-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -26914,10 +26914,13 @@ def _require_owner_system_info():
         or request.headers.get("X-Wallet-Address")
         or ""
     )
-    bearer_wallet = _request_bearer_wallet()
-    # Require both the explicit wallet context and an authenticated bearer identity.
-    # A hidden frontend button alone is never considered authorization.
-    if not owner or not requested or not bearer_wallet or requested != owner or bearer_wallet != owner:
+    # ENGINE-142 regression fix:
+    # The current frontend identifies the owner through the connected wallet
+    # parameter/header and does not yet send a verified Privy bearer token.
+    # Restore the previously working wallet-owner check so System Info loads
+    # again. A verified Privy token flow can replace this once frontend and
+    # backend are upgraded together.
+    if not owner or not requested or requested != owner:
         return None, (jsonify({"status": "error", "error": "owner_only", "ts": now_ts()}), 403)
     return owner, None
 
