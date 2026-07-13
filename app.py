@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-136-GRID-TRADER-EVENT-HISTORY"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-136-GRID-TRADER-EVENT-HISTORY"
+BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-139-ENGINE-HISTORY-500-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-138-GRID-TRADER-HISTORY-FINAL-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -30748,7 +30748,7 @@ def api_nkr_executor_tick():
 # -------------------------
 def _engine_history_init():
     with DB_WRITE_LOCK:
-        conn = _db_connect()
+        conn = _db()
         try:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS nexus_engine_event_history (
@@ -30785,7 +30785,7 @@ def api_nexus_engine_history_get():
         return jsonify({"status":"error","error":"engine must be GRID or TRADER"}), 400
     limit = max(1, min(5000, int(request.args.get("limit") or 1000)))
     _engine_history_init()
-    conn = _db_connect()
+    conn = _db()
     try:
         rows = conn.execute(
             "SELECT event_key,event_type,event_ts,payload_json,created_ts,updated_ts FROM nexus_engine_event_history WHERE wallet_address=? AND engine=? ORDER BY event_ts DESC, id DESC LIMIT ?",
@@ -30822,7 +30822,7 @@ def api_nexus_engine_history_sync():
     _engine_history_init()
     written=0
     with DB_WRITE_LOCK:
-        conn=_db_connect()
+        conn=_db()
         try:
             for raw in incoming:
                 if not isinstance(raw, dict):
