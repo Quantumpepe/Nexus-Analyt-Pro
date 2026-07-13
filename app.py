@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-134-CORE-ABI-MULTI-EVM-ASSET-ROUTER"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-134-CORE-ABI-MULTI-EVM-ASSET-ROUTER"
+BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-136-GRID-TRADER-EVENT-HISTORY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-136-GRID-TRADER-EVENT-HISTORY"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -30741,3 +30741,114 @@ def api_nkr_executor_tick():
         "updated_ts": bundle.get("updated_ts"),
         "ts": now_ts(),
     })
+
+
+# -------------------------
+# ENGINE-136: persistent Grid / Trader Event History
+# -------------------------
+def _engine_history_init():
+    with DB_WRITE_LOCK:
+        conn = _db_connect()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_engine_event_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet_address TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_ts INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL,
+                    UNIQUE(wallet_address, engine, event_key)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_engine_history_wallet_engine_ts ON nexus_engine_event_history(wallet_address, engine, event_ts DESC)")
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _engine_history_normalize_engine(value):
+    v = str(value or "").strip().upper()
+    return v if v in ("GRID", "TRADER") else ""
+
+
+@app.route("/api/nexus/engine-history", methods=["GET"])
+def api_nexus_engine_history_get():
+    wa, error_response = _nexus_wallet_from_request()
+    if error_response:
+        return error_response
+    engine = _engine_history_normalize_engine(request.args.get("engine"))
+    if not engine:
+        return jsonify({"status":"error","error":"engine must be GRID or TRADER"}), 400
+    limit = max(1, min(5000, int(request.args.get("limit") or 1000)))
+    _engine_history_init()
+    conn = _db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT event_key,event_type,event_ts,payload_json,created_ts,updated_ts FROM nexus_engine_event_history WHERE wallet_address=? AND engine=? ORDER BY event_ts DESC, id DESC LIMIT ?",
+            (_norm_addr(wa), engine, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    events=[]
+    for row in rows:
+        try:
+            payload=json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload={}
+        if not isinstance(payload, dict): payload={}
+        payload.setdefault("eventKey", row["event_key"])
+        payload.setdefault("eventType", row["event_type"])
+        payload.setdefault("ts", int(row["event_ts"] or 0))
+        events.append(payload)
+    return jsonify({"status":"ok","wallet":_norm_addr(wa),"engine":engine,"events":events,"count":len(events),"ts":now_ts()})
+
+
+@app.route("/api/nexus/engine-history/sync", methods=["POST"])
+def api_nexus_engine_history_sync():
+    wa, error_response = _nexus_wallet_from_request()
+    if error_response:
+        return error_response
+    body=request.get_json(silent=True) or {}
+    engine=_engine_history_normalize_engine(body.get("engine"))
+    if not engine:
+        return jsonify({"status":"error","error":"engine must be GRID or TRADER"}), 400
+    incoming=body.get("events") if isinstance(body.get("events"), list) else []
+    incoming=incoming[:2000]
+    now_i=now_ts()
+    _engine_history_init()
+    written=0
+    with DB_WRITE_LOCK:
+        conn=_db_connect()
+        try:
+            for raw in incoming:
+                if not isinstance(raw, dict):
+                    continue
+                event_key=str(raw.get("eventKey") or raw.get("event_key") or raw.get("id") or raw.get("orderId") or raw.get("sessionId") or "").strip()[:240]
+                if not event_key:
+                    continue
+                event_type=str(raw.get("eventType") or raw.get("event_type") or raw.get("status") or raw.get("action") or "EVENT").strip().upper()[:80]
+                try: event_ts=int(raw.get("ts") or raw.get("updatedTs") or raw.get("createdTs") or now_i)
+                except Exception: event_ts=now_i
+                payload=dict(raw)
+                payload["engine"]=engine
+                payload["eventKey"]=event_key
+                payload["eventType"]=event_type
+                payload["ts"]=event_ts
+                conn.execute("""
+                    INSERT INTO nexus_engine_event_history(wallet_address,engine,event_key,event_type,event_ts,payload_json,created_ts,updated_ts)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(wallet_address,engine,event_key) DO UPDATE SET
+                      event_type=excluded.event_type,
+                      event_ts=excluded.event_ts,
+                      payload_json=excluded.payload_json,
+                      updated_ts=excluded.updated_ts
+                """, (_norm_addr(wa),engine,event_key,event_type,event_ts,json.dumps(payload,separators=(",",":"),ensure_ascii=False),now_i,now_i))
+                written += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return jsonify({"status":"ok","engine":engine,"written":written,"ts":now_i})
