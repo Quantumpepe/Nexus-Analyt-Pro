@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-145-LIVE-EXECUTION-MODEL-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-145-LIVE-EXECUTION-MODEL-FIX"
+BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-146-REAL-LIVE-EXECUTOR-SERVICE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-146-REAL-LIVE-EXECUTOR-SERVICE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27458,6 +27458,671 @@ def api_nexus_shadow_test_report_summary():
 @app.get("/api/nexus/shadow-test-report-template")
 def api_nexus_shadow_test_report_template():
     return jsonify(_shadow_test_report_template())
+
+
+# ============================================================================
+# ENGINE-146: Real guarded Ethereum live executor service
+# ============================================================================
+_LIVE_EXECUTOR_LOCK = threading.RLock()
+_LIVE_EXECUTOR_WORKERS = {}
+_LIVE_EXECUTOR_HARD_CAP_USDC_UNITS = 1_000_000
+_LIVE_EXECUTOR_SELECTORS = {}
+
+
+def _keccak_selector(signature):
+    from Crypto.Hash import keccak
+    k = keccak.new(digest_bits=256)
+    k.update(signature.encode("ascii"))
+    return "0x" + k.hexdigest()[:8]
+
+
+def _live_executor_selectors():
+    if _LIVE_EXECUTOR_SELECTORS:
+        return _LIVE_EXECUTOR_SELECTORS
+    _LIVE_EXECUTOR_SELECTORS.update({
+        "approve": _keccak_selector("approve(address,uint256)"),
+        "balanceOf": _keccak_selector("balanceOf(address)"),
+        "pullForExecution": _keccak_selector("pullForExecution(address,address,uint8,uint256)"),
+        "returnFromExecution": _keccak_selector("returnFromExecution(address,address,uint8,uint256,uint256)"),
+        "exactInputSingle": _keccak_selector("exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))"),
+        "quoteExactInputSingle": _keccak_selector("quoteExactInputSingle((address,address,uint256,uint24,uint160))"),
+    })
+    return _LIVE_EXECUTOR_SELECTORS
+
+
+def _live_word_uint(value):
+    return hex(max(0, int(value)))[2:].rjust(64, "0")
+
+
+def _live_word_addr(value):
+    a = _norm_addr(value)
+    if not _looks_like_evm_addr(a):
+        raise ValueError("invalid_evm_address")
+    return a[2:].lower().rjust(64, "0")
+
+
+def _live_decode_words(raw):
+    h = str(raw or "").lower().removeprefix("0x")
+    if not h or len(h) % 64:
+        return []
+    try:
+        return [int(h[i:i + 64], 16) for i in range(0, len(h), 64)]
+    except Exception:
+        return []
+
+
+def _live_executor_db_init():
+    conn = _db()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nexus_live_executor_jobs (
+                job_id TEXT PRIMARY KEY,
+                wallet_address TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                system_id INTEGER NOT NULL,
+                chain_id INTEGER NOT NULL,
+                token_address TEXT NOT NULL,
+                amount_units INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                tx_pull TEXT DEFAULT '',
+                tx_buy TEXT DEFAULT '',
+                tx_sell TEXT DEFAULT '',
+                tx_return TEXT DEFAULT '',
+                acquired_units INTEGER DEFAULT 0,
+                returned_units INTEGER DEFAULT 0,
+                error_text TEXT DEFAULT '',
+                details_json TEXT DEFAULT '{}',
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_live_executor_wallet_ts ON nexus_live_executor_jobs(wallet_address, created_ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_live_executor_status ON nexus_live_executor_jobs(status, updated_ts)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS nexus_live_executor_control (
+                control_key TEXT PRIMARY KEY,
+                control_value TEXT NOT NULL,
+                updated_ts INTEGER NOT NULL
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO nexus_live_executor_control(control_key,control_value,updated_ts) VALUES('emergency_stop','0',?)", (now_ts(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _live_executor_control_get(key, default=""):
+    _live_executor_db_init()
+    conn = _db()
+    try:
+        row = conn.execute("SELECT control_value FROM nexus_live_executor_control WHERE control_key=?", (str(key),)).fetchone()
+        return str(row["control_value"]) if row else default
+    finally:
+        conn.close()
+
+
+def _live_executor_control_set(key, value):
+    _live_executor_db_init()
+    with DB_WRITE_LOCK:
+        conn = _db()
+        try:
+            conn.execute("""
+                INSERT INTO nexus_live_executor_control(control_key,control_value,updated_ts)
+                VALUES(?,?,?)
+                ON CONFLICT(control_key) DO UPDATE SET
+                    control_value=excluded.control_value,
+                    updated_ts=excluded.updated_ts
+            """, (str(key), str(value), now_ts()))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _live_executor_emergency_stopped():
+    return _live_executor_control_get("emergency_stop", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _live_executor_system_map():
+    raw = {
+        "TRADER": os.getenv("NEXUS_SYSTEM_ID_TRADER", ""),
+        "GRID": os.getenv("NEXUS_SYSTEM_ID_GRID", ""),
+        "NKR": os.getenv("NEXUS_SYSTEM_ID_NKR", ""),
+    }
+    out = {}
+    for name, value in raw.items():
+        try:
+            number = int(str(value).strip())
+        except Exception:
+            continue
+        if 0 <= number <= 255:
+            out[name] = number
+    return out
+
+
+def _live_executor_route_config():
+    return {
+        "chainId": 1,
+        "vault": _norm_addr(_VAULT_BY_CHAIN.get(1) or os.getenv("CORE_VAULT_ADDRESS_ETH") or ""),
+        "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        "weth": _norm_addr(os.getenv("NEXUS_EXECUTOR_WETH_ETH") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        "router": _norm_addr(os.getenv("NEXUS_EXECUTOR_SWAP_ROUTER_ETH") or ""),
+        "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or ""),
+        "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
+        "slippageBps": max(1, min(500, int(os.getenv("NEXUS_EXECUTOR_MAX_SLIPPAGE_BPS", "100")))),
+        "holdSec": max(0, min(300, int(os.getenv("NEXUS_EXECUTOR_TEST_HOLD_SEC", "10")))),
+        "routeVerifiedFlag": _env_bool("NEXUS_ETH_USDC_EXECUTION_ROUTE_VERIFIED", False),
+        "liveEnabledFlag": _env_bool("NEXUS_LIVE_EXECUTION_ENABLED", False),
+    }
+
+
+def _live_executor_account():
+    private_key = str(os.getenv("NEXUS_EXECUTOR_PRIVATE_KEY_ETH") or "").strip()
+    configured_address = _norm_addr(os.getenv("NEXUS_EXECUTOR_ADDRESS_ETH") or "")
+    result = {"available": False, "address": configured_address, "keyConfigured": bool(private_key), "error": ""}
+    if not private_key:
+        return result
+    try:
+        from eth_account import Account
+        acct = Account.from_key(private_key)
+        derived = _norm_addr(acct.address)
+        result.update({"available": True, "address": derived, "derivedAddress": derived})
+        if configured_address and configured_address != derived:
+            result.update({"available": False, "error": "executor_address_private_key_mismatch"})
+        return result
+    except Exception as exc:
+        result["error"] = "eth_account_unavailable_or_invalid_key:" + str(exc)[:160]
+        return result
+
+
+def _live_rpc_code(chain_id, address):
+    if not _looks_like_evm_addr(address):
+        return "0x"
+    try:
+        return str(_rpc_call(chain_id, "eth_getCode", [address, "latest"]) or "0x")
+    except Exception:
+        return "0x"
+
+
+def _live_erc20_balance(chain_id, token, account):
+    data = _live_executor_selectors()["balanceOf"] + _live_word_addr(account)
+    words = _live_decode_words(_eth_call(chain_id, token, data))
+    return int(words[0]) if words else 0
+
+
+def _live_quote_exact_input_single(cfg, token_in, token_out, amount_in):
+    data = (
+        _live_executor_selectors()["quoteExactInputSingle"]
+        + _live_word_addr(token_in)
+        + _live_word_addr(token_out)
+        + _live_word_uint(amount_in)
+        + _live_word_uint(cfg["poolFee"])
+        + _live_word_uint(0)
+    )
+    words = _live_decode_words(_eth_call(cfg["chainId"], cfg["quoter"], data))
+    if not words or words[0] <= 0:
+        raise RuntimeError("quoter_returned_zero")
+    return int(words[0])
+
+
+def _live_build_swap_data(cfg, token_in, token_out, recipient, amount_in, amount_out_min):
+    return (
+        _live_executor_selectors()["exactInputSingle"]
+        + _live_word_addr(token_in)
+        + _live_word_addr(token_out)
+        + _live_word_uint(cfg["poolFee"])
+        + _live_word_addr(recipient)
+        + _live_word_uint(amount_in)
+        + _live_word_uint(amount_out_min)
+        + _live_word_uint(0)
+    )
+
+
+def _live_fee_params(chain_id):
+    latest = _rpc_call(chain_id, "eth_getBlockByNumber", ["latest", False]) or {}
+    base = int(str(latest.get("baseFeePerGas") or "0x0"), 16)
+    try:
+        priority = int(str(_rpc_call(chain_id, "eth_maxPriorityFeePerGas", []) or "0x0"), 16)
+    except Exception:
+        priority = 1_000_000_000
+    priority = max(priority, 500_000_000)
+    return {"maxPriorityFeePerGas": priority, "maxFeePerGas": max(base * 2 + priority, priority * 2)}
+
+
+def _live_sign_and_send(to, data, value=0, gas_limit=None):
+    cfg = _live_executor_route_config()
+    acct_info = _live_executor_account()
+    if not acct_info.get("available"):
+        raise RuntimeError(acct_info.get("error") or "executor_signer_not_available")
+    from eth_account import Account
+    key = str(os.getenv("NEXUS_EXECUTOR_PRIVATE_KEY_ETH") or "").strip()
+    sender = acct_info["address"]
+    chain_id = cfg["chainId"]
+    with _LIVE_EXECUTOR_LOCK:
+        nonce = int(str(_rpc_call(chain_id, "eth_getTransactionCount", [sender, "pending"]) or "0x0"), 16)
+        tx_call = {"from": sender, "to": to, "value": hex(int(value)), "data": data}
+        if gas_limit is None:
+            try:
+                estimated = int(str(_rpc_call(chain_id, "eth_estimateGas", [tx_call]) or "0x0"), 16)
+                gas_limit = max(21000, int(estimated * 1.25))
+            except Exception as exc:
+                raise RuntimeError("gas_estimation_failed:" + str(exc)[:180])
+        fees = _live_fee_params(chain_id)
+        tx = {
+            "chainId": chain_id,
+            "nonce": nonce,
+            "to": to,
+            "value": int(value),
+            "data": data,
+            "gas": int(gas_limit),
+            "maxPriorityFeePerGas": int(fees["maxPriorityFeePerGas"]),
+            "maxFeePerGas": int(fees["maxFeePerGas"]),
+            "type": 2,
+        }
+        signed = Account.sign_transaction(tx, key)
+        raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
+        return str(_rpc_call(chain_id, "eth_sendRawTransaction", ["0x" + bytes(raw).hex()]))
+
+
+def _live_wait_receipt(tx_hash, timeout_sec=240):
+    deadline = time.time() + max(15, timeout_sec)
+    while time.time() < deadline:
+        receipt = _rpc_call(1, "eth_getTransactionReceipt", [tx_hash])
+        if receipt:
+            if int(str(receipt.get("status") or "0x0"), 16) != 1:
+                raise RuntimeError("transaction_reverted:" + tx_hash)
+            return receipt
+        time.sleep(3)
+    raise TimeoutError("transaction_receipt_timeout:" + tx_hash)
+
+
+def _live_job_update(job_id, **fields):
+    allowed = {"status", "stage", "tx_pull", "tx_buy", "tx_sell", "tx_return", "acquired_units", "returned_units", "error_text", "details_json"}
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    if not clean:
+        return
+    clean["updated_ts"] = now_ts()
+    columns = ",".join(k + "=?" for k in clean)
+    values = list(clean.values()) + [job_id]
+    with DB_WRITE_LOCK:
+        conn = _db()
+        try:
+            conn.execute("UPDATE nexus_live_executor_jobs SET " + columns + " WHERE job_id=?", values)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _live_job_get(job_id):
+    _live_executor_db_init()
+    conn = _db()
+    try:
+        row = conn.execute("SELECT * FROM nexus_live_executor_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _live_history_write(wallet, engine, event_type, job_id, payload):
+    try:
+        _engine_history_init()
+        now_i = now_ts()
+        event_key = "LIVE:" + job_id + ":" + event_type
+        body = dict(payload or {})
+        body.update({"eventKey": event_key, "eventType": event_type, "engine": engine, "source": "LIVE_EXECUTOR", "mode": "LIVE", "ts": now_i, "jobId": job_id})
+        with DB_WRITE_LOCK:
+            conn = _db()
+            try:
+                conn.execute("""
+                    INSERT INTO nexus_engine_event_history(wallet_address,engine,event_key,event_type,event_ts,payload_json,created_ts,updated_ts)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(wallet_address,engine,event_key) DO UPDATE SET
+                        payload_json=excluded.payload_json,
+                        updated_ts=excluded.updated_ts
+                """, (_norm_addr(wallet), engine, event_key, event_type, now_i, json.dumps(body, separators=(",", ":"), ensure_ascii=False), now_i, now_i))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:
+        print("[LIVE_EXECUTOR] history write failed:", exc)
+
+
+def _live_executor_runtime_status(wallet_address=""):
+    cfg = _live_executor_route_config()
+    account = _live_executor_account()
+    system_map = _live_executor_system_map()
+    required_map = all(k in system_map for k in ("TRADER", "GRID", "NKR")) and len(set(system_map.values())) == 3
+    contracts = {k: bool(_live_rpc_code(1, cfg[k]) not in ("0x", "0x0", "")) for k in ("vault", "usdc", "weth", "router", "quoter")}
+    signer_gas_wei = 0
+    if _looks_like_evm_addr(account.get("address")):
+        try:
+            signer_gas_wei = int(str(_rpc_call(1, "eth_getBalance", [account["address"], "latest"]) or "0x0"), 16)
+        except Exception:
+            pass
+    route_ok = bool(cfg["routeVerifiedFlag"] and cfg["poolFee"] in (100, 500, 3000, 10000) and contracts["router"] and contracts["quoter"] and contracts["usdc"] and contracts["weth"])
+    emergency = _live_executor_emergency_stopped()
+    operational = bool(cfg["liveEnabledFlag"] and account.get("available") and route_ok and required_map and not emergency and signer_gas_wei > 0)
+    return {
+        "status": "READY" if operational else "BLOCKED",
+        "operational": operational,
+        "liveEnabledFlag": cfg["liveEnabledFlag"],
+        "executorAddress": account.get("address") or "",
+        "signerConfigured": bool(account.get("keyConfigured")),
+        "signerAvailable": bool(account.get("available")),
+        "signerError": account.get("error") or "",
+        "signerGasWei": signer_gas_wei,
+        "routeVerified": route_ok,
+        "routeContracts": contracts,
+        "poolFee": cfg["poolFee"],
+        "systemMap": system_map,
+        "systemMapConfirmed": required_map,
+        "emergencyStop": emergency,
+        "hardCapUsdc": 1.0,
+        "supportedFirstRoute": "ETHEREUM_USDC_WETH_USDC",
+        "ts": now_ts(),
+    }
+
+
+def _live_vault_execution_readiness(wallet_address):
+    user_wallet = _norm_addr(wallet_address)
+    cfg = _live_executor_route_config()
+    runtime = _live_executor_runtime_status(user_wallet)
+    executor = _norm_addr(runtime.get("executorAddress") or os.getenv("NEXUS_EXECUTOR_ADDRESS_ETH") or "")
+    base = {
+        "chain": "ETH", "chainId": 1, "wallet": user_wallet, "userWallet": user_wallet,
+        "executor": executor, "vault": cfg["vault"], "token": cfg["usdc"], "tokenSymbol": "USDC",
+        "testLimitUnits": _LIVE_EXECUTOR_HARD_CAP_USDC_UNITS, "testLimitUsd": 1.0,
+        "privateKeyInFrontend": False, "privateKeyStoredAsRenderSecret": bool(runtime.get("signerConfigured")),
+        "userSignsOnlyOwnAllowance": True, "adminTransactionsInPrivyUi": False,
+        "executorRuntime": runtime, "ts": now_ts(),
+    }
+    if not (_looks_like_evm_addr(user_wallet) and _looks_like_evm_addr(cfg["vault"]) and _looks_like_evm_addr(cfg["usdc"])):
+        return dict(base, status="NOT_CONFIGURED", liveExecution="DISABLED", blockers=["user_wallet_or_vault_or_usdc_missing"])
+    try:
+        paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+        token_cfg = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["tokenConfig"], cfg["usdc"])) + [0, 0, 0]
+        solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
+        solvent = bool(solv[2])
+        executor_role = False
+        executor_limit = 0
+        if _looks_like_evm_addr(executor):
+            role_raw = _eth_call(1, cfg["vault"], _LIVE_SETUP_SELECTORS["executorRole"])
+            role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+            has_role_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_hex) + _addr_to_32(executor)
+            executor_role = bool((_core_vault_words(_eth_call(1, cfg["vault"], has_role_data)) or [0])[0])
+            limit_data = _LIVE_SETUP_SELECTORS["executorLimit"] + _addr_to_32(user_wallet) + _addr_to_32(executor) + _addr_to_32(cfg["usdc"])
+            executor_limit = int((_core_vault_words(_eth_call(1, cfg["vault"], limit_data)) or [0])[0])
+        checks = {
+            "vaultConnected": True, "vaultPaused": paused,
+            "usdcDepositEnabled": bool(token_cfg[0]), "usdcWithdrawEnabled": bool(token_cfg[1]), "usdcExecutionEnabled": bool(token_cfg[2]),
+            "executorConfigured": _looks_like_evm_addr(executor), "executorRoleGranted": executor_role,
+            "executorServiceReady": bool(runtime.get("operational")), "routeReady": bool(runtime.get("routeVerified")),
+            "systemIdConfirmed": bool(runtime.get("systemMapConfirmed")),
+            "executorLimitUnits": executor_limit, "executorLimitUsd": executor_limit / 1_000_000.0,
+            "oneUsdLimitReady": executor_limit >= 1_000_000, "userCanSetOwnLimit": _looks_like_evm_addr(executor),
+            "solvent": solvent, "emergencyStop": bool(runtime.get("emergencyStop")),
+            "signerGasReady": int(runtime.get("signerGasWei") or 0) > 0,
+        }
+        blockers = []
+        if paused: blockers.append("vault_paused")
+        if not bool(token_cfg[2]): blockers.append("usdc_execution_disabled_by_vault_admin")
+        if not checks["executorConfigured"]: blockers.append("nexus_executor_not_configured")
+        if checks["executorConfigured"] and not executor_role: blockers.append("executor_role_missing_on_configured_executor")
+        if not runtime.get("signerAvailable"): blockers.append("executor_signer_not_available")
+        if not runtime.get("signerGasWei"): blockers.append("executor_needs_eth_for_gas")
+        if not runtime.get("routeVerified"): blockers.append("eth_usdc_execution_route_not_verified")
+        if not runtime.get("systemMapConfirmed"): blockers.append("system_id_mapping_not_confirmed")
+        if runtime.get("emergencyStop"): blockers.append("emergency_stop_active")
+        if not cfg["liveEnabledFlag"]: blockers.append("live_execution_env_disabled")
+        if checks["executorConfigured"] and executor_limit < 1_000_000: blockers.append("user_one_usdc_limit_missing")
+        if not solvent: blockers.append("vault_not_solvent")
+        infrastructure_ready = bool(not paused and bool(token_cfg[0]) and bool(token_cfg[1]) and bool(token_cfg[2]) and solvent and executor_role and runtime.get("operational"))
+        active = bool(infrastructure_ready and executor_limit >= 1_000_000)
+        return dict(
+            base,
+            status="ACTIVE_FOR_1_USDC_TEST" if active else ("USER_LIMIT_REQUIRED" if infrastructure_ready else "INFRASTRUCTURE_REQUIRED"),
+            vaultSetupReady=infrastructure_ready,
+            liveExecution="ACTIVE" if active else "DISABLED",
+            checks=checks,
+            blockers=blockers,
+            nextAction="run_controlled_one_usdc_round_trip" if active else ("user_set_one_usdc_limit" if infrastructure_ready else "complete_executor_configuration"),
+        )
+    except Exception as exc:
+        return dict(base, status="RPC_ERROR", liveExecution="DISABLED", blockers=["rpc_read_failed"], error=str(exc))
+
+
+def _live_executor_run_job(job_id):
+    job = _live_job_get(job_id)
+    if not job:
+        return
+    wallet = _norm_addr(job["wallet_address"])
+    engine = str(job["engine"]).upper()
+    cfg = _live_executor_route_config()
+    account = _live_executor_account()
+    executor = account.get("address") or ""
+    principal = int(job["amount_units"])
+    system_id = int(job["system_id"])
+    start_usdc = 0
+    start_weth = 0
+    acquired = 0
+    pull_completed = False
+    try:
+        readiness = _live_vault_execution_readiness(wallet)
+        if readiness.get("liveExecution") != "ACTIVE":
+            raise RuntimeError("readiness_blocked:" + ",".join(readiness.get("blockers") or []))
+        if _live_executor_emergency_stopped():
+            raise RuntimeError("emergency_stop_active")
+        if principal != _LIVE_EXECUTOR_HARD_CAP_USDC_UNITS:
+            raise RuntimeError("hard_cap_violation")
+        _live_job_update(job_id, status="RUNNING", stage="PRECHECK")
+        _live_history_write(wallet, engine, "LIVE_TEST_STARTED", job_id, {"amountUsd": 1.0, "chain": "ETH", "asset": "USDC"})
+        start_usdc = _live_erc20_balance(1, cfg["usdc"], executor)
+        start_weth = _live_erc20_balance(1, cfg["weth"], executor)
+
+        pull_data = (
+            _live_executor_selectors()["pullForExecution"]
+            + _live_word_addr(wallet)
+            + _live_word_addr(cfg["usdc"])
+            + _live_word_uint(system_id)
+            + _live_word_uint(principal)
+        )
+        _live_job_update(job_id, stage="PULLING_FROM_VAULT")
+        tx_pull = _live_sign_and_send(cfg["vault"], pull_data)
+        _live_job_update(job_id, tx_pull=tx_pull)
+        _live_wait_receipt(tx_pull)
+        pull_completed = True
+
+        approve_usdc = _live_executor_selectors()["approve"] + _live_word_addr(cfg["router"]) + _live_word_uint(principal)
+        _live_job_update(job_id, stage="APPROVING_USDC")
+        _live_wait_receipt(_live_sign_and_send(cfg["usdc"], approve_usdc))
+
+        quote_buy = _live_quote_exact_input_single(cfg, cfg["usdc"], cfg["weth"], principal)
+        min_buy = quote_buy * (10_000 - cfg["slippageBps"]) // 10_000
+        buy_data = _live_build_swap_data(cfg, cfg["usdc"], cfg["weth"], executor, principal, min_buy)
+        _live_job_update(job_id, stage="BUYING_WETH")
+        tx_buy = _live_sign_and_send(cfg["router"], buy_data)
+        _live_job_update(job_id, tx_buy=tx_buy)
+        _live_wait_receipt(tx_buy)
+        acquired = max(0, _live_erc20_balance(1, cfg["weth"], executor) - start_weth)
+        if acquired <= 0:
+            raise RuntimeError("buy_completed_but_no_weth_acquired")
+        _live_job_update(job_id, acquired_units=acquired, stage="HOLDING_TEST_POSITION")
+        if cfg["holdSec"]:
+            time.sleep(cfg["holdSec"])
+
+        approve_weth = _live_executor_selectors()["approve"] + _live_word_addr(cfg["router"]) + _live_word_uint(acquired)
+        _live_job_update(job_id, stage="APPROVING_WETH")
+        _live_wait_receipt(_live_sign_and_send(cfg["weth"], approve_weth))
+        quote_sell = _live_quote_exact_input_single(cfg, cfg["weth"], cfg["usdc"], acquired)
+        min_sell = quote_sell * (10_000 - cfg["slippageBps"]) // 10_000
+        sell_data = _live_build_swap_data(cfg, cfg["weth"], cfg["usdc"], executor, acquired, min_sell)
+        _live_job_update(job_id, stage="SELLING_TO_USDC")
+        tx_sell = _live_sign_and_send(cfg["router"], sell_data)
+        _live_job_update(job_id, tx_sell=tx_sell)
+        _live_wait_receipt(tx_sell)
+
+        current_usdc = _live_erc20_balance(1, cfg["usdc"], executor)
+        returned = max(0, current_usdc - start_usdc)
+        if returned <= 0:
+            raise RuntimeError("round_trip_returned_zero_usdc")
+        approve_vault = _live_executor_selectors()["approve"] + _live_word_addr(cfg["vault"]) + _live_word_uint(returned)
+        _live_job_update(job_id, stage="APPROVING_VAULT_RETURN")
+        _live_wait_receipt(_live_sign_and_send(cfg["usdc"], approve_vault))
+        return_data = (
+            _live_executor_selectors()["returnFromExecution"]
+            + _live_word_addr(wallet)
+            + _live_word_addr(cfg["usdc"])
+            + _live_word_uint(system_id)
+            + _live_word_uint(principal)
+            + _live_word_uint(returned)
+        )
+        _live_job_update(job_id, stage="RETURNING_TO_VAULT")
+        tx_return = _live_sign_and_send(cfg["vault"], return_data)
+        _live_job_update(job_id, tx_return=tx_return)
+        _live_wait_receipt(tx_return)
+        pnl_units = returned - principal
+        details = {
+            "principalUnits": principal,
+            "returnedUnits": returned,
+            "netPnlUnits": pnl_units,
+            "netPnlUsd": pnl_units / 1_000_000.0,
+            "acquiredWethUnits": acquired,
+        }
+        _live_job_update(job_id, status="COMPLETED", stage="COMPLETE", returned_units=returned, details_json=json.dumps(details, separators=(",", ":")))
+        _live_history_write(wallet, engine, "LIVE_TEST_COMPLETED", job_id, dict(details, txPull=tx_pull, txBuy=tx_buy, txSell=tx_sell, txReturn=tx_return))
+    except Exception as exc:
+        error_text = str(exc)[:1000]
+        recovery = {"attempted": False, "completed": False, "error": ""}
+        # If Vault capital was already pulled, fail closed by attempting to sell
+        # any WETH acquired and return every USDC unit attributable to this job.
+        if pull_completed and _looks_like_evm_addr(executor):
+            recovery["attempted"] = True
+            try:
+                _live_job_update(job_id, status="RECOVERING", stage="RECOVERY_UNWIND")
+                residual_weth = max(0, _live_erc20_balance(1, cfg["weth"], executor) - start_weth)
+                if residual_weth > 0:
+                    approve_weth = _live_executor_selectors()["approve"] + _live_word_addr(cfg["router"]) + _live_word_uint(residual_weth)
+                    _live_wait_receipt(_live_sign_and_send(cfg["weth"], approve_weth))
+                    quote_recovery = _live_quote_exact_input_single(cfg, cfg["weth"], cfg["usdc"], residual_weth)
+                    min_recovery = quote_recovery * (10_000 - cfg["slippageBps"]) // 10_000
+                    recovery_sell = _live_build_swap_data(cfg, cfg["weth"], cfg["usdc"], executor, residual_weth, min_recovery)
+                    _live_wait_receipt(_live_sign_and_send(cfg["router"], recovery_sell))
+                recoverable_usdc = max(0, _live_erc20_balance(1, cfg["usdc"], executor) - start_usdc)
+                if recoverable_usdc > 0:
+                    approve_vault = _live_executor_selectors()["approve"] + _live_word_addr(cfg["vault"]) + _live_word_uint(recoverable_usdc)
+                    _live_wait_receipt(_live_sign_and_send(cfg["usdc"], approve_vault))
+                    return_data = (
+                        _live_executor_selectors()["returnFromExecution"]
+                        + _live_word_addr(wallet)
+                        + _live_word_addr(cfg["usdc"])
+                        + _live_word_uint(system_id)
+                        + _live_word_uint(principal)
+                        + _live_word_uint(recoverable_usdc)
+                    )
+                    recovery_tx = _live_sign_and_send(cfg["vault"], return_data)
+                    _live_wait_receipt(recovery_tx)
+                    recovery.update({"completed": True, "returnedUnits": recoverable_usdc, "txReturn": recovery_tx})
+                    _live_job_update(job_id, tx_return=recovery_tx, returned_units=recoverable_usdc)
+            except Exception as recovery_exc:
+                recovery["error"] = str(recovery_exc)[:700]
+        final_error = error_text if not recovery.get("error") else error_text + " | recovery:" + recovery["error"]
+        _live_job_update(job_id, status="FAILED_RECOVERED" if recovery.get("completed") else "FAILED", stage="FAILED", error_text=final_error, details_json=json.dumps({"recovery": recovery}, separators=(",", ":")))
+        _live_history_write(wallet, engine, "LIVE_TEST_FAILED", job_id, {"error": final_error, "acquiredWethUnits": acquired, "recovery": recovery})
+    finally:
+        _LIVE_EXECUTOR_WORKERS.pop(job_id, None)
+
+
+@app.get("/api/nexus/live-executor/status")
+def api_nexus_live_executor_status():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    _live_executor_db_init()
+    conn = _db()
+    try:
+        rows = conn.execute("SELECT * FROM nexus_live_executor_jobs WHERE wallet_address=? ORDER BY created_ts DESC LIMIT 20", (_norm_addr(owner),)).fetchall()
+        jobs = [dict(row) for row in rows]
+    finally:
+        conn.close()
+    for job in jobs:
+        try:
+            job["details"] = json.loads(job.get("details_json") or "{}")
+        except Exception:
+            job["details"] = {}
+        job.pop("details_json", None)
+    return jsonify({"status": "ok", "runtime": _live_executor_runtime_status(owner), "readiness": _live_vault_execution_readiness(owner), "jobs": jobs, "ts": now_ts()})
+
+
+@app.post("/api/nexus/live-executor/test/start")
+def api_nexus_live_executor_test_start():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    engine = str(body.get("engine") or "TRADER").strip().upper()
+    if engine == "TRADING":
+        engine = "TRADER"
+    if engine not in ("TRADER", "GRID", "NKR"):
+        return jsonify({"status": "error", "error": "engine_must_be_TRADER_GRID_or_NKR"}), 400
+    amount_units = int(body.get("amountUnits") or _LIVE_EXECUTOR_HARD_CAP_USDC_UNITS)
+    if amount_units != _LIVE_EXECUTOR_HARD_CAP_USDC_UNITS:
+        return jsonify({"status": "error", "error": "first_live_test_is_hard_limited_to_exactly_1_USDC"}), 400
+    mapping = _live_executor_system_map()
+    if engine not in mapping:
+        return jsonify({"status": "error", "error": "system_id_not_configured_for_engine", "engine": engine}), 409
+    readiness = _live_vault_execution_readiness(owner)
+    if readiness.get("liveExecution") != "ACTIVE":
+        return jsonify({"status": "blocked", "error": "live_execution_not_ready", "blockers": readiness.get("blockers") or [], "readiness": readiness}), 409
+    if _live_executor_emergency_stopped():
+        return jsonify({"status": "blocked", "error": "emergency_stop_active"}), 409
+    _live_executor_db_init()
+    now_i = now_ts()
+    idem = str(body.get("idempotencyKey") or (_norm_addr(owner) + ":" + engine + ":ONE_USDC:" + str(now_i // 300)))[:240]
+    job_id = "live_" + uuid.uuid4().hex
+    with DB_WRITE_LOCK:
+        conn = _db()
+        try:
+            active = conn.execute("SELECT job_id FROM nexus_live_executor_jobs WHERE wallet_address=? AND status IN ('QUEUED','RUNNING') LIMIT 1", (_norm_addr(owner),)).fetchone()
+            if active:
+                return jsonify({"status": "blocked", "error": "another_live_job_is_active", "jobId": active["job_id"]}), 409
+            try:
+                conn.execute("""
+                    INSERT INTO nexus_live_executor_jobs(job_id,wallet_address,engine,system_id,chain_id,token_address,amount_units,status,stage,idempotency_key,created_ts,updated_ts)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (job_id, _norm_addr(owner), engine, int(mapping[engine]), 1, _live_executor_route_config()["usdc"], amount_units, "QUEUED", "QUEUED", idem, now_i, now_i))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                row = conn.execute("SELECT job_id,status FROM nexus_live_executor_jobs WHERE idempotency_key=?", (idem,)).fetchone()
+                return jsonify({"status": "duplicate", "jobId": row["job_id"] if row else "", "jobStatus": row["status"] if row else ""}), 200
+        finally:
+            conn.close()
+    worker = threading.Thread(target=_live_executor_run_job, args=(job_id,), daemon=True, name="nexus-live-" + job_id[-8:])
+    _LIVE_EXECUTOR_WORKERS[job_id] = worker
+    worker.start()
+    return jsonify({"status": "queued", "jobId": job_id, "engine": engine, "amountUsd": 1.0, "ts": now_i}), 202
+
+
+@app.post("/api/nexus/live-executor/emergency-stop")
+def api_nexus_live_executor_emergency_stop():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled", True))
+    _live_executor_control_set("emergency_stop", "1" if enabled else "0")
+    return jsonify({
+        "status": "ok",
+        "emergencyStop": enabled,
+        "note": "Emergency stop blocks new pulls. An already purchased test position still attempts a safe sell and Vault return.",
+        "ts": now_ts(),
+    })
+
+
+try:
+    _live_executor_db_init()
+except Exception as _live_init_exc:
+    print("[WARN] live executor DB init failed:", _live_init_exc)
 
 
 if __name__ == "__main__":
