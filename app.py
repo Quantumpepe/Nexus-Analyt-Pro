@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-143-LIVE-VAULT-ACTIVATION-READINESS"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-143-LIVE-VAULT-ACTIVATION-READINESS"
+BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-144-LIVE-VAULT-ADMIN-PREFLIGHT"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-144-LIVE-VAULT-ADMIN-PREFLIGHT"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -26932,6 +26932,10 @@ def _require_owner_system_info():
 _LIVE_SETUP_SELECTORS = {
     "executorRole": "0x07bd0265",                # EXECUTOR_ROLE()
     "hasRole": "0x91d14854",                     # hasRole(bytes32,address)
+    "getRoleAdmin": "0x248a9ca3",                # getRoleAdmin(bytes32)
+    "defaultAdmin": "0x84ef8ffc",                # defaultAdmin()
+    "limitManagerRole": "0xbeca9879",             # LIMIT_MANAGER_ROLE()
+    "tokenManagerRole": "0xc2840e60",             # TOKEN_MANAGER_ROLE()
     "executorLimit": "0x9f1a3ff2",               # executorLimit(address,address,address)
 }
 
@@ -26971,6 +26975,24 @@ def _live_vault_execution_readiness(wallet_address: str) -> dict:
         role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
         has_role_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_hex) + _addr_to_32(wallet)
         has_role = bool((_core_vault_words(_eth_call(chain_id, vault, has_role_data)) or [0])[0])
+
+        default_admin_words = _core_vault_words(_eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["defaultAdmin"]))
+        default_admin = _norm_addr("0x" + hex(int((default_admin_words or [0])[0]))[2:].rjust(40, "0")[-40:])
+        role_admin_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["getRoleAdmin"] + _bytes32_word(role_hex))
+        role_admin_hex = str(role_admin_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+        grant_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_admin_hex) + _addr_to_32(wallet)
+        can_grant_executor_role = bool((_core_vault_words(_eth_call(chain_id, vault, grant_admin_data)) or [0])[0])
+
+        limit_role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["limitManagerRole"])
+        limit_role_hex = str(limit_role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+        limit_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(limit_role_hex) + _addr_to_32(wallet)
+        can_set_executor_limit = bool((_core_vault_words(_eth_call(chain_id, vault, limit_admin_data)) or [0])[0])
+
+        token_role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["tokenManagerRole"])
+        token_role_hex = str(token_role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+        token_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(token_role_hex) + _addr_to_32(wallet)
+        can_enable_usdc_execution = bool((_core_vault_words(_eth_call(chain_id, vault, token_admin_data)) or [0])[0])
+
         limit_data = _LIVE_SETUP_SELECTORS["executorLimit"] + _addr_to_32(wallet) + _addr_to_32(wallet) + _addr_to_32(usdc)
         executor_limit = int((_core_vault_words(_eth_call(chain_id, vault, limit_data)) or [0])[0])
         solv = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["solvency"], usdc))
@@ -26982,6 +27004,10 @@ def _live_vault_execution_readiness(wallet_address: str) -> dict:
             "usdcWithdrawEnabled": bool(cfg[1]),
             "usdcExecutionEnabled": bool(cfg[2]),
             "executorRoleGranted": has_role,
+            "connectedWalletIsDefaultAdmin": bool(wallet == default_admin),
+            "canGrantExecutorRole": can_grant_executor_role,
+            "canSetExecutorLimit": can_set_executor_limit,
+            "canEnableUsdcExecution": can_enable_usdc_execution,
             "executorLimitUnits": executor_limit,
             "executorLimitUsd": executor_limit / 1_000_000.0,
             "oneUsdLimitReady": executor_limit >= 1_000_000,
@@ -26992,7 +27018,10 @@ def _live_vault_execution_readiness(wallet_address: str) -> dict:
         if paused: blockers.append("vault_paused")
         if not bool(cfg[2]): blockers.append("usdc_execution_disabled")
         if not has_role: blockers.append("executor_role_missing")
+        if not has_role and not can_grant_executor_role: blockers.append("connected_wallet_cannot_grant_executor_role")
         if executor_limit < 1_000_000: blockers.append("one_usdc_executor_limit_missing")
+        if executor_limit < 1_000_000 and not can_set_executor_limit: blockers.append("connected_wallet_missing_limit_manager_role")
+        if not bool(cfg[2]) and not can_enable_usdc_execution: blockers.append("connected_wallet_missing_token_manager_role")
         if not solvent: blockers.append("vault_not_solvent")
         blockers.append("system_id_enum_not_confirmed")
         return {
@@ -27001,6 +27030,15 @@ def _live_vault_execution_readiness(wallet_address: str) -> dict:
             "vaultSetupReady": setup_ready,
             "liveExecution": "BLOCKED_SYSTEM_ID" if setup_ready else "DISABLED",
             "executorRole": "0x" + role_hex,
+            "executorRoleAdmin": "0x" + role_admin_hex,
+            "limitManagerRole": "0x" + limit_role_hex,
+            "tokenManagerRole": "0x" + token_role_hex,
+            "defaultAdmin": default_admin,
+            "permissions": {
+                "grantExecutorRole": can_grant_executor_role,
+                "setExecutorLimit": can_set_executor_limit,
+                "enableUsdcExecution": can_enable_usdc_execution,
+            },
             "checks": checks,
             "blockers": blockers,
             "nextAction": "confirm_system_id_enum_then_enable_one_usdc_round_trip" if setup_ready else "complete_owner_signed_setup",
