@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.13-ENGINE-142-OWNER-PANEL-403-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.13-ENGINE-138-GRID-TRADER-HISTORY-FINAL-FIX"
+BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-143-LIVE-VAULT-ACTIVATION-READINESS"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-143-LIVE-VAULT-ACTIVATION-READINESS"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -26924,12 +26924,110 @@ def _require_owner_system_info():
         return None, (jsonify({"status": "error", "error": "owner_only", "ts": now_ts()}), 403)
     return owner, None
 
+
+
+# ENGINE-143: Dynamic Ethereum Vault execution readiness.
+# This does not hold a private key and never sends a transaction. The owner signs
+# the three one-time setup transactions in the connected Privy wallet.
+_LIVE_SETUP_SELECTORS = {
+    "executorRole": "0x07bd0265",                # EXECUTOR_ROLE()
+    "hasRole": "0x91d14854",                     # hasRole(bytes32,address)
+    "executorLimit": "0x9f1a3ff2",               # executorLimit(address,address,address)
+}
+
+
+def _hex_word(value: int) -> str:
+    return hex(max(0, int(value)))[2:].rjust(64, "0")
+
+
+def _bytes32_word(value: str) -> str:
+    h = str(value or "").lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{64}", h):
+        return "0" * 64
+    return h
+
+
+def _live_vault_execution_readiness(wallet_address: str) -> dict:
+    wallet = _norm_addr(wallet_address)
+    chain_id = 1
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or os.getenv("CORE_VAULT_ADDRESS_ETH") or "")
+    usdc = _norm_addr(_USDC_BY_CHAIN.get(chain_id) or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    base = {
+        "chain": "ETH", "chainId": chain_id, "wallet": wallet,
+        "executor": wallet, "vault": vault, "token": usdc, "tokenSymbol": "USDC",
+        "testLimitUnits": 1_000_000, "testLimitUsd": 1.0,
+        "privateKeyInBackend": False, "transactionsRequireWalletSignature": True,
+        "systemIdConfirmed": False,
+        "systemIdBlocker": "Solidity SystemId enum source must be confirmed before pullForExecution/returnFromExecution is enabled.",
+        "ts": now_ts(),
+    }
+    if not (_looks_like_evm_addr(wallet) and _looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
+        return {**base, "status": "NOT_CONFIGURED", "liveExecution": "DISABLED", "blockers": ["wallet_or_vault_or_usdc_missing"]}
+    try:
+        paused = bool((_core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+        cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], usdc))
+        cfg += [0, 0, 0]
+        role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["executorRole"])
+        role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+        has_role_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_hex) + _addr_to_32(wallet)
+        has_role = bool((_core_vault_words(_eth_call(chain_id, vault, has_role_data)) or [0])[0])
+        limit_data = _LIVE_SETUP_SELECTORS["executorLimit"] + _addr_to_32(wallet) + _addr_to_32(wallet) + _addr_to_32(usdc)
+        executor_limit = int((_core_vault_words(_eth_call(chain_id, vault, limit_data)) or [0])[0])
+        solv = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["solvency"], usdc))
+        solvent = bool((solv + [0,0,0])[2])
+        checks = {
+            "vaultConnected": True,
+            "vaultPaused": paused,
+            "usdcDepositEnabled": bool(cfg[0]),
+            "usdcWithdrawEnabled": bool(cfg[1]),
+            "usdcExecutionEnabled": bool(cfg[2]),
+            "executorRoleGranted": has_role,
+            "executorLimitUnits": executor_limit,
+            "executorLimitUsd": executor_limit / 1_000_000.0,
+            "oneUsdLimitReady": executor_limit >= 1_000_000,
+            "solvent": solvent,
+        }
+        setup_ready = (not paused and bool(cfg[0]) and bool(cfg[1]) and bool(cfg[2]) and has_role and executor_limit >= 1_000_000 and solvent)
+        blockers = []
+        if paused: blockers.append("vault_paused")
+        if not bool(cfg[2]): blockers.append("usdc_execution_disabled")
+        if not has_role: blockers.append("executor_role_missing")
+        if executor_limit < 1_000_000: blockers.append("one_usdc_executor_limit_missing")
+        if not solvent: blockers.append("vault_not_solvent")
+        blockers.append("system_id_enum_not_confirmed")
+        return {
+            **base,
+            "status": "VAULT_SETUP_READY" if setup_ready else "SETUP_REQUIRED",
+            "vaultSetupReady": setup_ready,
+            "liveExecution": "BLOCKED_SYSTEM_ID" if setup_ready else "DISABLED",
+            "executorRole": "0x" + role_hex,
+            "checks": checks,
+            "blockers": blockers,
+            "nextAction": "confirm_system_id_enum_then_enable_one_usdc_round_trip" if setup_ready else "complete_owner_signed_setup",
+        }
+    except Exception as exc:
+        return {**base, "status": "RPC_ERROR", "liveExecution": "DISABLED", "blockers": ["rpc_read_failed"], "error": str(exc)}
+
+
+@app.get("/api/nexus/live-execution-readiness")
+def api_nexus_live_execution_readiness():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    return jsonify({"status": "ok", "readiness": _live_vault_execution_readiness(owner)})
+
+
 @app.get("/api/nexus/system-info-owner-panel")
 def api_nexus_system_info_owner_panel():
     owner, denied = _require_owner_system_info()
     if denied:
         return denied
     payload = _nexus_system_info_status_panel()
+    live_readiness = _live_vault_execution_readiness(owner)
+    payload["liveExecutionReadiness"] = live_readiness
+    payload["liveExecution"] = live_readiness.get("liveExecution")
+    payload["vault"] = {"status": "READY" if live_readiness.get("vaultSetupReady") else "SETUP REQUIRED"}
+    payload["privateKeys"] = "NOT IN BACKEND"
     liquidity_vault = _norm_addr(os.getenv("NKR_LIQUIDITY_VAULT_ADDRESS_ETH") or "")
     payload["ownerAuthenticated"] = True
     payload["ownerWallet"] = owner
