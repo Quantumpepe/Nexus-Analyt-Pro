@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-144-LIVE-VAULT-ADMIN-PREFLIGHT"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-144-LIVE-VAULT-ADMIN-PREFLIGHT"
+BACKEND_BUILD_ID = "B-2026.07.14-ENGINE-145-LIVE-EXECUTION-MODEL-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.14-ENGINE-145-LIVE-EXECUTION-MODEL-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -26926,22 +26926,18 @@ def _require_owner_system_info():
 
 
 
-# ENGINE-143: Dynamic Ethereum Vault execution readiness.
-# This does not hold a private key and never sends a transaction. The owner signs
-# the three one-time setup transactions in the connected Privy wallet.
+# ENGINE-145: Correct live-execution responsibility model.
+# - Privy wallet is the user wallet.
+# - A separately configured Nexus executor contract/service is the executor.
+# - The user may only set/revoke their own executor allowance.
+# - Admin/token-manager actions are never requested from the Privy user UI.
+# - Live execution stays blocked until the executor, route and SystemId mapping
+#   are explicitly configured and verified.
 _LIVE_SETUP_SELECTORS = {
     "executorRole": "0x07bd0265",                # EXECUTOR_ROLE()
     "hasRole": "0x91d14854",                     # hasRole(bytes32,address)
-    "getRoleAdmin": "0x248a9ca3",                # getRoleAdmin(bytes32)
-    "defaultAdmin": "0x84ef8ffc",                # defaultAdmin()
-    "limitManagerRole": "0xbeca9879",             # LIMIT_MANAGER_ROLE()
-    "tokenManagerRole": "0xc2840e60",             # TOKEN_MANAGER_ROLE()
     "executorLimit": "0x9f1a3ff2",               # executorLimit(address,address,address)
 }
-
-
-def _hex_word(value: int) -> str:
-    return hex(max(0, int(value)))[2:].rjust(64, "0")
 
 
 def _bytes32_word(value: str) -> str:
@@ -26952,96 +26948,108 @@ def _bytes32_word(value: str) -> str:
 
 
 def _live_vault_execution_readiness(wallet_address: str) -> dict:
-    wallet = _norm_addr(wallet_address)
+    user_wallet = _norm_addr(wallet_address)
     chain_id = 1
     vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or os.getenv("CORE_VAULT_ADDRESS_ETH") or "")
     usdc = _norm_addr(_USDC_BY_CHAIN.get(chain_id) or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    executor = _norm_addr(os.getenv("NEXUS_EXECUTOR_ADDRESS_ETH") or "")
+    executor_service_ready = _env_bool("NEXUS_EXECUTOR_SERVICE_READY", False)
+    route_ready = _env_bool("NEXUS_ETH_USDC_EXECUTION_ROUTE_READY", False)
+    system_id_confirmed = _env_bool("NEXUS_SYSTEM_ID_MAPPING_CONFIRMED", False)
     base = {
-        "chain": "ETH", "chainId": chain_id, "wallet": wallet,
-        "executor": wallet, "vault": vault, "token": usdc, "tokenSymbol": "USDC",
+        "chain": "ETH", "chainId": chain_id,
+        "wallet": user_wallet, "userWallet": user_wallet,
+        "executor": executor, "vault": vault, "token": usdc, "tokenSymbol": "USDC",
         "testLimitUnits": 1_000_000, "testLimitUsd": 1.0,
-        "privateKeyInBackend": False, "transactionsRequireWalletSignature": True,
-        "systemIdConfirmed": False,
-        "systemIdBlocker": "Solidity SystemId enum source must be confirmed before pullForExecution/returnFromExecution is enabled.",
+        "privateKeyInBackend": False,
+        "userSignsOnlyOwnAllowance": True,
+        "adminTransactionsInPrivyUi": False,
+        "systemIdConfirmed": system_id_confirmed,
+        "routeReady": route_ready,
+        "executorServiceReady": executor_service_ready,
         "ts": now_ts(),
     }
-    if not (_looks_like_evm_addr(wallet) and _looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
-        return {**base, "status": "NOT_CONFIGURED", "liveExecution": "DISABLED", "blockers": ["wallet_or_vault_or_usdc_missing"]}
+    if not (_looks_like_evm_addr(user_wallet) and _looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
+        return {**base, "status": "NOT_CONFIGURED", "liveExecution": "DISABLED", "blockers": ["user_wallet_or_vault_or_usdc_missing"]}
+
     try:
         paused = bool((_core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
         cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], usdc))
         cfg += [0, 0, 0]
-        role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["executorRole"])
-        role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
-        has_role_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_hex) + _addr_to_32(wallet)
-        has_role = bool((_core_vault_words(_eth_call(chain_id, vault, has_role_data)) or [0])[0])
-
-        default_admin_words = _core_vault_words(_eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["defaultAdmin"]))
-        default_admin = _norm_addr("0x" + hex(int((default_admin_words or [0])[0]))[2:].rjust(40, "0")[-40:])
-        role_admin_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["getRoleAdmin"] + _bytes32_word(role_hex))
-        role_admin_hex = str(role_admin_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
-        grant_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_admin_hex) + _addr_to_32(wallet)
-        can_grant_executor_role = bool((_core_vault_words(_eth_call(chain_id, vault, grant_admin_data)) or [0])[0])
-
-        limit_role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["limitManagerRole"])
-        limit_role_hex = str(limit_role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
-        limit_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(limit_role_hex) + _addr_to_32(wallet)
-        can_set_executor_limit = bool((_core_vault_words(_eth_call(chain_id, vault, limit_admin_data)) or [0])[0])
-
-        token_role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["tokenManagerRole"])
-        token_role_hex = str(token_role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
-        token_admin_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(token_role_hex) + _addr_to_32(wallet)
-        can_enable_usdc_execution = bool((_core_vault_words(_eth_call(chain_id, vault, token_admin_data)) or [0])[0])
-
-        limit_data = _LIVE_SETUP_SELECTORS["executorLimit"] + _addr_to_32(wallet) + _addr_to_32(wallet) + _addr_to_32(usdc)
-        executor_limit = int((_core_vault_words(_eth_call(chain_id, vault, limit_data)) or [0])[0])
         solv = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["solvency"], usdc))
-        solvent = bool((solv + [0,0,0])[2])
+        solvent = bool((solv + [0, 0, 0])[2])
+
+        executor_configured = _looks_like_evm_addr(executor)
+        executor_role_granted = False
+        executor_limit = 0
+        if executor_configured:
+            role_raw = _eth_call(chain_id, vault, _LIVE_SETUP_SELECTORS["executorRole"])
+            role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64, "0")[-64:]
+            has_role_data = _LIVE_SETUP_SELECTORS["hasRole"] + _bytes32_word(role_hex) + _addr_to_32(executor)
+            executor_role_granted = bool((_core_vault_words(_eth_call(chain_id, vault, has_role_data)) or [0])[0])
+            limit_data = _LIVE_SETUP_SELECTORS["executorLimit"] + _addr_to_32(user_wallet) + _addr_to_32(executor) + _addr_to_32(usdc)
+            executor_limit = int((_core_vault_words(_eth_call(chain_id, vault, limit_data)) or [0])[0])
+
         checks = {
             "vaultConnected": True,
             "vaultPaused": paused,
             "usdcDepositEnabled": bool(cfg[0]),
             "usdcWithdrawEnabled": bool(cfg[1]),
             "usdcExecutionEnabled": bool(cfg[2]),
-            "executorRoleGranted": has_role,
-            "connectedWalletIsDefaultAdmin": bool(wallet == default_admin),
-            "canGrantExecutorRole": can_grant_executor_role,
-            "canSetExecutorLimit": can_set_executor_limit,
-            "canEnableUsdcExecution": can_enable_usdc_execution,
+            "executorConfigured": executor_configured,
+            "executorRoleGranted": executor_role_granted,
+            "executorServiceReady": executor_service_ready,
+            "routeReady": route_ready,
+            "systemIdConfirmed": system_id_confirmed,
             "executorLimitUnits": executor_limit,
             "executorLimitUsd": executor_limit / 1_000_000.0,
             "oneUsdLimitReady": executor_limit >= 1_000_000,
+            "userCanSetOwnLimit": executor_configured,
             "solvent": solvent,
         }
-        setup_ready = (not paused and bool(cfg[0]) and bool(cfg[1]) and bool(cfg[2]) and has_role and executor_limit >= 1_000_000 and solvent)
         blockers = []
         if paused: blockers.append("vault_paused")
-        if not bool(cfg[2]): blockers.append("usdc_execution_disabled")
-        if not has_role: blockers.append("executor_role_missing")
-        if not has_role and not can_grant_executor_role: blockers.append("connected_wallet_cannot_grant_executor_role")
-        if executor_limit < 1_000_000: blockers.append("one_usdc_executor_limit_missing")
-        if executor_limit < 1_000_000 and not can_set_executor_limit: blockers.append("connected_wallet_missing_limit_manager_role")
-        if not bool(cfg[2]) and not can_enable_usdc_execution: blockers.append("connected_wallet_missing_token_manager_role")
+        if not bool(cfg[2]): blockers.append("usdc_execution_disabled_by_vault_admin")
+        if not executor_configured: blockers.append("nexus_executor_not_configured")
+        if executor_configured and not executor_role_granted: blockers.append("executor_role_missing_on_configured_executor")
+        if not executor_service_ready: blockers.append("executor_service_not_ready")
+        if not route_ready: blockers.append("eth_usdc_execution_route_not_verified")
+        if not system_id_confirmed: blockers.append("system_id_mapping_not_confirmed")
+        if executor_configured and executor_limit < 1_000_000: blockers.append("user_one_usdc_limit_missing")
         if not solvent: blockers.append("vault_not_solvent")
-        blockers.append("system_id_enum_not_confirmed")
+
+        infrastructure_ready = (
+            not paused and bool(cfg[0]) and bool(cfg[1]) and bool(cfg[2]) and solvent
+            and executor_configured and executor_role_granted
+            and executor_service_ready and route_ready and system_id_confirmed
+        )
+        live_active = infrastructure_ready and executor_limit >= 1_000_000
+        if live_active:
+            status = "ACTIVE_FOR_1_USDC_TEST"
+            live_execution = "ACTIVE"
+            next_action = "run_controlled_one_usdc_round_trip"
+        elif infrastructure_ready:
+            status = "USER_LIMIT_REQUIRED"
+            live_execution = "DISABLED"
+            next_action = "user_set_one_usdc_limit"
+        else:
+            status = "INFRASTRUCTURE_REQUIRED"
+            live_execution = "DISABLED"
+            next_action = "complete_backend_executor_and_admin_configuration"
+
         return {
             **base,
-            "status": "VAULT_SETUP_READY" if setup_ready else "SETUP_REQUIRED",
-            "vaultSetupReady": setup_ready,
-            "liveExecution": "BLOCKED_SYSTEM_ID" if setup_ready else "DISABLED",
-            "executorRole": "0x" + role_hex,
-            "executorRoleAdmin": "0x" + role_admin_hex,
-            "limitManagerRole": "0x" + limit_role_hex,
-            "tokenManagerRole": "0x" + token_role_hex,
-            "defaultAdmin": default_admin,
-            "permissions": {
-                "grantExecutorRole": can_grant_executor_role,
-                "setExecutorLimit": can_set_executor_limit,
-                "enableUsdcExecution": can_enable_usdc_execution,
-            },
+            "status": status,
+            "vaultSetupReady": infrastructure_ready,
+            "liveExecution": live_execution,
             "checks": checks,
             "blockers": blockers,
-            "nextAction": "confirm_system_id_enum_then_enable_one_usdc_round_trip" if setup_ready else "complete_owner_signed_setup",
+            "nextAction": next_action,
+            "responsibility": {
+                "privyWallet": "USER_WALLET_ONLY",
+                "configuredExecutor": "NEXUS_EXECUTOR_CONTRACT_OR_SERVICE",
+                "vaultAdmin": "ADMIN_CONFIGURATION_OUTSIDE_USER_UI",
+            },
         }
     except Exception as exc:
         return {**base, "status": "RPC_ERROR", "liveExecution": "DISABLED", "blockers": ["rpc_read_failed"], "error": str(exc)}
