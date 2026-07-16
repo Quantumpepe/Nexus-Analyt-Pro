@@ -5,3 +5,4 @@ gunicorn>=21.2
 itsdangerous>=2.1
 eth-account>=0.9
 web3==6.*
+cryptography>=42.0.0,<46.0.0
