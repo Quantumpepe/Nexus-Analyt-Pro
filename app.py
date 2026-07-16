@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.16-ENGINE-149-DUPLICATE-ROUTE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.16-ENGINE-152-PRIVY-VAULT-COMPATIBILITY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27654,45 +27654,83 @@ def _privy_job_rows(wallet, limit=10):
 
 
 def _privy_delegated_readiness(wallet_address):
-    cfg = _privy_trading_cfg(); user = _norm_addr(wallet_address); delegation = _privy_trading_delegation(user)
+    cfg = _privy_trading_cfg()
+    user = _norm_addr(wallet_address)
+    delegation = _privy_trading_delegation(user)
+    delegated_budget_units = int((delegation or {}).get("max_budget_units") or 0)
     checks = {
         "privyAppConfigured": bool(cfg["appId"] and cfg["appSecret"]),
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
         "walletDelegated": bool(delegation and delegation.get("enabled") and int(delegation.get("expires_ts") or 0) > now_ts()),
-        "vaultConnected": False, "usdcExecutionEnabled": False, "executorRoleGranted": False,
-        "executorLimitUnits": 0, "executorLimitUsd": 0.0, "oneUsdLimitReady": False,
-        "routeReady": False, "systemIdConfirmed": cfg["systemIds"] == {"NKR":0,"TRADER":1,"GRID":2}, "solvent": False,
+        "vaultConnected": False,
+        "usdcExecutionEnabled": False,
+        "routeReady": False,
+        "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
+        "solvent": False,
+        "delegatedBudgetUnits": delegated_budget_units,
+        "delegatedBudgetUsd": delegated_budget_units / 1_000_000.0,
+        "privyOnlyVaultCompatible": False,
+        "vaultCompatibilityReason": "CURRENT_VAULT_PULL_REQUIRES_EXECUTOR_ROLE",
     }
     blockers = []
     try:
-        paused = bool((_core_vault_words(_core_vault_call(1,cfg["vault"],_CORE_VAULT_SELECTORS["paused"])) or [0])[0])
-        tc = _core_vault_words(_core_vault_call(1,cfg["vault"],_CORE_VAULT_SELECTORS["tokenConfig"],cfg["usdc"])) + [0,0,0]
-        solv = _core_vault_words(_core_vault_call(1,cfg["vault"],_CORE_VAULT_SELECTORS["solvency"],cfg["usdc"])) + [0,0,0]
-        checks["vaultConnected"] = True; checks["usdcExecutionEnabled"] = bool(tc[2]); checks["solvent"] = bool(solv[2])
-        role_raw = _eth_call(1,cfg["vault"],_LIVE_SETUP_SELECTORS["executorRole"])
-        role_hex = str(role_raw or "0x").lower().removeprefix("0x").rjust(64,"0")[-64:]
-        checks["executorRoleGranted"] = bool((_core_vault_words(_eth_call(1,cfg["vault"],_LIVE_SETUP_SELECTORS["hasRole"]+_bytes32_word(role_hex)+_addr_to_32(user))) or [0])[0])
-        limit = int((_core_vault_words(_eth_call(1,cfg["vault"],_LIVE_SETUP_SELECTORS["executorLimit"]+_addr_to_32(user)+_addr_to_32(user)+_addr_to_32(cfg["usdc"]))) or [0])[0])
-        checks["executorLimitUnits"] = limit; checks["executorLimitUsd"] = limit/1_000_000.0; checks["oneUsdLimitReady"] = limit >= _PRIVY_TRADING_HARD_CAP_UNITS
-        checks["routeReady"] = bool(cfg["routeVerified"] and all(_looks_like_evm_addr(cfg[x]) for x in ("router","quoter","usdc","weth")))
-        if paused: blockers.append("vault_paused")
+        paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+        tc = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["tokenConfig"], cfg["usdc"])) + [0, 0, 0]
+        solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
+        checks["vaultConnected"] = True
+        checks["usdcExecutionEnabled"] = bool(tc[2])
+        checks["solvent"] = bool(solv[2])
+        checks["routeReady"] = bool(cfg["routeVerified"] and all(_looks_like_evm_addr(cfg[x]) for x in ("router", "quoter", "usdc", "weth")))
+        if paused:
+            blockers.append("vault_paused")
     except Exception as exc:
         blockers.append("vault_rpc_read_failed")
         checks["rpcError"] = str(exc)
+
     for key, code in [
-        ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
-        ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletDelegated","wallet_not_delegated"),
-        ("vaultConnected","vault_not_connected"),("usdcExecutionEnabled","usdc_execution_disabled"),
-        ("executorRoleGranted","privy_wallet_executor_role_missing"),("oneUsdLimitReady","user_self_limit_missing"),
-        ("routeReady","route_not_verified"),("systemIdConfirmed","system_mapping_invalid"),("solvent","vault_not_solvent")]:
-        if not checks.get(key): blockers.append(code)
-    if not cfg["liveEnabled"]: blockers.append("live_execution_env_disabled")
-    active = not blockers
-    return {"status":"ACTIVE" if active else "SETUP_REQUIRED","liveExecution":"ACTIVE" if active else "DISABLED","privyOnly":True,
-            "wallet":user,"userWallet":user,"vault":cfg["vault"],"token":cfg["usdc"],"tokenSymbol":"USDC",
-            "signerId":cfg["signerId"],"policyId":cfg["policyId"],"checks":checks,"blockers":list(dict.fromkeys(blockers)),
-            "delegation":delegation or {},"ts":now_ts()}
+        ("privyAppConfigured", "privy_app_credentials_missing"),
+        ("tradingSignerConfigured", "privy_trading_signer_missing"),
+        ("tradingPolicyConfigured", "privy_trading_policy_missing"),
+        ("walletDelegated", "wallet_not_delegated"),
+        ("vaultConnected", "vault_not_connected"),
+        ("usdcExecutionEnabled", "usdc_execution_disabled"),
+        ("routeReady", "route_not_verified"),
+        ("systemIdConfirmed", "system_mapping_invalid"),
+        ("solvent", "vault_not_solvent"),
+    ]:
+        if not checks.get(key):
+            blockers.append(code)
+
+    # The deployed Vault requires onlyRole(EXECUTOR_ROLE) for pullForExecution.
+    # A Privy delegated user wallet cannot be treated as a global protocol
+    # executor without per-user admin role grants. Therefore the current Vault
+    # is intentionally marked incompatible with the Privy-only architecture.
+    blockers.append("vault_contract_privy_only_incompatible")
+    if not cfg["liveEnabled"]:
+        blockers.append("live_execution_env_disabled")
+
+    return {
+        "status": "VAULT_UPDATE_REQUIRED",
+        "liveExecution": "DISABLED",
+        "privyOnly": True,
+        "wallet": user,
+        "userWallet": user,
+        "vault": cfg["vault"],
+        "token": cfg["usdc"],
+        "tokenSymbol": "USDC",
+        "signerId": cfg["signerId"],
+        "policyId": cfg["policyId"],
+        "checks": checks,
+        "blockers": list(dict.fromkeys(blockers)),
+        "delegation": delegation or {},
+        "requiredContractChange": {
+            "name": "Privy-only Vault execution",
+            "reason": "pullForExecution currently requires EXECUTOR_ROLE",
+            "requiredBehavior": "A delegated user wallet must be able to execute only for itself and only inside its signed budget/session policy, without receiving a global protocol role.",
+        },
+        "ts": now_ts(),
+    }
 
 
 def _live_vault_execution_readiness(wallet_address): return _privy_delegated_readiness(wallet_address)
@@ -27776,13 +27814,16 @@ def _privy_delegated_test_worker(job_id, wallet, wallet_id):
 @app.post("/api/nexus/privy-trading/test/start")
 def api_privy_trading_test_start():
     owner, denied = _require_owner_system_info()
-    if denied: return denied
-    rd=_privy_delegated_readiness(owner)
-    if rd.get("liveExecution")!="ACTIVE": return jsonify({"status":"blocked","blockers":rd.get("blockers"),"readiness":rd}),409
-    d=_privy_trading_delegation(owner); job_id=str(uuid.uuid4())
-    _privy_job_write(job_id,owner,d["privy_wallet_id"],"TRADER",_PRIVY_TRADING_HARD_CAP_UNITS,"QUEUED","QUEUED")
-    threading.Thread(target=_privy_delegated_test_worker,args=(job_id,owner,d["privy_wallet_id"]),daemon=True).start()
-    return jsonify({"status":"ok","jobId":job_id})
+    if denied:
+        return denied
+    rd = _privy_delegated_readiness(owner)
+    return jsonify({
+        "status": "blocked",
+        "error": "vault_contract_privy_only_incompatible",
+        "message": "The deployed Vault requires EXECUTOR_ROLE for pullForExecution. Live delegated trading stays disabled until the Vault execution interface is updated for self-scoped Privy sessions.",
+        "blockers": rd.get("blockers"),
+        "readiness": rd,
+    }), 409
 
 
 @app.get("/api/nexus/live-executor/status")
