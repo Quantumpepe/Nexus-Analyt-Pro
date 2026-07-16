@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
+BACKEND_BUILD_ID = "B-2026.07.16-ENGINE-149-DUPLICATE-ROUTE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27053,41 +27053,6 @@ def _live_vault_execution_readiness(wallet_address: str) -> dict:
         }
     except Exception as exc:
         return {**base, "status": "RPC_ERROR", "liveExecution": "DISABLED", "blockers": ["rpc_read_failed"], "error": str(exc)}
-
-
-@app.get("/api/nexus/live-execution-readiness")
-def api_nexus_live_execution_readiness():
-    owner, denied = _require_owner_system_info()
-    if denied:
-        return denied
-    return jsonify({"status": "ok", "readiness": _live_vault_execution_readiness(owner)})
-
-
-@app.get("/api/nexus/system-info-owner-panel")
-def api_nexus_system_info_owner_panel():
-    owner, denied = _require_owner_system_info()
-    if denied:
-        return denied
-    payload = _nexus_system_info_status_panel()
-    live_readiness = _live_vault_execution_readiness(owner)
-    payload["liveExecutionReadiness"] = live_readiness
-    payload["liveExecution"] = live_readiness.get("liveExecution")
-    payload["vault"] = {"status": "READY" if live_readiness.get("vaultSetupReady") else "SETUP REQUIRED"}
-    payload["privateKeys"] = "NOT IN BACKEND"
-    liquidity_vault = _norm_addr(os.getenv("NKR_LIQUIDITY_VAULT_ADDRESS_ETH") or "")
-    payload["ownerAuthenticated"] = True
-    payload["ownerWallet"] = owner
-    payload["nkrLiquidityVault"] = {
-        "status": "READY" if _looks_like_evm_addr(liquidity_vault) else "PREP_ONLY",
-        "chain": "ETH",
-        "contractAddress": liquidity_vault if _looks_like_evm_addr(liquidity_vault) else "",
-        "nkrReserveTarget": 200000000,
-        "usdtFundingEnabled": bool(_looks_like_evm_addr(liquidity_vault)),
-        "executeLiquidityEnabled": False,
-        "poolAddress": _norm_addr(os.getenv("NKR_USDT_POOL_ADDRESS_ETH") or ""),
-        "note": "Owner-only control surface prepared. Add USDT and Execute Liquidity stay locked until the dedicated audited liquidity vault is deployed and configured.",
-    }
-    return jsonify(payload)
 
 
 
