@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-158-OWNER-ADMIN-ACTION-PREPARE"
+BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-159-OWNER-ADMIN-EXISTING-VAULT-REGISTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1040,8 +1040,26 @@ def api_nexus_core_vault_admin_prepare_action():
             schedule_data = _function_selector('scheduleAction(bytes32,uint48)') + schedule_args
             result['executeAfter'] = execute_after
             result['scheduleCalldata'] = '0x' + schedule_data.hex()
-        return jsonify({'status': 'ok', 'abiVersion': NEXUS_CORE_VAULT_ABI_VERSION,
-                        'contractAddress': _CORE_VAULT_ADDRESS_BY_CHAIN.get(1, ''), **result})
+        # Use the existing Nexus chain and Vault registries. Do not introduce a
+        # second address map for Owner Admin, otherwise reads and writes can drift.
+        chain_key = _normalize_chain_key(body.get('chain') or 'ETH') or 'ETH'
+        chain_id = _chain_id_from_key(chain_key) or 1
+        contract_address = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or '')
+        if not contract_address:
+            return jsonify({
+                'status': 'error',
+                'error': 'core_vault_not_configured',
+                'chain': chain_key,
+                'chainId': chain_id,
+            }), 409
+        return jsonify({
+            'status': 'ok',
+            'abiVersion': NEXUS_CORE_VAULT_ABI_VERSION,
+            'chain': chain_key,
+            'chainId': chain_id,
+            'contractAddress': contract_address,
+            **result,
+        })
     except (TypeError, ValueError, OverflowError) as exc:
         return jsonify({'status': 'error', 'error': str(exc)}), 400
 
