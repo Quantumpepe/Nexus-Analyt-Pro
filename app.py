@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-157-VERIFIED-VAULT-ADDRESS-RPC-SAFE"
+BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-158-OWNER-ADMIN-ACTION-PREPARE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -818,6 +818,232 @@ def api_nexus_asset_route_validate():
     allowed = bool(route.get("liveEnabled"))
     return jsonify({"status": "ok", "allowed": allowed, "engine": engine, **route,
                     "reason": "route_ready" if allowed else "route_not_live_enabled"})
+
+
+
+# -----------------------------------------------------------------------------
+# CoreVault owner-admin action preparation
+# Pure-Python Ethereum ABI/Keccak helpers keep admin encoding out of the browser
+# and avoid any dependency on ethers/web3/Alchemy SDK bundles.
+# -----------------------------------------------------------------------------
+
+_KECCAK_RC = (
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A,
+    0x8000000080008000, 0x000000000000808B, 0x0000000080000001,
+    0x8000000080008081, 0x8000000000008009, 0x000000000000008A,
+    0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089,
+    0x8000000000008003, 0x8000000000008002, 0x8000000000000080,
+    0x000000000000800A, 0x800000008000000A, 0x8000000080008081,
+    0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+)
+_KECCAK_RHO = (
+    (0, 36, 3, 41, 18),
+    (1, 44, 10, 45, 2),
+    (62, 6, 43, 15, 61),
+    (28, 55, 25, 21, 56),
+    (27, 20, 39, 8, 14),
+)
+_U64_MASK = (1 << 64) - 1
+
+
+def _rol64(value: int, shift: int) -> int:
+    shift %= 64
+    if shift == 0:
+        return value & _U64_MASK
+    return ((value << shift) | (value >> (64 - shift))) & _U64_MASK
+
+
+def _keccak_f1600(state: list[int]) -> None:
+    for rc in _KECCAK_RC:
+        c = [state[x] ^ state[x + 5] ^ state[x + 10] ^ state[x + 15] ^ state[x + 20] for x in range(5)]
+        d = [c[(x - 1) % 5] ^ _rol64(c[(x + 1) % 5], 1) for x in range(5)]
+        for x in range(5):
+            for y in range(5):
+                state[x + 5 * y] ^= d[x]
+        b = [0] * 25
+        for x in range(5):
+            for y in range(5):
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = _rol64(state[x + 5 * y], _KECCAK_RHO[x][y])
+        for x in range(5):
+            for y in range(5):
+                state[x + 5 * y] = b[x + 5 * y] ^ ((~b[(x + 1) % 5 + 5 * y]) & b[(x + 2) % 5 + 5 * y])
+        state[0] ^= rc
+
+
+def _keccak256(data: bytes) -> bytes:
+    rate = 136
+    padded = bytearray(data)
+    padded.append(0x01)  # Ethereum Keccak padding, not SHA3 padding.
+    while len(padded) % rate != rate - 1:
+        padded.append(0)
+    padded.append(0x80)
+    state = [0] * 25
+    for offset in range(0, len(padded), rate):
+        block = padded[offset:offset + rate]
+        for i in range(rate // 8):
+            state[i] ^= int.from_bytes(block[i * 8:(i + 1) * 8], 'little')
+        _keccak_f1600(state)
+    out = bytearray()
+    while len(out) < 32:
+        for i in range(rate // 8):
+            out.extend(state[i].to_bytes(8, 'little'))
+            if len(out) >= 32:
+                return bytes(out[:32])
+        _keccak_f1600(state)
+    return bytes(out[:32])
+
+
+def _abi_word_uint(value: int, bits: int = 256) -> bytes:
+    value = int(value)
+    if value < 0 or value >= 1 << bits:
+        raise ValueError(f'uint{bits} out of range')
+    return value.to_bytes(32, 'big')
+
+
+def _abi_word_bool(value: object) -> bytes:
+    return _abi_word_uint(1 if bool(value) else 0, 8)
+
+
+def _abi_word_address(value: str) -> bytes:
+    value = str(value or '').strip()
+    if not re.fullmatch(r'0x[0-9a-fA-F]{40}', value):
+        raise ValueError('invalid address')
+    return bytes.fromhex(value[2:]).rjust(32, b'\x00')
+
+
+def _abi_word_bytes_fixed(value: str, size: int) -> bytes:
+    value = str(value or '').strip()
+    if not re.fullmatch(r'0x[0-9a-fA-F]{%d}' % (size * 2), value):
+        raise ValueError(f'invalid bytes{size}')
+    return bytes.fromhex(value[2:]).ljust(32, b'\x00')
+
+
+def _abi_dynamic_string(value: str) -> bytes:
+    raw = str(value).encode('utf-8')
+    return _abi_word_uint(len(raw)) + raw + (b'\x00' * ((32 - len(raw) % 32) % 32))
+
+
+def _function_selector(signature: str) -> bytes:
+    return _keccak256(signature.encode('ascii'))[:4]
+
+
+def _encode_token_admin_payload(body: dict) -> dict:
+    token = str(body.get('token') or '').strip()
+    cfg = body.get('cfg') if isinstance(body.get('cfg'), dict) else body
+    values = [
+        bool(cfg.get('configured')),
+        bool(cfg.get('depositEnabled')),
+        bool(cfg.get('withdrawEnabled')),
+        bool(cfg.get('executionEnabled')),
+        bool(cfg.get('paymentEnabled')),
+        bool(cfg.get('settlementToken')),
+        int(cfg.get('decimals', 0)),
+        int(str(cfg.get('maxSingleDeposit', '0'))),
+        int(str(cfg.get('maxSessionBudget', '0'))),
+        int(str(cfg.get('profitThreshold', '0'))),
+    ]
+    if not values[0] or values[6] > 30:
+        raise ValueError('invalid token configuration')
+    tuple_words = b''.join([
+        _abi_word_bool(values[0]), _abi_word_bool(values[1]), _abi_word_bool(values[2]),
+        _abi_word_bool(values[3]), _abi_word_bool(values[4]), _abi_word_bool(values[5]),
+        _abi_word_uint(values[6], 8), _abi_word_uint(values[7], 128),
+        _abi_word_uint(values[8], 128), _abi_word_uint(values[9], 128),
+    ])
+    token_word = _abi_word_address(token)
+    action_encoded = _abi_word_uint(12 * 32) + token_word + tuple_words + _abi_dynamic_string('TOKEN')
+    action_hash = _keccak256(action_encoded)
+    configure_args = token_word + tuple_words
+    execute_data = _function_selector('configureToken(address,(bool,bool,bool,bool,bool,bool,uint8,uint128,uint128,uint128))') + configure_args
+    return {
+        'action': 'token',
+        'actionHash': '0x' + action_hash.hex(),
+        'executeCalldata': '0x' + execute_data.hex(),
+        'normalized': {
+            'token': token,
+            'cfg': {
+                'configured': values[0], 'depositEnabled': values[1], 'withdrawEnabled': values[2],
+                'executionEnabled': values[3], 'paymentEnabled': values[4], 'settlementToken': values[5],
+                'decimals': values[6], 'maxSingleDeposit': str(values[7]),
+                'maxSessionBudget': str(values[8]), 'profitThreshold': str(values[9]),
+            },
+        },
+    }
+
+
+def _encode_route_admin_payload(body: dict) -> dict:
+    route_id = str(body.get('routeId') or '').strip()
+    cfg = body.get('cfg') if isinstance(body.get('cfg'), dict) else body
+    if not re.fullmatch(r'0x[0-9a-fA-F]{64}', route_id) or int(route_id, 16) == 0:
+        raise ValueError('invalid routeId')
+    enabled = bool(cfg.get('enabled'))
+    kind = int(cfg.get('kind', 0))
+    target = str(cfg.get('target') or '').strip()
+    oracle = str(cfg.get('oracle') or '').strip()
+    token_in = str(cfg.get('tokenIn') or '').strip()
+    token_out = str(cfg.get('tokenOut') or '').strip()
+    selector = str(cfg.get('selector') or '').strip()
+    tuple_words = b''.join([
+        _abi_word_bool(enabled), _abi_word_uint(kind, 8), _abi_word_address(target),
+        _abi_word_address(oracle), _abi_word_address(token_in), _abi_word_address(token_out),
+        _abi_word_bytes_fixed(selector, 4),
+    ])
+    route_word = _abi_word_bytes_fixed(route_id, 32)
+    action_encoded = _abi_word_uint(9 * 32) + route_word + tuple_words + _abi_dynamic_string('ROUTE')
+    action_hash = _keccak256(action_encoded)
+    execute_data = _function_selector('configureRoute(bytes32,(bool,uint8,address,address,address,address,bytes4))') + route_word + tuple_words
+    return {
+        'action': 'route',
+        'actionHash': '0x' + action_hash.hex(),
+        'executeCalldata': '0x' + execute_data.hex(),
+        'normalized': {
+            'routeId': route_id,
+            'cfg': {'enabled': enabled, 'kind': kind, 'target': target, 'oracle': oracle,
+                    'tokenIn': token_in, 'tokenOut': token_out, 'selector': selector},
+        },
+    }
+
+
+def _encode_address_admin_payload(action: str, body: dict) -> dict:
+    methods = {
+        'guardian': ('setGuardian(address)', 'guardian'),
+        'revenueWallet': ('setRevenueWallet(address)', 'revenueWallet'),
+        'liquidityDestination': ('setLiquidityDestination(address)', 'liquidityDestination'),
+    }
+    if action not in methods:
+        raise ValueError('unsupported address admin action')
+    signature, key = methods[action]
+    value = str(body.get('value') or body.get(key) or '').strip()
+    data = _function_selector(signature) + _abi_word_address(value)
+    return {'action': action, 'executeCalldata': '0x' + data.hex(), 'normalized': {'value': value}}
+
+
+@app.post('/api/nexus/core-vault/admin/prepare-action')
+def api_nexus_core_vault_admin_prepare_action():
+    body = request.get_json(silent=True) or {}
+    action = str(body.get('action') or '').strip()
+    try:
+        if action == 'token':
+            result = _encode_token_admin_payload(body)
+        elif action == 'route':
+            result = _encode_route_admin_payload(body)
+        elif action in {'guardian', 'revenueWallet', 'liquidityDestination'}:
+            result = _encode_address_admin_payload(action, body)
+        else:
+            return jsonify({'status': 'error', 'error': 'unsupported_action'}), 400
+        if action in {'token', 'route'}:
+            requested = int(body.get('executeAfter') or 0)
+            minimum = int(time.time()) + 3600
+            execute_after = max(requested, minimum + 60)
+            schedule_args = bytes.fromhex(result['actionHash'][2:]) + _abi_word_uint(execute_after, 48)
+            schedule_data = _function_selector('scheduleAction(bytes32,uint48)') + schedule_args
+            result['executeAfter'] = execute_after
+            result['scheduleCalldata'] = '0x' + schedule_data.hex()
+        return jsonify({'status': 'ok', 'abiVersion': NEXUS_CORE_VAULT_ABI_VERSION,
+                        'contractAddress': _CORE_VAULT_ADDRESS_BY_CHAIN.get(1, ''), **result})
+    except (TypeError, ValueError, OverflowError) as exc:
+        return jsonify({'status': 'error', 'error': str(exc)}), 400
 
 
 @app.get("/api/nexus/core-vault/abi")
