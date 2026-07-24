@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-156-CENTRAL-RPC-FAILOVER-DEPENDENCY-SAFE"
+BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-157-VERIFIED-VAULT-ADDRESS-RPC-SAFE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -7081,8 +7081,11 @@ _USDT_BY_CHAIN = {
 # Nexus Core Vault registry. One audited Core Vault implementation is deployed
 # separately on every enabled EVM chain. Old VAULT_ADDRESS_* names remain as a
 # migration fallback so current deployments do not break while addresses change.
+# Ethereum CoreVault is already deployed and verified. Do not allow a stale Render
+# environment variable to silently redirect reads/writes to an older contract.
+_VERIFIED_CORE_VAULT_ETH = "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1"
 _VAULT_BY_CHAIN = {
-    1: (os.getenv("CORE_VAULT_ADDRESS_ETH") or os.getenv("CORE_VAULT_ADDRESS_1") or "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1").strip(),
+    1: _VERIFIED_CORE_VAULT_ETH,
     56: (os.getenv("CORE_VAULT_ADDRESS_BNB") or os.getenv("CORE_VAULT_ADDRESS_56") or os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
     137: (os.getenv("CORE_VAULT_ADDRESS_POL") or os.getenv("CORE_VAULT_ADDRESS_POLYGON") or os.getenv("CORE_VAULT_ADDRESS_137") or os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
 }
@@ -15356,6 +15359,10 @@ def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dic
         return {**base, "status": "rpc_missing", "error": "RPC is not configured"}
 
     try:
+        # Fail early with a precise message if the configured address is not a contract.
+        code = _rpc_call(cid, "eth_getCode", [vault, "latest"])
+        if not isinstance(code, str) or code.lower() in ("0x", "0x0", "0x00"):
+            raise RuntimeError(f"no contract bytecode at {vault}")
         paused = bool((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
         profit_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["profitFeeBps"])) or [0])[0])
         liquidity_share = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityShareBps"])) or [0])[0])
