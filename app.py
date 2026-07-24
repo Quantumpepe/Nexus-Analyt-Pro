@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.16-ENGINE-152-PRIVY-VAULT-COMPATIBILITY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-154-COREVAULT-V3-NKR-VAULT-INTEGRATION"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -195,10 +195,14 @@ NEXUS_CAPITAL_CORE_MODE = "STABLECOIN_CAPITAL_CORE_V1"
 NEXUS_DEFAULT_CAPITAL_STATE = "USDC_USDT"
 NEXUS_TOKEN_POSITION_POLICY = "TOKEN_ONLY_DURING_ACTIVE_TRADE"
 NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_USDT_UNLESS_USER_REQUESTS_ORIGINAL_ASSET"
-NEXUS_CORE_VAULT_ABI_VERSION = "NEXUS_CORE_VAULT_ABI_V1"
-# Canonical verified NexusCoreVault ABI. Same ABI is used for every deployment
-# of this exact bytecode on supported EVM chains.
-NEXUS_CORE_VAULT_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"initialAdmin","type":"address"},{"internalType":"address","name":"initialLiquidityTreasury","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"AccessControlBadConfirmation","type":"error"},{"inputs":[{"internalType":"uint48","name":"schedule","type":"uint48"}],"name":"AccessControlEnforcedDefaultAdminDelay","type":"error"},{"inputs":[],"name":"AccessControlEnforcedDefaultAdminRules","type":"error"},{"inputs":[{"internalType":"address","name":"defaultAdmin","type":"address"}],"name":"AccessControlInvalidDefaultAdmin","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"},{"internalType":"bytes32","name":"neededRole","type":"bytes32"}],"name":"AccessControlUnauthorizedAccount","type":"error"},{"inputs":[{"internalType":"uint256","name":"limit","type":"uint256"},{"internalType":"uint256","name":"requestedTotal","type":"uint256"}],"name":"DailyWithdrawLimitExceeded","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"DepositDisabled","type":"error"},{"inputs":[],"name":"EnforcedPause","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"ExecutionDisabled","type":"error"},{"inputs":[{"internalType":"uint256","name":"limit","type":"uint256"},{"internalType":"uint256","name":"requestedExposure","type":"uint256"}],"name":"ExecutorLimitExceeded","type":"error"},{"inputs":[],"name":"ExpectedPause","type":"error"},{"inputs":[{"internalType":"uint256","name":"exposure","type":"uint256"},{"internalType":"uint256","name":"requestedClose","type":"uint256"}],"name":"ExposureTooLow","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"assets","type":"uint256"},{"internalType":"uint256","name":"obligations","type":"uint256"}],"name":"Insolvent","type":"error"},{"inputs":[{"internalType":"uint256","name":"available","type":"uint256"},{"internalType":"uint256","name":"requested","type":"uint256"}],"name":"InsufficientProtocolReserve","type":"error"},{"inputs":[{"internalType":"uint256","name":"available","type":"uint256"},{"internalType":"uint256","name":"requested","type":"uint256"}],"name":"InsufficientSecuredProfit","type":"error"},{"inputs":[{"internalType":"uint256","name":"available","type":"uint256"},{"internalType":"uint256","name":"requested","type":"uint256"}],"name":"InsufficientUnallocatedBase","type":"error"},{"inputs":[{"internalType":"uint16","name":"liquidityBps","type":"uint16"},{"internalType":"uint16","name":"reserveBps","type":"uint16"}],"name":"InvalidFeeSplit","type":"error"},{"inputs":[{"internalType":"uint16","name":"payoutBps","type":"uint16"}],"name":"InvalidPayoutBps","type":"error"},{"inputs":[{"internalType":"uint32","name":"intervalSeconds","type":"uint32"}],"name":"InvalidPayoutInterval","type":"error"},{"inputs":[{"internalType":"uint256","name":"baseCapital","type":"uint256"},{"internalType":"uint256","name":"loss","type":"uint256"}],"name":"LossExceedsBaseCapital","type":"error"},{"inputs":[],"name":"NativeAssetNotAccepted","type":"error"},{"inputs":[{"internalType":"uint256","name":"minimum","type":"uint256"},{"internalType":"uint256","name":"calculated","type":"uint256"}],"name":"PayoutBelowMinimum","type":"error"},{"inputs":[],"name":"PayoutNotDue","type":"error"},{"inputs":[],"name":"ReentrancyGuardReentrantCall","type":"error"},{"inputs":[{"internalType":"uint8","name":"bits","type":"uint8"},{"internalType":"uint256","name":"value","type":"uint256"}],"name":"SafeCastOverflowedUintDowncast","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},{"inputs":[{"internalType":"uint256","name":"limit","type":"uint256"},{"internalType":"uint256","name":"requested","type":"uint256"}],"name":"SingleWithdrawLimitExceeded","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SupportedAssetCannotBeRescued","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"UnsupportedTransferBehavior","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"WithdrawDisabled","type":"error"},{"inputs":[],"name":"ZeroAddress","type":"error"},{"inputs":[],"name":"ZeroAmount","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"eligibleNewProfit","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"grossPayout","type":"uint256"}],"name":"AutomaticPayoutExecuted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"executor","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVault.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"CapitalReleased","type":"event"},{"anonymous":false,"inputs":[],"name":"DefaultAdminDelayChangeCanceled","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint48","name":"newDelay","type":"uint48"},{"indexed":false,"internalType":"uint48","name":"effectSchedule","type":"uint48"}],"name":"DefaultAdminDelayChangeScheduled","type":"event"},{"anonymous":false,"inputs":[],"name":"DefaultAdminTransferCanceled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"newAdmin","type":"address"},{"indexed":false,"internalType":"uint48","name":"acceptSchedule","type":"uint48"}],"name":"DefaultAdminTransferScheduled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Deposited","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"executor","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVault.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"uint256","name":"principalClosed","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountReturned","type":"uint256"},{"indexed":false,"internalType":"int256","name":"netPnl","type":"int256"}],"name":"ExecutionSettled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"executor","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"limit","type":"uint256"}],"name":"ExecutorLimitUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint16","name":"liquidityFeeBps","type":"uint16"},{"indexed":false,"internalType":"uint16","name":"reserveFeeBps","type":"uint16"}],"name":"FeeSplitUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"oldTreasury","type":"address"},{"indexed":true,"internalType":"address","name":"newTreasury","type":"address"}],"name":"LiquidityTreasuryUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Paused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"bool","name":"enabled","type":"bool"},{"indexed":false,"internalType":"enum NexusCoreVault.PayoutMode","name":"mode","type":"uint8"},{"indexed":false,"internalType":"uint16","name":"payoutBps","type":"uint16"},{"indexed":false,"internalType":"uint32","name":"intervalSeconds","type":"uint32"},{"indexed":false,"internalType":"uint256","name":"minimumGrossAmount","type":"uint256"},{"indexed":false,"internalType":"address","name":"recipient","type":"address"}],"name":"PayoutConfigUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"ProtocolReserveSpent","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"role","type":"bytes32"},{"indexed":true,"internalType":"bytes32","name":"previousAdminRole","type":"bytes32"},{"indexed":true,"internalType":"bytes32","name":"newAdminRole","type":"bytes32"}],"name":"RoleAdminChanged","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"role","type":"bytes32"},{"indexed":true,"internalType":"address","name":"account","type":"address"},{"indexed":true,"internalType":"address","name":"sender","type":"address"}],"name":"RoleGranted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"role","type":"bytes32"},{"indexed":true,"internalType":"address","name":"account","type":"address"},{"indexed":true,"internalType":"address","name":"sender","type":"address"}],"name":"RoleRevoked","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"SecuredProfitReinvested","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"bool","name":"depositEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"executionEnabled","type":"bool"}],"name":"TokenConfigUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Unpaused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"UnsupportedTokenRescued","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"maxSingleAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"maxDailyAmount","type":"uint256"}],"name":"WithdrawLimitsUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVault.WithdrawalSource","name":"source","type":"uint8"},{"indexed":false,"internalType":"uint256","name":"grossAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"netAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"liquidityFee","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"reserveFee","type":"uint256"}],"name":"Withdrawn","type":"event"},{"stateMutability":"payable","type":"fallback"},{"inputs":[],"name":"BPS_DENOMINATOR","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"DEFAULT_ADMIN_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"EXECUTOR_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"FEE_MANAGER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"LIMIT_MANAGER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"PAUSER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"PAYOUT_KEEPER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"RESERVE_MANAGER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"TOKEN_MANAGER_ROLE","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"TOTAL_WITHDRAW_FEE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"acceptDefaultAdminTransfer","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"accountOf","outputs":[{"components":[{"internalType":"uint256","name":"baseCapital","type":"uint256"},{"internalType":"uint256","name":"securedNkrProfit","type":"uint256"},{"internalType":"uint256","name":"securedTraderProfit","type":"uint256"},{"internalType":"uint256","name":"securedGridProfit","type":"uint256"},{"internalType":"uint256","name":"allocatedNkr","type":"uint256"},{"internalType":"uint256","name":"allocatedTrader","type":"uint256"},{"internalType":"uint256","name":"allocatedGrid","type":"uint256"}],"internalType":"struct NexusCoreVault.Account","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVault.WithdrawalSource","name":"source","type":"uint8"}],"name":"availableForWithdrawal","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newAdmin","type":"address"}],"name":"beginDefaultAdminTransfer","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"cancelDefaultAdminTransfer","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint48","name":"newDelay","type":"uint48"}],"name":"changeDefaultAdminDelay","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"dailyWithdrawn","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"defaultAdmin","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"defaultAdminDelay","outputs":[{"internalType":"uint48","name":"","type":"uint48"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"defaultAdminDelayIncreaseWait","outputs":[{"internalType":"uint48","name":"","type":"uint48"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"executeAutomaticPayout","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"executor","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVault.SystemId","name":"system","type":"uint8"}],"name":"executorExposure","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"executor","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"executorLimit","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"role","type":"bytes32"}],"name":"getRoleAdmin","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"role","type":"bytes32"},{"internalType":"address","name":"account","type":"address"}],"name":"grantRole","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"role","type":"bytes32"},{"internalType":"address","name":"account","type":"address"}],"name":"hasRole","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"liquidityFeeBps","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"liquidityTreasury","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"maxDailyWithdraw","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"maxSingleWithdraw","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"paused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"payoutConfigOf","outputs":[{"components":[{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVault.PayoutMode","name":"mode","type":"uint8"},{"internalType":"uint16","name":"payoutBps","type":"uint16"},{"internalType":"uint32","name":"intervalSeconds","type":"uint32"},{"internalType":"uint64","name":"lastPayoutAt","type":"uint64"},{"internalType":"uint256","name":"minimumGrossAmount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"internalType":"struct NexusCoreVault.PayoutConfig","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"payoutPending","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pendingDefaultAdmin","outputs":[{"internalType":"address","name":"newAdmin","type":"address"},{"internalType":"uint48","name":"schedule","type":"uint48"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pendingDefaultAdminDelay","outputs":[{"internalType":"uint48","name":"newDelay","type":"uint48"},{"internalType":"uint48","name":"schedule","type":"uint48"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"protocolReserve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVault.SystemId","name":"system","type":"uint8"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"pullForExecution","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"reinvestSecuredProfit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"role","type":"bytes32"},{"internalType":"address","name":"account","type":"address"}],"name":"renounceRole","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"rescueUnsupportedToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"reserveFeeBps","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVault.SystemId","name":"system","type":"uint8"},{"internalType":"uint256","name":"principalClosed","type":"uint256"},{"internalType":"uint256","name":"amountReturned","type":"uint256"}],"name":"returnFromExecution","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"role","type":"bytes32"},{"internalType":"address","name":"account","type":"address"}],"name":"revokeRole","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"rollbackDefaultAdminDelay","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"executor","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"limit","type":"uint256"}],"name":"setExecutorLimit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint16","name":"newLiquidityFeeBps","type":"uint16"},{"internalType":"uint16","name":"newReserveFeeBps","type":"uint16"}],"name":"setFeeSplit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newTreasury","type":"address"}],"name":"setLiquidityTreasury","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVault.PayoutMode","name":"mode","type":"uint8"},{"internalType":"uint16","name":"payoutBps","type":"uint16"},{"internalType":"uint32","name":"intervalSeconds","type":"uint32"},{"internalType":"uint256","name":"minimumGrossAmount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"setPayoutConfig","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"}],"name":"setTokenConfig","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"newMaxSingleWithdraw","type":"uint256"},{"internalType":"uint256","name":"newMaxDailyWithdraw","type":"uint256"}],"name":"setWithdrawLimits","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"solvency","outputs":[{"internalType":"uint256","name":"assets","type":"uint256"},{"internalType":"uint256","name":"obligations","type":"uint256"},{"internalType":"bool","name":"solvent","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"spendProtocolReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes4","name":"interfaceId","type":"bytes4"}],"name":"supportsInterface","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"tokenConfig","outputs":[{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"totalAllocated","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"totalExternalExposure","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"totalSecuredProfit","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"totalUserLiability","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"unallocatedBase","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"unpause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"grossAmount","type":"uint256"},{"internalType":"enum NexusCoreVault.WithdrawalSource","name":"source","type":"uint8"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdraw","outputs":[],"stateMutability":"nonpayable","type":"function"},{"stateMutability":"payable","type":"receive"}]')
+NEXUS_CORE_VAULT_ABI_VERSION = "NEXUS_CORE_VAULT_V3_SLIM_ABI_V1"
+# Canonical verified NexusCoreVaultV3Slim ABI for the deployed Ethereum CoreVault.
+NEXUS_CORE_VAULT_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"initialOwner","type":"address"},{"internalType":"address","name":"initialGuardian","type":"address"},{"internalType":"address","name":"initialRevenueWallet","type":"address"},{"internalType":"address","name":"initialLiquidityDestination","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"EnforcedPause","type":"error"},{"inputs":[],"name":"ExpectedPause","type":"error"},{"inputs":[],"name":"InsufficientBalance","type":"error"},{"inputs":[],"name":"InvalidConfig","type":"error"},{"inputs":[],"name":"InvalidState","type":"error"},{"inputs":[],"name":"LimitExceeded","type":"error"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},{"inputs":[],"name":"ReentrancyGuardReentrantCall","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},{"inputs":[],"name":"TooEarly","type":"error"},{"inputs":[],"name":"Unauthorized","type":"error"},{"inputs":[],"name":"UnsafeExecution","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"actionHash","type":"bytes32"},{"indexed":false,"internalType":"uint48","name":"executeAfter","type":"uint48"}],"name":"ActionScheduled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"BaseWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Deposited","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"guardian","type":"address"}],"name":"GuardianUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"destination","type":"address"}],"name":"LiquidityDestinationUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"LiquidityReserveSettled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"loss","type":"uint256"}],"name":"LossRealized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"OwnerReserveWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferStarted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Paused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"grossProfitBatch","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"liquidityAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"ownerAmount","type":"uint256"}],"name":"ProfitFeeAllocated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"grossProfit","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"netProfit","type":"uint256"}],"name":"ProfitRealized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"uint256","name":"gross","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"net","type":"uint256"}],"name":"ProfitWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"wallet","type":"address"}],"name":"RevenueWalletUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"target","type":"address"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"address","name":"tokenOut","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"}],"name":"RouteConfigured","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"address","name":"settlementToken","type":"address"},{"indexed":false,"internalType":"uint256","name":"budget","type":"uint256"},{"indexed":false,"internalType":"uint64","name":"endsAt","type":"uint64"}],"name":"SessionCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"returnedBase","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"securedProfit","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"realizedLoss","type":"uint256"}],"name":"SessionFinalized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.SessionStatus","name":"status","type":"uint8"}],"name":"SessionStatusChanged","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"bytes32","name":"planId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"},{"indexed":false,"internalType":"address","name":"revenueWallet","type":"address"}],"name":"SubscriptionPaid","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"bool","name":"depositEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"executionEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"paymentEnabled","type":"bool"}],"name":"TokenConfigured","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"address","name":"tokenOut","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"TradeExecuted","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Unpaused","type":"event"},{"inputs":[],"name":"BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"LIQUIDITY_SHARE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SESSION_DURATION","outputs":[{"internalType":"uint32","name":"","type":"uint32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SESSION_ROUTES","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SLIPPAGE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"OWNER_SHARE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"PROFIT_FEE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"acceptOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"accountOf","outputs":[{"components":[{"internalType":"uint128","name":"baseCapital","type":"uint128"},{"internalType":"uint128","name":"securedNkrProfit","type":"uint128"},{"internalType":"uint128","name":"securedTraderProfit","type":"uint128"},{"internalType":"uint128","name":"securedGridProfit","type":"uint128"},{"internalType":"uint128","name":"allocatedNkr","type":"uint128"},{"internalType":"uint128","name":"allocatedTrader","type":"uint128"},{"internalType":"uint128","name":"allocatedGrid","type":"uint128"},{"internalType":"uint128","name":"lifetimeRealizedProfit","type":"uint128"},{"internalType":"uint128","name":"unchargedProfit","type":"uint128"},{"internalType":"bool","name":"feeActivated","type":"bool"}],"internalType":"struct NexusCoreVaultV3Slim.Account","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"components":[{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"},{"internalType":"address","name":"target","type":"address"},{"internalType":"address","name":"oracle","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"bytes4","name":"selector","type":"bytes4"}],"internalType":"struct NexusCoreVaultV3Slim.RouteConfig","name":"cfg","type":"tuple"}],"name":"configureRoute","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"components":[{"internalType":"bool","name":"configured","type":"bool"},{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"},{"internalType":"bool","name":"paymentEnabled","type":"bool"},{"internalType":"bool","name":"settlementToken","type":"bool"},{"internalType":"uint8","name":"decimals","type":"uint8"},{"internalType":"uint128","name":"maxSingleDeposit","type":"uint128"},{"internalType":"uint128","name":"maxSessionBudget","type":"uint128"},{"internalType":"uint128","name":"profitThreshold","type":"uint128"}],"internalType":"struct NexusCoreVaultV3Slim.TokenConfig","name":"cfg","type":"tuple"}],"name":"configureToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"address","name":"settlementToken","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"uint128","name":"budget","type":"uint128"},{"internalType":"uint32","name":"duration","type":"uint32"},{"internalType":"uint16","name":"maxSlippageBps","type":"uint16"},{"internalType":"uint16","name":"maxLossBps","type":"uint16"}],"internalType":"struct NexusCoreVaultV3Slim.SessionRequest","name":"r","type":"tuple"},{"internalType":"bytes32[]","name":"allowedRoutes","type":"bytes32[]"}],"name":"createSession","outputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"routeId","type":"bytes32"}],"name":"disableRoute","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"disableToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minAmountOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"internalType":"struct NexusCoreVaultV3Slim.TradeRequest","name":"t","type":"tuple"}],"name":"executeTrade","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"finalizeSession","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"flushLiquidityReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"freeBase","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"guardian","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"liquidityDestination","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"liquidityReserve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"nextSessionId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"ownerReserve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"paused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bytes32","name":"planId","type":"bytes32"}],"name":"paySubscription","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"pendingAction","outputs":[{"internalType":"uint48","name":"executeAfter","type":"uint48"},{"internalType":"bool","name":"exists","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pendingOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"address","name":"token","type":"address"}],"name":"positionOf","outputs":[{"components":[{"internalType":"uint128","name":"amount","type":"uint128"},{"internalType":"uint128","name":"costBasis","type":"uint128"}],"internalType":"struct NexusCoreVaultV3Slim.Position","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"revenueWallet","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"routeConfig","outputs":[{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"},{"internalType":"address","name":"target","type":"address"},{"internalType":"address","name":"oracle","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"bytes4","name":"selector","type":"bytes4"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"actionHash","type":"bytes32"},{"internalType":"uint48","name":"executeAfter","type":"uint48"}],"name":"scheduleAction","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"sessionOf","outputs":[{"components":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"settlementToken","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"enum NexusCoreVaultV3Slim.SessionStatus","name":"status","type":"uint8"},{"internalType":"uint64","name":"startsAt","type":"uint64"},{"internalType":"uint64","name":"endsAt","type":"uint64"},{"internalType":"uint16","name":"maxSlippageBps","type":"uint16"},{"internalType":"uint16","name":"maxLossBps","type":"uint16"},{"internalType":"uint128","name":"budget","type":"uint128"},{"internalType":"uint128","name":"settlementCash","type":"uint128"},{"internalType":"uint128","name":"realizedProfit","type":"uint128"},{"internalType":"uint128","name":"realizedLoss","type":"uint128"},{"internalType":"uint16","name":"openAssetCount","type":"uint16"}],"internalType":"struct NexusCoreVaultV3Slim.Session","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"sessionRouteAllowed","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setGuardian","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setLiquidityDestination","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setRevenueWallet","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"bool","name":"value","type":"bool"}],"name":"setSessionPaused","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bytes32","name":"planId","type":"bytes32"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"setSubscriptionPrice","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"settleLiquidityReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"solvency","outputs":[{"internalType":"uint256","name":"assets","type":"uint256"},{"internalType":"uint256","name":"obligations","type":"uint256"},{"internalType":"bool","name":"solvent","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"startClosing","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"subscriptionPrice","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"tokenConfig","outputs":[{"internalType":"bool","name":"configured","type":"bool"},{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"},{"internalType":"bool","name":"paymentEnabled","type":"bool"},{"internalType":"bool","name":"settlementToken","type":"bool"},{"internalType":"uint8","name":"decimals","type":"uint8"},{"internalType":"uint128","name":"maxSingleDeposit","type":"uint128"},{"internalType":"uint128","name":"maxSessionBudget","type":"uint128"},{"internalType":"uint128","name":"profitThreshold","type":"uint128"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"totalPositionCostBasis","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"totalUserLiability","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"unpause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawBase","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawOwnerReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawProfit","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION = "NEXUS_NKR_LIQUIDITY_VAULT_ABI_V1"
+# Canonical verified ABI for the deployed Ethereum NKR liquidity vault.
+NEXUS_NKR_LIQUIDITY_VAULT_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"initialOwner","type":"address"},{"internalType":"address","name":"initialOperator","type":"address"},{"internalType":"address","name":"nkrToken","type":"address"},{"internalType":"address","name":"wethToken","type":"address"},{"internalType":"address","name":"usdcToken","type":"address"},{"internalType":"address","name":"usdtToken","type":"address"},{"internalType":"address","name":"swapRouter","type":"address"},{"internalType":"address","name":"nftPositionManager","type":"address"},{"internalType":"uint24","name":"nkrWethPoolFee","type":"uint24"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"BelowThreshold","type":"error"},{"inputs":[],"name":"EnforcedPause","type":"error"},{"inputs":[],"name":"ExpectedPause","type":"error"},{"inputs":[],"name":"InvalidConfig","type":"error"},{"inputs":[],"name":"InvalidState","type":"error"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},{"inputs":[],"name":"ProtectedAsset","type":"error"},{"inputs":[],"name":"ReentrancyGuardReentrantCall","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},{"inputs":[],"name":"Unauthorized","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"ethSide","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"buybackSide","type":"uint256"}],"name":"LiquidityFundingReceived","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethAmount","type":"uint256"},{"indexed":false,"internalType":"uint128","name":"liquidity","type":"uint128"}],"name":"LockedPositionIncreased","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethAmount","type":"uint256"},{"indexed":false,"internalType":"uint128","name":"liquidity","type":"uint128"}],"name":"LockedPositionMinted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrOut","type":"uint256"}],"name":"NkrBoughtBack","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"bytes32","name":"planId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"NkrSubscriptionPaid","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"operator","type":"address"}],"name":"OperatorUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"OriginalReserveFunded","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferStarted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Paused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount0","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount1","type":"uint256"}],"name":"PositionFeesCollected","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethOut","type":"uint256"}],"name":"StableConvertedToWeth","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Unpaused","type":"event"},{"inputs":[],"name":"USD_100_E18","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"USD_50_E18","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"acceptOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minWethOut","type":"uint256"},{"internalType":"uint256","name":"minNkrOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"buyBackNkr","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"buybackStable","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"collectPositionFees","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minWethOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"convertStableToWeth","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"ethSideStable","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"fundOriginalReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint256","name":"nkrDesired","type":"uint256"},{"internalType":"uint256","name":"wethDesired","type":"uint256"},{"internalType":"uint256","name":"nkrMin","type":"uint256"},{"internalType":"uint256","name":"wethMin","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"increaseLockedPosition","outputs":[{"internalType":"uint128","name":"liquidity","type":"uint128"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"lockedPosition","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint256","name":"nkrDesired","type":"uint256"},{"internalType":"uint256","name":"wethDesired","type":"uint256"},{"internalType":"uint256","name":"nkrMin","type":"uint256"},{"internalType":"uint256","name":"wethMin","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"mintLockedPosition","outputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint128","name":"liquidity","type":"uint128"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"nkr","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"nkrSubscriptionPrice","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes","name":"","type":"bytes"}],"name":"onERC721Received","outputs":[{"internalType":"bytes4","name":"","type":"bytes4"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"operator","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"originalReserveFunded","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"originalReserveRemaining","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"paused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"planId","type":"bytes32"}],"name":"payNkrSubscription","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"pendingOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"poolFee","outputs":[{"internalType":"uint24","name":"","type":"uint24"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"positionIds","outputs":[{"internalType":"uint256[]","name":"","type":"uint256[]"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"positionManager","outputs":[{"internalType":"contract INonfungiblePositionManager","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"receiveLiquidityFunding","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"rescueUnsupportedToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"router","outputs":[{"internalType":"contract ISwapRouterV3","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"planId","type":"bytes32"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"setNkrSubscriptionPrice","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setOperator","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"}],"name":"setSwapFee","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"}],"name":"swapFee","outputs":[{"internalType":"uint24","name":"","type":"uint24"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"unpause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"usdc","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"usdt","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"weth","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
+NEXUS_CORE_VAULT_CONTRACT_NAME = "NexusCoreVaultV3Slim"
+NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME = "NexusNKRLiquidityVault"
 NEXUS_ASSET_ROUTER_MODE = "MULTI_EVM_EXECUTION_ASSET_ROUTER_V2"
 NEXUS_ASSET_ROUTER_ENGINES = ["GRID", "NKR", "TRADER"]
 NEXUS_ASSET_ROUTER_PUBLIC_POLICY = "USER_SEES_NATIVE_ASSET_SYMBOL_ONLY"
@@ -456,6 +460,10 @@ def api_build_info():
         "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
         "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
         "vault_core": NEXUS_VAULT_CORE_MODE,
+        "core_vault_contract": NEXUS_CORE_VAULT_CONTRACT_NAME,
+        "core_vault_abi_version": NEXUS_CORE_VAULT_ABI_VERSION,
+        "nkr_liquidity_vault_contract": NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME,
+        "nkr_liquidity_vault_abi_version": NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION,
         "vault_core_policy": NEXUS_VAULT_CORE_POLICY,
         "vault_execution_status": NEXUS_VAULT_EXECUTION_STATUS,
         "vault_core_chain": NEXUS_VAULT_CORE_CHAIN,
@@ -578,6 +586,10 @@ def api_version():
         "withdraw_unused_buffer_policy": NEXUS_WITHDRAW_UNUSED_BUFFER_POLICY,
         "withdraw_execution_status": NEXUS_WITHDRAW_EXECUTION_STATUS,
         "vault_core": NEXUS_VAULT_CORE_MODE,
+        "core_vault_contract": NEXUS_CORE_VAULT_CONTRACT_NAME,
+        "core_vault_abi_version": NEXUS_CORE_VAULT_ABI_VERSION,
+        "nkr_liquidity_vault_contract": NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME,
+        "nkr_liquidity_vault_abi_version": NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION,
         "vault_core_policy": NEXUS_VAULT_CORE_POLICY,
         "vault_execution_status": NEXUS_VAULT_EXECUTION_STATUS,
         "vault_core_chain": NEXUS_VAULT_CORE_CHAIN,
@@ -811,6 +823,19 @@ def api_nexus_asset_route_validate():
 @app.get("/api/nexus/core-vault/abi")
 def api_nexus_core_vault_abi():
     return jsonify({"status": "ok", "version": NEXUS_CORE_VAULT_ABI_VERSION, "abi": NEXUS_CORE_VAULT_ABI})
+
+
+@app.get("/api/nexus/nkr-liquidity-vault/abi")
+def api_nexus_nkr_liquidity_vault_abi():
+    return jsonify({
+        "status": "ok",
+        "version": NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION,
+        "contractName": NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME,
+        "chain": "ETH",
+        "chainId": 1,
+        "address": _NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1, ""),
+        "abi": NEXUS_NKR_LIQUIDITY_VAULT_ABI,
+    })
 
 
 @app.get("/api/nexus/asset-router/technical")
@@ -7047,9 +7072,13 @@ _USDT_BY_CHAIN = {
 # separately on every enabled EVM chain. Old VAULT_ADDRESS_* names remain as a
 # migration fallback so current deployments do not break while addresses change.
 _VAULT_BY_CHAIN = {
-    1: (os.getenv("CORE_VAULT_ADDRESS_ETH") or os.getenv("CORE_VAULT_ADDRESS_1") or os.getenv("VAULT_ADDRESS_ETH") or os.getenv("VAULT_ADDRESS_1") or "").strip(),
+    1: (os.getenv("CORE_VAULT_ADDRESS_ETH") or os.getenv("CORE_VAULT_ADDRESS_1") or "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1").strip(),
     56: (os.getenv("CORE_VAULT_ADDRESS_BNB") or os.getenv("CORE_VAULT_ADDRESS_56") or os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
     137: (os.getenv("CORE_VAULT_ADDRESS_POL") or os.getenv("CORE_VAULT_ADDRESS_POLYGON") or os.getenv("CORE_VAULT_ADDRESS_137") or os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
+}
+
+_NKR_LIQUIDITY_VAULT_BY_CHAIN = {
+    1: (os.getenv("NKR_LIQUIDITY_VAULT_ADDRESS_ETH") or os.getenv("NKR_LIQUIDITY_VAULT_ADDRESS_1") or "0x99a9D11313fDB43C258eedF146e02A41361A3491").strip(),
 }
 
 _EXECUTOR_BY_CHAIN = {
@@ -15142,21 +15171,25 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# Ethereum Core Vault V1 - read-only on-chain bridge
+# Ethereum CoreVaultV3Slim - read-only on-chain bridge
 # -----------------------------------------------------------------------------
-# This bridge intentionally exposes only eth_call results. It never signs, sends,
-# approves, deposits, withdraws, grants roles, or mutates the deployed Vault.
+# This bridge exposes eth_call state only. Mutating transactions remain behind
+# Privy delegated signing and explicit readiness checks.
 _CORE_VAULT_SELECTORS = {
     "paused": "0x5c975abb",
-    "totalFeeBps": "0xf1210187",
-    "liquidityFeeBps": "0x7e5689a3",
-    "reserveFeeBps": "0x65db6579",
-    "liquidityTreasury": "0xb918e5f9",
+    "profitFeeBps": "0xefedea8a",
+    "liquidityShareBps": "0x5619b144",
+    "ownerShareBps": "0xf4ed1743",
+    "guardian": "0x452a9320",
+    "revenueWallet": "0x44478425",
+    "liquidityDestination": "0x8110014d",
     "tokenConfig": "0xfe136c4e",
     "accountOf": "0x9ed55403",
+    "freeBase": "0x9973d10d",
     "solvency": "0x5d1554cd",
     "totalUserLiability": "0x173ee801",
-    "protocolReserve": "0xff9081a8",
+    "ownerReserve": "0x544ae7c7",
+    "liquidityReserve": "0xc87aab5d",
 }
 
 
@@ -15195,17 +15228,12 @@ def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dic
     vault = str(_VAULT_BY_CHAIN.get(cid) or "").strip()
     rpc_ready = bool(_rpc_url_for_chain(cid))
     base = {
-        "chain": ck,
-        "chainId": cid,
-        "wallet": wa,
-        "contractAddress": vault,
-        "configured": bool(_looks_like_evm_addr(vault)),
-        "rpcConfigured": rpc_ready,
-        "connected": False,
-        "readOnly": True,
-        "executionEnabled": False,
-        "tokens": {},
-        "ts": now_ts(),
+        "chain": ck, "chainId": cid, "wallet": wa, "contractAddress": vault,
+        "contractName": NEXUS_CORE_VAULT_CONTRACT_NAME,
+        "abiVersion": NEXUS_CORE_VAULT_ABI_VERSION,
+        "configured": bool(_looks_like_evm_addr(vault)), "rpcConfigured": rpc_ready,
+        "connected": False, "readOnly": True, "executionEnabled": False,
+        "tokens": {}, "ts": now_ts(),
     }
     if not _looks_like_evm_addr(wa):
         return {**base, "status": "error", "error": "invalid wallet"}
@@ -15216,113 +15244,90 @@ def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dic
 
     try:
         paused = bool((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
-        total_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["totalFeeBps"])) or [0])[0])
-        liquidity_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityFeeBps"])) or [0])[0])
-        reserve_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["reserveFeeBps"])) or [0])[0])
-        treasury = _core_vault_address_word(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityTreasury"]))
+        profit_fee = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["profitFeeBps"])) or [0])[0])
+        liquidity_share = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityShareBps"])) or [0])[0])
+        owner_share = int((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["ownerShareBps"])) or [0])[0])
+        guardian = _core_vault_address_word(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["guardian"]))
+        revenue_wallet = _core_vault_address_word(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["revenueWallet"]))
+        liquidity_destination = _core_vault_address_word(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityDestination"]))
     except Exception as exc:
-        return {**base, "status": "error", "error": f"Core Vault read failed: {exc}"}
+        return {**base, "status": "error", "error": f"Core Vault V3 read failed: {exc}"}
 
-    stable_specs = [
-        ("USDC", str(_USDC_BY_CHAIN.get(cid) or ""), 6),
-        ("USDT", str(_USDT_BY_CHAIN.get(cid) or ""), 6),
-    ]
-    total_base = total_secured = total_allocated = total_assets = total_liabilities = total_reserve = 0.0
+    stable_specs = [("USDC", str(_USDC_BY_CHAIN.get(cid) or ""), 6), ("USDT", str(_USDT_BY_CHAIN.get(cid) or ""), 6)]
+    totals = {"baseCapital": 0.0, "freeBase": 0.0, "securedProfit": 0.0, "allocated": 0.0, "contractAssets": 0.0, "userLiabilities": 0.0, "ownerReserve": 0.0, "liquidityReserve": 0.0}
     tokens = {}
-    for symbol, token, decimals in stable_specs:
+    for symbol, token, fallback_decimals in stable_specs:
         if not _looks_like_evm_addr(token):
             continue
-        scale = float(10 ** int(decimals))
         try:
             cfg = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token))
             acct = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["accountOf"], wa, token))
+            free_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["freeBase"], wa, token))
             solv = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["solvency"], token))
             liability_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["totalUserLiability"], token))
-            reserve_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["protocolReserve"], token))
-            cfg += [0] * (3 - len(cfg))
-            acct += [0] * (7 - len(acct))
-            solv += [0] * (3 - len(solv))
-            base_capital, secured_nkr, secured_trader, secured_grid, allocated_nkr, allocated_trader, allocated_grid = acct[:7]
-            secured = secured_nkr + secured_trader + secured_grid
-            allocated = allocated_nkr + allocated_trader + allocated_grid
-            assets = solv[0]
-            liabilities = (liability_words or [solv[1]])[0]
-            protocol_reserve = (reserve_words or [0])[0]
+            owner_reserve_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["ownerReserve"], token))
+            liquidity_reserve_words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["liquidityReserve"], token))
+            cfg += [0] * (10 - len(cfg)); acct += [0] * (10 - len(acct)); solv += [0] * (3 - len(solv))
+            decimals = int(cfg[6] or fallback_decimals); scale = float(10 ** decimals)
+            base_capital, secured_nkr, secured_trader, secured_grid, allocated_nkr, allocated_trader, allocated_grid, lifetime_profit, uncharged_profit, fee_activated = acct[:10]
+            secured = secured_nkr + secured_trader + secured_grid; allocated = allocated_nkr + allocated_trader + allocated_grid
+            assets = solv[0]; liabilities = (liability_words or [solv[1]])[0]
+            free_base = (free_words or [0])[0]; owner_reserve = (owner_reserve_words or [0])[0]; liquidity_reserve = (liquidity_reserve_words or [0])[0]
             token_state = {
-                "symbol": symbol,
-                "address": token,
-                "decimals": decimals,
+                "symbol": symbol, "address": token, "decimals": decimals,
                 "config": {
-                    "depositEnabled": bool(cfg[0]),
-                    "withdrawEnabled": bool(cfg[1]),
-                    "executionEnabled": bool(cfg[2]),
+                    "configured": bool(cfg[0]), "depositEnabled": bool(cfg[1]), "withdrawEnabled": bool(cfg[2]),
+                    "executionEnabled": bool(cfg[3]), "paymentEnabled": bool(cfg[4]), "settlementToken": bool(cfg[5]),
+                    "maxSingleDeposit": cfg[7] / scale, "maxSessionBudget": cfg[8] / scale, "profitThreshold": cfg[9] / scale,
                 },
                 "account": {
-                    "baseCapital": base_capital / scale,
-                    "securedNkrProfit": secured_nkr / scale,
-                    "securedTraderProfit": secured_trader / scale,
-                    "securedGridProfit": secured_grid / scale,
-                    "totalSecuredProfit": secured / scale,
-                    "allocatedNkr": allocated_nkr / scale,
-                    "allocatedTrader": allocated_trader / scale,
-                    "allocatedGrid": allocated_grid / scale,
-                    "totalAllocated": allocated / scale,
+                    "baseCapital": base_capital / scale, "freeBase": free_base / scale,
+                    "securedNkrProfit": secured_nkr / scale, "securedTraderProfit": secured_trader / scale, "securedGridProfit": secured_grid / scale,
+                    "totalSecuredProfit": secured / scale, "allocatedNkr": allocated_nkr / scale, "allocatedTrader": allocated_trader / scale,
+                    "allocatedGrid": allocated_grid / scale, "totalAllocated": allocated / scale,
+                    "lifetimeRealizedProfit": lifetime_profit / scale, "unchargedProfit": uncharged_profit / scale, "feeActivated": bool(fee_activated),
                 },
                 "solvency": {
-                    "assets": assets / scale,
-                    "obligations": solv[1] / scale,
-                    "totalUserLiability": liabilities / scale,
-                    "protocolReserve": protocol_reserve / scale,
-                    "solvent": bool(solv[2]),
+                    "assets": assets / scale, "obligations": solv[1] / scale, "totalUserLiability": liabilities / scale,
+                    "ownerReserve": owner_reserve / scale, "liquidityReserve": liquidity_reserve / scale, "solvent": bool(solv[2]),
                 },
             }
             tokens[symbol] = token_state
-            total_base += base_capital / scale
-            total_secured += secured / scale
-            total_allocated += allocated / scale
-            total_assets += assets / scale
-            total_liabilities += liabilities / scale
-            total_reserve += protocol_reserve / scale
+            for key,val in [("baseCapital",base_capital),("freeBase",free_base),("securedProfit",secured),("allocated",allocated),("contractAssets",assets),("userLiabilities",liabilities),("ownerReserve",owner_reserve),("liquidityReserve",liquidity_reserve)]:
+                totals[key] += val / scale
         except Exception as exc:
-            tokens[symbol] = {
-                "symbol": symbol,
-                "address": token,
-                "decimals": decimals,
-                "status": "error",
-                "error": str(exc),
-            }
+            tokens[symbol] = {"symbol": symbol, "address": token, "decimals": fallback_decimals, "status": "error", "error": str(exc)}
 
     return {
-        **base,
-        "status": "ok",
-        "connected": True,
-        "paused": paused,
+        **base, "status": "ok", "connected": True, "paused": paused,
+        "guardian": guardian, "revenueWallet": revenue_wallet, "liquidityDestination": liquidity_destination,
         "fees": {
-            "totalBps": total_fee,
-            "liquidityBps": liquidity_fee,
-            "reserveBps": reserve_fee,
-            "totalPct": total_fee / 100.0,
-            "liquidityPct": liquidity_fee / 100.0,
-            "reservePct": reserve_fee / 100.0,
+            "profitFeeBps": profit_fee, "profitFeePct": profit_fee / 100.0,
+            "liquidityShareBps": liquidity_share, "liquiditySharePct": liquidity_share / 100.0,
+            "ownerShareBps": owner_share, "ownerSharePct": owner_share / 100.0,
         },
-        "liquidityTreasury": treasury,
-        "tokens": tokens,
-        "totals": {
-            "baseCapital": round(total_base, 6),
-            "securedProfit": round(total_secured, 6),
-            "allocated": round(total_allocated, 6),
-            "contractAssets": round(total_assets, 6),
-            "userLiabilities": round(total_liabilities, 6),
-            "protocolReserve": round(total_reserve, 6),
-        },
-        "allConfiguredTokensSolvent": all(
-            bool((v.get("solvency") or {}).get("solvent"))
-            for v in tokens.values()
-            if not v.get("error")
-        ),
+        "tokens": tokens, "totals": {k: round(v, 6) for k,v in totals.items()},
+        "allConfiguredTokensSolvent": all(bool((v.get("solvency") or {}).get("solvent")) for v in tokens.values() if not v.get("error") and (v.get("config") or {}).get("configured")),
         "liveMutationAllowed": False,
-        "note": "Read-only Ethereum Core Vault connection. No approve, deposit, withdraw, role, or executor transaction is sent by this endpoint.",
+        "note": "Read-only CoreVaultV3Slim state. Mutations require Privy delegated signing and configured session routes.",
     }
+
+
+@app.get("/api/nexus/nkr-liquidity-vault/onchain-state")
+def api_nexus_nkr_liquidity_vault_onchain_state():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    vault = _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) or "")
+    payload = {
+        "status": "ok" if _looks_like_evm_addr(vault) else "not_configured",
+        "chain": "ETH", "chainId": 1, "contractName": NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME,
+        "abiVersion": NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION, "contractAddress": vault,
+        "configured": bool(_looks_like_evm_addr(vault)), "readOnly": True, "ts": now_ts(),
+    }
+    if not payload["configured"]:
+        payload["error"] = "NKR liquidity vault address is not configured"
+    return jsonify(payload)
 
 
 @app.get("/api/nexus/core-vault/onchain-state")
@@ -26926,7 +26931,7 @@ def _require_owner_system_info():
 
 
 
-# ENGINE-145: Correct live-execution responsibility model.
+# ENGINE-154: CoreVaultV3Slim session-based live-execution responsibility model.
 # - Privy wallet is the user wallet.
 # - A separately configured Nexus executor contract/service is the executor.
 # - The user may only set/revoke their own executor allowance.
@@ -27447,8 +27452,9 @@ _PRIVY_TRADING_API = "https://api.privy.io"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
 _PRIVY_EXACT_INPUT_SINGLE_SELECTOR = "0x414bf389"
-_PRIVY_PULL_SELECTOR = "0x3da266e4"
-_PRIVY_RETURN_SELECTOR = "0x8daba639"
+_PRIVY_CREATE_SESSION_SELECTOR = "0x00000000"  # encoded by frontend/ABI-aware executor; dynamic args
+_PRIVY_EXECUTE_TRADE_SELECTOR = "0x00000000"   # encoded by frontend/ABI-aware executor; dynamic tuple
+_PRIVY_FINALIZE_SESSION_SELECTOR = "0x2e1a7d4d"  # placeholder not used directly; live worker is route-gated
 
 
 def _uint_to_32(value):
@@ -27463,7 +27469,9 @@ def _privy_trading_cfg():
         "policyId": (os.getenv("PRIVY_TRADING_POLICY_ID") or "").strip(),
         "authorizationKey": (os.getenv("PRIVY_TRADING_AUTHORIZATION_PRIVATE_KEY") or "").strip(),
         "chainId": 1,
-        "vault": _norm_addr(_VAULT_BY_CHAIN.get(1) or os.getenv("CORE_VAULT_ADDRESS_ETH") or os.getenv("VAULT_ADDRESS_1") or ""),
+        "vault": _norm_addr(_VAULT_BY_CHAIN.get(1) or os.getenv("CORE_VAULT_ADDRESS_ETH") or ""),
+        "nkrLiquidityVault": _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) or ""),
+        "routeId": str(os.getenv("NEXUS_ETH_USDC_WETH_ROUTE_ID") or "").strip(),
         "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or "0xE592427A0AEce92De3Edee1F18E0157C05861564"),
@@ -27663,73 +27671,48 @@ def _privy_delegated_readiness(wallet_address):
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
         "walletDelegated": bool(delegation and delegation.get("enabled") and int(delegation.get("expires_ts") or 0) > now_ts()),
-        "vaultConnected": False,
-        "usdcExecutionEnabled": False,
-        "routeReady": False,
+        "vaultConnected": False, "usdcConfigured": False, "usdcExecutionEnabled": False,
+        "routeReady": False, "routeIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("routeId") or "")),
         "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
-        "solvent": False,
-        "delegatedBudgetUnits": delegated_budget_units,
+        "solvent": False, "delegatedBudgetUnits": delegated_budget_units,
         "delegatedBudgetUsd": delegated_budget_units / 1_000_000.0,
-        "privyOnlyVaultCompatible": False,
-        "vaultCompatibilityReason": "CURRENT_VAULT_PULL_REQUIRES_EXECUTOR_ROLE",
+        "privyOnlyVaultCompatible": True,
+        "vaultCompatibilityReason": "COREVAULT_V3_SELF_SCOPED_SESSION_MODEL",
     }
     blockers = []
     try:
         paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
-        tc = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["tokenConfig"], cfg["usdc"])) + [0, 0, 0]
+        tc = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["tokenConfig"], cfg["usdc"])) + [0] * 10
         solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
         checks["vaultConnected"] = True
-        checks["usdcExecutionEnabled"] = bool(tc[2])
+        checks["usdcConfigured"] = bool(tc[0])
+        checks["usdcExecutionEnabled"] = bool(tc[3])
         checks["solvent"] = bool(solv[2])
-        checks["routeReady"] = bool(cfg["routeVerified"] and all(_looks_like_evm_addr(cfg[x]) for x in ("router", "quoter", "usdc", "weth")))
-        if paused:
-            blockers.append("vault_paused")
+        checks["routeReady"] = bool(cfg["routeVerified"] and checks["routeIdConfigured"] and all(_looks_like_evm_addr(cfg[x]) for x in ("router", "quoter", "usdc", "weth")))
+        if paused: blockers.append("vault_paused")
     except Exception as exc:
-        blockers.append("vault_rpc_read_failed")
-        checks["rpcError"] = str(exc)
-
+        blockers.append("vault_rpc_read_failed"); checks["rpcError"] = str(exc)
     for key, code in [
-        ("privyAppConfigured", "privy_app_credentials_missing"),
-        ("tradingSignerConfigured", "privy_trading_signer_missing"),
-        ("tradingPolicyConfigured", "privy_trading_policy_missing"),
-        ("walletDelegated", "wallet_not_delegated"),
-        ("vaultConnected", "vault_not_connected"),
-        ("usdcExecutionEnabled", "usdc_execution_disabled"),
-        ("routeReady", "route_not_verified"),
-        ("systemIdConfirmed", "system_mapping_invalid"),
-        ("solvent", "vault_not_solvent"),
+        ("privyAppConfigured", "privy_app_credentials_missing"), ("tradingSignerConfigured", "privy_trading_signer_missing"),
+        ("tradingPolicyConfigured", "privy_trading_policy_missing"), ("walletDelegated", "wallet_not_delegated"),
+        ("vaultConnected", "vault_not_connected"), ("usdcConfigured", "usdc_not_configured"),
+        ("usdcExecutionEnabled", "usdc_execution_disabled"), ("routeIdConfigured", "route_id_missing"),
+        ("routeReady", "route_not_verified"), ("systemIdConfirmed", "system_mapping_invalid"), ("solvent", "vault_not_solvent")
     ]:
-        if not checks.get(key):
-            blockers.append(code)
-
-    # The deployed Vault requires onlyRole(EXECUTOR_ROLE) for pullForExecution.
-    # A Privy delegated user wallet cannot be treated as a global protocol
-    # executor without per-user admin role grants. Therefore the current Vault
-    # is intentionally marked incompatible with the Privy-only architecture.
-    blockers.append("vault_contract_privy_only_incompatible")
-    if not cfg["liveEnabled"]:
-        blockers.append("live_execution_env_disabled")
-
+        if not checks.get(key): blockers.append(code)
+    if not cfg["liveEnabled"]: blockers.append("live_execution_env_disabled")
+    active = not blockers
     return {
-        "status": "VAULT_UPDATE_REQUIRED",
-        "liveExecution": "DISABLED",
-        "privyOnly": True,
-        "wallet": user,
-        "userWallet": user,
-        "vault": cfg["vault"],
-        "token": cfg["usdc"],
-        "tokenSymbol": "USDC",
-        "signerId": cfg["signerId"],
-        "policyId": cfg["policyId"],
-        "checks": checks,
-        "blockers": list(dict.fromkeys(blockers)),
-        "delegation": delegation or {},
-        "requiredContractChange": {
-            "name": "Privy-only Vault execution",
-            "reason": "pullForExecution currently requires EXECUTOR_ROLE",
-            "requiredBehavior": "A delegated user wallet must be able to execute only for itself and only inside its signed budget/session policy, without receiving a global protocol role.",
-        },
-        "ts": now_ts(),
+        "status": "READY" if active else "SETUP_REQUIRED", "liveExecution": "ACTIVE" if active else "DISABLED",
+        "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
+        "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
+        "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
+        "blockers": list(dict.fromkeys(blockers)), "delegation": delegation or {},
+        "executionModel": {
+            "contract": "NexusCoreVaultV3Slim", "flow": ["createSession", "executeTrade", "startClosing", "finalizeSession"],
+            "withdrawBase": "withdrawBase(token,amount,recipient)",
+            "withdrawProfit": "withdrawProfit(token,system,amount,recipient)",
+        }, "ts": now_ts(),
     }
 
 
@@ -27782,33 +27765,14 @@ def api_privy_trading_revoke():
 
 
 def _privy_delegated_test_worker(job_id, wallet, wallet_id):
-    cfg=_privy_trading_cfg(); txs={}; amount=_PRIVY_TRADING_HARD_CAP_UNITS; sysid=cfg["systemIds"]["TRADER"]
-    try:
-        def send(stage,to,data):
-            _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING",stage,txs=txs)
-            result=_privy_send_delegated_transaction(wallet_id,{"to":to,"value":"0x0","data":data,"chain_id":1},f"{job_id}:{stage}")
-            txs[stage]=result["hash"]; _privy_wait_receipt(result["hash"]); return result["hash"]
-        usdc_before = _privy_erc20_balance(cfg["usdc"], wallet)
-        pull_data = _PRIVY_PULL_SELECTOR + _addr_to_32(wallet)+_addr_to_32(cfg["usdc"])+_uint_to_32(sysid)+_uint_to_32(amount)
-        send("PULL_FROM_VAULT",cfg["vault"],pull_data)
-        send("APPROVE_USDC",cfg["usdc"],_PRIVY_APPROVE_SELECTOR+_addr_to_32(cfg["router"])+_uint_to_32(amount))
-        qbuy=_privy_quote(cfg,cfg["usdc"],cfg["weth"],amount); minw=qbuy*(10000-cfg["slippageBps"])//10000
-        send("BUY_WETH",cfg["router"],_privy_exact_input_single_data(cfg["usdc"],cfg["weth"],wallet,amount,minw,cfg["poolFee"]))
-        if cfg["holdSec"]: time.sleep(cfg["holdSec"])
-        weth_bal=_privy_erc20_balance(cfg["weth"],wallet)
-        if weth_bal<=0: raise RuntimeError("weth_balance_zero_after_buy")
-        send("APPROVE_WETH",cfg["weth"],_PRIVY_APPROVE_SELECTOR+_addr_to_32(cfg["router"])+_uint_to_32(weth_bal))
-        qsell=_privy_quote(cfg,cfg["weth"],cfg["usdc"],weth_bal); minus=qsell*(10000-cfg["slippageBps"])//10000
-        send("SELL_WETH",cfg["router"],_privy_exact_input_single_data(cfg["weth"],cfg["usdc"],wallet,weth_bal,minus,cfg["poolFee"]))
-        usdc_after=_privy_erc20_balance(cfg["usdc"],wallet)
-        returned=max(0, usdc_after - usdc_before)
-        if returned <= 0: raise RuntimeError("no_usdc_returned_after_sell")
-        send("APPROVE_VAULT_RETURN",cfg["usdc"],_PRIVY_APPROVE_SELECTOR+_addr_to_32(cfg["vault"])+_uint_to_32(returned))
-        ret_data=_PRIVY_RETURN_SELECTOR+_addr_to_32(wallet)+_addr_to_32(cfg["usdc"])+_uint_to_32(sysid)+_uint_to_32(amount)+_uint_to_32(returned)
-        send("RETURN_TO_VAULT",cfg["vault"],ret_data)
-        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"COMPLETED","DONE",txs=txs)
-    except Exception as exc:
-        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"FAILED","FAILED",str(exc),txs)
+    # CoreVaultV3Slim uses dynamic tuple/bytes calldata for createSession and
+    # executeTrade. The backend intentionally refuses to synthesize router data
+    # until an audited routeId and route calldata encoder are configured.
+    _privy_job_write(
+        job_id, wallet, wallet_id, "TRADER", _PRIVY_TRADING_HARD_CAP_UNITS,
+        "BLOCKED", "V3_ROUTE_ENCODER_REQUIRED",
+        "CoreVaultV3Slim is connected, but live test execution requires the verified routeId and audited executeTrade calldata encoder.", {}
+    )
 
 
 @app.post("/api/nexus/privy-trading/test/start")
@@ -27817,11 +27781,15 @@ def api_privy_trading_test_start():
     if denied:
         return denied
     rd = _privy_delegated_readiness(owner)
+    if rd.get("liveExecution") != "ACTIVE":
+        return jsonify({
+            "status": "blocked", "error": "corevault_v3_setup_incomplete",
+            "message": "CoreVaultV3Slim is integrated. Configure USDC, the verified routeId, router/oracle route and Privy policy before the minimal live test.",
+            "blockers": rd.get("blockers"), "readiness": rd,
+        }), 409
     return jsonify({
-        "status": "blocked",
-        "error": "vault_contract_privy_only_incompatible",
-        "message": "The deployed Vault requires EXECUTOR_ROLE for pullForExecution. Live delegated trading stays disabled until the Vault execution interface is updated for self-scoped Privy sessions.",
-        "blockers": rd.get("blockers"),
+        "status": "blocked", "error": "v3_route_encoder_not_enabled",
+        "message": "Readiness is complete, but the audited executeTrade calldata encoder is not enabled in this build.",
         "readiness": rd,
     }), 409
 
