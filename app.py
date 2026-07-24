@@ -13,7 +13,7 @@ import sqlite3
 import threading
 DB_WRITE_LOCK = threading.RLock()
 
-# Short RPC cache to protect Alchemy quota. Grid execution polling is separate and remains fast.
+# Short RPC cache to reduce public RPC load. Grid execution polling is separate and remains fast.
 _VAULT_STATE_CACHE: dict[str, tuple[float, dict]] = {}
 _VAULT_STATE_CACHE_TTL_SEC = int(os.getenv("NEXUS_VAULT_STATE_CACHE_TTL_SEC", "8"))
 
@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-154-COREVAULT-V3-NKR-VAULT-INTEGRATION"
+BACKEND_BUILD_ID = "B-2026.07.24-ENGINE-155-PUBLIC-RPC-FAILOVER-NO-ALCHEMY-NO-ANKR"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -3813,46 +3813,33 @@ def _normalize_chain_key(raw: str) -> str:
     return alias.get(s, s)
 
 def _rpc_url_for_chain(chain_id: int) -> str:
+    """Return only an explicitly configured standard JSON-RPC endpoint.
+
+    No provider-specific environment variables or API-key URL construction are
+    used. Public no-key fallbacks are added separately by _rpc_urls_for_chain().
+    """
     cid = int(chain_id or 0)
 
-    # Existing configured map first
-    direct = (_RPC_URL_BY_CHAIN.get(cid) or "").strip()
+    def _accepted(url: str) -> str:
+        value = str(url or "").strip()
+        lowered = value.lower()
+        if not value or "alchemy.com" in lowered or "rpc.ankr.com" in lowered:
+            return ""
+        return value
+
+    direct = _accepted(_RPC_URL_BY_CHAIN.get(cid) or "")
     if direct:
         return direct
 
-    # Alternate env names seen across deployments
     env_fallbacks = {
-        1: [
-            os.getenv("ALCHEMY_RPC_ETH"),
-            os.getenv("RPC_URL_ETH"),
-            os.getenv("RPC_URL_1"),
-        ],
-        56: [
-            os.getenv("ALCHEMY_RPC_BNB"),
-            os.getenv("RPC_URL_BNB"),
-            os.getenv("RPC_URL_56"),
-        ],
-        137: [
-            os.getenv("ALCHEMY_RPC_POL"),
-            os.getenv("RPC_URL_POL"),
-            os.getenv("RPC_URL_POLYGON"),
-            os.getenv("RPC_URL_137"),
-        ],
+        1: [os.getenv("RPC_URL_ETH"), os.getenv("RPC_URL_1")],
+        56: [os.getenv("RPC_URL_BNB"), os.getenv("RPC_URL_56")],
+        137: [os.getenv("RPC_URL_POL"), os.getenv("RPC_URL_POLYGON"), os.getenv("RPC_URL_137")],
     }
-    for v in env_fallbacks.get(cid, []):
-        if str(v or "").strip():
-            return str(v).strip()
-
-    # Last-resort Alchemy construction from a single key
-    alchemy_key = str(os.getenv("ALCHEMY_KEY") or "").strip()
-    if alchemy_key:
-        if cid == 1:
-            return f"https://eth-mainnet.g.alchemy.com/v2/{alchemy_key}"
-        if cid == 56:
-            return f"https://bnb-mainnet.g.alchemy.com/v2/{alchemy_key}"
-        if cid == 137:
-            return f"https://polygon-mainnet.g.alchemy.com/v2/{alchemy_key}"
-
+    for value in env_fallbacks.get(cid, []):
+        value = _accepted(value)
+        if value:
+            return value
     return ""
 
 def _vault_balance_selector_for_chain(chain_key: str) -> str:
@@ -4022,7 +4009,7 @@ def api_wallet_native_balances():
                 "chainId": cid,
                 "native": float(wei) / 1e18,
                 "native_wei": str(wei),
-                "rpc_configured": bool(_rpc_url_for_chain(cid)),
+                "rpc_configured": bool(_rpc_urls_for_chain(cid)),
                 "status": "ok",
             }
         except Exception as e:
@@ -4031,7 +4018,7 @@ def api_wallet_native_balances():
                 "chainId": cid,
                 "native": None,
                 "native_wei": None,
-                "rpc_configured": bool(_rpc_url_for_chain(cid)),
+                "rpc_configured": bool(_rpc_urls_for_chain(cid)),
                 "status": "error",
                 "error": str(e),
             }
@@ -4061,13 +4048,13 @@ def api_debug_rpc_balance():
         "wallet": wa,
         "chain": chain,
         "chainId": cid,
-        "rpc_configured": bool(_rpc_url_for_chain(cid)),
+        "rpc_configured": bool(_rpc_urls_for_chain(cid)),
         "enabled_chains": list(_ENABLED_EVM_CHAINS),
         "enabled_chain_ids": sorted(list(_ENABLED_CHAIN_IDS)),
         "ts": now_ts(),
     }
 
-    rpc_url = _rpc_url_for_chain(cid)
+    rpc_url = (_rpc_urls_for_chain(cid) or [""])[0]
     out["rpc_url_preview"] = (rpc_url[:42] + "...") if rpc_url else ""
 
     if not _looks_like_evm_addr(wa):
@@ -4117,49 +4104,72 @@ def api_debug_rpc_balance():
 
 @app.route("/api/wallet/discover-tokens", methods=["POST"])
 def api_wallet_discover_tokens():
-    """Best-effort ERC-20 discovery for wallet display only.
+    """Discover Nexus-supported wallet tokens without provider-specific RPC methods.
 
-    Uses Alchemy enhanced RPC when the configured chain endpoint supports it.
-    Failure on one chain never hides native/stable balances and never changes
-    Vault admission policy.
+    Public standard JSON-RPC cannot enumerate every ERC-20 held by an address.
+    This endpoint therefore checks the Nexus canonical token registry (USDC,
+    USDT and configured NKR) with normal ERC-20 balanceOf calls. Market pricing
+    remains handled by CoinGecko and the existing market-data services.
     """
     body = request.get_json(silent=True) or {}
     wallet = body.get("wallet") or body.get("wallet_address") or request.headers.get("X-Wallet-Address") or ""
     wa = _norm_addr(wallet)
     if not _looks_like_evm_addr(wa):
         return jsonify({"status": "error", "error": "invalid wallet", "ts": now_ts()}), 400
+
     raw_chains = body.get("chains") or list(_ENABLED_EVM_CHAINS)
-    if not isinstance(raw_chains, list): raw_chains = [raw_chains]
-    out = {}
+    if not isinstance(raw_chains, list):
+        raw_chains = [raw_chains]
+
+    tokens_by_chain = {}
+    balances_by_chain = {}
     errors = {}
     for raw_chain in raw_chains[:20]:
         chain = _normalize_chain_key(raw_chain)
         cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
-        if cid <= 0: continue
+        if cid <= 0:
+            continue
+
+        candidates = [
+            {"address": str(_USDC_BY_CHAIN.get(cid) or "").strip(), "symbol": "USDC", "name": "USD Coin", "decimals": 6},
+            {"address": str(_USDT_BY_CHAIN.get(cid) or "").strip(), "symbol": "USDT", "name": "Tether USD", "decimals": 6 if cid in (1, 137) else 18},
+        ]
+        if cid == 1 and _looks_like_evm_addr(NKR_TOKEN_ADDRESS):
+            candidates.append({"address": NKR_TOKEN_ADDRESS, "symbol": "NKR", "name": "Nexus Kapital Rotation", "decimals": NKR_TOKEN_DECIMALS})
+
         found = []
-        try:
-            result = _rpc_call(cid, "alchemy_getTokenBalances", [wa, "erc20"])
-            balances = (result or {}).get("tokenBalances") if isinstance(result, dict) else []
-            for item in (balances or [])[:200]:
-                addr = _norm_addr((item or {}).get("contractAddress"))
-                raw_balance = str((item or {}).get("tokenBalance") or "0x0")
-                if not _looks_like_evm_addr(addr) or _hex_to_int(raw_balance) <= 0: continue
-                metadata = {}
-                try:
-                    metadata = _rpc_call(cid, "alchemy_getTokenMetadata", [addr]) or {}
-                except Exception:
-                    metadata = {}
-                decimals = metadata.get("decimals")
-                try: decimals = int(decimals if decimals is not None else 18)
-                except Exception: decimals = 18
-                symbol = str(metadata.get("symbol") or "TOKEN").strip().upper()[:24]
-                name = str(metadata.get("name") or "ERC-20 token").strip()[:120]
-                found.append({"address": addr, "symbol": symbol, "name": name, "decimals": decimals})
-            out[chain] = found
-        except Exception as exc:
-            out[chain] = []
-            errors[chain] = str(exc)[:240]
-    return jsonify({"status": "ok", "wallet": wa, "tokens_by_chain": out, "errors": errors, "display_only": True, "ts": now_ts()})
+        chain_balances = {}
+        chain_errors = []
+        seen = set()
+        for token in candidates:
+            addr = _norm_addr(token.get("address"))
+            if not _looks_like_evm_addr(addr) or addr in seen:
+                continue
+            seen.add(addr)
+            try:
+                bal = _erc20_balance_of_rpc(chain, addr, wa)
+                raw_balance = int(bal.get("balance_raw") or 0)
+                chain_balances[addr] = bal
+                if raw_balance > 0:
+                    found.append({**token, "address": addr, "balance_raw": str(raw_balance)})
+            except Exception as exc:
+                chain_errors.append(f"{token.get('symbol')}: {str(exc)[:180]}")
+
+        tokens_by_chain[chain] = found
+        balances_by_chain[chain] = chain_balances
+        if chain_errors:
+            errors[chain] = chain_errors
+
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "tokens_by_chain": tokens_by_chain,
+        "balances_by_chain": balances_by_chain,
+        "errors": errors,
+        "discoveryMode": "nexus_registry_standard_rpc",
+        "display_only": True,
+        "ts": now_ts(),
+    })
 
 
 @app.route("/api/wallet/token-balances", methods=["POST"])
@@ -4245,7 +4255,7 @@ def api_vault_state():
             "wallet": _norm_addr(wallet),
             "chain": chain,
             "chainId": cid,
-            "rpc_configured": bool(_rpc_url_for_chain(cid)),
+            "rpc_configured": bool(_rpc_urls_for_chain(cid)),
             "vault_configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
             "executor_configured": bool((_EXECUTOR_BY_CHAIN.get(cid) or "").strip()),
             "ts": now_ts(),
@@ -7363,7 +7373,10 @@ def _nft_activation_put(wallet_address: str, tier: str, contract: str, chain_id:
     conn.close()
 
 def _rpc_urls_for_chain(chain_id: int) -> list[str]:
-    """Configured RPC first, then safe public fallbacks for ETH/BNB/POL."""
+    """Configured standard RPC first, then public no-key fallbacks.
+
+    The list intentionally contains no Alchemy and no ANKR endpoint.
+    """
     cid = int(chain_id or 0)
     urls: list[str] = []
     configured = (_rpc_url_for_chain(cid) or "").strip()
@@ -7371,13 +7384,24 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         urls.append(configured)
 
     fallback = {
-        1: ["https://ethereum.publicnode.com", "https://eth.llamarpc.com", "https://rpc.ankr.com/eth"],
-        56: ["https://bsc-dataseed.binance.org", "https://bsc.publicnode.com", "https://rpc.ankr.com/bsc"],
-        137: ["https://polygon-rpc.com", "https://polygon-bor-rpc.publicnode.com", "https://rpc.ankr.com/polygon"],
+        1: [
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.llamarpc.com",
+            "https://rpc.flashbots.net",
+        ],
+        56: [
+            "https://bsc-rpc.publicnode.com",
+            "https://bsc-dataseed.binance.org",
+            "https://bsc-dataseed1.binance.org",
+        ],
+        137: [
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon-rpc.com",
+        ],
     }
-    for u in fallback.get(cid, []):
-        if u and u not in urls:
-            urls.append(u)
+    for url in fallback.get(cid, []):
+        if url and url not in urls:
+            urls.append(url)
     return urls
 
 
@@ -15226,7 +15250,7 @@ def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dic
     ck = _normalize_chain_key(chain_key or "ETH")
     cid = int(_CHAIN_ID_BY_KEY.get(ck, 0) or 0)
     vault = str(_VAULT_BY_CHAIN.get(cid) or "").strip()
-    rpc_ready = bool(_rpc_url_for_chain(cid))
+    rpc_ready = bool(_rpc_urls_for_chain(cid))
     base = {
         "chain": ck, "chainId": cid, "wallet": wa, "contractAddress": vault,
         "contractName": NEXUS_CORE_VAULT_CONTRACT_NAME,
@@ -28934,7 +28958,7 @@ def _nexus_vault_state_safe(wallet: str, chain: str) -> dict:
             "chain": ck,
             "chainId": cid,
             "vaultReady": False,
-            "rpc_configured": bool(_rpc_url_for_chain(cid)),
+            "rpc_configured": bool(_rpc_urls_for_chain(cid)),
             "vault_configured": bool((_VAULT_BY_CHAIN.get(cid) or "").strip()),
             "executor_configured": bool((_EXECUTOR_BY_CHAIN.get(cid) or "").strip()),
             "ts": now_ts(),
