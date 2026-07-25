@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-162-SWAPROUTER02-EXECUTION-ALIGNMENT"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-163-COREVAULT-V3-PRELIVE-AUDIT-COMPLETE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27903,9 +27903,14 @@ _PRIVY_TRADING_API = "https://api.privy.io"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
 _PRIVY_EXACT_INPUT_SINGLE_SELECTOR = UNISWAP_EXACT_INPUT_SINGLE_SELECTOR
-_PRIVY_CREATE_SESSION_SELECTOR = "0x00000000"  # encoded by frontend/ABI-aware executor; dynamic args
-_PRIVY_EXECUTE_TRADE_SELECTOR = "0x00000000"   # encoded by frontend/ABI-aware executor; dynamic tuple
-_PRIVY_FINALIZE_SESSION_SELECTOR = "0x2e1a7d4d"  # placeholder not used directly; live worker is route-gated
+_PRIVY_CREATE_SESSION_SELECTOR = "0x" + _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])")[:4].hex()
+_PRIVY_EXECUTE_TRADE_SELECTOR = "0x" + _keccak256(b"executeTrade((uint256,bytes32,uint256,uint256,uint256,bytes))")[:4].hex()
+_PRIVY_START_CLOSING_SELECTOR = "0x" + _keccak256(b"startClosing(uint256)")[:4].hex()
+_PRIVY_FINALIZE_SESSION_SELECTOR = "0x" + _keccak256(b"finalizeSession(uint256)")[:4].hex()
+_PRIVY_POSITION_OF_SELECTOR = "0x" + _keccak256(b"positionOf(uint256,address)")[:4].hex()
+_PRIVY_ROUTE_CONFIG_SELECTOR = "0x" + _keccak256(b"routeConfig(bytes32)")[:4].hex()
+_PRIVY_SESSION_CREATED_TOPIC = "0x" + _keccak256(b"SessionCreated(uint256,address,uint8,address,uint256,uint64)").hex()
+UNISWAP_QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 
 
 def _uint_to_32(value):
@@ -27927,7 +27932,7 @@ def _privy_trading_cfg():
         "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or UNISWAP_SWAP_ROUTER_02),
-        "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or ""),
+        "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or UNISWAP_QUOTER_V2),
         "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
         "slippageBps": max(1, min(500, int(os.getenv("NEXUS_EXECUTOR_MAX_SLIPPAGE_BPS", "100")))),
         "holdSec": max(0, min(300, int(os.getenv("NEXUS_EXECUTOR_TEST_HOLD_SEC", "10")))),
@@ -28091,6 +28096,135 @@ def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, am
             _uint_to_32(amount_out_min) + _uint_to_32(0))
 
 
+
+def _abi_hex_words(raw):
+    h = str(raw or "").removeprefix("0x")
+    if len(h) % 64:
+        return []
+    return [h[i:i + 64].lower() for i in range(0, len(h), 64)]
+
+
+def _word_address(word):
+    return _norm_addr("0x" + str(word or "")[-40:])
+
+
+def _word_bytes4(word):
+    return "0x" + str(word or "")[:8].lower()
+
+
+def _contract_has_code(address):
+    if not _looks_like_evm_addr(address):
+        return False
+    code = str(_rpc_call(1, "eth_getCode", [_norm_addr(address), "latest"]) or "0x")
+    return code not in ("0x", "0x0", "")
+
+
+def _read_token_config(vault, token):
+    raw = _core_vault_call(1, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token)
+    w = _abi_hex_words(raw)
+    if len(w) < 10:
+        raise RuntimeError("token_config_decode_failed")
+    return {
+        "configured": int(w[0], 16) != 0,
+        "depositEnabled": int(w[1], 16) != 0,
+        "withdrawEnabled": int(w[2], 16) != 0,
+        "executionEnabled": int(w[3], 16) != 0,
+        "paymentEnabled": int(w[4], 16) != 0,
+        "settlementToken": int(w[5], 16) != 0,
+        "decimals": int(w[6], 16),
+        "maxSingleDeposit": int(w[7], 16),
+        "maxSessionBudget": int(w[8], 16),
+        "profitThreshold": int(w[9], 16),
+    }
+
+
+def _read_route_config(vault, route_id):
+    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(route_id or "")):
+        raise RuntimeError("invalid_route_id")
+    raw = _eth_call(1, vault, _PRIVY_ROUTE_CONFIG_SELECTOR + str(route_id)[2:].lower())
+    w = _abi_hex_words(raw)
+    if len(w) < 7:
+        raise RuntimeError("route_config_decode_failed")
+    return {
+        "enabled": int(w[0], 16) != 0,
+        "kind": int(w[1], 16),
+        "target": _word_address(w[2]),
+        "oracle": _word_address(w[3]),
+        "tokenIn": _word_address(w[4]),
+        "tokenOut": _word_address(w[5]),
+        "selector": _word_bytes4(w[6]),
+    }
+
+
+def _route_matches(route, *, target, token_in, token_out, selector):
+    return bool(
+        route.get("enabled") and int(route.get("kind", -1)) == 0 and
+        _norm_addr(route.get("target")).lower() == _norm_addr(target).lower() and
+        _norm_addr(route.get("tokenIn")).lower() == _norm_addr(token_in).lower() and
+        _norm_addr(route.get("tokenOut")).lower() == _norm_addr(token_out).lower() and
+        str(route.get("selector") or "").lower() == str(selector or "").lower()
+    )
+
+
+def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, max_slippage_bps=100, max_loss_bps=1500):
+    route_ids = [cfg["routeId"], cfg["sellRouteId"]]
+    for route_id in route_ids:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(route_id or "")):
+            raise RuntimeError("invalid_session_route_id")
+    system_id = int(cfg["systemIds"].get(system_name, 1))
+    head = [
+        _addr_to_32(cfg["usdc"]), _uint_to_32(system_id), _uint_to_32(budget_units),
+        _uint_to_32(duration_sec), _uint_to_32(max_slippage_bps), _uint_to_32(max_loss_bps),
+        _uint_to_32(7 * 32),
+    ]
+    tail = [_uint_to_32(len(route_ids))] + [x[2:].lower() for x in route_ids]
+    return _PRIVY_CREATE_SESSION_SELECTOR + "".join(head + tail)
+
+
+def _encode_execute_trade(session_id, route_id, amount_in, min_amount_out, deadline, router_data):
+    data_hex = str(router_data or "").removeprefix("0x")
+    if len(data_hex) % 2 or not re.fullmatch(r"[0-9a-fA-F]*", data_hex):
+        raise RuntimeError("invalid_router_calldata")
+    raw = bytes.fromhex(data_hex)
+    padded = raw + b"\x00" * ((32 - len(raw) % 32) % 32)
+    tuple_head = [
+        _uint_to_32(session_id), str(route_id)[2:].lower(), _uint_to_32(amount_in),
+        _uint_to_32(min_amount_out), _uint_to_32(deadline), _uint_to_32(6 * 32),
+    ]
+    tuple_tail = _uint_to_32(len(raw)) + padded.hex()
+    return _PRIVY_EXECUTE_TRADE_SELECTOR + _uint_to_32(32) + "".join(tuple_head) + tuple_tail
+
+
+def _encode_uint_call(selector, value):
+    return str(selector) + _uint_to_32(value)
+
+
+def _session_id_from_receipt(receipt, vault):
+    vault_l = _norm_addr(vault).lower()
+    for log in (receipt or {}).get("logs") or []:
+        if _norm_addr(log.get("address") or "").lower() != vault_l:
+            continue
+        topics = [str(x).lower() for x in (log.get("topics") or [])]
+        if len(topics) >= 2 and topics[0] == _PRIVY_SESSION_CREATED_TOPIC.lower():
+            return int(topics[1], 16)
+    raise RuntimeError("session_created_event_not_found")
+
+
+def _position_amount(vault, session_id, token):
+    raw = _eth_call(1, vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(session_id) + _addr_to_32(token))
+    w = _abi_hex_words(raw)
+    if len(w) < 2:
+        raise RuntimeError("position_decode_failed")
+    return int(w[0], 16)
+
+
+def _send_vault_tx(wallet_id, wallet, vault, data, reference):
+    sent = _privy_send_delegated_transaction(wallet_id, {
+        "from": _norm_addr(wallet), "to": _norm_addr(vault), "data": data, "value": "0x0"
+    }, reference)
+    receipt = _privy_wait_receipt(sent["hash"])
+    return {"hash": sent["hash"], "receipt": receipt}
+
 def _privy_job_write(job_id, wallet, wallet_id, system, amount, status, stage, error="", txs=None):
     _privy_trading_db_init(); now = now_ts()
     with DB_WRITE_LOCK:
@@ -28123,35 +28257,66 @@ def _privy_delegated_readiness(wallet_address):
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
         "walletDelegated": bool(delegation and delegation.get("enabled") and int(delegation.get("expires_ts") or 0) > now_ts()),
-        "vaultConnected": False, "usdcConfigured": False, "usdcExecutionEnabled": False,
-        "routeReady": False, "routeIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("routeId") or "")),
-        "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
-        "solvent": False, "delegatedBudgetUnits": delegated_budget_units,
+        "delegatedBudgetUnits": delegated_budget_units,
         "delegatedBudgetUsd": delegated_budget_units / 1_000_000.0,
+        "vaultConnected": False, "vaultPaused": None, "solvent": False,
+        "usdcConfigured": False, "usdcExecutionEnabled": False, "usdcSettlementToken": False, "usdcDecimalsCorrect": False,
+        "wethConfigured": False, "wethExecutionEnabled": False, "wethDecimalsCorrect": False,
+        "routerHasCode": False, "quoterHasCode": False, "quotePathWorks": False,
+        "buyRouteReady": False, "sellRouteReady": False, "routeReady": False,
+        "routeIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("routeId") or "")),
+        "sellRouteIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("sellRouteId") or "")),
+        "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
         "privyOnlyVaultCompatible": True,
         "vaultCompatibilityReason": "COREVAULT_V3_SELF_SCOPED_SESSION_MODEL",
     }
     blockers = []
     try:
         paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
-        tc = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["tokenConfig"], cfg["usdc"])) + [0] * 10
+        checks["vaultConnected"] = True; checks["vaultPaused"] = paused
+        usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"])
+        weth_cfg = _read_token_config(cfg["vault"], cfg["weth"])
+        checks.update({
+            "usdcConfigured": usdc_cfg["configured"], "usdcExecutionEnabled": usdc_cfg["executionEnabled"],
+            "usdcSettlementToken": usdc_cfg["settlementToken"], "usdcDecimalsCorrect": usdc_cfg["decimals"] == 6,
+            "wethConfigured": weth_cfg["configured"], "wethExecutionEnabled": weth_cfg["executionEnabled"],
+            "wethDecimalsCorrect": weth_cfg["decimals"] == 18,
+        })
         solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
-        checks["vaultConnected"] = True
-        checks["usdcConfigured"] = bool(tc[0])
-        checks["usdcExecutionEnabled"] = bool(tc[3])
         checks["solvent"] = bool(solv[2])
-        checks["routeReady"] = bool(cfg["routeVerified"] and checks["routeIdConfigured"] and all(_looks_like_evm_addr(cfg[x]) for x in ("router", "quoter", "usdc", "weth")))
-        if paused: blockers.append("vault_paused")
+        checks["routerHasCode"] = _contract_has_code(cfg["router"])
+        checks["quoterHasCode"] = _contract_has_code(cfg["quoter"])
+        if checks["routeIdConfigured"]:
+            buy = _read_route_config(cfg["vault"], cfg["routeId"]); checks["buyRoute"] = buy
+            checks["buyRouteReady"] = _route_matches(buy, target=cfg["router"], token_in=cfg["usdc"], token_out=cfg["weth"], selector=_PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
+        if checks["sellRouteIdConfigured"]:
+            sell = _read_route_config(cfg["vault"], cfg["sellRouteId"]); checks["sellRoute"] = sell
+            checks["sellRouteReady"] = _route_matches(sell, target=cfg["router"], token_in=cfg["weth"], token_out=cfg["usdc"], selector=_PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
+        checks["routeReady"] = checks["buyRouteReady"] and checks["sellRouteReady"]
+        if checks["quoterHasCode"]:
+            q1 = _privy_quote(cfg, cfg["usdc"], cfg["weth"], 1_000_000)
+            q2 = _privy_quote(cfg, cfg["weth"], cfg["usdc"], max(1, q1))
+            checks["quotePathWorks"] = q1 > 0 and q2 > 0
+            checks["quoteProbe"] = {"buyAmountOut": q1, "roundTripAmountOut": q2}
     except Exception as exc:
-        blockers.append("vault_rpc_read_failed"); checks["rpcError"] = str(exc)
-    for key, code in [
-        ("privyAppConfigured", "privy_app_credentials_missing"), ("tradingSignerConfigured", "privy_trading_signer_missing"),
-        ("tradingPolicyConfigured", "privy_trading_policy_missing"), ("walletDelegated", "wallet_not_delegated"),
-        ("vaultConnected", "vault_not_connected"), ("usdcConfigured", "usdc_not_configured"),
-        ("usdcExecutionEnabled", "usdc_execution_disabled"), ("routeIdConfigured", "route_id_missing"),
-        ("routeReady", "route_not_verified"), ("systemIdConfirmed", "system_mapping_invalid"), ("solvent", "vault_not_solvent")
-    ]:
+        blockers.append("vault_rpc_or_decode_failed"); checks["rpcError"] = str(exc)
+    required = [
+        ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
+        ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletDelegated","wallet_not_delegated"),
+        ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
+        ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
+        ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
+        ("wethConfigured","weth_not_configured"),("wethExecutionEnabled","weth_execution_disabled"),
+        ("wethDecimalsCorrect","weth_decimals_invalid"),("routeIdConfigured","buy_route_id_missing"),
+        ("sellRouteIdConfigured","sell_route_id_missing"),("buyRouteReady","buy_route_not_active_or_mismatch"),
+        ("sellRouteReady","sell_route_not_active_or_mismatch"),("routerHasCode","router_contract_missing"),
+        ("quoterHasCode","quoter_contract_missing"),("quotePathWorks","quoter_path_failed"),
+        ("systemIdConfirmed","system_mapping_invalid"),
+    ]
+    if checks.get("vaultPaused"): blockers.append("vault_paused")
+    for key, code in required:
         if not checks.get(key): blockers.append(code)
+    if delegated_budget_units < _PRIVY_TRADING_HARD_CAP_UNITS: blockers.append("delegated_budget_below_test_cap")
     if not cfg["liveEnabled"]: blockers.append("live_execution_env_disabled")
     active = not blockers
     return {
@@ -28160,11 +28325,8 @@ def _privy_delegated_readiness(wallet_address):
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
         "blockers": list(dict.fromkeys(blockers)), "delegation": delegation or {},
-        "executionModel": {
-            "contract": "NexusCoreVaultV3Slim", "flow": ["createSession", "executeTrade", "startClosing", "finalizeSession"],
-            "withdrawBase": "withdrawBase(token,amount,recipient)",
-            "withdrawProfit": "withdrawProfit(token,system,amount,recipient)",
-        }, "ts": now_ts(),
+        "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
+        "ts": now_ts(),
     }
 
 
@@ -28217,33 +28379,61 @@ def api_privy_trading_revoke():
 
 
 def _privy_delegated_test_worker(job_id, wallet, wallet_id):
-    # CoreVaultV3Slim uses dynamic tuple/bytes calldata for createSession and
-    # executeTrade. The backend intentionally refuses to synthesize router data
-    # until an audited routeId and route calldata encoder are configured.
-    _privy_job_write(
-        job_id, wallet, wallet_id, "TRADER", _PRIVY_TRADING_HARD_CAP_UNITS,
-        "BLOCKED", "V3_ROUTE_ENCODER_REQUIRED",
-        "CoreVaultV3Slim is connected, but live test execution requires the verified routeId and audited executeTrade calldata encoder.", {}
-    )
+    cfg = _privy_trading_cfg(); amount = _PRIVY_TRADING_HARD_CAP_UNITS; txs = {}
+    try:
+        rd = _privy_delegated_readiness(wallet)
+        if rd.get("liveExecution") != "ACTIVE":
+            raise RuntimeError("readiness_blocked:" + ",".join(rd.get("blockers") or []))
+        delegation = _privy_trading_delegation(wallet) or {}
+        if str(delegation.get("privy_wallet_id") or "") != str(wallet_id):
+            raise RuntimeError("privy_wallet_id_mismatch")
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","CREATE_SESSION","",txs)
+        create_data = _encode_create_session(cfg,"TRADER",amount,86400,cfg["slippageBps"],1500)
+        txs["createSession"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],create_data,job_id+":create")
+        session_id = _session_id_from_receipt(txs["createSession"]["receipt"],cfg["vault"]); txs["sessionId"] = session_id
+
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","BUY_QUOTE","",txs)
+        buy_quote = _privy_quote(cfg,cfg["usdc"],cfg["weth"],amount)
+        buy_min = buy_quote * (10_000-cfg["slippageBps"]) // 10_000
+        deadline = now_ts()+300
+        router_buy = _privy_exact_input_single_data(cfg["usdc"],cfg["weth"],cfg["vault"],amount,buy_min,cfg["poolFee"])
+        buy_call = _encode_execute_trade(session_id,cfg["routeId"],amount,buy_min,deadline,router_buy)
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","EXECUTE_BUY","",txs)
+        txs["buy"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],buy_call,job_id+":buy")
+        if cfg["holdSec"]: time.sleep(cfg["holdSec"])
+
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","START_CLOSING","",txs)
+        txs["startClosing"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],_encode_uint_call(_PRIVY_START_CLOSING_SELECTOR,session_id),job_id+":closing")
+        weth_amount = _position_amount(cfg["vault"],session_id,cfg["weth"])
+        if weth_amount <= 0: raise RuntimeError("weth_position_zero_after_buy")
+        sell_quote = _privy_quote(cfg,cfg["weth"],cfg["usdc"],weth_amount)
+        sell_min = sell_quote * (10_000-cfg["slippageBps"]) // 10_000
+        router_sell = _privy_exact_input_single_data(cfg["weth"],cfg["usdc"],cfg["vault"],weth_amount,sell_min,cfg["poolFee"])
+        sell_call = _encode_execute_trade(session_id,cfg["sellRouteId"],weth_amount,sell_min,now_ts()+300,router_sell)
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","EXECUTE_SELL","",txs)
+        txs["sell"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],sell_call,job_id+":sell")
+
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","FINALIZE_SESSION","",txs)
+        txs["finalize"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],_encode_uint_call(_PRIVY_FINALIZE_SESSION_SELECTOR,session_id),job_id+":finalize")
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"COMPLETED","COMPLETE","",txs)
+    except Exception as exc:
+        _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"FAILED","FAILED",str(exc),txs)
 
 
 @app.post("/api/nexus/privy-trading/test/start")
 def api_privy_trading_test_start():
     owner, denied = _require_owner_system_info()
-    if denied:
-        return denied
+    if denied: return denied
     rd = _privy_delegated_readiness(owner)
     if rd.get("liveExecution") != "ACTIVE":
-        return jsonify({
-            "status": "blocked", "error": "corevault_v3_setup_incomplete",
-            "message": "CoreVaultV3Slim is integrated. Configure USDC, the verified routeId, router/oracle route and Privy policy before the minimal live test.",
-            "blockers": rd.get("blockers"), "readiness": rd,
-        }), 409
-    return jsonify({
-        "status": "blocked", "error": "v3_route_encoder_not_enabled",
-        "message": "Readiness is complete, but the audited executeTrade calldata encoder is not enabled in this build.",
-        "readiness": rd,
-    }), 409
+        return jsonify({"status":"blocked","error":"corevault_v3_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
+    delegation = _privy_trading_delegation(owner) or {}
+    wallet_id = str(delegation.get("privy_wallet_id") or "").strip()
+    if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
+    job_id = "v3test-" + uuid.uuid4().hex
+    _privy_job_write(job_id,owner,wallet_id,"TRADER",_PRIVY_TRADING_HARD_CAP_UNITS,"QUEUED","QUEUED","",{})
+    threading.Thread(target=_privy_delegated_test_worker,args=(job_id,owner,wallet_id),daemon=True).start()
+    return jsonify({"status":"queued","jobId":job_id,"amountUsdc":_PRIVY_TRADING_HARD_CAP_UNITS/1_000_000.0,"readiness":rd}),202
 
 
 @app.get("/api/nexus/live-executor/status")
@@ -29993,21 +30183,7 @@ def _nexus_execution_package_from_body(body: dict, wallet: str) -> dict:
 
 @app.route("/api/nexus/vault/execute-swap-package", methods=["POST"])
 def api_nexus_vault_execute_swap_package():
-    """Prepare a NexusVaultV2 executeSwapWithSig package for Privy embedded wallets.
-
-    This does not replace Privy. The user wallet address remains the Vault user.
-    The response contains the EIP-712 typed data that Privy/client must sign and
-    the exact struct args needed by the Vault after signature is added.
-    """
-    body = request.get_json(silent=True) or {}
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-    try:
-        return jsonify(_nexus_execution_package_from_body(body, wa))
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
-
+    return jsonify({"status":"gone","error":"legacy_vault_v2_path_disabled","activeExecutionPath":"NexusCoreVaultV3Slim"}),410
 
 @app.route("/api/nexus/vault/submit-signed-swap", methods=["POST"])
 def api_nexus_vault_submit_signed_swap():
