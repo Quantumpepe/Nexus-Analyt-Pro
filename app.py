@@ -28477,8 +28477,8 @@ def _privy_delegated_readiness(wallet_address):
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
         "walletProvisioned": bool(privy_wallet_id),
-        "walletDelegated": True,
-        "userApprovalRequired": False,
+        "walletDelegated": bool(delegation and int(delegation.get("consent_ts") or 0) > 0),
+        "userApprovalRequired": not bool(delegation and int(delegation.get("consent_ts") or 0) > 0),
         "delegatedBudgetUnits": None,
         "delegatedBudgetUsd": None,
         "budgetAuthority": "COREVAULT_SESSION",
@@ -28526,6 +28526,7 @@ def _privy_delegated_readiness(wallet_address):
     required = [
         ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
         ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletProvisioned","privy_wallet_mapping_pending"),
+        ("walletDelegated","privy_trading_signer_not_attached"),
         ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
         ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
@@ -28546,7 +28547,7 @@ def _privy_delegated_readiness(wallet_address):
         "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
-        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
+        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": False, "userActionRequired": not checks.get("walletDelegated"), "walletProvisioned": bool(privy_wallet_id), "signerAttached": bool(checks.get("walletDelegated"))},
         "privyWalletIdAvailable": bool(privy_wallet_id), "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
         "ts": now_ts(),
     }
@@ -28557,11 +28558,17 @@ def _live_vault_execution_readiness(wallet_address): return _privy_delegated_rea
 
 @app.get("/api/nexus/privy-trading/config")
 def api_privy_trading_config():
-    owner, denied = _require_owner_system_info()
-    if denied: return denied
-    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(owner)
+    """Return public signer/policy identifiers to the authenticated wallet.
+
+    IDs are not secrets. The private authorization key never leaves Render.
+    """
+    wallet = _require_auth()
+    if not wallet:
+        return err("unauthorized", 401)
+    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(wallet)
     return jsonify({"status":"ok","signerId":cfg["signerId"],"policyId":cfg["policyId"],"chainType":"ethereum","chainId":1,
-                    "configured":bool(cfg["signerId"] and cfg["policyId"]),"readiness":rd,"ts":now_ts()})
+                    "configured":bool(cfg["signerId"] and cfg["policyId"]),"signerAttached":bool((rd.get("checks") or {}).get("walletDelegated")),
+                    "readiness":rd,"ts":now_ts()})
 
 
 @app.post("/api/nexus/privy-trading/provision")
@@ -28580,7 +28587,8 @@ def api_privy_trading_provision():
     except ValueError as exc:
         return jsonify({"status":"error","error":str(exc)}), 400
     return jsonify({
-        "status":"ok", "automatic":True, "userActionRequired":False,
+        "status":"ok", "automatic":True,
+        "userActionRequired": not bool((_privy_trading_delegation(address) or {}).get("consent_ts")),
         "wallet":address, "walletProvisioned":True,
         "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
         "readiness":_privy_delegated_readiness(address), "ts":now_ts()
@@ -28591,6 +28599,37 @@ def api_privy_trading_provision():
 def api_privy_trading_consent():
     """Backward-compatible alias. This performs automatic provisioning only."""
     return api_privy_trading_provision()
+
+
+@app.post("/api/nexus/privy-trading/signer-confirmed")
+def api_privy_trading_signer_confirmed():
+    """Record successful Privy addSigners completion for this embedded wallet."""
+    wallet = _require_auth()
+    if not wallet:
+        return err("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    address = _norm_addr(body.get("walletAddress") or body.get("address") or wallet)
+    if address.lower() != _norm_addr(wallet).lower():
+        return jsonify({"status":"error","error":"wallet_mismatch"}), 403
+    cfg = _privy_trading_cfg()
+    now = now_ts()
+    _privy_trading_db_init()
+    with DB_WRITE_LOCK:
+        con = _db()
+        try:
+            row = con.execute("SELECT privy_wallet_id FROM privy_trading_delegations WHERE wallet_address=?", (address.lower(),)).fetchone()
+            if not row:
+                return jsonify({"status":"error","error":"wallet_not_provisioned"}), 409
+            con.execute("""UPDATE privy_trading_delegations
+                           SET signer_id=?, policy_id=?, consent_ts=?, updated_ts=?
+                           WHERE wallet_address=?""",
+                        (cfg.get("signerId") or "", cfg.get("policyId") or "", now, now, address.lower()))
+            con.commit()
+        finally:
+            con.close()
+    return jsonify({"status":"ok","wallet":address,"signerAttached":True,
+                    "signerId":cfg.get("signerId"),"policyId":cfg.get("policyId"),
+                    "readiness":_privy_delegated_readiness(address),"ts":now})
 
 
 @app.post("/api/nexus/privy-trading/revoke")
