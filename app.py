@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-177-MULTI-EVM-TOKEN-REGISTRY"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-178-PRIVY-AUTH-SIGNATURE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -28258,14 +28258,14 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     body["reference_id"] = safe_reference
     expiry = str(int(time.time() * 1000) + 60_000)
     idem = safe_reference
-    signed_headers = {"privy-request-expiry": expiry, "idempotency-key": idem}
+    signed_headers = {"privy-request-expiry": expiry, "privy-idempotency-key": idem}
     sig = _privy_authorization_signature(url, body, signed_headers)
     headers = {
         "Content-Type": "application/json",
         "privy-app-id": cfg["appId"],
         "privy-authorization-signature": sig,
         "privy-request-expiry": expiry,
-        "idempotency-key": idem,
+        "privy-idempotency-key": idem,
     }
     response = requests.post(url, json=body, headers=headers, auth=(cfg["appId"], cfg["appSecret"]), timeout=45)
     data = response.json() if response.content else {}
