@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-181-PRIVY-REMOTE-ACCESS-TOKEN-VERIFICATION"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-166-MULTI-EVM-TOKEN-REGISTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1229,12 +1229,7 @@ def api_core_vault_create_system_session_auto():
             max_slippage_bps=slippage_bps,
             max_loss_bps=max_loss_bps,
         )
-        # Do not include the full wallet address: Privy limits reference_id to 64 chars.
-        wallet_tag = wallet.lower().removeprefix("0x")[-10:]
-        reference = _privy_safe_reference_id(
-            f"nexus-{system_name.lower()}-session-{wallet_tag}-{int(time.time())}",
-            "nexus-session",
-        )
+        reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
         sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference)
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
         return jsonify({
@@ -6945,266 +6940,6 @@ def _pick_wallet_from_request() -> Optional[str]:
 
     return None        
 
-def _decode_jwt_claims_unverified(token: str) -> dict:
-    try:
-        parts = str(token or "").split(".")
-        if len(parts) != 3:
-            return {}
-        import base64
-        payload = parts[1] + "=" * (-len(parts[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
-    except Exception:
-        return {}
-
-
-# Privy access-token verification key cache. The official Privy server SDK
-# fetches the app verification key from Privy when no local key is supplied.
-_PRIVY_VERIFY_KEY_CACHE = {"key": "", "expires_at": 0.0, "source": "", "error": ""}
-_PRIVY_USER_WALLETS_CACHE = {}
-_PRIVY_REMOTE_CACHE_LOCK = threading.RLock()
-
-
-def _extract_privy_verification_key(payload) -> str:
-    """Find a PEM verification key in the safe JSON response shapes Privy has used."""
-    preferred = {
-        "verification_key", "verificationKey", "jwt_verification_key",
-        "jwtVerificationKey", "public_key", "publicKey",
-    }
-    found = []
-
-    def walk(obj, depth=0):
-        if depth > 8:
-            return
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key in preferred and isinstance(value, str):
-                    found.append(value)
-                walk(value, depth + 1)
-        elif isinstance(obj, list):
-            for value in obj:
-                walk(value, depth + 1)
-
-    walk(payload)
-    for value in found:
-        candidate = str(value or "").strip().replace("\\n", "\n")
-        if "BEGIN PUBLIC KEY" in candidate or "BEGIN CERTIFICATE" in candidate:
-            return candidate
-    return ""
-
-
-def _privy_basic_auth_header(app_id: str, app_secret: str) -> str:
-    import base64
-    raw = f"{app_id}:{app_secret}".encode("utf-8")
-    return "Basic " + base64.b64encode(raw).decode("ascii")
-
-
-def _fetch_privy_verification_key(force: bool = False) -> tuple[str, str, str]:
-    """Fetch and cache the Privy app JWT verification key.
-
-    A local PRIVY_VERIFICATION_KEY remains supported as an optional fast path,
-    but is no longer required. When absent, the backend asks Privy using the
-    app's server credentials, matching the behavior of Privy's server SDK.
-    """
-    local = str(
-        os.getenv("PRIVY_VERIFICATION_KEY")
-        or os.getenv("PRIVY_JWT_VERIFICATION_KEY")
-        or os.getenv("PRIVY_AUTH_VERIFICATION_KEY")
-        or ""
-    ).strip().replace("\\n", "\n")
-    if local:
-        return local, "render_env", ""
-
-    app_id = str(os.getenv("PRIVY_APP_ID") or "").strip()
-    app_secret = str(os.getenv("PRIVY_APP_SECRET") or "").strip()
-    if not app_id or not app_secret:
-        return "", "", "privy_app_credentials_missing"
-
-    now = time.time()
-    with _PRIVY_REMOTE_CACHE_LOCK:
-        if not force and _PRIVY_VERIFY_KEY_CACHE.get("key") and float(_PRIVY_VERIFY_KEY_CACHE.get("expires_at") or 0) > now:
-            return (_PRIVY_VERIFY_KEY_CACHE["key"], _PRIVY_VERIFY_KEY_CACHE.get("source") or "cache", "")
-
-    headers = {
-        "Authorization": _privy_basic_auth_header(app_id, app_secret),
-        "privy-app-id": app_id,
-        "Accept": "application/json",
-    }
-    # Privy's SDK retrieves this value from the app configuration service.
-    # Multiple compatible paths are attempted because older and newer Privy
-    # server SDK generations use different API hosts/shapes.
-    urls = [
-        f"https://auth.privy.io/api/v1/apps/{app_id}/verification_key",
-        f"https://auth.privy.io/api/v1/apps/{app_id}",
-        f"https://api.privy.io/v1/apps/{app_id}/verification-key",
-        f"https://api.privy.io/v1/apps/{app_id}/verification_key",
-        f"https://api.privy.io/v1/apps/{app_id}",
-    ]
-    errors = []
-    for url in urls:
-        try:
-            response = requests.get(url, headers=headers, timeout=12)
-            if response.status_code >= 400:
-                errors.append(f"{response.status_code}:{url.split('://',1)[-1].split('/',1)[0]}")
-                continue
-            try:
-                payload = response.json()
-            except Exception:
-                payload = {"verification_key": response.text}
-            key = _extract_privy_verification_key(payload)
-            if key:
-                with _PRIVY_REMOTE_CACHE_LOCK:
-                    _PRIVY_VERIFY_KEY_CACHE.update({
-                        "key": key,
-                        "source": "privy_api",
-                        "error": "",
-                        "expires_at": now + 3600,
-                    })
-                return key, "privy_api", ""
-            errors.append(f"key_not_in_response:{url.split('://',1)[-1].split('/',1)[0]}")
-        except Exception as exc:
-            errors.append(f"{exc.__class__.__name__}:{url.split('://',1)[-1].split('/',1)[0]}")
-
-    error = "privy_verification_key_fetch_failed:" + ",".join(errors[:5])
-    with _PRIVY_REMOTE_CACHE_LOCK:
-        _PRIVY_VERIFY_KEY_CACHE.update({"key": "", "source": "", "error": error, "expires_at": now + 30})
-    return "", "", error
-
-
-def _privy_user_wallets(privy_did: str) -> tuple[set[str], str]:
-    """Return EVM wallets owned by the verified Privy user DID."""
-    did = str(privy_did or "").strip()
-    if not did.startswith("did:privy:"):
-        return set(), "privy_did_invalid"
-    now = time.time()
-    with _PRIVY_REMOTE_CACHE_LOCK:
-        cached = _PRIVY_USER_WALLETS_CACHE.get(did)
-        if cached and cached.get("expires_at", 0) > now:
-            return set(cached.get("wallets") or []), ""
-
-    app_id = str(os.getenv("PRIVY_APP_ID") or "").strip()
-    app_secret = str(os.getenv("PRIVY_APP_SECRET") or "").strip()
-    if not app_id or not app_secret:
-        return set(), "privy_app_credentials_missing"
-    from urllib.parse import quote
-    url = "https://api.privy.io/v1/users/" + quote(did, safe="")
-    headers = {
-        "Authorization": _privy_basic_auth_header(app_id, app_secret),
-        "privy-app-id": app_id,
-        "Accept": "application/json",
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=12)
-        if response.status_code >= 400:
-            return set(), f"privy_user_lookup_failed:{response.status_code}"
-        payload = response.json()
-        wallets = set()
-
-        def walk(obj, parent_key="", depth=0):
-            if depth > 10:
-                return
-            if isinstance(obj, dict):
-                typ = str(obj.get("type") or obj.get("account_type") or "").lower()
-                chain = str(obj.get("chain_type") or obj.get("chainType") or "").lower()
-                address = obj.get("address") or obj.get("wallet_address") or obj.get("walletAddress")
-                if isinstance(address, str) and _looks_like_evm_addr(address):
-                    if typ in ("wallet", "embedded_wallet", "ethereum") or chain in ("ethereum", "evm", "") or "wallet" in parent_key.lower():
-                        wallets.add(_norm_addr(address).lower())
-                for key, value in obj.items():
-                    walk(value, str(key), depth + 1)
-            elif isinstance(obj, list):
-                for value in obj:
-                    walk(value, parent_key, depth + 1)
-        walk(payload)
-        with _PRIVY_REMOTE_CACHE_LOCK:
-            _PRIVY_USER_WALLETS_CACHE[did] = {"wallets": list(wallets), "expires_at": now + 120}
-        return wallets, ""
-    except Exception as exc:
-        return set(), f"privy_user_lookup_error:{exc.__class__.__name__}"
-
-
-def _privy_access_token_diagnostics(token: str, requested_wallet: Optional[str] = None) -> dict:
-    """Securely verify a Privy access token without requiring a Render key.
-
-    The verification key is loaded from Render when supplied, otherwise fetched
-    from Privy and cached. A requested wallet is accepted only when Privy's user
-    record confirms that it belongs to the verified DID.
-    """
-    claims = _decode_jwt_claims_unverified(token)
-    app_id = str(os.getenv("PRIVY_APP_ID") or "").strip()
-    now = int(time.time())
-    verification_key, key_source, key_error = _fetch_privy_verification_key()
-    out = {
-        "tokenPresent": bool(token),
-        "jwtShape": str(token or "").count(".") == 2,
-        "issuer": claims.get("iss"),
-        "audienceMatches": bool(app_id and claims.get("aud") == app_id),
-        "issuerMatches": claims.get("iss") == "privy.io",
-        "notExpired": bool(isinstance(claims.get("exp"), (int, float)) and int(claims.get("exp")) > now),
-        "privyDidPresent": bool(str(claims.get("sub") or "").startswith("did:privy:")),
-        "verificationKeyConfigured": bool(str(os.getenv("PRIVY_VERIFICATION_KEY") or "").strip()),
-        "verificationKeyAvailable": bool(verification_key),
-        "verificationKeySource": key_source or None,
-        "signatureValid": False,
-        "walletOwnershipChecked": False,
-        "walletOwnedByUser": False,
-        "error": None,
-    }
-    if not token:
-        out["error"] = "authorization_bearer_missing"
-        return out
-    if not verification_key:
-        out["error"] = key_error or "privy_verification_key_unavailable"
-        return out
-    try:
-        import jwt
-        verified = jwt.decode(
-            token,
-            verification_key,
-            algorithms=["ES256"],
-            audience=app_id,
-            issuer="privy.io",
-            options={"require": ["exp", "iat", "sub", "aud", "iss"]},
-        )
-        out["signatureValid"] = True
-        did = str(verified.get("sub") or "")
-        out["privyDidPresent"] = did.startswith("did:privy:")
-        if requested_wallet and _looks_like_evm_addr(requested_wallet):
-            wallets, wallet_error = _privy_user_wallets(did)
-            out["walletOwnershipChecked"] = not bool(wallet_error)
-            out["walletOwnedByUser"] = _norm_addr(requested_wallet).lower() in wallets
-            if wallet_error:
-                out["error"] = wallet_error
-            elif not out["walletOwnedByUser"]:
-                out["error"] = "wallet_not_owned_by_authenticated_privy_user"
-        else:
-            out["error"] = "wallet_header_missing_or_invalid"
-    except Exception as exc:
-        # If Privy rotated its key, force one refresh and retry exactly once.
-        try:
-            refreshed_key, refreshed_source, refreshed_error = _fetch_privy_verification_key(force=True)
-            if refreshed_key and refreshed_key != verification_key:
-                import jwt
-                verified = jwt.decode(
-                    token, refreshed_key, algorithms=["ES256"], audience=app_id,
-                    issuer="privy.io", options={"require": ["exp", "iat", "sub", "aud", "iss"]},
-                )
-                out["signatureValid"] = True
-                out["verificationKeySource"] = refreshed_source
-                did = str(verified.get("sub") or "")
-                out["privyDidPresent"] = did.startswith("did:privy:")
-                wallets, wallet_error = _privy_user_wallets(did)
-                out["walletOwnershipChecked"] = not bool(wallet_error)
-                out["walletOwnedByUser"] = bool(requested_wallet and _norm_addr(requested_wallet).lower() in wallets)
-                out["error"] = wallet_error or (None if out["walletOwnedByUser"] else "wallet_not_owned_by_authenticated_privy_user")
-                return out
-            if refreshed_error:
-                out["verificationKeyRefreshError"] = refreshed_error
-        except Exception:
-            pass
-        out["error"] = f"privy_access_token_invalid:{exc.__class__.__name__}"
-    return out
-
-
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None."""
 
@@ -7250,12 +6985,9 @@ def _require_auth() -> Optional[str]:
     except Exception:
         pass
 
-    # (3) Privy access token. Its ``sub`` is a Privy DID, not an EVM address.
-    # Verify the JWT first, then bind it to the wallet supplied by the client.
-    wa = _pick_wallet_from_request()
-    privy_diag = _privy_access_token_diagnostics(token, wa)
-    if (privy_diag.get("signatureValid") and privy_diag.get("privyDidPresent")
-            and privy_diag.get("walletOwnershipChecked") and privy_diag.get("walletOwnedByUser")):
+    # (3) Privy-style JWT (best-effort decode without verification)
+    wa = _extract_wallet_from_jwt_best_effort(token)
+    if isinstance(wa, str) and _looks_like_evm_addr(wa):
         return _norm_addr(wa)
 
     return None
@@ -8902,7 +8634,7 @@ def api_access_auto_renew_set():
             or ""
         )
     if not wa or not _looks_like_evm_addr(wa):
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     enabled = str(body.get("enabled", body.get("auto_renew_enabled", "0"))).strip().lower() in ("1", "true", "yes", "on")
@@ -8966,7 +8698,7 @@ def api_access_auto_renew_due():
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     auth = (request.headers.get("Authorization") or "").strip()
     if server_key and auth != f"Bearer {server_key}":
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     now_i = now_ts()
     conn = _db()
@@ -9211,7 +8943,7 @@ def api_access_auto_renew_consent():
     if not wa:
         wa = _norm_addr((request.get_json(silent=True) or {}).get("wallet") or request.args.get("wallet") or "")
     if not wa or not _looks_like_evm_addr(wa):
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     token = str(body.get("token") or body.get("preferred_token") or "USDT").upper()
@@ -9296,7 +9028,7 @@ def api_access_auto_renew_test_enable():
     # If NEXUS_API_KEY exists, protect the test endpoint for shell/admin use.
     # If no key is configured, wallet param is still required.
     if server_key and auth != f"Bearer {server_key}":
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     wa = _norm_addr(
         body.get("wallet")
@@ -9370,7 +9102,7 @@ def api_access_auto_renew_test_disable():
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     auth = (request.headers.get("Authorization") or "").strip()
     if server_key and auth != f"Bearer {server_key}":
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     wa = _norm_addr(body.get("wallet") or body.get("wallet_address") or request.args.get("wallet") or "")
@@ -9400,7 +9132,7 @@ def api_access_auto_renew_run():
     server_key = (os.getenv("NEXUS_API_KEY") or "").strip()
     auth = (request.headers.get("Authorization") or "").strip()
     if server_key and auth != f"Bearer {server_key}":
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     now_i = now_ts()
     limit = max(1, min(50, int((request.get_json(silent=True) or {}).get("limit") or 10)))
@@ -9719,7 +9451,7 @@ def _coin_rating_summary(symbol: str) -> dict:
 def api_rating_coin_status():
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     sym = str(request.args.get("symbol") or request.args.get("coin") or "").strip().upper()
     if not sym:
         return err("missing symbol", 400)
@@ -9762,7 +9494,7 @@ def api_coin_info():
 def api_rating_vote():
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
     sym = str(body.get("symbol") or body.get("coin") or "").strip().upper()
     rating = str(body.get("rating") or "").strip().upper().replace("-", "_")
@@ -10095,7 +9827,7 @@ def api_fees_state():
     """Return lifetime profit + fee state for the authenticated wallet."""
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _profit_state_get(wa)
     return jsonify({
         "status": "ok",
@@ -10111,7 +9843,7 @@ def api_fees_preview():
     """Preview the fee for a hypothetical profit delta (no state change)."""
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     try:
         profit_delta = float(request.args.get("profit_delta") or 0.0)
     except Exception:
@@ -10140,7 +9872,7 @@ def api_withdraw_quote():
     body = request.get_json(silent=True) or {}
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     try:
         amount_usd = float(body.get("amount_usd") or body.get("amount") or 0.0)
@@ -11277,7 +11009,7 @@ def api_access_subscribe_verify():
         if isinstance(wa_candidate, str) and _looks_like_evm_addr(wa_candidate):
             wa = _norm_addr(wa_candidate)
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     chain_id = body.get("chain_id")
     tx_hash = str(body.get("tx_hash") or "").strip()
@@ -11475,7 +11207,7 @@ def api_policy_get():
 def api_policy_set():
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     policy = body.get("policy") or {}
@@ -11509,7 +11241,7 @@ def api_intent_create():
         return e_access
 
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     chain_id = body.get("chain_id") or 137
@@ -11548,7 +11280,7 @@ def api_intent_create():
 def api_intent_get(intent_id):
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     conn = _db()
     cur = conn.cursor()
@@ -11571,7 +11303,7 @@ def api_intent_submit(intent_id):
     # Stub for later: AA / smart-contract / keeper submission.
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     conn = _db()
     cur = conn.cursor()
@@ -20540,7 +20272,7 @@ def api_grid_tick():
         item_id, chain_eff = _grid_canonical_item_chain(item_id, (body.get("chain") if request.method != "GET" else request.args.get("chain")) or "")
         wa = _require_auth() or _pick_wallet_from_request()
         if not wa:
-            return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+            return err("unauthorized", 401)
 
         session = _get_owned_session(item_id, wa)
         if isinstance(session, dict):
@@ -20770,7 +20502,7 @@ def api_grid_stop():
 
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     item_id = body.get("item") or body.get("item_id")
     if not item_id:
         return err("missing 'item' in body", 400)
@@ -21565,7 +21297,7 @@ def api_nexus_funding_resolve():
     body = request.get_json(silent=True) or {}
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     try:
         return jsonify(_nexus_funding_resolver_report(body, wa))
     except Exception as e:
@@ -21766,7 +21498,7 @@ def api_grid_manual_alias():
 def api_ai_insight_profile_get():
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -21795,7 +21527,7 @@ def api_ai_insight_profile_get():
 def api_ai_insight_profile_refresh():
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
 
     body = request.get_json(silent=True) or {}
     wallet_q = _norm_addr(body.get("wallet") or body.get("wallet_address") or wa)
@@ -25918,7 +25650,7 @@ def api_ai_run():
     """AI Analyst endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -26581,7 +26313,7 @@ def _strategist_ai_insight_bridge(wallet_address: str = "", pair: str = "", limi
 def api_market_memory_recent():
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     pair = str(request.args.get("pair") or "").strip().upper()
     try:
         limit = int(request.args.get("limit") or 25)
@@ -26601,7 +26333,7 @@ def api_ai_insight():
     """AI Insight endpoint. Uses wallet-specific order_memory / insight_profile, never ai_memory chat history."""
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -26699,7 +26431,7 @@ def api_ai_insight():
 def api_ai_memory_get():
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -26714,7 +26446,7 @@ def api_ai_memory_get():
 def api_ai_memory_clear():
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -26740,7 +26472,7 @@ def api_ai():
     """
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     st = _compute_access_status(wa)
     ai_gate = _ai_demo_consume_or_error(wa, st)
     if ai_gate:
@@ -28491,21 +28223,6 @@ def _privy_authorization_signature(url, body, extra_headers=None):
     return _b64.b64encode(signature).decode("ascii")
 
 
-def _privy_safe_reference_id(reference_id="", prefix="nexus"):
-    """Return a Privy-safe reference/idempotency key (maximum 64 chars)."""
-    raw = str(reference_id or "").strip()
-    if not raw:
-        raw = f"{prefix}-{uuid.uuid4().hex}"
-    # Privy accepts at most 64 characters. Keep a readable prefix and append a
-    # deterministic digest so shortened references remain unique.
-    safe = re.sub(r"[^A-Za-z0-9._:-]+", "-", raw).strip("-.")
-    if len(safe) <= 64:
-        return safe
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
-    head = safe[:43].rstrip("-._:")
-    return f"{head}-{digest}"[:64]
-
-
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id=""):
     cfg = _privy_trading_cfg()
     if not cfg["appId"] or not cfg["appSecret"]:
@@ -28517,18 +28234,18 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
         "chain_type": "ethereum",
         "params": {"transaction": transaction},
     }
-    safe_reference = _privy_safe_reference_id(reference_id, "nexus-tx")
-    body["reference_id"] = safe_reference
+    if reference_id:
+        body["reference_id"] = reference_id
     expiry = str(int(time.time() * 1000) + 60_000)
-    idem = safe_reference
-    signed_headers = {"privy-request-expiry": expiry, "privy-idempotency-key": idem}
+    idem = reference_id or str(uuid.uuid4())
+    signed_headers = {"privy-request-expiry": expiry, "idempotency-key": idem}
     sig = _privy_authorization_signature(url, body, signed_headers)
     headers = {
         "Content-Type": "application/json",
         "privy-app-id": cfg["appId"],
         "privy-authorization-signature": sig,
         "privy-request-expiry": expiry,
-        "privy-idempotency-key": idem,
+        "idempotency-key": idem,
     }
     response = requests.post(url, json=body, headers=headers, auth=(cfg["appId"], cfg["appSecret"]), timeout=45)
     data = response.json() if response.content else {}
@@ -28740,8 +28457,8 @@ def _privy_delegated_readiness(wallet_address):
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
         "walletProvisioned": bool(privy_wallet_id),
-        "walletDelegated": bool(delegation and int(delegation.get("consent_ts") or 0) > 0),
-        "userApprovalRequired": not bool(delegation and int(delegation.get("consent_ts") or 0) > 0),
+        "walletDelegated": True,
+        "userApprovalRequired": False,
         "delegatedBudgetUnits": None,
         "delegatedBudgetUsd": None,
         "budgetAuthority": "COREVAULT_SESSION",
@@ -28789,7 +28506,6 @@ def _privy_delegated_readiness(wallet_address):
     required = [
         ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
         ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletProvisioned","privy_wallet_mapping_pending"),
-        ("walletDelegated","privy_trading_signer_not_attached"),
         ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
         ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
@@ -28810,7 +28526,7 @@ def _privy_delegated_readiness(wallet_address):
         "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
-        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": False, "userActionRequired": not checks.get("walletDelegated"), "walletProvisioned": bool(privy_wallet_id), "signerAttached": bool(checks.get("walletDelegated"))},
+        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
         "privyWalletIdAvailable": bool(privy_wallet_id), "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
         "ts": now_ts(),
     }
@@ -28819,36 +28535,13 @@ def _privy_delegated_readiness(wallet_address):
 def _live_vault_execution_readiness(wallet_address): return _privy_delegated_readiness(wallet_address)
 
 
-@app.get("/api/nexus/privy-trading/auth-diagnostics")
-def api_privy_trading_auth_diagnostics():
-    auth = str(request.headers.get("Authorization") or "").strip()
-    token = auth.split(" ", 1)[1].strip() if auth.lower().startswith("bearer ") and " " in auth else ""
-    requested_wallet = _pick_wallet_from_request()
-    diag = _privy_access_token_diagnostics(token, requested_wallet)
-    diag.update({
-        "walletHeaderPresent": bool(requested_wallet),
-        "walletHeaderValid": bool(requested_wallet and _looks_like_evm_addr(requested_wallet)),
-        "authorized": bool(diag.get("signatureValid") and diag.get("privyDidPresent") and diag.get("walletOwnershipChecked") and diag.get("walletOwnedByUser")),
-        "build": BACKEND_BUILD_ID,
-        "ts": now_ts(),
-    })
-    # Never return the token, private keys, full DID or raw claims.
-    return jsonify({"status": "ok" if diag["authorized"] else "SETUP_REQUIRED", "diagnostics": diag}), (200 if diag["authorized"] else 401)
-
-
 @app.get("/api/nexus/privy-trading/config")
 def api_privy_trading_config():
-    """Return public signer/policy identifiers to the authenticated wallet.
-
-    IDs are not secrets. The private authorization key never leaves Render.
-    """
-    wallet = _require_auth()
-    if not wallet:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
-    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(wallet)
+    owner, denied = _require_owner_system_info()
+    if denied: return denied
+    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(owner)
     return jsonify({"status":"ok","signerId":cfg["signerId"],"policyId":cfg["policyId"],"chainType":"ethereum","chainId":1,
-                    "configured":bool(cfg["signerId"] and cfg["policyId"]),"signerAttached":bool((rd.get("checks") or {}).get("walletDelegated")),
-                    "readiness":rd,"ts":now_ts()})
+                    "configured":bool(cfg["signerId"] and cfg["policyId"]),"readiness":rd,"ts":now_ts()})
 
 
 @app.post("/api/nexus/privy-trading/provision")
@@ -28856,7 +28549,7 @@ def api_privy_trading_provision():
     """Automatic login/onboarding registration; no user approval or signature."""
     wa = _require_auth()
     if not wa:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
+        return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
     address = _norm_addr(body.get("walletAddress") or body.get("address") or wa)
     if address.lower() != _norm_addr(wa).lower():
@@ -28867,8 +28560,7 @@ def api_privy_trading_provision():
     except ValueError as exc:
         return jsonify({"status":"error","error":str(exc)}), 400
     return jsonify({
-        "status":"ok", "automatic":True,
-        "userActionRequired": not bool((_privy_trading_delegation(address) or {}).get("consent_ts")),
+        "status":"ok", "automatic":True, "userActionRequired":False,
         "wallet":address, "walletProvisioned":True,
         "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
         "readiness":_privy_delegated_readiness(address), "ts":now_ts()
@@ -28879,37 +28571,6 @@ def api_privy_trading_provision():
 def api_privy_trading_consent():
     """Backward-compatible alias. This performs automatic provisioning only."""
     return api_privy_trading_provision()
-
-
-@app.post("/api/nexus/privy-trading/signer-confirmed")
-def api_privy_trading_signer_confirmed():
-    """Record successful Privy addSigners completion for this embedded wallet."""
-    wallet = _require_auth()
-    if not wallet:
-        return jsonify({"status":"error","error":"unauthorized","authDiagnostics":_privy_access_token_diagnostics((request.headers.get("Authorization") or "").split(" ",1)[1].strip() if (request.headers.get("Authorization") or "").lower().startswith("bearer ") and " " in (request.headers.get("Authorization") or "") else "", _pick_wallet_from_request()),"ts":now_ts()}), 401
-    body = request.get_json(silent=True) or {}
-    address = _norm_addr(body.get("walletAddress") or body.get("address") or wallet)
-    if address.lower() != _norm_addr(wallet).lower():
-        return jsonify({"status":"error","error":"wallet_mismatch"}), 403
-    cfg = _privy_trading_cfg()
-    now = now_ts()
-    _privy_trading_db_init()
-    with DB_WRITE_LOCK:
-        con = _db()
-        try:
-            row = con.execute("SELECT privy_wallet_id FROM privy_trading_delegations WHERE wallet_address=?", (address.lower(),)).fetchone()
-            if not row:
-                return jsonify({"status":"error","error":"wallet_not_provisioned"}), 409
-            con.execute("""UPDATE privy_trading_delegations
-                           SET signer_id=?, policy_id=?, consent_ts=?, updated_ts=?
-                           WHERE wallet_address=?""",
-                        (cfg.get("signerId") or "", cfg.get("policyId") or "", now, now, address.lower()))
-            con.commit()
-        finally:
-            con.close()
-    return jsonify({"status":"ok","wallet":address,"signerAttached":True,
-                    "signerId":cfg.get("signerId"),"policyId":cfg.get("policyId"),
-                    "readiness":_privy_delegated_readiness(address),"ts":now})
 
 
 @app.post("/api/nexus/privy-trading/revoke")
