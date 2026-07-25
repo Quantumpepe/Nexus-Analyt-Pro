@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-161-UNISWAP-V3-ROUTE-PRESETS-ENCODER"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-162-SWAPROUTER02-EXECUTION-ALIGNMENT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27902,7 +27902,7 @@ _PRIVY_TRADING_HARD_CAP_UNITS = int(os.getenv("NEXUS_PRIVY_TEST_CAP_USDC_UNITS",
 _PRIVY_TRADING_API = "https://api.privy.io"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
-_PRIVY_EXACT_INPUT_SINGLE_SELECTOR = "0x414bf389"
+_PRIVY_EXACT_INPUT_SINGLE_SELECTOR = UNISWAP_EXACT_INPUT_SINGLE_SELECTOR
 _PRIVY_CREATE_SESSION_SELECTOR = "0x00000000"  # encoded by frontend/ABI-aware executor; dynamic args
 _PRIVY_EXECUTE_TRADE_SELECTOR = "0x00000000"   # encoded by frontend/ABI-aware executor; dynamic tuple
 _PRIVY_FINALIZE_SESSION_SELECTOR = "0x2e1a7d4d"  # placeholder not used directly; live worker is route-gated
@@ -27922,10 +27922,11 @@ def _privy_trading_cfg():
         "chainId": 1,
         "vault": _norm_addr(_VAULT_BY_CHAIN.get(1) or os.getenv("CORE_VAULT_ADDRESS_ETH") or ""),
         "nkrLiquidityVault": _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) or ""),
-        "routeId": str(os.getenv("NEXUS_ETH_USDC_WETH_ROUTE_ID") or "").strip(),
+        "routeId": str(os.getenv("NEXUS_ETH_USDC_WETH_ROUTE_ID") or ETH_USDC_WETH_BUY_ROUTE_ID).strip(),
+        "sellRouteId": str(os.getenv("NEXUS_ETH_WETH_USDC_ROUTE_ID") or ETH_WETH_USDC_SELL_ROUTE_ID).strip(),
         "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or "0xE592427A0AEce92De3Edee1F18E0157C05861564"),
+        "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or UNISWAP_SWAP_ROUTER_02),
         "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or ""),
         "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
         "slippageBps": max(1, min(500, int(os.getenv("NEXUS_EXECUTOR_MAX_SLIPPAGE_BPS", "100")))),
@@ -28083,11 +28084,11 @@ def _privy_quote(cfg, token_in, token_out, amount_in):
 
 
 def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, amount_out_min, fee):
-    # exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))
-    deadline = int(time.time()) + 600
+    # SwapRouter02 exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+    # Selector 0x04e45aaf. SwapRouter02 has no deadline field in this tuple.
     return (_PRIVY_EXACT_INPUT_SINGLE_SELECTOR + _addr_to_32(token_in) + _addr_to_32(token_out) +
-            _uint_to_32(fee) + _addr_to_32(recipient) + _uint_to_32(deadline) +
-            _uint_to_32(amount_in) + _uint_to_32(amount_out_min) + _uint_to_32(0))
+            _uint_to_32(fee) + _addr_to_32(recipient) + _uint_to_32(amount_in) +
+            _uint_to_32(amount_out_min) + _uint_to_32(0))
 
 
 def _privy_job_write(job_id, wallet, wallet_id, system, amount, status, stage, error="", txs=None):
@@ -28304,8 +28305,10 @@ def api_core_vault_prepare_system_session():
 
     route_ids = body.get("allowedRoutes") if isinstance(body.get("allowedRoutes"), list) else []
     route_ids = [str(x).strip() for x in route_ids if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x).strip())]
-    if not route_ids and re.fullmatch(r"0x[0-9a-fA-F]{64}", str(cfg.get("routeId") or "")):
-        route_ids = [str(cfg["routeId"])]
+    if not route_ids:
+        configured_route_ids = [cfg.get("routeId"), cfg.get("sellRouteId")]
+        route_ids = [str(x).strip() for x in configured_route_ids
+                     if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x or "").strip())]
     if not route_ids:
         return jsonify({
             "status":"blocked",
