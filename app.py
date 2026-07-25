@@ -28732,6 +28732,84 @@ def _evm_registry_cg_coin(coin_id: str) -> dict:
         return {}
 
 
+def _evm_registry_dex_market_probe(chain_id: int, token_address: str) -> dict:
+    """Verify that a token has a real, liquid market on the expected EVM chain.
+
+    This is intentionally independent from CoreVault admission. It keeps clearly
+    established tokens out of the owner's manual review queue, while ambiguous
+    or thinly traded tokens remain reviewable.
+    """
+    cid = int(chain_id or 0)
+    addr = _norm_addr(token_address)
+    chain_names = {
+        1: {"ethereum"},
+        56: {"bsc", "binance-smart-chain"},
+        137: {"polygon", "polygon-pos"},
+        8453: {"base"},
+        42161: {"arbitrum"},
+        10: {"optimism"},
+        43114: {"avalanche"},
+    }.get(cid, set())
+    out = {
+        "checked": False, "verified": False, "pairCount": 0,
+        "liquidityUsd": 0.0, "volume24hUsd": 0.0,
+        "buys24h": 0, "sells24h": 0, "bestPair": "", "error": "",
+    }
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
+            headers={"Accept": "application/json", "User-Agent": "Nexus/1.0"},
+            timeout=12,
+        )
+        if not r.ok:
+            out["error"] = f"dex_market_http_{r.status_code}"
+            return out
+        payload = r.json() if r.content else {}
+        pairs = payload.get("pairs") if isinstance(payload, dict) else []
+        pairs = pairs if isinstance(pairs, list) else []
+        matching = []
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            if chain_names and str(pair.get("chainId") or "").strip().lower() not in chain_names:
+                continue
+            base = _norm_addr(((pair.get("baseToken") or {}).get("address") or ""))
+            quote = _norm_addr(((pair.get("quoteToken") or {}).get("address") or ""))
+            if addr not in (base, quote):
+                continue
+            matching.append(pair)
+        out["checked"] = True
+        out["pairCount"] = len(matching)
+        if not matching:
+            return out
+        def fnum(v):
+            try: return float(v or 0)
+            except Exception: return 0.0
+        def inum(v):
+            try: return int(v or 0)
+            except Exception: return 0
+        ranked = sorted(matching, key=lambda x: fnum((x.get("liquidity") or {}).get("usd")), reverse=True)
+        best = ranked[0]
+        out["liquidityUsd"] = fnum((best.get("liquidity") or {}).get("usd"))
+        out["volume24hUsd"] = fnum((best.get("volume") or {}).get("h24"))
+        tx24 = (best.get("txns") or {}).get("h24") or {}
+        out["buys24h"] = inum(tx24.get("buys"))
+        out["sells24h"] = inum(tx24.get("sells"))
+        out["bestPair"] = str(best.get("pairAddress") or "")
+        min_liq = float(os.getenv("NEXUS_AUTO_APPROVE_MIN_LIQUIDITY_USD", "100000"))
+        min_vol = float(os.getenv("NEXUS_AUTO_APPROVE_MIN_VOLUME_24H_USD", "10000"))
+        out["verified"] = bool(
+            out["liquidityUsd"] >= min_liq
+            and out["volume24hUsd"] >= min_vol
+            and out["buys24h"] > 0
+            and out["sells24h"] > 0
+        )
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)[:220]
+        return out
+
+
 def _evm_registry_route_probe(chain_id: int, token_address: str) -> dict:
     cid = int(chain_id or 0)
     routers = []
@@ -28751,7 +28829,18 @@ def _evm_registry_route_probe(chain_id: int, token_address: str) -> dict:
         code_ok = _looks_like_evm_addr(router) and str(_rpc_call(cid,"eth_getCode",[router,"latest"]) or "0x") not in ("0x","0x0")
     except Exception:
         pass
-    return {"router":router,"routerConfigured":_looks_like_evm_addr(router),"routerHasCode":code_ok,"tokenHasCode":token_code_ok,"baseAsset":stable,"buyRouteCandidate":bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),"sellRouteCandidate":bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),"quoteVerified":False}
+    market = _evm_registry_dex_market_probe(cid, token_address)
+    return {
+        "router": router,
+        "routerConfigured": _looks_like_evm_addr(router),
+        "routerHasCode": code_ok,
+        "tokenHasCode": token_code_ok,
+        "baseAsset": stable,
+        "buyRouteCandidate": bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),
+        "sellRouteCandidate": bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),
+        "quoteVerified": bool(market.get("verified")),
+        "market": market,
+    }
 
 
 def _evm_registry_scan_contract(chain_id: int, token_address: str, symbol: str, name: str, coin_id: str, source: str="watchlist") -> dict:
@@ -28770,19 +28859,45 @@ def _evm_registry_scan_contract(chain_id: int, token_address: str, symbol: str, 
     if truth(raw.get("cannot_sell_all")): blockers.append("sell_restriction")
     if sell_tax is not None and sell_tax > 0.10: blockers.append("sell_tax_over_10pct")
     if not route.get("tokenHasCode"): blockers.append("no_contract_code")
+
+    review_flags=[]
+    if truth(raw.get("owner_change_balance")): review_flags.append("owner_can_change_balance")
+    if truth(raw.get("hidden_owner")): review_flags.append("hidden_owner")
+    if truth(raw.get("is_mintable")): review_flags.append("mintable")
+    if buy_tax is not None and buy_tax > 0.03: review_flags.append("buy_tax_over_3pct")
+    if sell_tax is not None and sell_tax > 0.03: review_flags.append("sell_tax_over_3pct")
+
+    known_identity = bool(str(coin_id or "").strip())
+    security_clear = bool(raw and not raw.get("scan_error") and not blockers and not review_flags)
+    infrastructure_clear = bool(route.get("buyRouteCandidate") and route.get("sellRouteCandidate"))
+    market_clear = bool(route.get("quoteVerified"))
+
     if blockers:
         status="BLOCKED"
         reason=", ".join(blockers)
     elif raw.get("scan_error"):
         status="PENDING_OWNER"
         reason="security scan temporarily unavailable"
-    elif not route.get("buyRouteCandidate") or not route.get("sellRouteCandidate"):
+    elif review_flags:
+        status="PENDING_OWNER"
+        reason="manual review: " + ", ".join(review_flags)
+    elif not known_identity:
+        status="PENDING_OWNER"
+        reason="token identity is not uniquely confirmed"
+    elif not infrastructure_clear:
         status="PENDING_OWNER"
         reason="router or stable route infrastructure incomplete"
+    elif not market_clear:
+        status="PENDING_OWNER"
+        reason="market liquidity or two-way trading could not be confirmed"
+    elif security_clear:
+        status="APPROVED"
+        reason="automatically approved: identity, security and liquid two-way market verified"
     else:
         status="PENDING_OWNER"
-        reason="automatic checks passed; owner confirmation required before CoreVault admission"
-    row={"chain_id":cid,"chain_key":_EVM_CHAIN_KEY_BY_ID.get(cid,str(cid)),"token_address":addr,"symbol":symbol,"name":name,"decimals":int(raw.get("token_decimals") or 18),"coingecko_id":coin_id,"source":source,"status":status,"decision_reason":reason,"risk":{"blockers":blockers,"isHoneypot":truth(raw.get("is_honeypot")),"buyTax":buy_tax,"sellTax":sell_tax,"ownerChangeBalance":truth(raw.get("owner_change_balance")),"hiddenOwner":truth(raw.get("hidden_owner")),"mintable":truth(raw.get("is_mintable")),"proxy":truth(raw.get("is_proxy")),"rawAvailable":bool(raw and not raw.get("scan_error")),"scanError":raw.get("scan_error","")},"route":route}
+        reason="automatic checks were inconclusive"
+
+    row={"chain_id":cid,"chain_key":_EVM_CHAIN_KEY_BY_ID.get(cid,str(cid)),"token_address":addr,"symbol":symbol,"name":name,"decimals":int(raw.get("token_decimals") or 18),"coingecko_id":coin_id,"source":source,"status":status,"decision_reason":reason,"risk":{"blockers":blockers,"reviewFlags":review_flags,"isHoneypot":truth(raw.get("is_honeypot")),"buyTax":buy_tax,"sellTax":sell_tax,"ownerChangeBalance":truth(raw.get("owner_change_balance")),"hiddenOwner":truth(raw.get("hidden_owner")),"mintable":truth(raw.get("is_mintable")),"proxy":truth(raw.get("is_proxy")),"rawAvailable":bool(raw and not raw.get("scan_error")),"scanError":raw.get("scan_error","")},"route":route}
     _evm_registry_upsert(row)
     return row
 
@@ -28800,7 +28915,18 @@ def _evm_registry_scan_watch_items(items: list) -> dict:
             platform=_EVM_PLATFORM_BY_CHAIN.get(cid,"")
             addr=str(platforms.get(platform) or "").strip()
             if not addr and str(it.get("mode") or "").lower()=="dex":
-                addr=str(it.get("contract") or it.get("tokenAddress") or "").strip()
+                item_chain = str(it.get("chain") or "").strip().lower()
+                allowed_item_chains = {
+                    1: {"eth", "ethereum"},
+                    56: {"bnb", "bsc", "binance-smart-chain"},
+                    137: {"pol", "polygon", "polygon-pos", "matic"},
+                    8453: {"base"},
+                    42161: {"arb", "arbitrum", "arbitrum-one"},
+                    10: {"op", "optimism", "optimistic-ethereum"},
+                    43114: {"avax", "avalanche"},
+                }.get(cid, set())
+                if item_chain in allowed_item_chains:
+                    addr=str(it.get("contract") or it.get("tokenAddress") or "").strip()
             if not _looks_like_evm_addr(addr):
                 continue
             row=_evm_registry_scan_contract(cid,addr,sym,str(it.get("name") or cg.get("name") or sym),coin_id)
@@ -28826,7 +28952,7 @@ def _evm_registry_rows() -> list[dict]:
 
 def _evm_registry_summary() -> dict:
     rows=_evm_registry_rows()
-    return {"status":"ok","mode":"MULTI_EVM_TOKEN_REGISTRY_V1","chains":[_EVM_CHAIN_KEY_BY_ID.get(x,str(x)) for x in _evm_registry_enabled_chain_ids()],"pending":[x for x in rows if x.get("status")=="PENDING_OWNER"],"blocked":[x for x in rows if x.get("status")=="BLOCKED"],"approved":[x for x in rows if x.get("status")=="APPROVED"],"rejected":[x for x in rows if x.get("status")=="REJECTED"],"counts":{"total":len(rows),"pending":sum(x.get("status")=="PENDING_OWNER" for x in rows),"blocked":sum(x.get("status")=="BLOCKED" for x in rows),"approved":sum(x.get("status")=="APPROVED" for x in rows),"rejected":sum(x.get("status")=="REJECTED" for x in rows)},"rules":{"userTokenApprovalRequired":False,"ownerReviewInSystemInfo":True,"exactContractRequired":True,"nkrUsesApprovedOnly":True,"onchainCoreVaultConfigurationStillRequired":True},"ts":now_ts()}
+    return {"status":"ok","mode":"MULTI_EVM_TOKEN_REGISTRY_V2_AUTO_APPROVAL","chains":[_EVM_CHAIN_KEY_BY_ID.get(x,str(x)) for x in _evm_registry_enabled_chain_ids()],"pending":[x for x in rows if x.get("status")=="PENDING_OWNER"],"blocked":[x for x in rows if x.get("status")=="BLOCKED"],"approved":[x for x in rows if x.get("status")=="APPROVED"],"rejected":[x for x in rows if x.get("status")=="REJECTED"],"counts":{"total":len(rows),"pending":sum(x.get("status")=="PENDING_OWNER" for x in rows),"blocked":sum(x.get("status")=="BLOCKED" for x in rows),"approved":sum(x.get("status")=="APPROVED" for x in rows),"rejected":sum(x.get("status")=="REJECTED" for x in rows)},"rules":{"userTokenApprovalRequired":False,"ownerReviewInSystemInfo":True,"exactContractRequired":True,"nkrUsesApprovedOnly":True,"onchainCoreVaultConfigurationStillRequired":True},"ts":now_ts()}
 
 
 @app.get("/api/nexus/evm-token-registry")
