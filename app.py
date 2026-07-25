@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-163-COREVAULT-V3-PRELIVE-AUDIT-COMPLETE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.16-ENGINE-148-PRIVY-DELEGATED-TRADING"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-164-PRIVY-AUTO-PROVISION-NO-USER-GATE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-173-PRIVY-AUTO-PROVISION-NO-USER-GATE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27882,11 +27882,12 @@ def api_nexus_shadow_test_report_template():
 
 
 # ============================================================================
-# ENGINE-148: Privy delegated trading
-# The user's existing Privy embedded wallet stays the only execution wallet.
-# The user approves the nexus-live-trading key quorum once. Afterwards the
-# backend may request transactions from that wallet, but Privy enforces the
-# signer policy created in the Dashboard. Nexus never receives the wallet key.
+# ENGINE-164: Privy automatic wallet execution
+# The user's Privy embedded wallet stays the only user execution wallet.
+# Privy/Nexus already provisions the signer and policy at platform level. A user
+# never performs a second delegation, approval, per-session signature or MetaMask
+# step. The backend only stores the Privy wallet-id/address mapping automatically
+# after login so it can address Privy's wallet RPC. Nexus never receives the key.
 #
 # IMPORTANT CONTRACT BOUNDARY:
 # NexusCoreVault.pullForExecution is callable only by EXECUTOR_ROLE. With the
@@ -27900,6 +27901,9 @@ from cryptography.hazmat.primitives.asymmetric import ec as _crypto_ec
 
 _PRIVY_TRADING_HARD_CAP_UNITS = int(os.getenv("NEXUS_PRIVY_TEST_CAP_USDC_UNITS", "1000000"))
 _PRIVY_TRADING_API = "https://api.privy.io"
+NEXUS_PRIVY_USER_APPROVAL_MODE = "ZERO_ADDITIONAL_USER_ACTION"
+NEXUS_PRIVY_WALLET_PROVISION_MODE = "AUTOMATIC_ON_LOGIN"
+NEXUS_PRIVY_BUDGET_AUTHORITY = "COREVAULT_SESSION"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
 _PRIVY_EXACT_INPUT_SINGLE_SELECTOR = UNISWAP_EXACT_INPUT_SINGLE_SELECTOR
@@ -27995,6 +27999,65 @@ def _privy_trading_delegation(wallet_address):
         return dict(row) if row else None
     finally:
         con.close()
+
+
+def _privy_wallet_id_for_user(wallet_address):
+    """Resolve the Privy wallet id without any user-consent gate.
+
+    The dedicated mapping is preferred. access_state is a migration/fallback
+    source because older auto-renew onboarding already stored the same wallet id.
+    """
+    wa = _norm_addr(wallet_address)
+    if not wa:
+        return ""
+    rec = _privy_trading_delegation(wa) or {}
+    wallet_id = str(rec.get("privy_wallet_id") or "").strip()
+    if wallet_id:
+        return wallet_id
+    con = _db()
+    try:
+        row = con.execute("SELECT privy_wallet_id FROM access_state WHERE lower(wallet_address)=?", (wa.lower(),)).fetchone()
+        if row:
+            try:
+                return str(row["privy_wallet_id"] or "").strip()
+            except Exception:
+                return str(row[0] or "").strip()
+    except Exception:
+        return ""
+    finally:
+        con.close()
+    return ""
+
+
+def _privy_auto_provision_wallet(wallet_address, privy_wallet_id):
+    """Persist address -> Privy wallet id automatically; no approval semantics."""
+    wa = _norm_addr(wallet_address)
+    wallet_id = str(privy_wallet_id or "").strip()
+    if not _looks_like_evm_addr(wa):
+        raise ValueError("valid_wallet_required")
+    if not wallet_id or len(wallet_id) > 255:
+        raise ValueError("privy_wallet_id_required")
+    cfg = _privy_trading_cfg()
+    now = now_ts()
+    _privy_trading_db_init()
+    with DB_WRITE_LOCK:
+        con = _db()
+        try:
+            con.execute("""INSERT INTO privy_trading_delegations(
+                wallet_address,privy_wallet_id,signer_id,policy_id,enabled,max_budget_units,
+                system_name,chain_id,duration_days,consent_ts,expires_ts,updated_ts
+            ) VALUES(?,?,?,?,1,0,'ALL',1,0,0,0,?)
+            ON CONFLICT(wallet_address) DO UPDATE SET
+                privy_wallet_id=excluded.privy_wallet_id,
+                signer_id=excluded.signer_id,
+                policy_id=excluded.policy_id,
+                enabled=1,max_budget_units=0,system_name='ALL',chain_id=1,
+                duration_days=0,consent_ts=0,expires_ts=0,updated_ts=excluded.updated_ts""",
+                (wa.lower(), wallet_id, cfg.get("signerId") or "", cfg.get("policyId") or "", now))
+            con.commit()
+        finally:
+            con.close()
+    return wallet_id
 
 
 def _privy_canonical_json(obj):
@@ -28251,14 +28314,17 @@ def _privy_delegated_readiness(wallet_address):
     cfg = _privy_trading_cfg()
     user = _norm_addr(wallet_address)
     delegation = _privy_trading_delegation(user)
-    delegated_budget_units = int((delegation or {}).get("max_budget_units") or 0)
+    privy_wallet_id = _privy_wallet_id_for_user(user)
     checks = {
         "privyAppConfigured": bool(cfg["appId"] and cfg["appSecret"]),
         "tradingSignerConfigured": bool(cfg["signerId"] and cfg["authorizationKey"]),
         "tradingPolicyConfigured": bool(cfg["policyId"]),
-        "walletDelegated": bool(delegation and delegation.get("enabled") and int(delegation.get("expires_ts") or 0) > now_ts()),
-        "delegatedBudgetUnits": delegated_budget_units,
-        "delegatedBudgetUsd": delegated_budget_units / 1_000_000.0,
+        "walletProvisioned": bool(privy_wallet_id),
+        "walletDelegated": True,
+        "userApprovalRequired": False,
+        "delegatedBudgetUnits": None,
+        "delegatedBudgetUsd": None,
+        "budgetAuthority": "COREVAULT_SESSION",
         "vaultConnected": False, "vaultPaused": None, "solvent": False,
         "usdcConfigured": False, "usdcExecutionEnabled": False, "usdcSettlementToken": False, "usdcDecimalsCorrect": False,
         "wethConfigured": False, "wethExecutionEnabled": False, "wethDecimalsCorrect": False,
@@ -28302,7 +28368,7 @@ def _privy_delegated_readiness(wallet_address):
         blockers.append("vault_rpc_or_decode_failed"); checks["rpcError"] = str(exc)
     required = [
         ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
-        ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletDelegated","wallet_not_delegated"),
+        ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletProvisioned","privy_wallet_mapping_pending"),
         ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
         ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
@@ -28316,7 +28382,6 @@ def _privy_delegated_readiness(wallet_address):
     if checks.get("vaultPaused"): blockers.append("vault_paused")
     for key, code in required:
         if not checks.get(key): blockers.append(code)
-    if delegated_budget_units < _PRIVY_TRADING_HARD_CAP_UNITS: blockers.append("delegated_budget_below_test_cap")
     if not cfg["liveEnabled"]: blockers.append("live_execution_env_disabled")
     active = not blockers
     return {
@@ -28324,8 +28389,8 @@ def _privy_delegated_readiness(wallet_address):
         "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
-        "blockers": list(dict.fromkeys(blockers)), "delegation": delegation or {},
-        "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
+        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
+        "privyWalletIdAvailable": bool(privy_wallet_id), "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
         "ts": now_ts(),
     }
 
@@ -28342,40 +28407,45 @@ def api_privy_trading_config():
                     "configured":bool(cfg["signerId"] and cfg["policyId"]),"readiness":rd,"ts":now_ts()})
 
 
+@app.post("/api/nexus/privy-trading/provision")
+def api_privy_trading_provision():
+    """Automatic login/onboarding registration; no user approval or signature."""
+    wa = _require_auth()
+    if not wa:
+        return err("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    address = _norm_addr(body.get("walletAddress") or body.get("address") or wa)
+    if address.lower() != _norm_addr(wa).lower():
+        return jsonify({"status":"error","error":"wallet_mismatch"}), 403
+    wallet_id = str(body.get("privyWalletId") or body.get("privy_wallet_id") or body.get("wallet_id") or "").strip()
+    try:
+        _privy_auto_provision_wallet(address, wallet_id)
+    except ValueError as exc:
+        return jsonify({"status":"error","error":str(exc)}), 400
+    return jsonify({
+        "status":"ok", "automatic":True, "userActionRequired":False,
+        "wallet":address, "walletProvisioned":True,
+        "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
+        "readiness":_privy_delegated_readiness(address), "ts":now_ts()
+    })
+
+
 @app.post("/api/nexus/privy-trading/consent")
 def api_privy_trading_consent():
-    owner, denied = _require_owner_system_info()
-    if denied: return denied
-    body = request.get_json(silent=True) or {}; cfg = _privy_trading_cfg()
-    wallet_id = str(body.get("privyWalletId") or body.get("wallet_id") or "").strip()
-    address = _norm_addr(body.get("walletAddress") or owner)
-    if address.lower() != _norm_addr(owner).lower(): return jsonify({"status":"error","error":"wallet_mismatch"}),403
-    if not wallet_id: return jsonify({"status":"error","error":"privy_wallet_id_required"}),400
-    system = str(body.get("system") or "TRADER").upper(); system = "TRADER" if system == "TRADING" else system
-    if system not in ("TRADER","GRID","NKR"): return jsonify({"status":"error","error":"invalid_system"}),400
-    budget = max(1, min(int(body.get("budgetUsdcUnits") or _PRIVY_TRADING_HARD_CAP_UNITS), 100_000_000_000))
-    duration = max(1, min(int(body.get("durationDays") or 1),3650)); now=now_ts(); expires=now+duration*86400
-    _privy_trading_db_init()
-    with DB_WRITE_LOCK:
-        con=_db()
-        try:
-            con.execute("""INSERT INTO privy_trading_delegations(wallet_address,privy_wallet_id,signer_id,policy_id,enabled,max_budget_units,system_name,chain_id,duration_days,consent_ts,expires_ts,updated_ts)
-                         VALUES(?,?,?,?,1,?,?,?,?,?,?,?) ON CONFLICT(wallet_address) DO UPDATE SET privy_wallet_id=excluded.privy_wallet_id,signer_id=excluded.signer_id,policy_id=excluded.policy_id,enabled=1,max_budget_units=excluded.max_budget_units,system_name=excluded.system_name,chain_id=excluded.chain_id,duration_days=excluded.duration_days,consent_ts=excluded.consent_ts,expires_ts=excluded.expires_ts,updated_ts=excluded.updated_ts""",
-                        (address.lower(),wallet_id,cfg["signerId"],cfg["policyId"],budget,system,1,duration,now,expires,now)); con.commit()
-        finally: con.close()
-    return jsonify({"status":"ok","delegated":True,"readiness":_privy_delegated_readiness(address)})
+    """Backward-compatible alias. This performs automatic provisioning only."""
+    return api_privy_trading_provision()
 
 
 @app.post("/api/nexus/privy-trading/revoke")
 def api_privy_trading_revoke():
     owner, denied = _require_owner_system_info()
-    if denied: return denied
-    _privy_trading_db_init()
-    with DB_WRITE_LOCK:
-        con=_db()
-        try: con.execute("UPDATE privy_trading_delegations SET enabled=0,updated_ts=? WHERE wallet_address=?",(now_ts(),_norm_addr(owner).lower())); con.commit()
-        finally: con.close()
-    return jsonify({"status":"ok","delegated":False})
+    if denied:
+        return denied
+    return jsonify({
+        "status":"ok", "revoked":False,
+        "message":"User automation has no per-user approval gate. Use the global emergency stop or Privy dashboard policy controls.",
+        "ts":now_ts()
+    })
 
 
 def _privy_delegated_test_worker(job_id, wallet, wallet_id):
@@ -28384,9 +28454,9 @@ def _privy_delegated_test_worker(job_id, wallet, wallet_id):
         rd = _privy_delegated_readiness(wallet)
         if rd.get("liveExecution") != "ACTIVE":
             raise RuntimeError("readiness_blocked:" + ",".join(rd.get("blockers") or []))
-        delegation = _privy_trading_delegation(wallet) or {}
-        if str(delegation.get("privy_wallet_id") or "") != str(wallet_id):
-            raise RuntimeError("privy_wallet_id_mismatch")
+        resolved_wallet_id = _privy_wallet_id_for_user(wallet)
+        if not resolved_wallet_id or str(resolved_wallet_id) != str(wallet_id):
+            raise RuntimeError("privy_wallet_id_mapping_mismatch")
         _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","CREATE_SESSION","",txs)
         create_data = _encode_create_session(cfg,"TRADER",amount,86400,cfg["slippageBps"],1500)
         txs["createSession"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],create_data,job_id+":create")
@@ -28427,8 +28497,7 @@ def api_privy_trading_test_start():
     rd = _privy_delegated_readiness(owner)
     if rd.get("liveExecution") != "ACTIVE":
         return jsonify({"status":"blocked","error":"corevault_v3_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
-    delegation = _privy_trading_delegation(owner) or {}
-    wallet_id = str(delegation.get("privy_wallet_id") or "").strip()
+    wallet_id = _privy_wallet_id_for_user(owner)
     if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
     job_id = "v3test-" + uuid.uuid4().hex
     _privy_job_write(job_id,owner,wallet_id,"TRADER",_PRIVY_TRADING_HARD_CAP_UNITS,"QUEUED","QUEUED","",{})
@@ -28441,7 +28510,7 @@ def api_nexus_live_executor_status():
     owner, denied = _require_owner_system_info()
     if denied:return denied
     rd=_privy_delegated_readiness(owner)
-    return jsonify({"status":"ok","runtime":{"status":"READY" if rd.get("liveExecution")=="ACTIVE" else "BLOCKED","operational":rd.get("liveExecution")=="ACTIVE","privyOnly":True,"delegatedSigner":True,"hardCapUsdc":_PRIVY_TRADING_HARD_CAP_UNITS/1_000_000.0,"ts":now_ts()},"readiness":rd,"jobs":_privy_job_rows(owner),"ts":now_ts()})
+    return jsonify({"status":"ok","runtime":{"status":"READY" if rd.get("liveExecution")=="ACTIVE" else "BLOCKED","operational":rd.get("liveExecution")=="ACTIVE","privyOnly":True,"delegatedSigner":True,"userApprovalRequired":False,"testAmountUsdc":_PRIVY_TRADING_HARD_CAP_UNITS/1_000_000.0,"ts":now_ts()},"readiness":rd,"jobs":_privy_job_rows(owner),"ts":now_ts()})
 
 
 @app.get("/api/nexus/live-execution-readiness")
@@ -28462,7 +28531,7 @@ def api_nexus_system_info_owner_panel():
 
 # ENGINE-160: CoreVault budget/session bridge for NKR, Trader and Grid.
 # The deployed CoreVault contract requires at least one enabled TRADE route when a session is created.
-# The backend only prepares calldata. The user's own Privy embedded wallet signs and sends it.
+# The backend prepares CoreVault calldata; Privy/Nexus executes automatically through the configured embedded-wallet policy.
 @app.post("/api/nexus/core-vault/session/prepare-create")
 def api_core_vault_prepare_system_session():
     body = request.get_json(silent=True) or {}
@@ -30187,43 +30256,13 @@ def api_nexus_vault_execute_swap_package():
 
 @app.route("/api/nexus/vault/submit-signed-swap", methods=["POST"])
 def api_nexus_vault_submit_signed_swap():
-    """Accept a Privy-signed Vault package and keep live execution gated by ENV.
-
-    By default this endpoint validates and logs the signed package but does not submit
-    a transaction. Set NEXUS_VAULT_EXECUTION_LIVE=1 only after fork/testnet testing
-    and after a Privy server-side signer/tx sender is connected.
-    """
-    body = request.get_json(silent=True) or {}
-    wa = _require_auth()
-    if not wa:
-        return err("unauthorized", 401)
-    sig = str(body.get("signature") or ((body.get("vaultArgs") or {}) if isinstance(body.get("vaultArgs"), dict) else {}).get("signature") or "").strip()
-    if not _nexus_is_hex_data(sig):
-        return err("missing/invalid Privy EIP-712 signature", 400)
-
-    merged = dict(body)
-    if isinstance(body.get("vaultArgs"), dict):
-        for k, v in (body.get("vaultArgs") or {}).items():
-            merged.setdefault(k, v)
-    merged["signature"] = sig
-
-    package = _nexus_execution_package_from_body(merged, wa)
-    if package.get("status") != "ok":
-        return jsonify(package), 400
-
-    if not _NEXUS_VAULT_EXECUTION_LIVE:
-        package["status"] = "ready_not_submitted"
-        package["message"] = "Signed package valid, but live Vault execution is disabled. Enable NEXUS_VAULT_EXECUTION_LIVE only after tests."
-        return jsonify(package)
-
-    # Live tx sending is intentionally not implemented here because Privy server-side signing/delegated
-    # transaction execution requires the project-specific Privy API credentials and policy IDs.
     return jsonify({
-        "status": "blocked",
-        "error": "live Privy transaction sender not connected in this backend file yet",
-        "package": package,
-        "ts": now_ts(),
-    }), 501
+        "status":"gone", "error":"legacy_vault_v2_path_disabled",
+        "activeExecutionPath":"NexusCoreVaultV3Slim",
+        "message":"Use the CoreVault V3 session/executor endpoints. This legacy endpoint is not part of user execution.",
+        "ts":now_ts()
+    }), 410
+
 
 @app.route("/api/nexus/routers", methods=["GET"])
 def api_nexus_routers():
