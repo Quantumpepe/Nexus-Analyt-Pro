@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-176-MULTI-EVM-TOKEN-REGISTRY"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-177-MULTI-EVM-TOKEN-REGISTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1229,7 +1229,12 @@ def api_core_vault_create_system_session_auto():
             max_slippage_bps=slippage_bps,
             max_loss_bps=max_loss_bps,
         )
-        reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
+        # Do not include the full wallet address: Privy limits reference_id to 64 chars.
+        wallet_tag = wallet.lower().removeprefix("0x")[-10:]
+        reference = _privy_safe_reference_id(
+            f"nexus-{system_name.lower()}-session-{wallet_tag}-{int(time.time())}",
+            "nexus-session",
+        )
         sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference)
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
         return jsonify({
@@ -28223,6 +28228,21 @@ def _privy_authorization_signature(url, body, extra_headers=None):
     return _b64.b64encode(signature).decode("ascii")
 
 
+def _privy_safe_reference_id(reference_id="", prefix="nexus"):
+    """Return a Privy-safe reference/idempotency key (maximum 64 chars)."""
+    raw = str(reference_id or "").strip()
+    if not raw:
+        raw = f"{prefix}-{uuid.uuid4().hex}"
+    # Privy accepts at most 64 characters. Keep a readable prefix and append a
+    # deterministic digest so shortened references remain unique.
+    safe = re.sub(r"[^A-Za-z0-9._:-]+", "-", raw).strip("-.")
+    if len(safe) <= 64:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+    head = safe[:43].rstrip("-._:")
+    return f"{head}-{digest}"[:64]
+
+
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id=""):
     cfg = _privy_trading_cfg()
     if not cfg["appId"] or not cfg["appSecret"]:
@@ -28234,10 +28254,10 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
         "chain_type": "ethereum",
         "params": {"transaction": transaction},
     }
-    if reference_id:
-        body["reference_id"] = reference_id
+    safe_reference = _privy_safe_reference_id(reference_id, "nexus-tx")
+    body["reference_id"] = safe_reference
     expiry = str(int(time.time() * 1000) + 60_000)
-    idem = reference_id or str(uuid.uuid4())
+    idem = safe_reference
     signed_headers = {"privy-request-expiry": expiry, "idempotency-key": idem}
     sig = _privy_authorization_signature(url, body, signed_headers)
     headers = {
