@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-164-PRIVY-AUTO-PROVISION-NO-USER-GATE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-173-PRIVY-AUTO-PROVISION-NO-USER-GATE"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-165-PRIVY-AUTO-SESSION-START"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-175-NKR-NO-PRIVY-POPUP"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1149,6 +1149,104 @@ def api_nexus_core_vault_admin_prepare_action():
         })
     except (TypeError, ValueError, OverflowError) as exc:
         return jsonify({'status': 'error', 'error': str(exc)}), 400
+
+
+@app.post("/api/nexus/core-vault/session/create-auto")
+def api_core_vault_create_system_session_auto():
+    """Create a CoreVault session through the server-side Privy wallet API.
+
+    This endpoint is the normal NKR/Trader/Grid user path. It never asks the
+    browser wallet to sign and therefore must not open a Privy approval dialog.
+    Session limits remain enforced by the deployed CoreVault contract.
+    """
+    body = request.get_json(silent=True) or {}
+    wallet = _norm_addr(
+        body.get("wallet") or body.get("walletAddress") or
+        request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
+    )
+    if not _looks_like_evm_addr(wallet):
+        return jsonify({"status": "error", "error": "valid_wallet_required"}), 400
+
+    system_name = str(body.get("system") or "").upper().strip()
+    if system_name == "TRADING":
+        system_name = "TRADER"
+    if system_name not in ("NKR", "TRADER", "GRID"):
+        return jsonify({"status": "error", "error": "invalid_system"}), 400
+
+    try:
+        amount_usd = float(body.get("amountUsd") or body.get("budgetUsd") or 0)
+    except Exception:
+        amount_usd = 0
+    if not (amount_usd > 0):
+        return jsonify({"status": "error", "error": "positive_budget_required"}), 400
+
+    cfg = _privy_trading_cfg()
+    readiness = _privy_delegated_readiness(wallet)
+    blockers = list(readiness.get("blockers") or [])
+    if blockers:
+        return jsonify({
+            "status": "blocked",
+            "error": "privy_live_execution_not_ready",
+            "blockers": blockers,
+            "readiness": readiness,
+        }), 409
+
+    wallet_id = _privy_wallet_id_for_user(wallet)
+    if not wallet_id:
+        return jsonify({"status": "blocked", "error": "privy_wallet_mapping_pending"}), 409
+
+    duration_hours = max(1, min(int(float(body.get("durationHours") or 24)), 24 * 30))
+    duration_sec = duration_hours * 3600
+    slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
+    max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
+    amount_units = int(round(amount_usd * 1_000_000))
+
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
+    usdc = _norm_addr(_USDC_BY_CHAIN.get(1) or cfg.get("usdc") or "")
+    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
+        return jsonify({"status": "error", "error": "ethereum_core_vault_not_configured"}), 409
+
+    try:
+        free_words = _core_vault_words(_core_vault_call(1, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, usdc))
+        free_units = int(free_words[0]) if free_words else 0
+    except Exception as exc:
+        return jsonify({"status": "error", "error": f"free_base_read_failed:{exc}"}), 502
+
+    if amount_units > free_units:
+        return jsonify({
+            "status": "blocked",
+            "error": "insufficient_free_vault_budget",
+            "requestedUsd": round(amount_units / 1_000_000.0, 6),
+            "availableUsd": round(free_units / 1_000_000.0, 6),
+        }), 409
+
+    try:
+        calldata = _encode_create_session(
+            cfg,
+            system_name,
+            amount_units,
+            duration_sec=duration_sec,
+            max_slippage_bps=slippage_bps,
+            max_loss_bps=max_loss_bps,
+        )
+        reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
+        sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference)
+        session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
+        return jsonify({
+            "status": "ok",
+            "execution": "server_side_privy",
+            "userApprovalRequired": False,
+            "wallet": wallet,
+            "system": system_name,
+            "sessionId": session_id,
+            "txHash": sent.get("hash"),
+            "budgetUsd": round(amount_units / 1_000_000.0, 6),
+            "durationHours": duration_hours,
+            "maxSlippageBps": slippage_bps,
+            "maxLossBps": max_loss_bps,
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 502
 
 
 @app.get("/api/nexus/core-vault/abi")
