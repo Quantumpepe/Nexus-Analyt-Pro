@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-165-PRIVY-AUTO-SESSION-START"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-175-NKR-NO-PRIVY-POPUP"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-166-MULTI-EVM-TOKEN-REGISTRY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5491,6 +5491,41 @@ def init_db():
             wallet_address TEXT PRIMARY KEY,
             items_json TEXT NOT NULL,
             updated_ts INTEGER
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_evm_token_registry (
+            chain_id INTEGER NOT NULL,
+            chain_key TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            symbol TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            decimals INTEGER DEFAULT 18,
+            coingecko_id TEXT DEFAULT '',
+            source TEXT DEFAULT 'watchlist',
+            status TEXT DEFAULT 'PENDING_SCAN',
+            decision TEXT DEFAULT '',
+            decision_reason TEXT DEFAULT '',
+            risk_json TEXT DEFAULT '{}',
+            route_json TEXT DEFAULT '{}',
+            first_seen_ts INTEGER DEFAULT 0,
+            last_scan_ts INTEGER DEFAULT 0,
+            decided_ts INTEGER DEFAULT 0,
+            decided_by TEXT DEFAULT '',
+            PRIMARY KEY (chain_id, token_address)
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS nexus_evm_token_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_id INTEGER NOT NULL,
+            token_address TEXT NOT NULL,
+            action TEXT NOT NULL,
+            actor_wallet TEXT DEFAULT '',
+            details_json TEXT DEFAULT '{}',
+            created_ts INTEGER DEFAULT 0
         )
     """)
 
@@ -13378,6 +13413,10 @@ def api_watchlist():
         if not wa:
             return err("wallet required", 401)
         clean, updated_ts = _db_set_user_watchlist(wa, items or [])
+        try:
+            threading.Thread(target=_evm_registry_scan_watch_items, args=(clean,), daemon=True).start()
+        except Exception:
+            pass
         resp = {"status": "ok", "wallet": wa, "items": clean, "updated_ts": updated_ts, "ts": now_ts()}
         out = jsonify(resp)
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -28618,12 +28657,242 @@ def api_nexus_live_execution_readiness():
     return jsonify({"status":"ok","readiness":_privy_delegated_readiness(owner)})
 
 
+
+# ENGINE-166: Central multi-EVM token registry and owner review queue.
+# Watchlist appearance triggers an automatic backend scan. The user never approves
+# individual tokens. Only the owner sees unresolved candidates in System Info.
+_EVM_PLATFORM_BY_CHAIN = {
+    1: "ethereum",
+    56: "binance-smart-chain",
+    137: "polygon-pos",
+    8453: "base",
+    42161: "arbitrum-one",
+    10: "optimistic-ethereum",
+    43114: "avalanche",
+}
+_EVM_CHAIN_KEY_BY_ID = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARBITRUM",10:"OPTIMISM",43114:"AVALANCHE"}
+_EVM_NATIVE_BY_CHAIN = {1:"ETH",56:"BNB",137:"POL",8453:"ETH",42161:"ETH",10:"ETH",43114:"AVAX"}
+
+
+def _evm_registry_enabled_chain_ids() -> list[int]:
+    ids = []
+    for key in list(globals().get("_ENABLED_EVM_CHAINS", []) or []):
+        cid = int((globals().get("_CHAIN_ID_BY_KEY", {}) or {}).get(key, 0) or 0)
+        if cid > 0 and cid not in ids:
+            ids.append(cid)
+    if not ids:
+        ids = [1, 56, 137]
+    return ids
+
+
+def _evm_registry_upsert(row: dict):
+    cid = int(row.get("chain_id") or 0)
+    addr = _norm_addr(row.get("token_address") or "")
+    if cid <= 0 or not _looks_like_evm_addr(addr):
+        return
+    nowi = now_ts()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO nexus_evm_token_registry(
+                    chain_id,chain_key,token_address,symbol,name,decimals,coingecko_id,source,status,
+                    decision,decision_reason,risk_json,route_json,first_seen_ts,last_scan_ts,decided_ts,decided_by
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(chain_id,token_address) DO UPDATE SET
+                    chain_key=excluded.chain_key,symbol=excluded.symbol,name=excluded.name,decimals=excluded.decimals,
+                    coingecko_id=excluded.coingecko_id,source=excluded.source,
+                    status=CASE WHEN nexus_evm_token_registry.decision='APPROVE' THEN 'APPROVED' WHEN nexus_evm_token_registry.decision='REJECT' THEN 'REJECTED' ELSE excluded.status END,
+                    decision_reason=CASE WHEN nexus_evm_token_registry.decision<>'' THEN nexus_evm_token_registry.decision_reason ELSE excluded.decision_reason END,
+                    risk_json=excluded.risk_json,route_json=excluded.route_json,last_scan_ts=excluded.last_scan_ts
+            """,(
+                cid,str(row.get("chain_key") or _EVM_CHAIN_KEY_BY_ID.get(cid,"")),addr,
+                str(row.get("symbol") or "").upper()[:24],str(row.get("name") or "")[:120],int(row.get("decimals") or 18),
+                str(row.get("coingecko_id") or "")[:120],str(row.get("source") or "watchlist")[:40],str(row.get("status") or "PENDING_OWNER"),
+                "",str(row.get("decision_reason") or "")[:500],json.dumps(row.get("risk") or {},ensure_ascii=False),
+                json.dumps(row.get("route") or {},ensure_ascii=False),nowi,nowi,0,""
+            ))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _evm_registry_cg_coin(coin_id: str) -> dict:
+    cid = str(coin_id or "").strip()
+    if not cid:
+        return {}
+    try:
+        headers = {"Accept":"application/json"}
+        if COINGECKO_API_KEY:
+            headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+        r = requests.get(f"{COINGECKO_BASE}/coins/{cid}", params={"localization":"false","tickers":"false","market_data":"true","community_data":"false","developer_data":"false","sparkline":"false"}, headers=headers, timeout=12)
+        return r.json() if r.ok and isinstance(r.json(),dict) else {}
+    except Exception:
+        return {}
+
+
+def _evm_registry_route_probe(chain_id: int, token_address: str) -> dict:
+    cid = int(chain_id or 0)
+    routers = []
+    try:
+        routers = _nexus_allowed_routers_for_chain(cid) if "_nexus_allowed_routers_for_chain" in globals() else []
+    except Exception:
+        routers = []
+    router = _norm_addr((routers or [""])[0] if routers else (globals().get("_ROUTER_V3_BY_CHAIN",{}).get(cid) or globals().get("_ROUTER_BY_CHAIN",{}).get(cid) or ""))
+    stable = _norm_addr((globals().get("_USDC_BY_CHAIN",{}) or {}).get(cid) or (globals().get("_USDT_BY_CHAIN",{}) or {}).get(cid) or "")
+    code_ok = False
+    token_code_ok = False
+    try:
+        token_code_ok = str(_rpc_call(cid,"eth_getCode",[_norm_addr(token_address),"latest"]) or "0x") not in ("0x","0x0")
+    except Exception:
+        pass
+    try:
+        code_ok = _looks_like_evm_addr(router) and str(_rpc_call(cid,"eth_getCode",[router,"latest"]) or "0x") not in ("0x","0x0")
+    except Exception:
+        pass
+    return {"router":router,"routerConfigured":_looks_like_evm_addr(router),"routerHasCode":code_ok,"tokenHasCode":token_code_ok,"baseAsset":stable,"buyRouteCandidate":bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),"sellRouteCandidate":bool(code_ok and token_code_ok and _looks_like_evm_addr(stable)),"quoteVerified":False}
+
+
+def _evm_registry_scan_contract(chain_id: int, token_address: str, symbol: str, name: str, coin_id: str, source: str="watchlist") -> dict:
+    cid = int(chain_id or 0); addr = _norm_addr(token_address)
+    route = _evm_registry_route_probe(cid,addr)
+    raw = {}
+    try:
+        raw = _goplus_fetch_token_security(cid,addr) or {}
+    except Exception as exc:
+        raw = {"scan_error":str(exc)[:220]}
+    truth = lambda v: str(v).strip().lower() in ("1","true","yes","y")
+    buy_tax = _goplus_to_float(raw.get("buy_tax")); sell_tax = _goplus_to_float(raw.get("sell_tax"))
+    blockers=[]
+    if truth(raw.get("is_honeypot")): blockers.append("honeypot")
+    if truth(raw.get("is_blacklisted")): blockers.append("blacklist")
+    if truth(raw.get("cannot_sell_all")): blockers.append("sell_restriction")
+    if sell_tax is not None and sell_tax > 0.10: blockers.append("sell_tax_over_10pct")
+    if not route.get("tokenHasCode"): blockers.append("no_contract_code")
+    if blockers:
+        status="BLOCKED"
+        reason=", ".join(blockers)
+    elif raw.get("scan_error"):
+        status="PENDING_OWNER"
+        reason="security scan temporarily unavailable"
+    elif not route.get("buyRouteCandidate") or not route.get("sellRouteCandidate"):
+        status="PENDING_OWNER"
+        reason="router or stable route infrastructure incomplete"
+    else:
+        status="PENDING_OWNER"
+        reason="automatic checks passed; owner confirmation required before CoreVault admission"
+    row={"chain_id":cid,"chain_key":_EVM_CHAIN_KEY_BY_ID.get(cid,str(cid)),"token_address":addr,"symbol":symbol,"name":name,"decimals":int(raw.get("token_decimals") or 18),"coingecko_id":coin_id,"source":source,"status":status,"decision_reason":reason,"risk":{"blockers":blockers,"isHoneypot":truth(raw.get("is_honeypot")),"buyTax":buy_tax,"sellTax":sell_tax,"ownerChangeBalance":truth(raw.get("owner_change_balance")),"hiddenOwner":truth(raw.get("hidden_owner")),"mintable":truth(raw.get("is_mintable")),"proxy":truth(raw.get("is_proxy")),"rawAvailable":bool(raw and not raw.get("scan_error")),"scanError":raw.get("scan_error","")},"route":route}
+    _evm_registry_upsert(row)
+    return row
+
+
+def _evm_registry_scan_watch_items(items: list) -> dict:
+    scanned=[]; unresolved=[]
+    for it in _watch_items_normalize(items or []):
+        sym=str(it.get("symbol") or "").upper(); coin_id=str(it.get("coingecko_id") or it.get("id") or "")
+        cg=_evm_registry_cg_coin(coin_id) if coin_id else {}
+        platforms=cg.get("platforms") if isinstance(cg.get("platforms"),dict) else {}
+        for cid in _evm_registry_enabled_chain_ids():
+            native_sym=_EVM_NATIVE_BY_CHAIN.get(cid,"")
+            if sym == native_sym:
+                continue
+            platform=_EVM_PLATFORM_BY_CHAIN.get(cid,"")
+            addr=str(platforms.get(platform) or "").strip()
+            if not addr and str(it.get("mode") or "").lower()=="dex":
+                addr=str(it.get("contract") or it.get("tokenAddress") or "").strip()
+            if not _looks_like_evm_addr(addr):
+                continue
+            row=_evm_registry_scan_contract(cid,addr,sym,str(it.get("name") or cg.get("name") or sym),coin_id)
+            scanned.append(row)
+    return {"status":"ok","scanned":len(scanned),"items":scanned,"ts":now_ts()}
+
+
+def _evm_registry_rows() -> list[dict]:
+    conn=_db()
+    try:
+        cur=conn.cursor(); cur.execute("SELECT * FROM nexus_evm_token_registry ORDER BY CASE status WHEN 'PENDING_OWNER' THEN 0 WHEN 'BLOCKED' THEN 1 WHEN 'APPROVED' THEN 2 ELSE 3 END,last_scan_ts DESC")
+        out=[]
+        for r in cur.fetchall():
+            d=dict(r)
+            for src,dst in (("risk_json","risk"),("route_json","route")):
+                try:d[dst]=json.loads(d.get(src) or "{}")
+                except Exception:d[dst]={}
+                d.pop(src,None)
+            out.append(d)
+        return out
+    finally: conn.close()
+
+
+def _evm_registry_summary() -> dict:
+    rows=_evm_registry_rows()
+    return {"status":"ok","mode":"MULTI_EVM_TOKEN_REGISTRY_V1","chains":[_EVM_CHAIN_KEY_BY_ID.get(x,str(x)) for x in _evm_registry_enabled_chain_ids()],"pending":[x for x in rows if x.get("status")=="PENDING_OWNER"],"blocked":[x for x in rows if x.get("status")=="BLOCKED"],"approved":[x for x in rows if x.get("status")=="APPROVED"],"rejected":[x for x in rows if x.get("status")=="REJECTED"],"counts":{"total":len(rows),"pending":sum(x.get("status")=="PENDING_OWNER" for x in rows),"blocked":sum(x.get("status")=="BLOCKED" for x in rows),"approved":sum(x.get("status")=="APPROVED" for x in rows),"rejected":sum(x.get("status")=="REJECTED" for x in rows)},"rules":{"userTokenApprovalRequired":False,"ownerReviewInSystemInfo":True,"exactContractRequired":True,"nkrUsesApprovedOnly":True,"onchainCoreVaultConfigurationStillRequired":True},"ts":now_ts()}
+
+
+@app.get("/api/nexus/evm-token-registry")
+def api_nexus_evm_token_registry():
+    owner,denied=_require_owner_system_info()
+    if denied:return denied
+    return jsonify(_evm_registry_summary())
+
+
+@app.post("/api/nexus/evm-token-registry/scan")
+def api_nexus_evm_token_registry_scan():
+    owner,denied=_require_owner_system_info()
+    if denied:return denied
+    conn=_db(); items=[]
+    try:
+        cur=conn.cursor(); cur.execute("SELECT items_json FROM user_watchlists")
+        for row in cur.fetchall():
+            try: items.extend(json.loads(row["items_json"] or "[]"))
+            except Exception: pass
+    finally: conn.close()
+    result=_evm_registry_scan_watch_items(items)
+    result["registry"]=_evm_registry_summary()
+    return jsonify(result)
+
+
+@app.post("/api/nexus/evm-token-registry/decision")
+def api_nexus_evm_token_registry_decision():
+    owner,denied=_require_owner_system_info()
+    if denied:return denied
+    body=request.get_json(silent=True) or {}
+    cid=int(body.get("chainId") or body.get("chain_id") or 0); addr=_norm_addr(body.get("tokenAddress") or body.get("token_address") or "")
+    decision=str(body.get("decision") or "").upper()
+    if decision not in {"APPROVE","REJECT","RECHECK"}: return jsonify({"status":"error","error":"decision_must_be_approve_reject_or_recheck"}),400
+    if cid<=0 or not _looks_like_evm_addr(addr): return jsonify({"status":"error","error":"valid_chain_and_token_required"}),400
+    if decision=="RECHECK":
+        conn=_db();
+        try:
+            cur=conn.cursor(); cur.execute("SELECT symbol,name,coingecko_id,source FROM nexus_evm_token_registry WHERE chain_id=? AND token_address=?",(cid,addr)); row=cur.fetchone()
+        finally: conn.close()
+        if not row:return jsonify({"status":"error","error":"token_not_found"}),404
+        scanned=_evm_registry_scan_contract(cid,addr,row["symbol"],row["name"],row["coingecko_id"],row["source"])
+        return jsonify({"status":"ok","decision":"RECHECK","token":scanned,"registry":_evm_registry_summary()})
+    status="APPROVED" if decision=="APPROVE" else "REJECTED"
+    conn=_db()
+    try:
+        with DB_WRITE_LOCK:
+            cur=conn.cursor(); cur.execute("UPDATE nexus_evm_token_registry SET decision=?,status=?,decision_reason=?,decided_ts=?,decided_by=? WHERE chain_id=? AND token_address=?",(decision,status,str(body.get("reason") or ("owner approved after automatic checks" if decision=="APPROVE" else "owner rejected"))[:500],now_ts(),owner,cid,addr))
+            if cur.rowcount!=1:return jsonify({"status":"error","error":"token_not_found"}),404
+            cur.execute("INSERT INTO nexus_evm_token_audit(chain_id,token_address,action,actor_wallet,details_json,created_ts) VALUES(?,?,?,?,?,?)",(cid,addr,decision,owner,json.dumps({"reason":body.get("reason") or ""},ensure_ascii=False),now_ts()))
+            conn.commit()
+    finally: conn.close()
+    return jsonify({"status":"ok","decision":decision,"registry":_evm_registry_summary(),"note":"Central Nexus approval recorded. CoreVault token/route configuration remains an owner on-chain admin action before live execution."})
+
+
+@app.get("/api/nexus/evm-token-registry/approved")
+def api_nexus_evm_token_registry_approved():
+    rows=[x for x in _evm_registry_rows() if x.get("status")=="APPROVED"]
+    return jsonify({"status":"ok","tokens":rows,"ts":now_ts()})
+
+
 @app.get("/api/nexus/system-info-owner-panel")
 def api_nexus_system_info_owner_panel():
     owner,denied=_require_owner_system_info()
     if denied:return denied
     payload=_nexus_system_info_status_panel(); rd=_privy_delegated_readiness(owner)
-    payload["liveExecutionReadiness"]=rd; payload["liveExecution"]=rd.get("liveExecution"); payload["vault"]={"status":"READY" if rd.get("checks",{}).get("vaultConnected") else "SETUP REQUIRED"}; payload["privateKeys"]="PRIVY WALLET KEY NEVER EXPOSED"; payload["ownerAuthenticated"]=True; payload["ownerWallet"]=owner
+    payload["liveExecutionReadiness"]=rd; payload["liveExecution"]=rd.get("liveExecution"); payload["vault"]={"status":"READY" if rd.get("checks",{}).get("vaultConnected") else "SETUP REQUIRED"}; payload["privateKeys"]="PRIVY WALLET KEY NEVER EXPOSED"; payload["ownerAuthenticated"]=True; payload["ownerWallet"]=owner; payload["evmTokenRegistry"]=_evm_registry_summary()
     return jsonify(payload)
 
 
