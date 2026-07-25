@@ -28181,6 +28181,90 @@ def api_nexus_system_info_owner_panel():
     payload["liveExecutionReadiness"]=rd; payload["liveExecution"]=rd.get("liveExecution"); payload["vault"]={"status":"READY" if rd.get("checks",{}).get("vaultConnected") else "SETUP REQUIRED"}; payload["privateKeys"]="PRIVY WALLET KEY NEVER EXPOSED"; payload["ownerAuthenticated"]=True; payload["ownerWallet"]=owner
     return jsonify(payload)
 
+
+# ENGINE-161: CoreVault budget/session bridge for NKR, Trader and Grid.
+# The backend only prepares calldata. The user's own Privy embedded wallet signs and sends it.
+@app.post("/api/nexus/core-vault/session/prepare-create")
+def api_core_vault_prepare_system_session():
+    body = request.get_json(silent=True) or {}
+    wallet = _norm_addr(
+        body.get("wallet") or body.get("walletAddress") or
+        request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
+    )
+    if not _looks_like_evm_addr(wallet):
+        return jsonify({"status":"error","error":"valid_wallet_required"}), 400
+
+    system_name = str(body.get("system") or "").upper().strip()
+    if system_name == "TRADING":
+        system_name = "TRADER"
+    cfg = _privy_trading_cfg()
+    if system_name not in ("NKR", "TRADER", "GRID"):
+        return jsonify({"status":"error","error":"invalid_system"}), 400
+
+    try:
+        amount_usd = float(body.get("amountUsd") or body.get("budgetUsd") or 0)
+    except Exception:
+        amount_usd = 0
+    if not (amount_usd > 0):
+        return jsonify({"status":"error","error":"positive_budget_required"}), 400
+
+    duration_hours = max(1, min(int(float(body.get("durationHours") or 24)), 24 * 30))
+    duration_sec = duration_hours * 3600
+    slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
+    max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
+    amount_units = int(round(amount_usd * 1_000_000))
+
+    route_ids = body.get("allowedRoutes") if isinstance(body.get("allowedRoutes"), list) else []
+    route_ids = [str(x).strip() for x in route_ids if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x).strip())]
+    if not route_ids and re.fullmatch(r"0x[0-9a-fA-F]{64}", str(cfg.get("routeId") or "")):
+        route_ids = [str(cfg["routeId"])]
+    if not route_ids:
+        return jsonify({
+            "status":"blocked",
+            "error":"verified_trade_route_required",
+            "message":"No verified CoreVault trade route is configured for this session."
+        }), 409
+
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
+    usdc = _norm_addr(_USDC_BY_CHAIN.get(1) or cfg.get("usdc") or "")
+    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
+        return jsonify({"status":"error","error":"ethereum_core_vault_not_configured"}), 409
+
+    # createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])
+    selector = _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])")[:4].hex()
+    system_id = int(cfg.get("systemIds", {}).get(system_name, {"NKR":0,"TRADER":1,"GRID":2}[system_name]))
+    head_words = [
+        _addr_to_32(usdc),
+        _uint_to_32(system_id),
+        _uint_to_32(amount_units),
+        _uint_to_32(duration_sec),
+        _uint_to_32(slippage_bps),
+        _uint_to_32(max_loss_bps),
+        _uint_to_32(7 * 32),
+    ]
+    tail_words = [_uint_to_32(len(route_ids))] + [rid[2:].lower() for rid in route_ids]
+    calldata = "0x" + selector + "".join(head_words + tail_words)
+
+    return jsonify({
+        "status":"ok",
+        "chainId":1,
+        "from":wallet,
+        "to":vault,
+        "data":calldata,
+        "value":"0x0",
+        "session":{
+            "system":system_name,
+            "systemId":system_id,
+            "settlementToken":usdc,
+            "budgetUsd":round(amount_units / 1_000_000.0, 6),
+            "budgetUnits":amount_units,
+            "durationHours":duration_hours,
+            "maxSlippageBps":slippage_bps,
+            "maxLossBps":max_loss_bps,
+            "allowedRoutes":route_ids,
+        }
+    })
+
 # -------------------------
 # AI Pair Insight (backend-native)
 # -------------------------
