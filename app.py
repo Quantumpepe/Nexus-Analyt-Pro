@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-202-NKR-LIVE-STATE-SYNC"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-203-NKR-LIVE-STATE-CONSISTENCY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -636,7 +636,21 @@ def _live_engine_health_payload(wallet=""):
             try:
                 sessions, _, _ = _db_get_rotation_sessions(wallet)
                 active_local = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or x.get("lifecycleState") or "").upper() not in {"STOPPED","FINALIZED","CLOSED","EXPIRED","CANCELLED","RELEASED","ARCHIVED"}]
-                current = active_local[0] if active_local else {}
+                # Prefer the row that actually carries the live on-chain position. Older
+                # placeholder/stop rows can survive in local persistence after a deploy and
+                # must never overwrite the authoritative CoreVault position state.
+                def _row_has_live_position(x):
+                    if not isinstance(x, dict):
+                        return False
+                    xm = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+                    xo = x.get("openRotation") if isinstance(x.get("openRotation"), dict) else {}
+                    xa = str(x.get("positionAsset") or xo.get("asset") or x.get("targetAsset") or x.get("asset") or x.get("symbol") or xm.get("nkr_active_asset") or "").upper()
+                    xq = float(x.get("positionQty") or xo.get("quantity") or xm.get("nkr_position_qty") or 0)
+                    xt = str(x.get("txHash") or x.get("tradeTxHash") or xo.get("txHash") or xm.get("nkr_live_buy_tx_hash") or "")
+                    xs = str(x.get("onchainStatus") or xm.get("onchain_status") or "").upper()
+                    return bool(xa and xa not in {"ASSET","WAITING","NONE","NULL"} and (xq > 0 or xt or xs == "CONFIRMED"))
+
+                current = next((x for x in active_local if _row_has_live_position(x)), active_local[0] if active_local else {})
                 meta = current.get("meta") if isinstance(current.get("meta"), dict) else {}
                 open_pos = current.get("openRotation") if isinstance(current.get("openRotation"), dict) else {}
                 asset = str(current.get("positionAsset") or open_pos.get("asset") or current.get("targetAsset") or current.get("asset") or current.get("symbol") or meta.get("nkr_active_asset") or "").upper()
@@ -644,28 +658,38 @@ def _live_engine_health_payload(wallet=""):
                     asset = ""
                 position_state = str(current.get("positionState") or meta.get("position_state") or "").upper()
                 onchain_state = str(current.get("onchainStatus") or meta.get("onchain_status") or "").upper()
-                has_position = bool(asset and (position_state == "OPEN" or onchain_state == "CONFIRMED" or float(current.get("positionQty") or open_pos.get("quantity") or meta.get("nkr_position_qty") or 0) > 0))
+                position_qty = float(current.get("positionQty") or open_pos.get("quantity") or meta.get("nkr_position_qty") or 0)
+                tx_hash_hint = str(current.get("txHash") or current.get("tradeTxHash") or open_pos.get("txHash") or meta.get("nkr_live_buy_tx_hash") or live[0].get("tx_hash") or "")
+                live_session_state = str(live[0].get("status") or "").upper()
+                exit_pending = bool(str(row.get("pending_tx") or "").strip() or live_session_state in {"CLOSING","EXITING"})
+                has_position = bool(asset and (position_state == "OPEN" or onchain_state == "CONFIRMED" or position_qty > 0 or tx_hash_hint) and not (live_session_state in {"FINALIZED","CLOSED","STOPPED"}))
+                if has_position and not exit_pending:
+                    position_state = "OPEN"
                 live_statuses = {str(x.get("status") or "").upper() for x in live}
                 paused = bool(live_statuses and live_statuses <= {"PAUSED"})
                 latest_ms = max([int(float(x.get("updatedAt") or x.get("updated_at") or x.get("createdAt") or 0)) for x in active_local] or [0])
                 latest_sec = latest_ms // 1000 if latest_ms > 10_000_000_000 else latest_ms
-                tx_hash = str(current.get("txHash") or current.get("tradeTxHash") or meta.get("nkr_live_buy_tx_hash") or live[0].get("tx_hash") or "")
+                tx_hash = tx_hash_hint
                 price = float(current.get("currentPriceUsd") or open_pos.get("currentPriceUsd") or meta.get("nkr_current_price_usd") or 0)
+                working_capital = float(current.get("workingCapitalUsd") or current.get("budgetUsd") or current.get("approvedBudgetUsd") or current.get("reservedCapitalUsd") or current.get("allocatedUsd") or meta.get("workingCapitalUsd") or meta.get("budgetUsd") or 0)
+                position_value = float(current.get("positionValueUsd") or open_pos.get("currentValueUsd") or meta.get("nkr_position_value_usd") or 0)
+                if has_position and position_value <= 0:
+                    position_value = (position_qty * price) if position_qty > 0 and price > 0 else working_capital
                 row.update({
                     "status": "paused" if paused else "running",
                     "last_tick_ts": int(row.get("last_tick_ts") or latest_sec or live[0].get("updated_ts") or nowi),
                     "tick_count": max(int(row.get("tick_count") or 0), int(current.get("eventCount") or current.get("totalEventCount") or 0), 1),
                     "best_candidate": asset or str(row.get("best_candidate") or ""),
                     "candidate_price": price or float(row.get("candidate_price") or 0),
-                    "decision": "PAUSED" if paused else ("HOLD" if has_position else str(row.get("decision") or "WAIT")),
-                    "gate_status": "PAUSED" if paused else ("POSITION_ACTIVE" if has_position else str(row.get("gate_status") or "SESSION_ACTIVE")),
+                    "decision": "PAUSED" if paused else ("EXITING" if exit_pending else ("HOLD" if has_position else str(row.get("decision") or "WAIT"))),
+                    "gate_status": "PAUSED" if paused else ("EXIT_PENDING" if exit_pending else ("POSITION_ACTIVE" if has_position else str(row.get("gate_status") or "SESSION_ACTIVE"))),
                     "decision_detail": (f"{asset} position is open and tracked by CoreVault." if has_position else str(row.get("decision_detail") or "CoreVault session is active.")),
                     "reason": "wallet-bound CoreVault state synchronized",
                     "pending_tx": "",
                     "last_error": "",
                     "active_asset": asset,
-                    "position_state": position_state or ("OPEN" if has_position else "WAITING"),
-                    "position_value_usd": float(current.get("positionValueUsd") or open_pos.get("currentValueUsd") or meta.get("nkr_position_value_usd") or 0),
+                    "position_state": ("EXITING" if exit_pending else ("OPEN" if has_position else (position_state or "WAITING"))),
+                    "position_value_usd": position_value,
                     "tx_hash": tx_hash,
                 })
             except Exception as exc:
