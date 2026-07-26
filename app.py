@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-190-COREVAULT-SESSION-INSPECTOR-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-190-COREVAULT-SESSION-INSPECTOR-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-192-AUTOMATIC-STOP-FINALIZATION-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-192-AUTOMATIC-STOP-FINALIZATION-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -399,44 +399,145 @@ def _live_active_sessions(wallet, engine):
     finally:
         conn.close()
 
-def _live_finalize_engine_sessions(wallet, engine):
-    rows = _live_active_sessions(wallet, engine)
+def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
+    """Persist the user-visible NKR lifecycle without exposing blockchain details."""
+    wa = _norm_addr(wallet)
+    nowi = _nkr_now_ms() if "_nkr_now_ms" in globals() else int(time.time() * 1000)
+    sessions, active, _ = _db_get_rotation_sessions(wa)
+    nkr_rows = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x)]
+    state_u = str(state or "STOPPING").upper()
+    updated = []
+    for src in nkr_rows:
+        row = dict(src)
+        meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
+        row["status"] = state_u
+        row["lifecycleState"] = state_u
+        row["active"] = state_u not in {"STOPPED", "FINALIZED"}
+        row["updatedAt"] = nowi
+        if state_u == "STOPPING":
+            row["stoppingAt"] = nowi
+            row["positionState"] = "STOPPING"
+        else:
+            row["stoppedAt"] = nowi
+            row["positionState"] = "STOPPED"
+            row["reservedUsd"] = 0
+        meta.update({
+            "nkr_session": True,
+            "lifecycle_state": state_u,
+            "position_state": row.get("positionState"),
+            "stop_message": str(message or "")[:240],
+            "reserved_usd": 0 if state_u in {"STOPPED", "FINALIZED"} else meta.get("reserved_usd", row.get("reservedUsd", 0)),
+        })
+        row["meta"] = meta
+        updated.append(row)
+    if updated:
+        _db_set_rotation_sessions(wa, updated, active_session_id=active if state_u == "STOPPING" else "", replace_missing=False)
+    _db_set_user_app_state(wa, {"ui": {"nkrControlState": state_u}})
+
+
+def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
+    sid = int(str(row.get("onchain_session_id") or "0"))
+    wallet_id = str(row.get("privy_wallet_id") or "")
+    vault = _norm_addr(row.get("vault_address") or "")
+    chain_id = int(row.get("chain_id") or 1)
+    if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
+        raise RuntimeError("incomplete_live_session_mapping")
+
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    if len(words) < 13:
+        raise RuntimeError("session_decode_failed_before_stop")
+    status_id = int(words[3])
+    open_assets = int(words[12])
+    if open_assets != 0:
+        raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
+
+    close_tx = ""
+    if status_id in (1, 2):
+        _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Safe stop requested", pending_tx="submitting")
+        ref = f"nexus-{engine.lower()}-stop-{sid}-{int(time.time())}-close"
+        sent = _privy_send_delegated_transaction(wallet_id, {
+            "from": _norm_addr(wallet), "to": vault,
+            "data": _core_selector("startClosing(uint256)") + _uint_to_32(sid), "value": "0x0"
+        }, ref)
+        close_tx = str(sent.get("hash") or "")
+        _privy_wait_receipt(close_tx, timeout_sec=240)
+        status_id = 3
+
+    finalize_tx = ""
+    if status_id == 3:
+        ref = f"nexus-{engine.lower()}-stop-{sid}-{int(time.time())}-finalize"
+        sent = _privy_send_delegated_transaction(wallet_id, {
+            "from": _norm_addr(wallet), "to": vault,
+            "data": _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid), "value": "0x0"
+        }, ref)
+        finalize_tx = str(sent.get("hash") or "")
+        _live_engine_mark(engine, status="closing", decision="FINALIZING", reason="Waiting for safe release", pending_tx=finalize_tx or "submitted")
+        _privy_wait_receipt(finalize_tx, timeout_sec=240)
+
+    after = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    after_words = _core_words(after)
+    after_status = int(after_words[3]) if len(after_words) >= 4 else -1
+    if after_status != 4:
+        raise RuntimeError(f"stop_finalize_not_confirmed_status_{after_status}")
+
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE id=?", (finalize_tx or close_tx, int(time.time()), row.get("id")))
+            conn.commit()
+    finally:
+        conn.close()
+    return {"sessionId": sid, "status": "finalized", "startClosingTxHash": close_tx, "finalizeTxHash": finalize_tx}
+
+
+def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
     results = []
-    for row in rows:
-        sid = int(str(row.get("onchain_session_id") or "0"))
-        wallet_id = str(row.get("privy_wallet_id") or "")
-        vault = _norm_addr(row.get("vault_address") or "")
-        if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
-            results.append({"sessionId": sid, "status": "error", "error": "incomplete_live_session_mapping"})
-            continue
-        try:
-            calldata = _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid)
-            ref = f"nexus-{str(engine).lower()}-finalize-{sid}-{int(time.time())}"
-            _live_engine_mark(engine, status="closing", decision="FINALIZING", pending_tx="submitting")
-            sent = _send_vault_tx(wallet_id, _norm_addr(wallet), vault, calldata, ref)
-            txh = str(sent.get("hash") or "")
-            conn = _db()
+    try:
+        for row in rows:
             try:
-                with DB_WRITE_LOCK:
-                    conn.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE id=?", (txh, int(time.time()), row.get("id")))
-                    conn.commit()
-            finally:
-                conn.close()
-            results.append({"sessionId": sid, "status": "finalized", "txHash": txh})
-        except Exception as exc:
-            msg = str(exc)[:1000]
-            conn = _db()
-            try:
-                with DB_WRITE_LOCK:
-                    conn.execute("UPDATE nexus_live_core_vault_sessions SET status='ERROR', updated_ts=?, last_error=? WHERE id=?", (int(time.time()), msg, row.get("id")))
-                    conn.commit()
-            finally:
-                conn.close()
-            _live_engine_mark(engine, status="error", decision="FINALIZE_FAILED", last_error=msg, pending_tx="")
-            results.append({"sessionId": sid, "status": "error", "error": msg})
-    if rows and all(x.get("status") == "finalized" for x in results):
-        _live_engine_mark(engine, status="stopped", decision="FINALIZED", reason="CoreVault allocation released", pending_tx="", last_error="")
-    return results
+                results.append(_finalize_one_live_session(wallet, engine, row))
+            except Exception as exc:
+                msg = str(exc)[:1000]
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute("UPDATE nexus_live_core_vault_sessions SET status='ERROR', updated_ts=?, last_error=? WHERE id=?", (int(time.time()), msg, row.get("id")))
+                        conn.commit()
+                finally:
+                    conn.close()
+                results.append({"sessionId": row.get("onchain_session_id"), "status": "error", "error": msg})
+        if rows and all(x.get("status") == "finalized" for x in results):
+            if str(engine).upper() == "NKR":
+                _nkr_set_local_stop_state(wallet, "STOPPED", "NKR safely stopped and capital released")
+            _live_engine_mark(engine, status="stopped", decision="FINALIZED", reason="CoreVault allocation released", pending_tx="", last_error="")
+        elif not rows:
+            if str(engine).upper() == "NKR":
+                _nkr_set_local_stop_state(wallet, "STOPPED", "NKR stopped")
+            _live_engine_mark(engine, status="stopped", decision="STOPPED", reason="No live allocation found", pending_tx="", last_error="")
+        else:
+            errors = "; ".join(str(x.get("error") or "") for x in results if x.get("status") == "error")[:1000]
+            _live_engine_mark(engine, status="error", decision="STOP_FAILED", reason="Safe stop requires owner review", pending_tx="", last_error=errors)
+    except Exception as exc:
+        _live_engine_mark(engine, status="error", decision="STOP_FAILED", reason="Safe stop requires owner review", pending_tx="", last_error=str(exc)[:1000])
+
+
+def _live_finalize_engine_sessions(wallet, engine):
+    """Queue a browser-independent safe stop and return immediately.
+
+    The local NKR session stays STOPPING until the CoreVault confirms FINALIZED.
+    """
+    rows = _live_active_sessions(wallet, engine)
+    if str(engine).upper() == "NKR":
+        _nkr_set_local_stop_state(wallet, "STOPPING", "NKR is being safely stopped")
+    _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Safe stop requested", pending_tx="queued")
+    threading.Thread(
+        target=_live_stop_worker,
+        args=(_norm_addr(wallet), str(engine).upper(), [dict(x) for x in rows]),
+        daemon=True,
+        name=f"live-stop-{str(engine).lower()}-{int(time.time())}",
+    ).start()
+    return [{"sessionId": int(str(x.get("onchain_session_id") or "0")), "status": "queued"} for x in rows]
 
 def _live_engine_health_payload(wallet=""):
     nowi = int(time.time())
@@ -480,6 +581,117 @@ def _core_words(raw):
 
 def _word_addr(word):
     return "0x" + int(word or 0).to_bytes(32, "big")[-20:].hex()
+
+def _recovery_jobs_init():
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_core_vault_recovery_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    wallet_address TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    chain_id INTEGER NOT NULL,
+                    vault_address TEXT NOT NULL,
+                    session_id INTEGER NOT NULL,
+                    raw_status_id INTEGER,
+                    status_label TEXT,
+                    job_status TEXT NOT NULL,
+                    step INTEGER NOT NULL DEFAULT 0,
+                    step_label TEXT,
+                    start_closing_tx_hash TEXT,
+                    finalize_tx_hash TEXT,
+                    receipt_status TEXT,
+                    last_error TEXT,
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
+    finally:
+        conn.close()
+
+def _recovery_job_write(job_id, **patch):
+    _recovery_jobs_init()
+    allowed = {"raw_status_id","status_label","job_status","step","step_label","start_closing_tx_hash","finalize_tx_hash","receipt_status","last_error","updated_ts"}
+    fields=[]; vals=[]
+    for k,v in patch.items():
+        if k in allowed:
+            fields.append(f"{k}=?"); vals.append(v)
+    if not fields:
+        return
+    vals.extend([int(time.time()), str(job_id)]) if "updated_ts" not in patch else vals.append(str(job_id))
+    sql = "UPDATE nexus_core_vault_recovery_jobs SET " + ",".join(fields)
+    if "updated_ts" not in patch:
+        sql += ",updated_ts=?"
+    sql += " WHERE job_id=?"
+    conn=_db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(sql, vals); conn.commit()
+    finally:
+        conn.close()
+
+def _recovery_job_get(job_id, wallet=""):
+    _recovery_jobs_init(); conn=_db()
+    try:
+        if wallet:
+            row=conn.execute("SELECT * FROM nexus_core_vault_recovery_jobs WHERE job_id=? AND wallet_address=?",(str(job_id),_norm_addr(wallet))).fetchone()
+        else:
+            row=conn.execute("SELECT * FROM nexus_core_vault_recovery_jobs WHERE job_id=?",(str(job_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snapshot, wallet_id):
+    sid=int(session_snapshot.get("sessionId") or 0)
+    try:
+        _recovery_job_write(job_id, job_status="RUNNING", step=1, step_label="SESSION_VERIFIED", receipt_status="not_submitted", last_error="")
+        _live_engine_mark(engine,status="closing",decision="RECOVERING_STALE_RESERVATION",pending_tx="verifying")
+        current_raw=_eth_call(int(chain_id),vault_addr,_core_selector("sessionOf(uint256)")+_uint_to_32(sid))
+        words=_core_words(current_raw)
+        if len(words)<13:
+            raise RuntimeError("session_decode_failed_before_recovery")
+        raw_status=int(words[3]); open_assets=int(words[12])
+        label={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(raw_status,f"UNKNOWN_{raw_status}")
+        _recovery_job_write(job_id, raw_status_id=raw_status, status_label=label, step=2, step_label="CONTRACT_STATE_READ")
+        if open_assets != 0:
+            raise RuntimeError(f"open_assets_block_recovery:{open_assets}")
+        if raw_status == 4:
+            _recovery_job_write(job_id, job_status="SUCCESS", step=5, step_label="ALREADY_FINALIZED", receipt_status="confirmed")
+            return
+        if raw_status in (1,2):
+            _recovery_job_write(job_id, step=3, step_label="START_CLOSING_SUBMIT", receipt_status="submitting")
+            ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-close"
+            sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_core_selector("startClosing(uint256)")+_uint_to_32(sid),"value":"0x0"},ref)
+            txh=str(sent.get("hash") or "")
+            _recovery_job_write(job_id,start_closing_tx_hash=txh,receipt_status="waiting_start_closing_receipt",step_label="START_CLOSING_WAIT")
+            _privy_wait_receipt(txh,timeout_sec=180)
+            _recovery_job_write(job_id,receipt_status="start_closing_confirmed",step_label="START_CLOSING_CONFIRMED")
+        _recovery_job_write(job_id, step=4, step_label="FINALIZE_SUBMIT", receipt_status="submitting_finalize")
+        ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-finalize"
+        sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),"value":"0x0"},ref)
+        txh=str(sent.get("hash") or "")
+        _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
+        _privy_wait_receipt(txh,timeout_sec=180)
+        after_raw=_eth_call(int(chain_id),vault_addr,_core_selector("sessionOf(uint256)")+_uint_to_32(sid))
+        after_words=_core_words(after_raw)
+        after_status=int(after_words[3]) if len(after_words)>=4 else -1
+        after_label={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(after_status,f"UNKNOWN_{after_status}")
+        if after_status != 4:
+            raise RuntimeError(f"finalize_receipt_confirmed_but_status_{after_status}")
+        _live_session_register(wallet,engine,wallet_id,vault_addr,sid,txh,int(session_snapshot.get("budgetUnits") or 0),chain_id)
+        con=_db()
+        try:
+            with DB_WRITE_LOCK:
+                con.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",(txh,now_ts(),chain_id,vault_addr.lower(),str(sid))); con.commit()
+        finally: con.close()
+        _recovery_job_write(job_id,raw_status_id=after_status,status_label=after_label,job_status="SUCCESS",step=5,step_label="FINALIZED_CONFIRMED",receipt_status="confirmed",last_error="")
+        _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
+    except Exception as exc:
+        msg=str(exc)[:1500]
+        _recovery_job_write(job_id,job_status="FAILED",step_label="FAILED",receipt_status="failed",last_error=msg)
+        _live_engine_mark(engine,status="error",decision="STALE_RECOVERY_FAILED",pending_tx="",last_error=msg)
 
 def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
     wa = _norm_addr(wallet)
@@ -526,76 +738,46 @@ def api_nexus_live_reservation_recover():
     if not wa:
         return err("wallet required", 401)
     body = request.get_json(silent=True) or {}
+    job_id = str(body.get("jobId") or request.args.get("jobId") or "").strip()
+    if job_id:
+        job=_recovery_job_get(job_id,wa)
+        if not job: return err("recovery job not found",404)
+        return jsonify({"status":"ok","job":job,"ts":now_ts()})
     engine = str(body.get("engine") or request.args.get("engine") or "NKR").upper()
     if engine == "TRADING": engine = "TRADER"
-    if engine not in _CORE_SYSTEM_ID:
-        return err("invalid engine", 400)
-    chain_id = int(body.get("chainId") or request.args.get("chainId") or 1)
-    vault = str(body.get("vault") or request.args.get("vault") or "")
-    vault_addr, next_id, sessions = _discover_wallet_core_sessions(wa, engine, chain_id, vault)
-
-    # CoreVault V3Slim session status labels. Only live/paused/closing sessions can
-    # hold an allocation. Finalized sessions remain visible for inspection but are
-    # never offered for recovery again.
-    status_labels = {0: "UNINITIALIZED", 1: "ACTIVE", 2: "PAUSED", 3: "CLOSING", 4: "FINALIZED"}
+    if engine not in _CORE_SYSTEM_ID: return err("invalid engine",400)
+    chain_id=int(body.get("chainId") or request.args.get("chainId") or 1)
+    vault=str(body.get("vault") or request.args.get("vault") or "")
+    vault_addr,next_id,sessions=_discover_wallet_core_sessions(wa,engine,chain_id,vault)
+    status_labels={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}
     for s in sessions:
-        s["statusLabel"] = status_labels.get(int(s.get("statusId") or 0), f"UNKNOWN_{int(s.get('statusId') or 0)}")
-        s["recoverable"] = bool(int(s.get("statusId") or 0) in (1, 2, 3) and int(s.get("openAssetCount") or 0) == 0)
-    candidates = [s for s in sessions if s.get("recoverable")]
-    blocked = [s for s in sessions if int(s.get("statusId") or 0) in (1, 2, 3) and int(s.get("openAssetCount") or 0) > 0]
-    preview = request.method == "GET" or not bool(body.get("execute"))
+        sid=int(s.get("statusId") or 0)
+        s["statusLabel"]=status_labels.get(sid,f"UNKNOWN_{sid}")
+        s["rawStatusId"]=sid
+        s["recoverable"]=bool(sid in (1,2,3) and int(s.get("openAssetCount") or 0)==0)
+    candidates=[s for s in sessions if s.get("recoverable")]
+    blocked=[s for s in sessions if int(s.get("statusId") or 0) in (1,2,3) and int(s.get("openAssetCount") or 0)>0]
+    preview=request.method=="GET" or not bool(body.get("execute"))
     if preview:
         return jsonify({"status":"ok","mode":"preview","wallet":_norm_addr(wa),"engine":engine,"vault":vault_addr,"nextSessionId":next_id,"sessions":sessions,"candidates":candidates,"blockedOpenPositions":blocked,"ts":now_ts()})
-
-    # Recovery is allowed only when the local engine has no active run. This avoids
-    # finalizing a legitimate current session from the owner tool.
-    local_sessions, _, _ = _db_get_rotation_sessions(wa) if engine == "NKR" else ([], "", 0)
-    if engine == "NKR":
-        active_local = [x for x in local_sessions if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
-        if active_local:
-            return jsonify({"status":"blocked","error":"active_local_nkr_session_exists","count":len(active_local)}), 409
-    if blocked:
-        return jsonify({"status":"blocked","error":"open_core_vault_position_exists","sessions":blocked}), 409
-    if not candidates:
-        return jsonify({"status":"ok","mode":"execute","message":"No recoverable stale reservation found.","recovered":[],"ts":now_ts()})
-
-    wallet_id = _privy_wallet_id_for_user(wa)
-    if not wallet_id:
-        return jsonify({"status":"blocked","error":"privy_wallet_id_required"}), 409
-    recovered=[]
-    errors=[]
-    for s in candidates:
-        sid=int(s["sessionId"])
-        try:
-            ref=f"nexus-{engine.lower()}-stale-recover-{sid}-{int(time.time())}"
-            _live_engine_mark(engine,status="closing",decision="RECOVERING_STALE_RESERVATION",pending_tx="submitting")
-            closing_txh = ""
-            # ACTIVE/PAUSED sessions must first enter CLOSING. A direct finalize from
-            # ACTIVE is rejected by CoreVault V3Slim with InvalidState.
-            if int(s.get("statusId") or 0) in (1, 2):
-                closing_ref = f"{ref}-start-closing"
-                closing_sent = _send_vault_tx(wallet_id,_norm_addr(wa),vault_addr,_core_selector("startClosing(uint256)")+_uint_to_32(sid),closing_ref)
-                closing_txh = str(closing_sent.get("hash") or "")
-            sent=_send_vault_tx(wallet_id,_norm_addr(wa),vault_addr,_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),ref)
-            txh=str(sent.get("hash") or "")
-            _live_session_register(wa,engine,wallet_id,vault_addr,sid,txh,int(s.get("budgetUnits") or 0),chain_id)
-            con=_db()
-            try:
-                with DB_WRITE_LOCK:
-                    con.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",(txh,now_ts(),chain_id,vault_addr.lower(),str(sid)))
-                    con.commit()
-            finally:
-                con.close()
-            recovered.append({"sessionId":sid,"txHash":txh})
-        except Exception as exc:
-            errors.append({"sessionId":sid,"error":str(exc)[:1000]})
-    if recovered and not errors:
-        _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",reason="CoreVault session finalized and capital returned to free base",pending_tx="",last_error="")
-        if engine == "NKR":
-            _db_set_user_app_state(wa,{"ui":{"nkrControlState":"STOPPED"}})
-    elif errors:
-        _live_engine_mark(engine,status="error",decision="STALE_RECOVERY_FAILED",pending_tx="",last_error=errors[0]["error"])
-    return jsonify({"status":"ok" if recovered and not errors else "partial" if recovered else "error","mode":"execute","wallet":_norm_addr(wa),"engine":engine,"recovered":recovered,"errors":errors,"ts":now_ts()}), (200 if recovered else 409)
+    target_id=int(body.get("sessionId") or 0)
+    target=next((s for s in candidates if int(s.get("sessionId") or 0)==target_id),None)
+    if not target:
+        return jsonify({"status":"blocked","error":"selected_session_not_recoverable","sessionId":target_id}),409
+    local_sessions,_,_=_db_get_rotation_sessions(wa) if engine=="NKR" else ([],"",0)
+    if engine=="NKR":
+        active_local=[x for x in local_sessions if isinstance(x,dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
+        if active_local: return jsonify({"status":"blocked","error":"active_local_nkr_session_exists","count":len(active_local)}),409
+    wallet_id=_privy_wallet_id_for_user(wa)
+    if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
+    _recovery_jobs_init(); jid=f"recovery-{engine.lower()}-{target_id}-{uuid.uuid4().hex[:12]}"; nowi=now_ts()
+    conn=_db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("INSERT INTO nexus_core_vault_recovery_jobs(job_id,wallet_address,engine,chain_id,vault_address,session_id,raw_status_id,status_label,job_status,step,step_label,receipt_status,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(jid,_norm_addr(wa),engine,chain_id,vault_addr,target_id,int(target.get("statusId") or 0),str(target.get("statusLabel") or ""),"QUEUED",0,"QUEUED","not_submitted",nowi,nowi)); conn.commit()
+    finally: conn.close()
+    threading.Thread(target=_run_recovery_job,args=(jid,_norm_addr(wa),engine,chain_id,vault_addr,target,wallet_id),daemon=True,name=f"vault-recovery-{target_id}").start()
+    return jsonify({"status":"accepted","mode":"execute","jobId":jid,"sessionId":target_id,"job":_recovery_job_get(jid,wa),"ts":now_ts()}),202
 
 
 # ENGINE-093: regime hysteresis / anti-flicker memory.
@@ -31723,12 +31905,14 @@ def api_nkr_control():
         return out
     finalize_results = []
     if action in {"STOP", "PANIC_STOP"}:
+        # Safe live stop is asynchronous. Do not erase the local session or mark it
+        # STOPPED until CoreVault status 4 (FINALIZED) is confirmed on-chain.
         finalize_results = _live_finalize_engine_sessions(wa, "NKR")
-    if not nkr_sessions and action in {"PAUSE", "STOP", "PANIC_STOP"}:
-        _db_set_user_app_state(wa, {"ui": {"nkrControlState": "PAUSED" if action == "PAUSE" else "STOPPED"}})
+    elif not nkr_sessions and action == "PAUSE":
+        _db_set_user_app_state(wa, {"ui": {"nkrControlState": "PAUSED"}})
     else:
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
-        next_control = "PAUSED" if action == "PAUSE" else ("RUNNING" if action == "RESUME" else "STOPPED")
+        next_control = "PAUSED" if action == "PAUSE" else "RUNNING"
         _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
     bundle = _nkr_get_wallet_bundle(wa)
@@ -31737,8 +31921,8 @@ def api_nkr_control():
     bundle["message"] = {
         "PAUSE": "NKR paused and stored wallet-bound in backend.",
         "RESUME": "NKR resumed by explicit user action.",
-        "STOP": "NKR stopped/protected. It will not resume unless user explicitly resumes or deletes.",
-        "PANIC_STOP": "NKR panic-protected. Paper/live-intent is stopped and capital should be secured by live executor when connected.",
+        "STOP": "NKR is being safely stopped. Capital is released automatically after confirmation.",
+        "PANIC_STOP": "NKR safe stop started. New trades are blocked and capital is released automatically.",
     }.get(action, "NKR control updated.")
     out = jsonify(bundle)
     out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
