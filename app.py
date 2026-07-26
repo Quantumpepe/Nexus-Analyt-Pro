@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-196-NKR-LIVE-MOMENTUM-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-196-NKR-LIVE-MOMENTUM-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-198-NKR-NO-FIXED-ALLOCATION-CAP"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-198-NKR-NO-FIXED-ALLOCATION-CAP"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -32068,6 +32068,157 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
     }
 
 
+
+
+def _bytes32_arg(value: str) -> str:
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", raw):
+        raise RuntimeError("invalid_route_id")
+    return raw[2:].lower()
+
+
+def _nkr_route_allowed(vault: str, session_id: int, route_id: str) -> bool:
+    data = _core_selector("sessionRouteAllowed(uint256,bytes32)") + _uint_to_32(session_id) + _bytes32_arg(route_id)
+    raw = _eth_call(1, vault, data)
+    words = _core_words(raw)
+    return bool(words and int(words[0]) == 1)
+
+
+def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amount_usd: float,
+                               price_usd: float, tx_hash: str, amount_out_raw: int = 0) -> None:
+    sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    nowi = _nkr_now_ms()
+    local_id = f"NKR-LIVE-{session_id}"
+    updated = []
+    patched = False
+    for src in sessions:
+        if not isinstance(src, dict):
+            continue
+        row = dict(src)
+        rid = str(row.get("id") or row.get("session_id") or "")
+        if rid == local_id:
+            patched = True
+            trade_id = f"LIVE-{session_id}-{str(tx_hash)[-10:]}"
+            event = {
+                "id": f"EV-{trade_id}", "type": "BUY", "action": "BUY", "engine": "NKR",
+                "asset": symbol, "symbol": symbol, "amountUsd": round(float(amount_usd), 6),
+                "priceUsd": round(float(price_usd), 10), "txHash": tx_hash,
+                "onchainSessionId": str(session_id), "timestamp": nowi, "createdAt": nowi,
+                "status": "CONFIRMED", "executionMode": "live",
+            }
+            history = list(row.get("rotationEvents") or row.get("events") or [])
+            history.append(event)
+            row.update({
+                "targetAsset": symbol, "asset": symbol, "symbol": symbol,
+                "positionState": "OPEN", "status": "ACTIVE", "active": True,
+                "updatedAt": nowi, "lastAction": "BUY", "lastTxHash": tx_hash,
+                "events": history, "rotationEvents": history,
+                "eventCount": len(history), "totalEventCount": len(history),
+                "openRotation": {
+                    "tradeId": trade_id, "asset": symbol, "symbol": symbol,
+                    "entryPriceUsd": round(float(price_usd), 10),
+                    "capitalUsd": round(float(amount_usd), 6),
+                    "amountOutRaw": str(int(amount_out_raw or 0)),
+                    "openedAt": nowi, "txHash": tx_hash, "executionMode": "live",
+                },
+            })
+            meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
+            meta.update({
+                "position_state": "OPEN", "nkr_active_asset": symbol,
+                "nkr_entry_price_usd": round(float(price_usd), 10),
+                "nkr_live_buy_tx_hash": tx_hash, "nkr_trade_opened_at": nowi,
+                "onchain_session_id": str(session_id), "execution_mode": "live",
+            })
+            row["meta"] = meta
+        updated.append(row)
+    if patched:
+        _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
+
+
+def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
+    """Execute the already configured USDC/WETH CoreVault route for NKR.
+
+    This is the first real product-worker execution path. It never fabricates an
+    ACTION state: ACTION is returned only after a confirmed CoreVault receipt.
+    """
+    cfg = _privy_trading_cfg()
+    sid = int(str(live_row.get("onchain_session_id") or "0"))
+    wallet_id = str(live_row.get("privy_wallet_id") or "").strip()
+    vault = _norm_addr(live_row.get("vault_address") or "")
+    if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
+        raise RuntimeError("incomplete_live_session_mapping")
+    if int(live_row.get("chain_id") or 1) != 1:
+        return {"executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_EXECUTABLE", "detail": "NKR live execution is currently attached to the Ethereum CoreVault."}
+    if vault.lower() != _norm_addr(cfg.get("vault") or "").lower():
+        raise RuntimeError("corevault_address_mismatch")
+    if not cfg.get("liveEnabled") or not cfg.get("routeVerified"):
+        raise RuntimeError("live_route_not_enabled_or_verified")
+
+    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    if len(words) < 13:
+        raise RuntimeError("session_decode_failed")
+    status_id = int(words[3])
+    settlement_cash = int(words[9])
+    if status_id != 1:
+        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {status_id}."}
+
+    current_weth = _position_amount(vault, sid, cfg["weth"])
+    if current_weth > 0:
+        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH"}
+
+    eth_row = next((x for x in market_rows if str((x or {}).get("symbol") or "").upper() in {"ETH", "WETH"}), None)
+    if not isinstance(eth_row, dict):
+        return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
+    price = _nkr_row_price_usd(eth_row)
+    change = _nkr_row_change_pct(eth_row)
+    score = _nkr_session_score({"score": eth_row.get("score") or eth_row.get("systemScore") or eth_row.get("ratingScore") or 0}, eth_row)
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    threshold = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    if price <= 0:
+        return {"executed": False, "decision": "WAIT", "gate": "PRICE_MISSING", "detail": "Ethereum price is unavailable.", "asset": "ETH", "score": score, "change": change, "price": price}
+    if score < threshold:
+        return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_SCORE_BLOCKED", "detail": f"ETH score {score:.1f} is below {mode} entry gate {threshold:.1f}.", "asset": "ETH", "score": score, "change": change, "price": price}
+    if change <= -0.25:
+        return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_MOMENTUM_BLOCKED", "detail": f"ETH cleared score but 24h momentum is {change:+.2f}%.", "asset": "ETH", "score": score, "change": change, "price": price}
+    if not _nkr_route_allowed(vault, sid, cfg["routeId"]):
+        raise RuntimeError("session_buy_route_not_allowed")
+
+    budget_units = int(str(live_row.get("budget_units") or "0"))
+    # No hard-coded per-asset percentage cap. The user already defines the total
+    # NKR session budget. With one executable candidate, NKR may deploy the full
+    # currently available session cash; CoreVault budget and settlementCash remain
+    # the authoritative limits. When several executable routes are available, the
+    # portfolio allocator may split this same budget dynamically by score.
+    amount = min(settlement_cash, budget_units) if budget_units > 0 else settlement_cash
+    min_units = max(1, int(os.getenv("NEXUS_NKR_LIVE_MIN_ENTRY_USDC_UNITS", "1000000")))
+    if amount < min_units:
+        return {"executed": False, "decision": "WAIT", "gate": "ENTRY_AMOUNT_TOO_SMALL", "detail": f"Executable stable balance is below {min_units / 1_000_000:.2f} USDC.", "asset": "ETH", "score": score, "change": change, "price": price}
+
+    quote = _privy_quote(cfg, cfg["usdc"], cfg["weth"], amount)
+    min_out = quote * (10_000 - cfg["slippageBps"]) // 10_000
+    deadline = now_ts() + 300
+    router_data = _privy_exact_input_single_data(cfg["usdc"], cfg["weth"], vault, amount, min_out, cfg["poolFee"])
+    call = _encode_execute_trade(sid, cfg["routeId"], amount, min_out, deadline, router_data)
+    ref = f"nexus-nkr-live-buy-{sid}-{int(time.time())}"
+    _live_engine_mark("NKR", status="running", decision="SUBMITTING", gate_status="EXECUTION", reason="Submitting CoreVault trade", pending_tx="submitting")
+    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
+    tx_hash = str(sent.get("hash") or sent.get("txHash") or "")
+    receipt = sent.get("receipt") if isinstance(sent.get("receipt"), dict) else {}
+    if not tx_hash:
+        tx_hash = str(receipt.get("transactionHash") or "")
+    amount_out = _position_amount(vault, sid, cfg["weth"])
+    if amount_out <= 0:
+        raise RuntimeError("weth_position_zero_after_confirmed_buy")
+    _nkr_patch_local_execution(wallet, sid, symbol="ETH", amount_usd=amount / 1_000_000.0,
+                               price_usd=price, tx_hash=tx_hash, amount_out_raw=amount_out)
+    return {
+        "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
+        "detail": f"Bought ETH through the CoreVault with {amount / 1_000_000:.2f} USDC.",
+        "asset": "ETH", "score": score, "change": change, "price": price,
+        "txHash": tx_hash, "amountInUnits": amount, "amountOutRaw": amount_out,
+    }
+
 def _nkr_live_worker_cycle() -> None:
     _live_engine_tables_init()
     conn = _db()
@@ -32096,18 +32247,21 @@ def _nkr_live_worker_cycle() -> None:
             processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
+            execution = _nkr_live_execute_existing_eth_route(wallet, active_rows[0], market_rows, settings)
+            exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             _live_engine_mark(
                 "NKR", tick=True, status="running",
                 assets_scanned=len(market_rows),
                 tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0),
-                best_candidate=diag.get("best_candidate", ""),
-                candidate_score=diag.get("candidate_score", 0.0),
-                candidate_momentum_24h=diag.get("candidate_momentum_24h", 0.0),
-                candidate_price=diag.get("candidate_price", 0.0),
-                decision=diag.get("decision", "WAIT"),
-                gate_status=diag.get("gate_status", ""),
-                decision_detail=diag.get("decision_detail", ""),
-                reason="backend worker tick completed", last_error=""
+                best_candidate=exec_asset,
+                candidate_score=execution.get("score", diag.get("candidate_score", 0.0)),
+                candidate_momentum_24h=execution.get("change", diag.get("candidate_momentum_24h", 0.0)),
+                candidate_price=execution.get("price", diag.get("candidate_price", 0.0)),
+                decision=execution.get("decision", "WAIT"),
+                gate_status=execution.get("gate", ""),
+                decision_detail=execution.get("detail", ""),
+                reason="CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed",
+                pending_tx=execution.get("txHash", ""), last_error=""
             )
         except Exception as exc:
             _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
