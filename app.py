@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-192-AUTOMATIC-STOP-FINALIZATION-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-192-AUTOMATIC-STOP-FINALIZATION-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-194-NKR-WORKER-PAUSE-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-194-NKR-WORKER-PAUSE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -556,6 +556,8 @@ def _live_engine_health_payload(wallet=""):
 
 @app.get("/api/nexus/engine-runtime/status")
 def api_nexus_engine_runtime_status():
+    if "_ensure_nkr_live_worker_started" in globals():
+        _ensure_nkr_live_worker_started()
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("wallet required", 401)
@@ -31722,8 +31724,8 @@ def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
         "status": next_status,
         "lifecycleState": next_status,
         "positionState": "STOPPED" if next_status == "STOPPED" else ("PAUSED" if next_status == "PAUSED" else (src.get("positionState") or "WAITING")),
-        "executionMode": str(src.get("executionMode") or meta.get("execution_mode") or "shadow").lower(),
-        "liveVaultReady": False,
+        "executionMode": str(src.get("executionMode") or meta.get("execution_mode") or "live").lower(),
+        "liveVaultReady": bool(src.get("liveVaultReady", meta.get("live_vault_ready", True))),
         "updatedAt": nowi,
         "meta": {
             **meta,
@@ -31732,8 +31734,8 @@ def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
             "lifecycle_state": next_status,
             "position_state": "STOPPED" if next_status == "STOPPED" else ("PAUSED" if next_status == "PAUSED" else (meta.get("position_state") or "WAITING")),
             "nkr_user_control": msg,
-            "live_vault_ready": False,
-            "execution_mode": "shadow",
+            "live_vault_ready": bool(src.get("liveVaultReady", meta.get("live_vault_ready", True))),
+            "execution_mode": str(src.get("executionMode") or meta.get("execution_mode") or "live").lower(),
             "reserved_usd": 0 if next_status == "STOPPED" else meta.get("reserved_usd", src.get("reservedUsd", 0)),
             "backend_persistence": NEXUS_NKR_BACKEND_PERSISTENCE_MODE,
         },
@@ -31790,12 +31792,14 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     nkr_sessions, campaign_clock = _nkr_apply_campaign_clock(nkr_sessions, ui.get("nkrPeriodDays", "10"))
     control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
-    if any(str((x or {}).get("status") or "").upper() == "PAUSED" for x in nkr_sessions):
-        control = "PAUSED"
-    elif any(str((x or {}).get("status") or "").upper() == "STOPPED" for x in nkr_sessions):
-        control = "STOPPED"
-    elif any(str((x or {}).get("status") or "").upper() in {"ACTIVE", "WAITING", "OPEN"} for x in nkr_sessions):
+    # Active state wins over historical stopped rows. Otherwise one old STOPPED
+    # session can incorrectly hide a currently paused/running live session.
+    if any(str((x or {}).get("status") or "").upper() in {"ACTIVE", "WAITING", "OPEN", "RUNNING"} for x in nkr_sessions):
         control = "RUNNING"
+    elif any(str((x or {}).get("status") or "").upper() == "PAUSED" for x in nkr_sessions):
+        control = "PAUSED"
+    elif nkr_sessions and all(str((x or {}).get("status") or "").upper() in {"STOPPED", "FINALIZED", "CLOSED"} for x in nkr_sessions):
+        control = "STOPPED"
     return {
         "status": "ok",
         "wallet": _norm_addr(wa),
@@ -31863,6 +31867,143 @@ def api_nkr_state():
     return out
 
 
+
+
+# ENGINE-194: browser-independent NKR runtime.
+# The previous build only ticked when the React page was open and a local session
+# happened to exist. A live CoreVault session could therefore remain RUNNING with
+# Tick Count 0 forever. This worker owns the heartbeat in the backend.
+_NKR_LIVE_WORKER_STARTED = False
+_NKR_LIVE_WORKER_LOCK = threading.RLock()
+_NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "30")))
+
+
+def _nkr_live_market_rows(wallet: str) -> list[dict]:
+    items, _ = _db_get_user_watchlist(wallet)
+    rows = []
+    for item in (items or [])[:40]:
+        if isinstance(item, str):
+            sym = item.strip().upper()
+        elif isinstance(item, dict):
+            sym = str(item.get("symbol") or item.get("sym") or "").strip().upper()
+        else:
+            sym = ""
+        if not sym or sym in {"USDC", "USDT", "USD"}:
+            continue
+        row = {"symbol": sym, "mode": "market"}
+        try:
+            px = _price_multi(sym)
+            if isinstance(px, dict):
+                row["price"] = px.get("price") or px.get("priceUsd") or 0
+                row["change24h"] = px.get("change24h") or px.get("change_24h") or 0
+                row["volume24h"] = px.get("volume24h") or px.get("volume_24h") or 0
+        except Exception:
+            pass
+        rows.append(row)
+    return _binance_enrich_market_rows(rows)
+
+
+def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
+    sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    sid = str(live_row.get("onchain_session_id") or "")
+    local_id = f"NKR-LIVE-{sid}"
+    if any(str((x or {}).get("id") or (x or {}).get("session_id") or "") == local_id for x in sessions if isinstance(x, dict)):
+        return
+    nowi = _nkr_now_ms()
+    budget = int(str(live_row.get("budget_units") or "0")) / 1_000_000.0
+    state, _ = _db_get_user_app_state(wallet)
+    ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+    days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or 10)
+    row = {
+        "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
+        "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "WAITING",
+        "active": True, "executionMode": "live", "liveVaultReady": True,
+        "budgetUsd": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
+        "createdAt": nowi, "startedAt": nowi, "campaignStartedAt": nowi,
+        "campaignExpiresAt": nowi + days * 86400000, "periodDays": days,
+        "meta": {"nkr_session": True, "wallet_bound": True, "execution_mode": "live",
+                 "live_vault_ready": True, "onchain_session_id": sid,
+                 "reserved_usd": budget, "lifecycle_state": "ACTIVE", "position_state": "WAITING"},
+    }
+    _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
+
+
+def _nkr_set_onchain_pause(wallet: str, paused: bool) -> list[dict]:
+    rows = _live_active_sessions(wallet, "NKR")
+    results = []
+    for row in rows:
+        sid = int(str(row.get("onchain_session_id") or "0"))
+        wallet_id = str(row.get("privy_wallet_id") or "")
+        vault = _norm_addr(row.get("vault_address") or "")
+        if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
+            continue
+        data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
+        ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{sid}-{int(time.time())}"
+        sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref)
+        txh = str(sent.get("hash") or "")
+        _privy_wait_receipt(txh, timeout_sec=240)
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute("UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL WHERE id=?", ("PAUSED" if paused else "ACTIVE", int(time.time()), row.get("id")))
+                conn.commit()
+        finally:
+            conn.close()
+        results.append({"sessionId": sid, "status": "paused" if paused else "active", "txHash": txh})
+    return results
+
+
+def _nkr_live_worker_cycle() -> None:
+    _live_engine_tables_init()
+    conn = _db()
+    try:
+        rows = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE engine='NKR' AND status IN ('ACTIVE','PAUSED') ORDER BY updated_ts DESC").fetchall()
+        live_rows = [dict(r) for r in rows]
+    finally:
+        conn.close()
+    by_wallet = {}
+    for row in live_rows:
+        by_wallet.setdefault(_norm_addr(row.get("wallet_address")), []).append(row)
+    for wallet, wallet_rows in by_wallet.items():
+        active_rows = [r for r in wallet_rows if str(r.get("status") or "").upper() == "ACTIVE"]
+        if not active_rows:
+            _live_engine_mark("NKR", status="paused", decision="PAUSED", reason="User paused NKR", pending_tx="")
+            continue
+        try:
+            for row in active_rows:
+                _nkr_ensure_local_live_session(wallet, row)
+            sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+            nkr_sessions = [x for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}]
+            market_rows = _nkr_live_market_rows(wallet)
+            state, _ = _db_get_user_app_state(wallet)
+            ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+            settings = {"nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"), "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"), "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"), "nkrPeriodDays": ui.get("nkrPeriodDays", "10"), "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0)}
+            processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
+            _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
+            best = str((summary or {}).get("bestCandidate") or (summary or {}).get("best_candidate") or (summary or {}).get("topAsset") or "")
+            _live_engine_mark("NKR", tick=True, status="running", assets_scanned=len(market_rows), tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0), best_candidate=best, decision="UPDATED" if (summary or {}).get("changed") else "WAITING", reason="backend worker tick completed", last_error="")
+        except Exception as exc:
+            _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
+
+
+def _nkr_live_worker_loop() -> None:
+    while True:
+        try:
+            _nkr_live_worker_cycle()
+        except Exception as exc:
+            _live_engine_mark("NKR", status="error", decision="WORKER_FAILED", last_error=str(exc)[:1000])
+        time.sleep(_NKR_LIVE_WORKER_INTERVAL_SEC)
+
+
+def _ensure_nkr_live_worker_started() -> None:
+    global _NKR_LIVE_WORKER_STARTED
+    with _NKR_LIVE_WORKER_LOCK:
+        if _NKR_LIVE_WORKER_STARTED:
+            return
+        threading.Thread(target=_nkr_live_worker_loop, daemon=True, name="nkr-live-worker").start()
+        _NKR_LIVE_WORKER_STARTED = True
+
+
 @app.route("/api/nkr/control", methods=["POST"])
 def api_nkr_control():
     wa = _require_auth() or _pick_wallet_from_request()
@@ -31908,11 +32049,22 @@ def api_nkr_control():
         # Safe live stop is asynchronous. Do not erase the local session or mark it
         # STOPPED until CoreVault status 4 (FINALIZED) is confirmed on-chain.
         finalize_results = _live_finalize_engine_sessions(wa, "NKR")
-    elif not nkr_sessions and action == "PAUSE":
-        _db_set_user_app_state(wa, {"ui": {"nkrControlState": "PAUSED"}})
-    else:
+    elif action in {"PAUSE", "RESUME"}:
+        # Pause/resume is not stop. Keep the session visible and keep its Vault
+        # allocation reserved while blocking/unblocking new engine actions.
+        try:
+            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE")
+        except Exception as exc:
+            return jsonify({"status": "error", "error": f"nkr_{action.lower()}_failed:{exc}"}), 502
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         next_control = "PAUSED" if action == "PAUSE" else "RUNNING"
+        if updated:
+            _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
+        _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
+        _live_engine_mark("NKR", status="paused" if action == "PAUSE" else "running", decision=next_control, reason="User control confirmed on-chain", pending_tx="", last_error="")
+    else:
+        updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
+        next_control = "RUNNING"
         _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
     bundle = _nkr_get_wallet_bundle(wa)
@@ -33417,3 +33569,9 @@ def api_nexus_engine_history_sync():
         finally:
             conn.close()
     return jsonify({"status":"ok","engine":engine,"written":written,"ts":now_i})
+
+# ENGINE-194 boot hook: safe under Flask reload/multiple requests; guarded once per process.
+@app.before_request
+def _boot_nkr_live_worker_once():
+    _ensure_nkr_live_worker_started()
+    return None
