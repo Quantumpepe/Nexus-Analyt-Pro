@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-184-PRIVY-SIGNER-DIAGNOSTICS"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-182-PRIVY-TX-LIFECYCLE"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-185-PRIVY-PROVISION-VERIFY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-183-EXPLICIT-PRIVY-PROVISIONING"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -28855,10 +28855,29 @@ def api_privy_trading_provision():
         _privy_auto_provision_wallet(address, wallet_id)
     except ValueError as exc:
         return jsonify({"status":"error","error":str(exc)}), 400
+
+    diagnostics = _privy_signer_diagnostics(address, wallet_id)
+    signer_attached = bool(
+        diagnostics.get("status") == "MATCH" and
+        (diagnostics.get("checks") or {}).get("configuredSignerMentionedOnWallet") and
+        (diagnostics.get("checks") or {}).get("backendKeyInConfiguredQuorum")
+    )
+    if not signer_attached:
+        return jsonify({
+            "status": "error",
+            "error": "privy_signer_not_attached_to_wallet",
+            "wallet": address,
+            "walletProvisioned": False,
+            "signerAttached": False,
+            "diagnostics": diagnostics,
+            "ts": now_ts(),
+        }), 409
+
     return jsonify({
-        "status":"ok", "automatic":True, "userActionRequired":False,
-        "wallet":address, "walletProvisioned":True,
+        "status":"ok", "automatic":False, "userActionRequired":False,
+        "wallet":address, "walletProvisioned":True, "signerAttached":True,
         "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
+        "diagnostics":diagnostics,
         "readiness":_privy_delegated_readiness(address), "ts":now_ts()
     })
 
