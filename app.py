@@ -184,7 +184,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-166-MULTI-EVM-TOKEN-REGISTRY"
+BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-180-MULTI-EVM-TOKEN-REGISTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1159,13 +1159,19 @@ def api_core_vault_create_system_session_auto():
     browser wallet to sign and therefore must not open a Privy approval dialog.
     Session limits remain enforced by the deployed CoreVault contract.
     """
+    authenticated_wallet = _require_auth()
+    if not authenticated_wallet:
+        return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
     wallet = _norm_addr(
         body.get("wallet") or body.get("walletAddress") or
-        request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
+        request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or
+        authenticated_wallet
     )
     if not _looks_like_evm_addr(wallet):
         return jsonify({"status": "error", "error": "valid_wallet_required"}), 400
+    if wallet.lower() != _norm_addr(authenticated_wallet).lower():
+        return jsonify({"status": "error", "error": "wallet_mismatch"}), 403
 
     system_name = str(body.get("system") or "").upper().strip()
     if system_name == "TRADING":
@@ -28237,16 +28243,21 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if reference_id:
         body["reference_id"] = reference_id
     expiry = str(int(time.time() * 1000) + 60_000)
-    idem = reference_id or str(uuid.uuid4())
-    signed_headers = {"privy-request-expiry": expiry, "idempotency-key": idem}
+    # Privy only accepts Privy-specific headers in the authorization payload.
+    # The documented idempotency header is `privy-idempotency-key`, not the
+    # generic `idempotency-key`. Keep it deterministic when a reference exists.
+    signed_headers = {"privy-request-expiry": expiry}
+    if reference_id:
+        signed_headers["privy-idempotency-key"] = reference_id
     sig = _privy_authorization_signature(url, body, signed_headers)
     headers = {
         "Content-Type": "application/json",
         "privy-app-id": cfg["appId"],
         "privy-authorization-signature": sig,
         "privy-request-expiry": expiry,
-        "idempotency-key": idem,
     }
+    if reference_id:
+        headers["privy-idempotency-key"] = reference_id
     response = requests.post(url, json=body, headers=headers, auth=(cfg["appId"], cfg["appSecret"]), timeout=45)
     data = response.json() if response.content else {}
     if response.status_code >= 300:
@@ -28537,9 +28548,13 @@ def _live_vault_execution_readiness(wallet_address): return _privy_delegated_rea
 
 @app.get("/api/nexus/privy-trading/config")
 def api_privy_trading_config():
-    owner, denied = _require_owner_system_info()
-    if denied: return denied
-    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(owner)
+    # Every authenticated Privy user needs the public signer/quorum and policy
+    # identifiers in order to attach the app signer to their own embedded wallet.
+    # Private authorization material is never returned.
+    wallet = _require_auth()
+    if not wallet:
+        return err("unauthorized", 401)
+    cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(wallet)
     return jsonify({"status":"ok","signerId":cfg["signerId"],"policyId":cfg["policyId"],"chainType":"ethereum","chainId":1,
                     "configured":bool(cfg["signerId"] and cfg["policyId"]),"readiness":rd,"ts":now_ts()})
 
