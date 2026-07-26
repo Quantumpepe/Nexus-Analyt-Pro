@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-212-NKR-LIVE-EXIT-DECISION-BRIDGE"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-213-NKR-LIVE-VALUE-POST-PERSIST-SYNC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32709,6 +32709,34 @@ def _nkr_live_worker_cycle() -> None:
                         conn.close()
 
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
+
+            # ENGINE-213: the executor synchronizes the live on-chain position before this
+            # processed-session batch is persisted.  The batch was calculated from the
+            # earlier snapshot and could therefore overwrite the fresh positionValueUsd
+            # and live PnL with the previous tick's values.  Re-apply the authoritative
+            # CoreVault amount and current market price after the batch write so the UI
+            # receives a moving live value on every completed worker cycle.
+            for live_row, execution_row in executions:
+                if str(execution_row.get("gate") or "").upper() != "POSITION_ACTIVE":
+                    continue
+                if int(live_row.get("chain_id") or 1) != 1:
+                    continue
+                try:
+                    sid_sync = int(str(live_row.get("onchain_session_id") or "0"))
+                    vault_sync = _norm_addr(live_row.get("vault_address") or "")
+                    cfg_sync = _privy_trading_cfg()
+                    amount_sync = _position_amount(vault_sync, sid_sync, cfg_sync["weth"])
+                    price_sync = _safe_float(execution_row.get("price"), 0.0)
+                    if price_sync <= 0:
+                        eth_sync = next((x for x in market_rows if str((x or {}).get("symbol") or "").upper() in {"ETH", "WETH"}), None)
+                        price_sync = _nkr_row_price_usd(eth_sync) if isinstance(eth_sync, dict) else 0.0
+                    if amount_sync > 0 and price_sync > 0:
+                        _nkr_sync_local_open_position(
+                            wallet, sid_sync, symbol="ETH",
+                            amount_out_raw=amount_sync, current_price_usd=price_sync,
+                        )
+                except Exception as sync_exc:
+                    _live_engine_mark("NKR", last_error=f"live_value_sync:{str(sync_exc)[:300]}")
 
             # Runtime panel remains a summary; prefer an open/executed session result.
             execution = next(
