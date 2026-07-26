@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-201-NKR-SYNC-ORDERLY-EXIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -413,6 +413,7 @@ def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
         row["status"] = state_u
         row["lifecycleState"] = state_u
         row["active"] = state_u not in {"STOPPED", "FINALIZED"}
+        row["visibleInActiveSessions"] = state_u not in {"STOPPED", "FINALIZED"}
         row["updatedAt"] = nowi
         if state_u == "STOPPING":
             row["stoppingAt"] = nowi
@@ -435,6 +436,60 @@ def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
     _db_set_user_app_state(wa, {"ui": {"nkrControlState": state_u}})
 
 
+def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict:
+    """Sell the complete live WETH position back to USDC before closing NKR.
+
+    CoreVault refuses startClosing while openAssetCount is non-zero. This helper
+    performs the already configured and session-allowed WETH -> USDC route, waits
+    for confirmation, then verifies both the WETH position and open asset count.
+    """
+    cfg = _privy_trading_cfg()
+    wallet_id = str(row.get("privy_wallet_id") or "").strip()
+    vault = _norm_addr(row.get("vault_address") or "")
+    chain_id = int(row.get("chain_id") or 1)
+    if chain_id != 1:
+        raise RuntimeError("orderly_exit_not_implemented_for_chain")
+    if not wallet_id or not _looks_like_evm_addr(vault):
+        raise RuntimeError("incomplete_live_session_mapping_for_exit")
+    if vault.lower() != _norm_addr(cfg.get("vault") or "").lower():
+        raise RuntimeError("corevault_address_mismatch_for_exit")
+
+    amount_in = _position_amount(vault, session_id, cfg["weth"])
+    if amount_in <= 0:
+        return {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
+    sell_route = str(cfg.get("sellRouteId") or "").strip()
+    if not sell_route or not _nkr_route_allowed(vault, session_id, sell_route):
+        raise RuntimeError("session_sell_route_not_allowed")
+
+    quote = _privy_quote(cfg, cfg["weth"], cfg["usdc"], amount_in)
+    min_out = quote * (10_000 - int(cfg.get("slippageBps") or 0)) // 10_000
+    deadline = now_ts() + 300
+    router_data = _privy_exact_input_single_data(
+        cfg["weth"], cfg["usdc"], vault, amount_in, min_out, cfg["poolFee"]
+    )
+    call = _encode_execute_trade(session_id, sell_route, amount_in, min_out, deadline, router_data)
+    _live_engine_mark(
+        "NKR", status="closing", decision="EXIT_SUBMITTING", gate_status="ORDERLY_EXIT",
+        reason="Selling open Ethereum position before CoreVault finalize", pending_tx="submitting", last_error=""
+    )
+    ref = f"nexus-nkr-live-exit-{session_id}-{int(time.time())}"
+    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
+    tx_hash = str(sent.get("hash") or sent.get("txHash") or "")
+    receipt = sent.get("receipt") if isinstance(sent.get("receipt"), dict) else {}
+    if not tx_hash:
+        tx_hash = str(receipt.get("transactionHash") or "")
+
+    remaining = _position_amount(vault, session_id, cfg["weth"])
+    if remaining != 0:
+        raise RuntimeError(f"weth_position_not_zero_after_exit:{remaining}")
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(session_id))
+    words = _core_words(raw)
+    open_assets = int(words[12]) if len(words) >= 13 else -1
+    if open_assets != 0:
+        raise RuntimeError(f"open_assets_after_orderly_exit:{open_assets}")
+    return {"executed": True, "txHash": tx_hash, "amountIn": amount_in, "amountOut": quote}
+
+
 def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
     sid = int(str(row.get("onchain_session_id") or "0"))
     wallet_id = str(row.get("privy_wallet_id") or "")
@@ -449,8 +504,19 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         raise RuntimeError("session_decode_failed_before_stop")
     status_id = int(words[3])
     open_assets = int(words[12])
+    exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
     if open_assets != 0:
-        raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
+        if str(engine or "").upper() != "NKR":
+            raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
+        exit_result = _nkr_exit_open_eth_position(wallet, row, sid)
+        raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+        words = _core_words(raw)
+        if len(words) < 13:
+            raise RuntimeError("session_decode_failed_after_orderly_exit")
+        status_id = int(words[3])
+        open_assets = int(words[12])
+        if open_assets != 0:
+            raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
 
     close_tx = ""
     if status_id in (1, 2):
@@ -488,7 +554,11 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
             conn.commit()
     finally:
         conn.close()
-    return {"sessionId": sid, "status": "finalized", "startClosingTxHash": close_tx, "finalizeTxHash": finalize_tx}
+    return {
+        "sessionId": sid, "status": "finalized",
+        "exitTxHash": str(exit_result.get("txHash") or ""),
+        "startClosingTxHash": close_tx, "finalizeTxHash": finalize_tx
+    }
 
 
 def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
@@ -13533,6 +13603,69 @@ def _rotation_event_to_db_tuple(wa: str, sid: str, ev: dict):
     )
 
 
+def _rotation_onchain_session_id(sess: dict) -> str:
+    if not isinstance(sess, dict):
+        return ""
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    raw = (
+        sess.get("onchainSessionId") or sess.get("onchain_session_id") or
+        meta.get("onchain_session_id") or meta.get("onchainSessionId") or ""
+    )
+    text = str(raw or "").strip()
+    if text.isdigit() and int(text) > 0:
+        return text
+    sid = _rotation_session_id(sess)
+    m = re.fullmatch(r"NKR-LIVE-(\d+)", sid, flags=re.I)
+    return m.group(1) if m else ""
+
+
+def _rotation_session_richness(sess: dict) -> tuple:
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    sym = _rotation_norm_symbol(
+        sess.get("positionAsset") or sess.get("targetAsset") or sess.get("asset") or
+        sess.get("symbol") or meta.get("nkr_active_asset") or ""
+    )
+    real_sym = 1 if sym and sym not in {"ASSET", "WAITING"} else 0
+    live = 1 if _rotation_onchain_session_id(sess) else 0
+    qty = 1 if _rotation_float(sess.get("positionQty") or meta.get("nkr_position_qty"), 0.0) > 0 else 0
+    tx = 1 if str(sess.get("lastTxHash") or meta.get("nkr_live_buy_tx_hash") or "").strip() else 0
+    updated = _rotation_ms(sess.get("updatedAt") or sess.get("updated_at") or 0, 0)
+    return (live, real_sym, qty, tx, updated)
+
+
+def _rotation_canonical_sessions(sessions: list[dict]) -> list[dict]:
+    """Return one backend-truth row per on-chain NKR session.
+
+    Old browser caches used to upload a second ASSET placeholder next to the real
+    NKR-LIVE row. Once a live on-chain row exists, active placeholders without an
+    on-chain id are not runtime truth and must never be sent to another device.
+    """
+    rows = [dict(x) for x in (sessions or []) if isinstance(x, dict)]
+    live_rows = [x for x in rows if _rotation_onchain_session_id(x)]
+    live_onchain_ids = {_rotation_onchain_session_id(x) for x in live_rows}
+
+    filtered = []
+    for row in rows:
+        status = str(row.get("status") or "").strip().upper()
+        oid = _rotation_onchain_session_id(row)
+        if live_onchain_ids and not oid and not _rotation_terminal_status(status) and _nkr_is_session(row):
+            # Stale active placeholder created by a browser before CoreVault mapping.
+            continue
+        filtered.append(row)
+
+    by_key = {}
+    order = []
+    for row in filtered:
+        oid = _rotation_onchain_session_id(row)
+        key = f"ONCHAIN:{oid}" if oid else f"LOCAL:{_rotation_session_id(row)}"
+        if key not in by_key:
+            by_key[key] = row
+            order.append(key)
+        elif _rotation_session_richness(row) > _rotation_session_richness(by_key[key]):
+            by_key[key] = row
+    return [by_key[k] for k in order]
+
+
 def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int]:
     wa = _norm_addr(wallet_address or "")
     if not wa:
@@ -13573,6 +13706,10 @@ def _db_get_rotation_sessions(wallet_address: str) -> tuple[list[dict], str, int
                 sess["status"] = db_status
             sessions.append(sess)
             updated_ts = max(updated_ts, int(row["updated_ts"] or 0))
+        sessions = _rotation_canonical_sessions(sessions)
+        valid_ids = {_rotation_session_id(x) for x in sessions}
+        if active_id not in valid_ids:
+            active_id = next((_rotation_session_id(x) for x in sessions if not _rotation_terminal_status(x.get("status"))), "")
         return sessions, active_id, updated_ts
     finally:
         conn.close()
@@ -13582,7 +13719,7 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
     wa = _norm_addr(wallet_address or "")
     if not wa:
         return [], "", 0
-    clean = [dict(x) for x in (sessions if isinstance(sessions, list) else []) if isinstance(x, dict)][:30]
+    clean = _rotation_canonical_sessions([dict(x) for x in (sessions if isinstance(sessions, list) else []) if isinstance(x, dict)])[:30]
     nowi = int(time.time() * 1000)
     conn = _db()
     try:
