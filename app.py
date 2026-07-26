@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-211-NKR-RECOVER-ERROR-SESSION-TICKS"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-212-NKR-LIVE-EXIT-DECISION-BRIDGE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32440,7 +32440,7 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
         _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
 
 
-def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
+def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
     """Execute the already configured USDC/WETH CoreVault route for NKR.
 
     This is the first real product-worker execution path. It never fabricates an
@@ -32482,7 +32482,37 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         live_change = _nkr_row_change_pct(eth_row) if isinstance(eth_row, dict) else 0.0
         live_score = _nkr_session_score({"score": (eth_row or {}).get("score") or (eth_row or {}).get("systemScore") or (eth_row or {}).get("ratingScore") or 0}, eth_row or {})
         _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price)
-        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH", "score": live_score, "change": live_change, "price": live_price, "amountOutRaw": current_weth}
+
+        # ENGINE-212: bridge the backend NKR decision into the real CoreVault route.
+        # Earlier builds returned HOLD immediately for every open WETH position, so
+        # the Strategist could calculate CLOSED_PROFIT / WAITING_REALLOCATION but the
+        # live executor never saw or acted on that decision.  We only sell when the
+        # backend-owned session decision explicitly requests a close; ordinary open
+        # positions continue to HOLD.
+        ds = decision_session if isinstance(decision_session, dict) else {}
+        ds_status = str(ds.get("status") or ds.get("lifecycleState") or "").upper()
+        ds_position = str(ds.get("positionState") or "").upper()
+        ds_event = ds.get("lastRotationEvent") if isinstance(ds.get("lastRotationEvent"), dict) else {}
+        ds_action = str(ds_event.get("action") or ds_event.get("status") or ds.get("lastAction") or "").upper()
+        exit_requested = bool(
+            ds_status == "WAITING_REALLOCATION"
+            or ds_position in {"CLOSED_PROFIT", "EXIT_PENDING", "EXITING"}
+            or ds_action in {"CLOSED_PROFIT", "SELL", "EXIT"}
+        )
+        if exit_requested:
+            exit_result = _nkr_exit_open_eth_position(wallet, live_row, sid)
+            return {
+                "executed": bool(exit_result.get("executed")),
+                "decision": "EXIT" if exit_result.get("executed") else "HOLD",
+                "gate": "ONCHAIN_EXIT_CONFIRMED" if exit_result.get("executed") else "POSITION_ACTIVE",
+                "detail": "NKR exit decision was executed and the Ethereum position returned to USDC." if exit_result.get("executed") else "Ethereum position remains open.",
+                "asset": "ETH", "score": live_score, "change": live_change,
+                "price": live_price, "amountOutRaw": current_weth,
+                "txHash": str(exit_result.get("txHash") or ""),
+                "amountInRaw": int(exit_result.get("amountIn") or 0),
+                "amountOutRaw": int(exit_result.get("amountOut") or 0),
+            }
+        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault; no backend exit decision is active.", "asset": "ETH", "score": live_score, "change": live_change, "price": live_price, "amountOutRaw": current_weth}
 
     if not isinstance(eth_row, dict):
         return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
@@ -32535,6 +32565,53 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         "asset": "ETH", "score": score, "change": change, "price": price,
         "txHash": tx_hash, "amountInUnits": amount, "amountOutRaw": amount_out,
     }
+
+def _nkr_processed_session_for_live_row(processed: list[dict], live_row: dict) -> dict:
+    """Return the wallet-local NKR session bound to one CoreVault registry row."""
+    sid = str(live_row.get("onchain_session_id") or "")
+    local_id = f"NKR-LIVE-{sid}"
+    for sess in processed or []:
+        if not isinstance(sess, dict):
+            continue
+        rid = str(sess.get("id") or sess.get("session_id") or "")
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        if rid == local_id or str(meta.get("onchain_session_id") or "") == sid:
+            return sess
+    return {}
+
+
+def _nkr_confirm_processed_live_exit(processed: list[dict], live_row: dict, execution: dict) -> None:
+    """Attach the confirmed sell transaction to the already computed close decision."""
+    if not execution.get("executed") or execution.get("decision") != "EXIT":
+        return
+    sess = _nkr_processed_session_for_live_row(processed, live_row)
+    if not sess:
+        return
+    nowi = _nkr_now_ms()
+    txh = str(execution.get("txHash") or "")
+    sess.update({
+        "status": "WAITING_REALLOCATION", "lifecycleState": "WAITING_REALLOCATION",
+        "positionState": "CLOSED_PROFIT", "onchainStatus": "CONFIRMED",
+        "lastAction": "SELL", "lastTxHash": txh, "updatedAt": nowi,
+        "openRotation": None,
+    })
+    meta = dict(sess.get("meta") if isinstance(sess.get("meta"), dict) else {})
+    meta.update({
+        "position_state": "CLOSED_PROFIT", "lifecycle_state": "WAITING_REALLOCATION",
+        "nkr_live_sell_tx_hash": txh, "nkr_trade_closed_at": nowi,
+        "onchain_status": "CONFIRMED", "execution_mode": "live",
+    })
+    sess["meta"] = meta
+    events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+    if events and isinstance(events[0], dict):
+        events[0].update({
+            "txHash": txh, "status": "CLOSED_PROFIT", "action": "SELL",
+            "onchainStatus": "CONFIRMED", "executionMode": "live",
+            "confirmedAt": nowi,
+        })
+        sess["lastRotationEvent"] = events[0]
+        sess["rotationEvents"] = events
+
 
 def _nkr_live_worker_cycle() -> None:
     """Process every recoverable NKR registry row.
@@ -32601,14 +32678,19 @@ def _nkr_live_worker_cycle() -> None:
             processed, summary = _nkr_backend_process_executor_tick(
                 nkr_sessions, market_rows=market_rows, settings=settings
             )
-            _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
 
             # Process every registry session rather than silently using active_rows[0].
+            # Persist the processed session only after any requested on-chain action
+            # succeeds, so the UI can never show CLOSED while the CoreVault is still open.
             executions = []
             for live_row in runnable_rows:
+                decision_session = _nkr_processed_session_for_live_row(processed, live_row)
                 with _NKR_LIVE_TRADE_LOCK:
-                    execution = _nkr_live_execute_existing_eth_route(wallet, live_row, market_rows, settings)
+                    execution = _nkr_live_execute_existing_eth_route(
+                        wallet, live_row, market_rows, settings, decision_session=decision_session
+                    )
+                _nkr_confirm_processed_live_exit(processed, live_row, execution)
                 executions.append((live_row, execution))
 
                 # A successful on-chain read/tick proves that a previous local ERROR was
@@ -32625,6 +32707,8 @@ def _nkr_live_worker_cycle() -> None:
                             conn.commit()
                     finally:
                         conn.close()
+
+            _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
 
             # Runtime panel remains a summary; prefer an open/executed session result.
             execution = next(
