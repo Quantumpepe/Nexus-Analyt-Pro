@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-195-NKR-DECISION-DIAGNOSTICS"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-195-NKR-DECISION-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-196-NKR-LIVE-MOMENTUM-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-196-NKR-LIVE-MOMENTUM-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27294,6 +27294,51 @@ def _search_assets_multi(query: str, limit: int = 25) -> list:
     except Exception:
         return []
 
+
+
+def _binance_24h_for_symbol(symbol: str) -> dict | None:
+    """Return a cached real 24h spot ticker for NKR momentum diagnostics.
+
+    The ordinary price endpoint only returns the current price. Build 195 therefore
+    filled change24h with zero. This endpoint supplies the actual 24h percentage
+    change and quote volume while keeping requests bounded by a short shared cache.
+    """
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+    cache_key = f"bz:24h|{s}"
+    try:
+        cached = _gen_cache_get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+    except Exception:
+        pass
+    for pair in _binance_symbol_candidates(s):
+        try:
+            url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/24hr"
+            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=4)
+            if r.status_code == 400:
+                continue
+            r.raise_for_status()
+            j = r.json() or {}
+            price = _safe_float(j.get("lastPrice"), 0.0)
+            change = _safe_float(j.get("priceChangePercent"), 0.0)
+            quote_volume = _safe_float(j.get("quoteVolume"), 0.0)
+            if price > 0:
+                out = {
+                    "symbol": s, "pair": pair, "price": price,
+                    "change24h": change, "volume24h": quote_volume,
+                    "source": "binance_24h", "updatedAt": int(time.time() * 1000),
+                }
+                try:
+                    _gen_cache_set(cache_key, out, ttl=15)
+                except Exception:
+                    pass
+                return out
+        except Exception:
+            continue
+    return None
+
 def _price_multi(symbol: str) -> dict | None:
     """Price router: Binance first, CoinGecko fallback."""
     try:
@@ -31892,11 +31937,22 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
             continue
         row = {"symbol": sym, "mode": "market"}
         try:
-            px = _price_multi(sym)
+            ticker24 = _binance_24h_for_symbol(sym)
+            px = ticker24 or _price_multi(sym)
             if isinstance(px, dict):
                 row["price"] = px.get("price") or px.get("priceUsd") or 0
-                row["change24h"] = px.get("change24h") or px.get("change_24h") or 0
-                row["volume24h"] = px.get("volume24h") or px.get("volume_24h") or 0
+                # Do not use `or` for numeric market fields: a legitimate 0.0 is
+                # different from a missing value and negative percentages are valid.
+                change = px.get("change24h")
+                if change is None:
+                    change = px.get("change_24h")
+                volume = px.get("volume24h")
+                if volume is None:
+                    volume = px.get("volume_24h")
+                row["change24h"] = _safe_float(change, 0.0)
+                row["volume24h"] = _safe_float(volume, 0.0)
+                row["marketDataSource"] = str(px.get("source") or "")
+                row["marketDataUpdatedAt"] = int(px.get("updatedAt") or int(time.time() * 1000))
         except Exception:
             pass
         rows.append(row)
@@ -32433,7 +32489,18 @@ def _nkr_market_row_map(rows):
 def _nkr_row_change_pct(row):
     if not isinstance(row, dict):
         return 0.0
-    return _safe_float(row.get("change24h") or row.get("chg_24h") or row.get("usd_24h_change") or row.get("change_24h") or 0.0, 0.0)
+    # Preserve negative and exact-zero values and support all current market row schemas.
+    for key in (
+        "change24h", "change_24h", "change_24h_pct", "priceChangePercent",
+        "price_change_percentage_24h", "chg_24h", "usd_24h_change", "pct", "change_pct",
+    ):
+        if key in row and row.get(key) is not None:
+            return _safe_float(row.get(key), 0.0)
+    fut = row.get("binanceFutures") if isinstance(row.get("binanceFutures"), dict) else {}
+    for key in ("change24h", "priceChangePercent", "change_pct"):
+        if key in fut and fut.get(key) is not None:
+            return _safe_float(fut.get(key), 0.0)
+    return 0.0
 
 
 def _nkr_row_price_usd(row):
