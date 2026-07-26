@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-185-PRIVY-PROVISION-VERIFY"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-183-EXPLICIT-PRIVY-PROVISIONING"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-186-PRIVY-PROVISION-RETRY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-184-PRIVY-WALLET-ID-RESOLUTION"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -28856,12 +28856,33 @@ def api_privy_trading_provision():
     except ValueError as exc:
         return jsonify({"status":"error","error":str(exc)}), 400
 
-    diagnostics = _privy_signer_diagnostics(address, wallet_id)
-    signer_attached = bool(
-        diagnostics.get("status") == "MATCH" and
-        (diagnostics.get("checks") or {}).get("configuredSignerMentionedOnWallet") and
-        (diagnostics.get("checks") or {}).get("backendKeyInConfiguredQuorum")
-    )
+    # Privy may acknowledge addSigners before the updated wallet signer relation
+    # is visible through every read endpoint. Poll briefly instead of returning a
+    # false 409 immediately after the user approved the one-time signer setup.
+    retry_delays = (0, 1, 2, 3, 5, 8)
+    diagnostics = {}
+    signer_attached = False
+    attempts = []
+    for attempt_index, delay_seconds in enumerate(retry_delays, start=1):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        diagnostics = _privy_signer_diagnostics(address, wallet_id)
+        checks = diagnostics.get("checks") or {}
+        signer_attached = bool(
+            diagnostics.get("status") == "MATCH" and
+            checks.get("configuredSignerMentionedOnWallet") and
+            checks.get("backendKeyInConfiguredQuorum")
+        )
+        attempts.append({
+            "attempt": attempt_index,
+            "delaySeconds": delay_seconds,
+            "status": diagnostics.get("status"),
+            "signerMentionedOnWallet": bool(checks.get("configuredSignerMentionedOnWallet")),
+            "walletLinkedToBackendKey": bool(checks.get("walletOwnedByOrLinkedToBackendKey")),
+        })
+        if signer_attached:
+            break
+
     if not signer_attached:
         return jsonify({
             "status": "error",
@@ -28869,13 +28890,16 @@ def api_privy_trading_provision():
             "wallet": address,
             "walletProvisioned": False,
             "signerAttached": False,
+            "verificationAttempts": attempts,
             "diagnostics": diagnostics,
+            "message": "Privy did not expose the approved signer on this wallet within the verification window.",
             "ts": now_ts(),
         }), 409
 
     return jsonify({
         "status":"ok", "automatic":False, "userActionRequired":False,
         "wallet":address, "walletProvisioned":True, "signerAttached":True,
+        "verificationAttempts":attempts,
         "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
         "diagnostics":diagnostics,
         "readiness":_privy_delegated_readiness(address), "ts":now_ts()
