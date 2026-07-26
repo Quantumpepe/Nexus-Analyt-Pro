@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-199-NKR-ONCHAIN-ROUTE-VERIFY-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-199-NKR-ONCHAIN-ROUTE-VERIFY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -32135,6 +32135,58 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
         _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
 
 
+def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float) -> None:
+    """Keep the wallet-bound UI session synchronized with the real CoreVault position."""
+    sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    nowi = _nkr_now_ms()
+    local_id = f"NKR-LIVE-{session_id}"
+    updated = []
+    patched = False
+    qty = float(int(amount_out_raw or 0)) / 1e18
+    for src in sessions:
+        if not isinstance(src, dict):
+            continue
+        row = dict(src)
+        rid = str(row.get("id") or row.get("session_id") or "")
+        if rid == local_id:
+            patched = True
+            open_pos = dict(row.get("openRotation") if isinstance(row.get("openRotation"), dict) else {})
+            entry = _safe_float(open_pos.get("entryPriceUsd") or (row.get("meta") or {}).get("nkr_entry_price_usd"), 0.0)
+            capital = _safe_float(open_pos.get("capitalUsd") or row.get("workingCapitalUsd") or row.get("budgetUsd"), 0.0)
+            if entry <= 0 and qty > 0 and capital > 0:
+                entry = capital / qty
+            value = qty * max(0.0, float(current_price_usd or 0.0))
+            pnl = value - capital if capital > 0 and value > 0 else 0.0
+            pnl_pct = (pnl / capital * 100.0) if capital > 0 else 0.0
+            open_pos.update({
+                "asset": symbol, "symbol": symbol, "amountOutRaw": str(int(amount_out_raw or 0)),
+                "quantity": qty, "positionQty": qty, "entryPriceUsd": entry,
+                "currentPriceUsd": float(current_price_usd or 0.0), "currentValueUsd": value,
+                "pnlUsd": pnl, "pnlPct": pnl_pct, "executionMode": "live",
+            })
+            row.update({
+                "targetAsset": symbol, "asset": symbol, "symbol": symbol, "positionAsset": symbol,
+                "positionState": "OPEN", "status": "ACTIVE", "active": True,
+                "positionQty": qty, "positionAmount": qty, "entryPriceUsd": entry,
+                "currentPriceUsd": float(current_price_usd or 0.0), "positionValueUsd": value,
+                "unrealizedPnlUsd": pnl, "unrealizedPnlPct": pnl_pct,
+                "onchainStatus": "CONFIRMED", "updatedAt": nowi, "openRotation": open_pos,
+            })
+            meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
+            meta.update({
+                "position_state": "OPEN", "nkr_active_asset": symbol,
+                "nkr_position_qty": qty, "nkr_entry_price_usd": entry,
+                "nkr_current_price_usd": float(current_price_usd or 0.0),
+                "nkr_position_value_usd": value, "nkr_unrealized_pnl_usd": pnl,
+                "nkr_unrealized_pnl_pct": pnl_pct, "onchain_status": "CONFIRMED",
+                "onchain_session_id": str(session_id), "execution_mode": "live",
+            })
+            row["meta"] = meta
+        updated.append(row)
+    if patched:
+        _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
+
+
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
     """Execute the already configured USDC/WETH CoreVault route for NKR.
 
@@ -32167,10 +32219,12 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {status_id}."}
 
     current_weth = _position_amount(vault, sid, cfg["weth"])
-    if current_weth > 0:
-        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH"}
-
     eth_row = next((x for x in market_rows if str((x or {}).get("symbol") or "").upper() in {"ETH", "WETH"}), None)
+    if current_weth > 0:
+        live_price = _nkr_row_price_usd(eth_row) if isinstance(eth_row, dict) else 0.0
+        _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price)
+        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH", "price": live_price, "amountOutRaw": current_weth}
+
     if not isinstance(eth_row, dict):
         return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
     price = _nkr_row_price_usd(eth_row)
@@ -32215,6 +32269,7 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         raise RuntimeError("weth_position_zero_after_confirmed_buy")
     _nkr_patch_local_execution(wallet, sid, symbol="ETH", amount_usd=amount / 1_000_000.0,
                                price_usd=price, tx_hash=tx_hash, amount_out_raw=amount_out)
+    _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=amount_out, current_price_usd=price)
     return {
         "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
         "detail": f"Bought ETH through the CoreVault with {amount / 1_000_000:.2f} USDC.",
