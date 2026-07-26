@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-203-NKR-LIVE-STATE-CONSISTENCY"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-204-NKR-WORKER-WATCHDOG-LIVE-VALUE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -703,8 +703,8 @@ def _live_engine_health_payload(wallet=""):
 
 @app.get("/api/nexus/engine-runtime/status")
 def api_nexus_engine_runtime_status():
-    if "_ensure_nkr_live_worker_started" in globals():
-        _ensure_nkr_live_worker_started()
+    if "_nkr_live_watchdog_kick" in globals():
+        _nkr_live_watchdog_kick()
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("wallet required", 401)
@@ -32133,8 +32133,12 @@ def api_nkr_state():
 # happened to exist. A live CoreVault session could therefore remain RUNNING with
 # Tick Count 0 forever. This worker owns the heartbeat in the backend.
 _NKR_LIVE_WORKER_STARTED = False
+_NKR_LIVE_WORKER_THREAD = None
 _NKR_LIVE_WORKER_LOCK = threading.RLock()
+_NKR_LIVE_CYCLE_LOCK = threading.Lock()
+_NKR_LIVE_WORKER_LAST_HEARTBEAT = 0
 _NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "30")))
+_NKR_LIVE_WORKER_STALE_SEC = max(90, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "120")))
 
 
 def _nkr_live_market_rows(wallet: str) -> list[dict]:
@@ -32491,7 +32495,7 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         "txHash": tx_hash, "amountInUnits": amount, "amountOutRaw": amount_out,
     }
 
-def _nkr_live_worker_cycle() -> None:
+def _nkr_live_worker_cycle_impl() -> None:
     _live_engine_tables_init()
     conn = _db()
     try:
@@ -32539,22 +32543,52 @@ def _nkr_live_worker_cycle() -> None:
             _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
 
 
+def _nkr_live_worker_cycle() -> None:
+    global _NKR_LIVE_WORKER_LAST_HEARTBEAT
+    if not _NKR_LIVE_CYCLE_LOCK.acquire(blocking=False):
+        return
+    _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+    try:
+        _nkr_live_worker_cycle_impl()
+    finally:
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+        _NKR_LIVE_CYCLE_LOCK.release()
+
+
 def _nkr_live_worker_loop() -> None:
+    global _NKR_LIVE_WORKER_LAST_HEARTBEAT
     while True:
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
         try:
             _nkr_live_worker_cycle()
         except Exception as exc:
             _live_engine_mark("NKR", status="error", decision="WORKER_FAILED", last_error=str(exc)[:1000])
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
         time.sleep(_NKR_LIVE_WORKER_INTERVAL_SEC)
 
 
 def _ensure_nkr_live_worker_started() -> None:
-    global _NKR_LIVE_WORKER_STARTED
+    global _NKR_LIVE_WORKER_STARTED, _NKR_LIVE_WORKER_THREAD, _NKR_LIVE_WORKER_LAST_HEARTBEAT
     with _NKR_LIVE_WORKER_LOCK:
-        if _NKR_LIVE_WORKER_STARTED:
+        alive = bool(_NKR_LIVE_WORKER_THREAD and _NKR_LIVE_WORKER_THREAD.is_alive())
+        heartbeat_age = int(time.time()) - int(_NKR_LIVE_WORKER_LAST_HEARTBEAT or 0)
+        if alive and heartbeat_age <= _NKR_LIVE_WORKER_STALE_SEC:
+            _NKR_LIVE_WORKER_STARTED = True
             return
-        threading.Thread(target=_nkr_live_worker_loop, daemon=True, name="nkr-live-worker").start()
+        t = threading.Thread(target=_nkr_live_worker_loop, daemon=True, name=f"nkr-live-worker-{int(time.time())}")
+        t.start()
+        _NKR_LIVE_WORKER_THREAD = t
         _NKR_LIVE_WORKER_STARTED = True
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+
+
+def _nkr_live_watchdog_kick() -> None:
+    _ensure_nkr_live_worker_started()
+    with _LIVE_ENGINE_RUNTIME_LOCK:
+        last = int((_LIVE_ENGINE_RUNTIME.get("NKR") or {}).get("last_tick_ts") or 0)
+    if last and int(time.time()) - last <= _NKR_LIVE_WORKER_STALE_SEC:
+        return
+    threading.Thread(target=_nkr_live_worker_cycle, daemon=True, name=f"nkr-live-kick-{int(time.time())}").start()
 
 
 @app.route("/api/nkr/control", methods=["POST"])
@@ -34137,5 +34171,5 @@ def api_nexus_engine_history_sync():
 # ENGINE-194 boot hook: safe under Flask reload/multiple requests; guarded once per process.
 @app.before_request
 def _boot_nkr_live_worker_once():
-    _ensure_nkr_live_worker_started()
+    _nkr_live_watchdog_kick()
     return None
