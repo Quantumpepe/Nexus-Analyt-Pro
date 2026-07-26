@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-205-NKR-WORKER-RECOVERY-LIVE-PNL"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -703,11 +703,26 @@ def _live_engine_health_payload(wallet=""):
 
 @app.get("/api/nexus/engine-runtime/status")
 def api_nexus_engine_runtime_status():
-    if "_nkr_live_watchdog_kick" in globals():
-        _nkr_live_watchdog_kick()
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("wallet required", 401)
+
+    # ENGINE-206: Render/Gunicorn may recycle web workers, so a daemon thread alone
+    # is not authoritative. Every runtime-status request also becomes a safe watchdog.
+    # If the persisted NKR tick is stale, run one lease-protected cycle synchronously
+    # before returning the payload. This guarantees that desktop/mobile polling refreshes
+    # scan diagnostics, the real WETH balance, current position value and live PnL.
+    try:
+        current = _live_engine_health_payload(wa).get("NKR") or {}
+        last_tick = int(current.get("last_tick_ts") or 0)
+        stale = (not last_tick) or (int(time.time()) - last_tick > _NKR_LIVE_WORKER_STALE_SEC)
+        if stale and "_nkr_live_worker_cycle" in globals():
+            _nkr_live_worker_cycle(force=False)
+        elif "_nkr_live_watchdog_kick" in globals():
+            _nkr_live_watchdog_kick()
+    except Exception as exc:
+        _live_engine_mark("NKR", status="error", decision="WATCHDOG_FAILED", reason="request-driven watchdog failed", last_error=str(exc)[:1000])
+
     return jsonify({"status": "ok", "wallet": _norm_addr(wa), "engines": _live_engine_health_payload(wa), "ts": int(time.time())})
 
 
