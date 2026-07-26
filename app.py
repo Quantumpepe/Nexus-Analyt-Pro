@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-201-NKR-SYNC-ORDERLY-EXIT"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-202-NKR-LIVE-STATE-SYNC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -610,18 +610,71 @@ def _live_finalize_engine_sessions(wallet, engine):
     return [{"sessionId": int(str(x.get("onchain_session_id") or "0")), "status": "queued"} for x in rows]
 
 def _live_engine_health_payload(wallet=""):
+    """Return one authoritative live state for System Info and the main NKR UI.
+
+    Process-local runtime counters are useful while a worker stays alive, but they
+    reset on every backend deploy.  For NKR we therefore hydrate the payload from
+    the wallet-bound session registry whenever an active CoreVault session exists.
+    This prevents System Info from showing IDLE while the main UI and CoreVault
+    still have a confirmed open position.
+    """
     nowi = int(time.time())
     out = {}
     with _LIVE_ENGINE_RUNTIME_LOCK:
-        for eng, src in _LIVE_ENGINE_RUNTIME.items():
-            row = dict(src or {})
-            last = int(row.get("last_tick_ts") or 0)
-            row["tick_age_sec"] = (nowi - last) if last else None
-            row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > 120))
-            if wallet:
-                live = _live_active_sessions(wallet, eng)
-                row["core_vault_sessions"] = [{"sessionId": x.get("onchain_session_id"), "status": x.get("status"), "txHash": x.get("tx_hash"), "finalizedTxHash": x.get("finalized_tx_hash"), "lastError": x.get("last_error")} for x in live]
-            out[eng] = row
+        runtime_snapshot = {k: dict(v or {}) for k, v in _LIVE_ENGINE_RUNTIME.items()}
+
+    for eng, src in runtime_snapshot.items():
+        row = dict(src or {})
+        live = _live_active_sessions(wallet, eng) if wallet else []
+        row["core_vault_sessions"] = [{
+            "sessionId": x.get("onchain_session_id"), "status": x.get("status"),
+            "txHash": x.get("tx_hash"), "finalizedTxHash": x.get("finalized_tx_hash"),
+            "lastError": x.get("last_error")
+        } for x in live]
+
+        if wallet and eng == "NKR" and live:
+            try:
+                sessions, _, _ = _db_get_rotation_sessions(wallet)
+                active_local = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or x.get("lifecycleState") or "").upper() not in {"STOPPED","FINALIZED","CLOSED","EXPIRED","CANCELLED","RELEASED","ARCHIVED"}]
+                current = active_local[0] if active_local else {}
+                meta = current.get("meta") if isinstance(current.get("meta"), dict) else {}
+                open_pos = current.get("openRotation") if isinstance(current.get("openRotation"), dict) else {}
+                asset = str(current.get("positionAsset") or open_pos.get("asset") or current.get("targetAsset") or current.get("asset") or current.get("symbol") or meta.get("nkr_active_asset") or "").upper()
+                if asset in {"ASSET","WAITING","NONE","NULL"}:
+                    asset = ""
+                position_state = str(current.get("positionState") or meta.get("position_state") or "").upper()
+                onchain_state = str(current.get("onchainStatus") or meta.get("onchain_status") or "").upper()
+                has_position = bool(asset and (position_state == "OPEN" or onchain_state == "CONFIRMED" or float(current.get("positionQty") or open_pos.get("quantity") or meta.get("nkr_position_qty") or 0) > 0))
+                live_statuses = {str(x.get("status") or "").upper() for x in live}
+                paused = bool(live_statuses and live_statuses <= {"PAUSED"})
+                latest_ms = max([int(float(x.get("updatedAt") or x.get("updated_at") or x.get("createdAt") or 0)) for x in active_local] or [0])
+                latest_sec = latest_ms // 1000 if latest_ms > 10_000_000_000 else latest_ms
+                tx_hash = str(current.get("txHash") or current.get("tradeTxHash") or meta.get("nkr_live_buy_tx_hash") or live[0].get("tx_hash") or "")
+                price = float(current.get("currentPriceUsd") or open_pos.get("currentPriceUsd") or meta.get("nkr_current_price_usd") or 0)
+                row.update({
+                    "status": "paused" if paused else "running",
+                    "last_tick_ts": int(row.get("last_tick_ts") or latest_sec or live[0].get("updated_ts") or nowi),
+                    "tick_count": max(int(row.get("tick_count") or 0), int(current.get("eventCount") or current.get("totalEventCount") or 0), 1),
+                    "best_candidate": asset or str(row.get("best_candidate") or ""),
+                    "candidate_price": price or float(row.get("candidate_price") or 0),
+                    "decision": "PAUSED" if paused else ("HOLD" if has_position else str(row.get("decision") or "WAIT")),
+                    "gate_status": "PAUSED" if paused else ("POSITION_ACTIVE" if has_position else str(row.get("gate_status") or "SESSION_ACTIVE")),
+                    "decision_detail": (f"{asset} position is open and tracked by CoreVault." if has_position else str(row.get("decision_detail") or "CoreVault session is active.")),
+                    "reason": "wallet-bound CoreVault state synchronized",
+                    "pending_tx": "",
+                    "last_error": "",
+                    "active_asset": asset,
+                    "position_state": position_state or ("OPEN" if has_position else "WAITING"),
+                    "position_value_usd": float(current.get("positionValueUsd") or open_pos.get("currentValueUsd") or meta.get("nkr_position_value_usd") or 0),
+                    "tx_hash": tx_hash,
+                })
+            except Exception as exc:
+                row["sync_warning"] = str(exc)[:300]
+
+        last = int(row.get("last_tick_ts") or 0)
+        row["tick_age_sec"] = (nowi - last) if last else None
+        row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > 120))
+        out[eng] = row
     return out
 
 @app.get("/api/nexus/engine-runtime/status")
