@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-186-PRIVY-PROVISION-RETRY"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-184-PRIVY-WALLET-ID-RESOLUTION"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-187-PRIVY-VERIFICATION-ENDPOINT-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-186-PRIVY-VERIFICATION-FLOW-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -28450,18 +28450,20 @@ def _privy_signer_diagnostics(wallet_address, wallet_id=None):
         result["findings"].append("backend_private_key_does_not_match_configured_key_quorum")
     if wallet_res["ok"] and not result["checks"]["configuredSignerMentionedOnWallet"]:
         result["findings"].append("configured_key_quorum_not_present_on_wallet")
-    if by_key_res["ok"] and not result["checks"]["walletOwnedByOrLinkedToBackendKey"]:
-        result["findings"].append("wallet_not_returned_for_backend_authorization_public_key")
+    # `authorization_key` on GET /v1/wallets filters wallets OWNED by a key
+    # quorum containing that key. It does not prove whether the key quorum is an
+    # additional signer on a user-owned wallet, so this lookup is diagnostic only.
+    # Do not classify a missing result as a signer mismatch.
     if wallet_res["ok"] and policy_id and not result["checks"]["configuredPolicyMentionedOnWallet"]:
         result["findings"].append("configured_policy_not_present_on_wallet")
 
     critical = (
         result["checks"].get("walletLookupOk") and
         result["checks"].get("keyQuorumLookupOk") and
-        result["checks"].get("backendKeyInConfiguredQuorum") and
-        result["checks"].get("configuredSignerMentionedOnWallet")
+        result["checks"].get("backendKeyInConfiguredQuorum")
     )
-    result["status"] = "MATCH" if critical and not result["findings"] else "MISMATCH"
+    signer_visible = bool(result["checks"].get("configuredSignerMentionedOnWallet"))
+    result["status"] = "MATCH" if critical and signer_visible else ("CONFIG_OK_SIGNER_NOT_VISIBLE" if critical else "MISMATCH")
     return result
 
 
@@ -28842,7 +28844,13 @@ def api_privy_trading_config():
 
 @app.post("/api/nexus/privy-trading/provision")
 def api_privy_trading_provision():
-    """Automatic login/onboarding registration; no user approval or signature."""
+    """Register the Privy wallet mapping after client-side addSigners succeeds.
+
+    Privy's GET /v1/wallets?authorization_key=... endpoint only returns wallets
+    owned by a quorum containing that key; it is not an additional-signer lookup.
+    The React addSigners call is therefore authoritative for provisioning, while
+    the first real wallet RPC remains the authoritative execution test.
+    """
     wa = _require_auth()
     if not wa:
         return err("unauthorized", 401)
@@ -28856,53 +28864,42 @@ def api_privy_trading_provision():
     except ValueError as exc:
         return jsonify({"status":"error","error":str(exc)}), 400
 
-    # Privy may acknowledge addSigners before the updated wallet signer relation
-    # is visible through every read endpoint. Poll briefly instead of returning a
-    # false 409 immediately after the user approved the one-time signer setup.
-    retry_delays = (0, 1, 2, 3, 5, 8)
-    diagnostics = {}
-    signer_attached = False
-    attempts = []
-    for attempt_index, delay_seconds in enumerate(retry_delays, start=1):
-        if delay_seconds:
-            time.sleep(delay_seconds)
-        diagnostics = _privy_signer_diagnostics(address, wallet_id)
-        checks = diagnostics.get("checks") or {}
-        signer_attached = bool(
-            diagnostics.get("status") == "MATCH" and
-            checks.get("configuredSignerMentionedOnWallet") and
-            checks.get("backendKeyInConfiguredQuorum")
-        )
-        attempts.append({
-            "attempt": attempt_index,
-            "delaySeconds": delay_seconds,
-            "status": diagnostics.get("status"),
-            "signerMentionedOnWallet": bool(checks.get("configuredSignerMentionedOnWallet")),
-            "walletLinkedToBackendKey": bool(checks.get("walletOwnedByOrLinkedToBackendKey")),
-        })
-        if signer_attached:
-            break
-
-    if not signer_attached:
+    diagnostics = _privy_signer_diagnostics(address, wallet_id)
+    checks = diagnostics.get("checks") or {}
+    config_ok = bool(
+        checks.get("walletLookupOk") and
+        checks.get("keyQuorumLookupOk") and
+        checks.get("backendKeyInConfiguredQuorum")
+    )
+    if not config_ok:
         return jsonify({
-            "status": "error",
-            "error": "privy_signer_not_attached_to_wallet",
-            "wallet": address,
-            "walletProvisioned": False,
-            "signerAttached": False,
-            "verificationAttempts": attempts,
-            "diagnostics": diagnostics,
-            "message": "Privy did not expose the approved signer on this wallet within the verification window.",
-            "ts": now_ts(),
+            "status":"error",
+            "error":"privy_signer_configuration_mismatch",
+            "wallet":address,
+            "walletProvisioned":False,
+            "signerAttached":False,
+            "provisionAccepted":False,
+            "diagnostics":diagnostics,
+            "ts":now_ts(),
         }), 409
 
+    signer_visible = bool(checks.get("configuredSignerMentionedOnWallet"))
     return jsonify({
-        "status":"ok", "automatic":False, "userActionRequired":False,
-        "wallet":address, "walletProvisioned":True, "signerAttached":True,
-        "verificationAttempts":attempts,
-        "systems":["NKR","TRADER","GRID"], "budgetAuthority":"COREVAULT_SESSION",
+        "status":"ok",
+        "automatic":False,
+        "userActionRequired":False,
+        "wallet":address,
+        "walletProvisioned":True,
+        "provisionAccepted":True,
+        "signerAttached":signer_visible,
+        "signerVisibility":"VISIBLE" if signer_visible else "NOT_EXPOSED_BY_WALLET_READ",
+        "verificationMode":"CLIENT_ADD_SIGNERS_THEN_FIRST_RPC",
+        "message":"Privy addSigners completed or reported the signer already present. The first signed wallet RPC is the authoritative execution check.",
+        "systems":["NKR","TRADER","GRID"],
+        "budgetAuthority":"COREVAULT_SESSION",
         "diagnostics":diagnostics,
-        "readiness":_privy_delegated_readiness(address), "ts":now_ts()
+        "readiness":_privy_delegated_readiness(address),
+        "ts":now_ts(),
     })
 
 
