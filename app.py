@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-198-NKR-NO-FIXED-ALLOCATION-CAP"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-198-NKR-NO-FIXED-ALLOCATION-CAP"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-199-NKR-ONCHAIN-ROUTE-VERIFY-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-199-NKR-ONCHAIN-ROUTE-VERIFY-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -32151,8 +32151,11 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         return {"executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_EXECUTABLE", "detail": "NKR live execution is currently attached to the Ethereum CoreVault."}
     if vault.lower() != _norm_addr(cfg.get("vault") or "").lower():
         raise RuntimeError("corevault_address_mismatch")
-    if not cfg.get("liveEnabled") or not cfg.get("routeVerified"):
-        raise RuntimeError("live_route_not_enabled_or_verified")
+    # Live execution is controlled by the global execution switch. Route readiness
+    # is verified from the current CoreVault session and on-chain route config below.
+    # Do not block the worker because of a stale/manual environment flag.
+    if not cfg.get("liveEnabled"):
+        raise RuntimeError("live_execution_env_disabled")
 
     raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
     words = _core_words(raw)
