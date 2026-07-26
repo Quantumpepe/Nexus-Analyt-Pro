@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-183-PRIVY-SIGNER-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-184-PRIVY-SIGNER-DIAGNOSTICS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-182-PRIVY-TX-LIFECYCLE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -28402,7 +28402,7 @@ def _privy_signer_diagnostics(wallet_address, wallet_id=None):
     result["checks"]["walletLookupOk"] = bool(wallet_res["ok"])
 
     quorum_id = str(cfg.get("signerId") or "").strip()
-    quorum_res = _privy_basic_get(f"/v1/key-quorums/{quorum_id}") if quorum_id else {
+    quorum_res = _privy_basic_get(f"/v1/key_quorums/{quorum_id}") if quorum_id else {
         "ok": False, "statusCode": 0, "error": "privy_key_quorum_id_missing", "data": {}
     }
     qdata = quorum_res.get("data") if isinstance(quorum_res.get("data"), dict) else {}
