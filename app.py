@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-209-NKR-RESTORED-WORKER-LIVE-VALUE"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-210-NKR-WORKER-HEARTBEAT-DIAGNOSTICS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -698,6 +698,25 @@ def _live_engine_health_payload(wallet=""):
         last = int(row.get("last_tick_ts") or 0)
         row["tick_age_sec"] = (nowi - last) if last else None
         row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > _NKR_LIVE_WORKER_STALE_SEC))
+
+        if eng == "NKR":
+            thread = globals().get("_NKR_LIVE_WORKER_THREAD")
+            heartbeat = int(globals().get("_NKR_LIVE_WORKER_LAST_HEARTBEAT") or 0)
+            cycle_started = int(globals().get("_NKR_LIVE_WORKER_CYCLE_STARTED_TS") or 0)
+            cycle_completed = int(globals().get("_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS") or 0)
+            row["worker_thread_alive"] = bool(thread is not None and thread.is_alive())
+            row["worker_thread_name"] = str(getattr(thread, "name", "") or "")
+            row["worker_heartbeat_ts"] = heartbeat
+            row["worker_heartbeat_age_sec"] = (nowi - heartbeat) if heartbeat else None
+            row["worker_cycle_started_ts"] = cycle_started
+            row["worker_cycle_started_age_sec"] = (nowi - cycle_started) if cycle_started else None
+            row["worker_cycle_completed_ts"] = cycle_completed
+            row["worker_cycle_completed_age_sec"] = (nowi - cycle_completed) if cycle_completed else None
+            row["worker_last_stage"] = str(globals().get("_NKR_LIVE_WORKER_LAST_STAGE") or "unknown")
+            row["worker_loop_count"] = int(globals().get("_NKR_LIVE_WORKER_LOOP_COUNT") or 0)
+            row["worker_heartbeat_stalled"] = bool(not heartbeat or nowi - heartbeat > max(5, _NKR_LIVE_WORKER_INTERVAL_SEC + 5))
+            row["session_state_updated_ts"] = max([int(x.get("updated_ts") or 0) for x in live] or [0])
+
         out[eng] = row
     return out
 
@@ -32148,6 +32167,10 @@ _NKR_LIVE_CYCLE_LEASE_TOKEN = ""
 _NKR_LIVE_CYCLE_STARTED_TS = 0
 _NKR_LIVE_TRADE_LOCK = threading.Lock()
 _NKR_LIVE_WORKER_LAST_HEARTBEAT = 0
+_NKR_LIVE_WORKER_CYCLE_STARTED_TS = 0
+_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = 0
+_NKR_LIVE_WORKER_LAST_STAGE = "boot"
+_NKR_LIVE_WORKER_LOOP_COUNT = 0
 _NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "15")))
 _NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "45")))
 _NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
@@ -32563,26 +32586,67 @@ def _nkr_live_worker_cycle() -> None:
 
 
 def _nkr_live_worker_loop() -> None:
-    # Proven Build-199 behavior: one permanent loop, one direct cycle, then sleep.
-    # Any cycle exception is recorded, and the next interval continues normally.
+    """Permanent in-process NKR loop with independent heartbeat diagnostics.
+
+    Heartbeat and cycle timestamps are deliberately separate from session timestamps
+    and completed trading ticks. This lets System Info prove whether the thread is
+    alive, whether a cycle started, and whether it completed.
+    """
+    global _NKR_LIVE_WORKER_LAST_HEARTBEAT
+    global _NKR_LIVE_WORKER_CYCLE_STARTED_TS
+    global _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS
+    global _NKR_LIVE_WORKER_LAST_STAGE
+    global _NKR_LIVE_WORKER_LOOP_COUNT
+
     while True:
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+        _NKR_LIVE_WORKER_CYCLE_STARTED_TS = _NKR_LIVE_WORKER_LAST_HEARTBEAT
+        _NKR_LIVE_WORKER_LAST_STAGE = "cycle_started"
+        _NKR_LIVE_WORKER_LOOP_COUNT += 1
         try:
+            _NKR_LIVE_WORKER_LAST_STAGE = "cycle_running"
             _nkr_live_worker_cycle()
+            _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = int(time.time())
+            _NKR_LIVE_WORKER_LAST_STAGE = "cycle_completed"
         except Exception as exc:
-            _live_engine_mark("NKR", status="error", decision="WORKER_FAILED", reason="NKR worker loop recovered after an exception", last_error=str(exc)[:1000])
-        time.sleep(_NKR_LIVE_WORKER_INTERVAL_SEC)
+            _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = int(time.time())
+            _NKR_LIVE_WORKER_LAST_STAGE = "cycle_failed"
+            _live_engine_mark(
+                "NKR", status="error", decision="WORKER_FAILED",
+                reason="NKR worker loop recovered after an exception",
+                last_error=str(exc)[:1000],
+            )
+        finally:
+            _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+
+        # Sleep in short steps so the heartbeat continues to prove the thread is alive.
+        sleep_left = float(_NKR_LIVE_WORKER_INTERVAL_SEC)
+        _NKR_LIVE_WORKER_LAST_STAGE = "sleeping"
+        while sleep_left > 0:
+            step = min(1.0, sleep_left)
+            time.sleep(step)
+            sleep_left -= step
+            _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
 
 
 def _ensure_nkr_live_worker_started() -> None:
     global _NKR_LIVE_WORKER_STARTED
+    global _NKR_LIVE_WORKER_THREAD
+    global _NKR_LIVE_WORKER_LAST_STAGE
+
     with _NKR_LIVE_WORKER_LOCK:
-        if _NKR_LIVE_WORKER_STARTED:
+        if _NKR_LIVE_WORKER_THREAD is not None and _NKR_LIVE_WORKER_THREAD.is_alive():
+            _NKR_LIVE_WORKER_STARTED = True
             return
-        threading.Thread(
+
+        _NKR_LIVE_WORKER_LAST_STAGE = "thread_starting"
+        thread = threading.Thread(
             target=_nkr_live_worker_loop,
             daemon=True,
             name="nkr-live-worker",
-        ).start()
+        )
+        thread.start()
+        _NKR_LIVE_WORKER_THREAD = thread
         _NKR_LIVE_WORKER_STARTED = True
 
 
