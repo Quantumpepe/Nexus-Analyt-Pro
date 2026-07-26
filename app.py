@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-204-NKR-WORKER-WATCHDOG-LIVE-VALUE"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-205-NKR-WORKER-RECOVERY-LIVE-PNL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -697,7 +697,7 @@ def _live_engine_health_payload(wallet=""):
 
         last = int(row.get("last_tick_ts") or 0)
         row["tick_age_sec"] = (nowi - last) if last else None
-        row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > 120))
+        row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > _NKR_LIVE_WORKER_STALE_SEC))
         out[eng] = row
     return out
 
@@ -32135,10 +32135,14 @@ def api_nkr_state():
 _NKR_LIVE_WORKER_STARTED = False
 _NKR_LIVE_WORKER_THREAD = None
 _NKR_LIVE_WORKER_LOCK = threading.RLock()
-_NKR_LIVE_CYCLE_LOCK = threading.Lock()
+_NKR_LIVE_CYCLE_LEASE_LOCK = threading.RLock()
+_NKR_LIVE_CYCLE_LEASE_TOKEN = ""
+_NKR_LIVE_CYCLE_STARTED_TS = 0
+_NKR_LIVE_TRADE_LOCK = threading.Lock()
 _NKR_LIVE_WORKER_LAST_HEARTBEAT = 0
-_NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "30")))
-_NKR_LIVE_WORKER_STALE_SEC = max(90, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "120")))
+_NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "15")))
+_NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "45")))
+_NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
 
 
 def _nkr_live_market_rows(wallet: str) -> list[dict]:
@@ -32440,8 +32444,14 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     eth_row = next((x for x in market_rows if str((x or {}).get("symbol") or "").upper() in {"ETH", "WETH"}), None)
     if current_weth > 0:
         live_price = _nkr_row_price_usd(eth_row) if isinstance(eth_row, dict) else 0.0
+        if live_price <= 0:
+            fallback = _price_multi("ETH")
+            if isinstance(fallback, dict):
+                live_price = _safe_float(fallback.get("price") or fallback.get("priceUsd"), 0.0)
+        live_change = _nkr_row_change_pct(eth_row) if isinstance(eth_row, dict) else 0.0
+        live_score = _nkr_session_score({"score": (eth_row or {}).get("score") or (eth_row or {}).get("systemScore") or (eth_row or {}).get("ratingScore") or 0}, eth_row or {})
         _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price)
-        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH", "price": live_price, "amountOutRaw": current_weth}
+        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault.", "asset": "ETH", "score": live_score, "change": live_change, "price": live_price, "amountOutRaw": current_weth}
 
     if not isinstance(eth_row, dict):
         return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
@@ -32523,7 +32533,8 @@ def _nkr_live_worker_cycle_impl() -> None:
             processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
-            execution = _nkr_live_execute_existing_eth_route(wallet, active_rows[0], market_rows, settings)
+            with _NKR_LIVE_TRADE_LOCK:
+                execution = _nkr_live_execute_existing_eth_route(wallet, active_rows[0], market_rows, settings)
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             _live_engine_mark(
                 "NKR", tick=True, status="running",
@@ -32543,16 +32554,25 @@ def _nkr_live_worker_cycle_impl() -> None:
             _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
 
 
-def _nkr_live_worker_cycle() -> None:
-    global _NKR_LIVE_WORKER_LAST_HEARTBEAT
-    if not _NKR_LIVE_CYCLE_LOCK.acquire(blocking=False):
-        return
-    _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
+def _nkr_live_worker_cycle(force: bool = False) -> None:
+    global _NKR_LIVE_WORKER_LAST_HEARTBEAT, _NKR_LIVE_CYCLE_LEASE_TOKEN, _NKR_LIVE_CYCLE_STARTED_TS
+    nowi = int(time.time())
+    token = f"{threading.get_ident()}-{nowi}-{time.time_ns()}"
+    with _NKR_LIVE_CYCLE_LEASE_LOCK:
+        lease_age = nowi - int(_NKR_LIVE_CYCLE_STARTED_TS or 0)
+        if _NKR_LIVE_CYCLE_LEASE_TOKEN and lease_age < _NKR_LIVE_CYCLE_LEASE_SEC and not force:
+            return
+        _NKR_LIVE_CYCLE_LEASE_TOKEN = token
+        _NKR_LIVE_CYCLE_STARTED_TS = nowi
+    _NKR_LIVE_WORKER_LAST_HEARTBEAT = nowi
     try:
         _nkr_live_worker_cycle_impl()
     finally:
         _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
-        _NKR_LIVE_CYCLE_LOCK.release()
+        with _NKR_LIVE_CYCLE_LEASE_LOCK:
+            if _NKR_LIVE_CYCLE_LEASE_TOKEN == token:
+                _NKR_LIVE_CYCLE_LEASE_TOKEN = ""
+                _NKR_LIVE_CYCLE_STARTED_TS = 0
 
 
 def _nkr_live_worker_loop() -> None:
@@ -32584,11 +32604,13 @@ def _ensure_nkr_live_worker_started() -> None:
 
 def _nkr_live_watchdog_kick() -> None:
     _ensure_nkr_live_worker_started()
+    nowi = int(time.time())
     with _LIVE_ENGINE_RUNTIME_LOCK:
         last = int((_LIVE_ENGINE_RUNTIME.get("NKR") or {}).get("last_tick_ts") or 0)
-    if last and int(time.time()) - last <= _NKR_LIVE_WORKER_STALE_SEC:
+    if last and nowi - last <= _NKR_LIVE_WORKER_STALE_SEC:
         return
-    threading.Thread(target=_nkr_live_worker_cycle, daemon=True, name=f"nkr-live-kick-{int(time.time())}").start()
+    threading.Thread(target=lambda: _nkr_live_worker_cycle(force=True), daemon=True,
+                     name=f"nkr-live-kick-{nowi}").start()
 
 
 @app.route("/api/nkr/control", methods=["POST"])
