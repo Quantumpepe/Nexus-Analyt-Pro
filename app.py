@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-182-PRIVY-REFERENCE-ID-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-183-PRIVY-SIGNER-DIAGNOSTICS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-182-PRIVY-TX-LIFECYCLE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1253,7 +1253,24 @@ def api_core_vault_create_system_session_auto():
             "maxLossBps": max_loss_bps,
         })
     except Exception as exc:
-        return jsonify({"status": "error", "error": str(exc)}), 502
+        error_text = str(exc)
+        payload = {"status": "error", "error": error_text}
+        if "privy_rpc_401" in error_text or "authorization signature" in error_text.lower():
+            try:
+                diagnostics = _privy_signer_diagnostics(wallet, wallet_id)
+                payload["privyDiagnostics"] = {
+                    "status": diagnostics.get("status"),
+                    "checks": diagnostics.get("checks"),
+                    "findings": diagnostics.get("findings"),
+                    "authorizationKey": diagnostics.get("authorizationKey"),
+                    "keyQuorumLookup": diagnostics.get("keyQuorumLookup"),
+                    "walletLookup": diagnostics.get("walletLookup"),
+                    "walletsByAuthorizationKey": diagnostics.get("walletsByAuthorizationKey"),
+                }
+                app.logger.error("Privy signer diagnostics: %s", json.dumps(payload["privyDiagnostics"], default=str))
+            except Exception as diag_exc:
+                payload["privyDiagnostics"] = {"status": "DIAGNOSTIC_FAILED", "error": str(diag_exc)[:500]}
+        return jsonify(payload), 502
 
 
 @app.get("/api/nexus/core-vault/abi")
@@ -28249,6 +28266,19 @@ def _privy_canonical_json(obj):
 
 def _privy_authorization_signature(url, body, extra_headers=None):
     cfg = _privy_trading_cfg()
+    key = _privy_load_authorization_private_key()
+    headers = {"privy-app-id": cfg["appId"]}
+    for k, v in (extra_headers or {}).items():
+        headers[str(k).lower()] = str(v)
+    payload = {"version": 1, "method": "POST", "url": url, "body": body, "headers": headers}
+    encoded = _privy_canonical_json(payload).encode("utf-8")
+    signature = key.sign(encoded, _crypto_ec.ECDSA(_crypto_hashes.SHA256()))
+    return _b64.b64encode(signature).decode("ascii")
+
+
+
+def _privy_load_authorization_private_key():
+    cfg = _privy_trading_cfg()
     raw_key = str(cfg.get("authorizationKey") or "").strip()
     if not raw_key:
         raise RuntimeError("privy_trading_authorization_key_missing")
@@ -28258,13 +28288,181 @@ def _privy_authorization_signature(url, body, extra_headers=None):
     else:
         pem = ("-----BEGIN PRIVATE KEY-----\n" + key_body + "\n-----END PRIVATE KEY-----\n").encode()
     key = _crypto_serialization.load_pem_private_key(pem, password=None)
-    headers = {"privy-app-id": cfg["appId"]}
-    for k, v in (extra_headers or {}).items():
-        headers[str(k).lower()] = str(v)
-    payload = {"version": 1, "method": "POST", "url": url, "body": body, "headers": headers}
-    encoded = _privy_canonical_json(payload).encode("utf-8")
-    signature = key.sign(encoded, _crypto_ec.ECDSA(_crypto_hashes.SHA256()))
-    return _b64.b64encode(signature).decode("ascii")
+    if not isinstance(key, _crypto_ec.EllipticCurvePrivateKey) or not isinstance(key.curve, _crypto_ec.SECP256R1):
+        raise RuntimeError("privy_authorization_key_must_be_p256")
+    return key
+
+
+def _privy_authorization_public_key_info():
+    key = _privy_load_authorization_private_key()
+    public_key = key.public_key()
+    der = public_key.public_bytes(
+        encoding=_crypto_serialization.Encoding.DER,
+        format=_crypto_serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    der_b64 = _b64.b64encode(der).decode("ascii")
+    return {
+        "derBase64": der_b64,
+        "sha256": hashlib.sha256(der).hexdigest(),
+        "shortFingerprint": hashlib.sha256(der).hexdigest()[:16],
+        "curve": "P-256",
+    }
+
+
+def _privy_basic_get(path, params=None):
+    cfg = _privy_trading_cfg()
+    if not cfg.get("appId") or not cfg.get("appSecret"):
+        return {"ok": False, "statusCode": 0, "error": "privy_app_credentials_missing", "data": {}}
+    url = f"{_PRIVY_TRADING_API}{path}"
+    try:
+        response = requests.get(
+            url,
+            params=params or None,
+            headers={"privy-app-id": cfg["appId"], "Accept": "application/json"},
+            auth=(cfg["appId"], cfg["appSecret"]),
+            timeout=(10, 30),
+        )
+        try:
+            data = response.json() if response.content else {}
+        except Exception:
+            data = {"raw": (response.text or "")[:1000]}
+        return {
+            "ok": response.status_code < 300,
+            "statusCode": int(response.status_code),
+            "error": "" if response.status_code < 300 else str(data)[:1000],
+            "data": data if isinstance(data, (dict, list)) else {},
+        }
+    except Exception as exc:
+        return {"ok": False, "statusCode": 0, "error": str(exc)[:1000], "data": {}}
+
+
+def _privy_collect_public_keys(value):
+    found = []
+    def walk(node):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                lk = str(key).lower()
+                if lk in ("public_key", "publickey", "authorization_key", "authorizationkey") and isinstance(child, str):
+                    found.append(child.strip())
+                else:
+                    walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+    walk(value)
+    return [x for x in dict.fromkeys(found) if x]
+
+
+def _privy_redact_wallet_shape(wallet_data):
+    if not isinstance(wallet_data, dict):
+        return {}
+    keep = (
+        "id", "address", "chain_type", "created_at", "owner_id", "owner", "owners",
+        "signer_ids", "signers", "policy_ids", "policies", "additional_signers",
+    )
+    return {k: wallet_data.get(k) for k in keep if k in wallet_data}
+
+
+def _privy_signer_diagnostics(wallet_address, wallet_id=None):
+    cfg = _privy_trading_cfg()
+    wallet = _norm_addr(wallet_address)
+    resolved_wallet_id = str(wallet_id or _privy_wallet_id_for_user(wallet) or "").strip()
+    result = {
+        "status": "CHECK_REQUIRED",
+        "wallet": wallet,
+        "privyWalletId": resolved_wallet_id,
+        "configuredSignerId": cfg.get("signerId") or "",
+        "configuredPolicyId": cfg.get("policyId") or "",
+        "checks": {},
+        "findings": [],
+        "ts": now_ts(),
+    }
+    try:
+        pub = _privy_authorization_public_key_info()
+        result["authorizationKey"] = {
+            "curve": pub["curve"],
+            "shortFingerprint": pub["shortFingerprint"],
+            "sha256": pub["sha256"],
+        }
+    except Exception as exc:
+        result["checks"]["privateKeyLoaded"] = False
+        result["findings"].append(f"authorization_key_invalid:{exc}")
+        return result
+
+    result["checks"]["privateKeyLoaded"] = True
+    result["checks"]["p256Key"] = pub.get("curve") == "P-256"
+
+    wallet_res = _privy_basic_get(f"/v1/wallets/{resolved_wallet_id}") if resolved_wallet_id else {
+        "ok": False, "statusCode": 0, "error": "privy_wallet_id_missing", "data": {}
+    }
+    result["walletLookup"] = {
+        "ok": wallet_res["ok"], "statusCode": wallet_res["statusCode"], "error": wallet_res["error"],
+        "wallet": _privy_redact_wallet_shape(wallet_res.get("data") or {}),
+    }
+    result["checks"]["walletLookupOk"] = bool(wallet_res["ok"])
+
+    quorum_id = str(cfg.get("signerId") or "").strip()
+    quorum_res = _privy_basic_get(f"/v1/key-quorums/{quorum_id}") if quorum_id else {
+        "ok": False, "statusCode": 0, "error": "privy_key_quorum_id_missing", "data": {}
+    }
+    qdata = quorum_res.get("data") if isinstance(quorum_res.get("data"), dict) else {}
+    quorum_public_keys = _privy_collect_public_keys(qdata)
+    result["keyQuorumLookup"] = {
+        "ok": quorum_res["ok"], "statusCode": quorum_res["statusCode"], "error": quorum_res["error"],
+        "id": qdata.get("id") if isinstance(qdata, dict) else None,
+        "displayName": qdata.get("display_name") if isinstance(qdata, dict) else None,
+        "authorizationThreshold": qdata.get("authorization_threshold") if isinstance(qdata, dict) else None,
+        "authorizationKeyCount": len(qdata.get("authorization_keys") or []) if isinstance(qdata, dict) else 0,
+        "userIdCount": len(qdata.get("user_ids") or []) if isinstance(qdata, dict) else 0,
+        "nestedQuorumCount": len(qdata.get("key_quorum_ids") or []) if isinstance(qdata, dict) else 0,
+    }
+    result["checks"]["keyQuorumLookupOk"] = bool(quorum_res["ok"])
+    normalized_local = "".join(pub["derBase64"].split())
+    normalized_remote = {"".join(str(x).split()) for x in quorum_public_keys}
+    key_match = normalized_local in normalized_remote
+    result["checks"]["backendKeyInConfiguredQuorum"] = key_match
+
+    by_key_res = _privy_basic_get("/v1/wallets", params={"authorization_key": pub["derBase64"], "limit": 100})
+    by_key_data = by_key_res.get("data") or {}
+    wallets = []
+    if isinstance(by_key_data, dict):
+        wallets = by_key_data.get("data") or by_key_data.get("wallets") or []
+    if not isinstance(wallets, list):
+        wallets = []
+    matched_ids = [str(w.get("id") or "") for w in wallets if isinstance(w, dict)]
+    result["walletsByAuthorizationKey"] = {
+        "ok": by_key_res["ok"], "statusCode": by_key_res["statusCode"], "error": by_key_res["error"],
+        "count": len(matched_ids), "walletIdMatch": resolved_wallet_id in matched_ids,
+        "matchedWalletIds": matched_ids[:20],
+    }
+    result["checks"]["walletOwnedByOrLinkedToBackendKey"] = resolved_wallet_id in matched_ids
+
+    wallet_json = wallet_res.get("data") if isinstance(wallet_res.get("data"), dict) else {}
+    wallet_blob = json.dumps(wallet_json, sort_keys=True, default=str)
+    result["checks"]["configuredSignerMentionedOnWallet"] = bool(quorum_id and quorum_id in wallet_blob)
+    policy_id = str(cfg.get("policyId") or "").strip()
+    result["checks"]["configuredPolicyMentionedOnWallet"] = bool(policy_id and policy_id in wallet_blob)
+
+    threshold = qdata.get("authorization_threshold") if isinstance(qdata, dict) else None
+    if isinstance(threshold, (int, float)) and int(threshold) > 1:
+        result["findings"].append(f"key_quorum_requires_{int(threshold)}_signatures_but_backend_sends_one")
+    if quorum_res["ok"] and not key_match:
+        result["findings"].append("backend_private_key_does_not_match_configured_key_quorum")
+    if wallet_res["ok"] and not result["checks"]["configuredSignerMentionedOnWallet"]:
+        result["findings"].append("configured_key_quorum_not_present_on_wallet")
+    if by_key_res["ok"] and not result["checks"]["walletOwnedByOrLinkedToBackendKey"]:
+        result["findings"].append("wallet_not_returned_for_backend_authorization_public_key")
+    if wallet_res["ok"] and policy_id and not result["checks"]["configuredPolicyMentionedOnWallet"]:
+        result["findings"].append("configured_policy_not_present_on_wallet")
+
+    critical = (
+        result["checks"].get("walletLookupOk") and
+        result["checks"].get("keyQuorumLookupOk") and
+        result["checks"].get("backendKeyInConfiguredQuorum") and
+        result["checks"].get("configuredSignerMentionedOnWallet")
+    )
+    result["status"] = "MATCH" if critical and not result["findings"] else "MISMATCH"
+    return result
 
 
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id=""):
@@ -28617,6 +28815,16 @@ def _privy_delegated_readiness(wallet_address):
 
 
 def _live_vault_execution_readiness(wallet_address): return _privy_delegated_readiness(wallet_address)
+
+
+@app.get("/api/nexus/privy-trading/diagnostics")
+def api_privy_trading_diagnostics():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    wallet_id = str(request.args.get("wallet_id") or _privy_wallet_id_for_user(owner) or "").strip()
+    diagnostics = _privy_signer_diagnostics(owner, wallet_id)
+    return jsonify({"status": "ok", "diagnostics": diagnostics, "ts": now_ts()})
 
 
 @app.get("/api/nexus/privy-trading/config")
