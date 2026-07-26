@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-207-NKR-SINGLE-FLIGHT-WATCHDOG-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-200-NKR-LIVE-POSITION-UI"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -716,9 +716,11 @@ def api_nexus_engine_runtime_status():
         current = _live_engine_health_payload(wa).get("NKR") or {}
         last_tick = int(current.get("last_tick_ts") or 0)
         stale = (not last_tick) or (int(time.time()) - last_tick > _NKR_LIVE_WORKER_STALE_SEC)
-        if stale and "_nkr_live_worker_cycle" in globals():
-            _nkr_live_worker_cycle(force=False)
-        elif "_nkr_live_watchdog_kick" in globals():
+        # Never execute a complete live cycle inside the HTTP request. A slow RPC,
+        # market-data provider or receipt lookup would otherwise block the status
+        # endpoint and can create overlapping request-driven cycles. The watchdog
+        # below is asynchronous and single-flight.
+        if "_nkr_live_watchdog_kick" in globals():
             _nkr_live_watchdog_kick()
     except Exception as exc:
         _live_engine_mark("NKR", status="error", decision="WATCHDOG_FAILED", reason="request-driven watchdog failed", last_error=str(exc)[:1000])
@@ -32155,15 +32157,19 @@ _NKR_LIVE_CYCLE_LEASE_TOKEN = ""
 _NKR_LIVE_CYCLE_STARTED_TS = 0
 _NKR_LIVE_TRADE_LOCK = threading.Lock()
 _NKR_LIVE_WORKER_LAST_HEARTBEAT = 0
+_NKR_LIVE_RESCUE_THREAD = None
 _NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "15")))
 _NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "45")))
-_NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
+_NKR_LIVE_CYCLE_LEASE_SEC = max(60, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "240")))
+_NKR_LIVE_HARD_STALL_SEC = max(_NKR_LIVE_CYCLE_LEASE_SEC, int(os.getenv("NEXUS_NKR_HARD_STALL_SEC", "240")))
 
 
 def _nkr_live_market_rows(wallet: str) -> list[dict]:
     items, _ = _db_get_user_watchlist(wallet)
     rows = []
     for item in (items or [])[:40]:
+        global _NKR_LIVE_WORKER_LAST_HEARTBEAT
+        _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
         if isinstance(item, str):
             sym = item.strip().upper()
         elif isinstance(item, dict):
@@ -32537,19 +32543,25 @@ def _nkr_live_worker_cycle_impl() -> None:
             _live_engine_mark("NKR", status="paused", decision="PAUSED", reason="User paused NKR", pending_tx="")
             continue
         try:
+            global _NKR_LIVE_WORKER_LAST_HEARTBEAT
+            _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
             for row in active_rows:
                 _nkr_ensure_local_live_session(wallet, row)
             sessions, active_id, _ = _db_get_rotation_sessions(wallet)
             nkr_sessions = [x for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}]
             market_rows = _nkr_live_market_rows(wallet)
+            _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
             state, _ = _db_get_user_app_state(wallet)
             ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
             settings = {"nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"), "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"), "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"), "nkrPeriodDays": ui.get("nkrPeriodDays", "10"), "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0)}
             processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
+            _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
             with _NKR_LIVE_TRADE_LOCK:
+                _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
                 execution = _nkr_live_execute_existing_eth_route(wallet, active_rows[0], market_rows, settings)
+                _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             _live_engine_mark(
                 "NKR", tick=True, status="running",
@@ -32575,8 +32587,14 @@ def _nkr_live_worker_cycle(force: bool = False) -> None:
     token = f"{threading.get_ident()}-{nowi}-{time.time_ns()}"
     with _NKR_LIVE_CYCLE_LEASE_LOCK:
         lease_age = nowi - int(_NKR_LIVE_CYCLE_STARTED_TS or 0)
-        if _NKR_LIVE_CYCLE_LEASE_TOKEN and lease_age < _NKR_LIVE_CYCLE_LEASE_SEC and not force:
-            return
+        if _NKR_LIVE_CYCLE_LEASE_TOKEN:
+            # Normal ticks must never overlap. A rescue is permitted only after the
+            # hard-stall window, not after the ordinary 45-second UI stale window.
+            # This prevents duplicate scans and, most importantly, duplicate on-chain
+            # execution attempts while still allowing recovery from a genuinely dead
+            # cycle.
+            if not force or lease_age < _NKR_LIVE_HARD_STALL_SEC:
+                return
         _NKR_LIVE_CYCLE_LEASE_TOKEN = token
         _NKR_LIVE_CYCLE_STARTED_TS = nowi
     _NKR_LIVE_WORKER_LAST_HEARTBEAT = nowi
@@ -32606,8 +32624,11 @@ def _ensure_nkr_live_worker_started() -> None:
     global _NKR_LIVE_WORKER_STARTED, _NKR_LIVE_WORKER_THREAD, _NKR_LIVE_WORKER_LAST_HEARTBEAT
     with _NKR_LIVE_WORKER_LOCK:
         alive = bool(_NKR_LIVE_WORKER_THREAD and _NKR_LIVE_WORKER_THREAD.is_alive())
-        heartbeat_age = int(time.time()) - int(_NKR_LIVE_WORKER_LAST_HEARTBEAT or 0)
-        if alive and heartbeat_age <= _NKR_LIVE_WORKER_STALE_SEC:
+        # A Python thread cannot be killed safely. Starting a second permanent worker
+        # merely because the first heartbeat is old causes duplicate loops forever.
+        # Keep exactly one permanent worker per process; hard-stall recovery is handled
+        # by the single-flight rescue cycle below.
+        if alive:
             _NKR_LIVE_WORKER_STARTED = True
             return
         t = threading.Thread(target=_nkr_live_worker_loop, daemon=True, name=f"nkr-live-worker-{int(time.time())}")
@@ -32618,14 +32639,34 @@ def _ensure_nkr_live_worker_started() -> None:
 
 
 def _nkr_live_watchdog_kick() -> None:
+    global _NKR_LIVE_RESCUE_THREAD
     _ensure_nkr_live_worker_started()
     nowi = int(time.time())
     with _LIVE_ENGINE_RUNTIME_LOCK:
         last = int((_LIVE_ENGINE_RUNTIME.get("NKR") or {}).get("last_tick_ts") or 0)
     if last and nowi - last <= _NKR_LIVE_WORKER_STALE_SEC:
         return
-    threading.Thread(target=lambda: _nkr_live_worker_cycle(force=True), daemon=True,
-                     name=f"nkr-live-kick-{nowi}").start()
+
+    with _NKR_LIVE_CYCLE_LEASE_LOCK:
+        lease_age = nowi - int(_NKR_LIVE_CYCLE_STARTED_TS or 0)
+        cycle_active = bool(_NKR_LIVE_CYCLE_LEASE_TOKEN)
+
+    # Give a normal in-flight cycle enough time to finish. Market/RPC calls already
+    # have finite timeouts; rescuing after only 45 seconds was the source of overlapping
+    # workers. Only a genuinely hard-stalled lease may be replaced.
+    if cycle_active and lease_age < _NKR_LIVE_HARD_STALL_SEC:
+        return
+
+    with _NKR_LIVE_WORKER_LOCK:
+        if _NKR_LIVE_RESCUE_THREAD and _NKR_LIVE_RESCUE_THREAD.is_alive():
+            return
+        rescue = threading.Thread(
+            target=lambda: _nkr_live_worker_cycle(force=cycle_active),
+            daemon=True,
+            name=f"nkr-live-rescue-{nowi}",
+        )
+        _NKR_LIVE_RESCUE_THREAD = rescue
+        rescue.start()
 
 
 @app.route("/api/nkr/control", methods=["POST"])
