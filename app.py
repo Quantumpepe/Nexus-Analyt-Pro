@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-189-STALE-RESERVATION-RECOVERY-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-189-STALE-RESERVATION-RECOVERY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-190-COREVAULT-SESSION-INSPECTOR-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-190-COREVAULT-SESSION-INSPECTOR-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -534,13 +534,18 @@ def api_nexus_live_reservation_recover():
     vault = str(body.get("vault") or request.args.get("vault") or "")
     vault_addr, next_id, sessions = _discover_wallet_core_sessions(wa, engine, chain_id, vault)
 
-    # Status 0 is the zero/uninitialized value. Finalized sessions normally have
-    # no allocation and are skipped after the transaction reverts or by status.
-    candidates = [s for s in sessions if int(s.get("statusId") or 0) != 0 and int(s.get("openAssetCount") or 0) == 0]
-    blocked = [s for s in sessions if int(s.get("openAssetCount") or 0) > 0]
+    # CoreVault V3Slim session status labels. Only live/paused/closing sessions can
+    # hold an allocation. Finalized sessions remain visible for inspection but are
+    # never offered for recovery again.
+    status_labels = {0: "UNINITIALIZED", 1: "ACTIVE", 2: "PAUSED", 3: "CLOSING", 4: "FINALIZED"}
+    for s in sessions:
+        s["statusLabel"] = status_labels.get(int(s.get("statusId") or 0), f"UNKNOWN_{int(s.get('statusId') or 0)}")
+        s["recoverable"] = bool(int(s.get("statusId") or 0) in (1, 2, 3) and int(s.get("openAssetCount") or 0) == 0)
+    candidates = [s for s in sessions if s.get("recoverable")]
+    blocked = [s for s in sessions if int(s.get("statusId") or 0) in (1, 2, 3) and int(s.get("openAssetCount") or 0) > 0]
     preview = request.method == "GET" or not bool(body.get("execute"))
     if preview:
-        return jsonify({"status":"ok","mode":"preview","wallet":_norm_addr(wa),"engine":engine,"vault":vault_addr,"nextSessionId":next_id,"candidates":candidates,"blockedOpenPositions":blocked,"ts":now_ts()})
+        return jsonify({"status":"ok","mode":"preview","wallet":_norm_addr(wa),"engine":engine,"vault":vault_addr,"nextSessionId":next_id,"sessions":sessions,"candidates":candidates,"blockedOpenPositions":blocked,"ts":now_ts()})
 
     # Recovery is allowed only when the local engine has no active run. This avoids
     # finalizing a legitimate current session from the owner tool.
@@ -564,6 +569,13 @@ def api_nexus_live_reservation_recover():
         try:
             ref=f"nexus-{engine.lower()}-stale-recover-{sid}-{int(time.time())}"
             _live_engine_mark(engine,status="closing",decision="RECOVERING_STALE_RESERVATION",pending_tx="submitting")
+            closing_txh = ""
+            # ACTIVE/PAUSED sessions must first enter CLOSING. A direct finalize from
+            # ACTIVE is rejected by CoreVault V3Slim with InvalidState.
+            if int(s.get("statusId") or 0) in (1, 2):
+                closing_ref = f"{ref}-start-closing"
+                closing_sent = _send_vault_tx(wallet_id,_norm_addr(wa),vault_addr,_core_selector("startClosing(uint256)")+_uint_to_32(sid),closing_ref)
+                closing_txh = str(closing_sent.get("hash") or "")
             sent=_send_vault_tx(wallet_id,_norm_addr(wa),vault_addr,_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),ref)
             txh=str(sent.get("hash") or "")
             _live_session_register(wa,engine,wallet_id,vault_addr,sid,txh,int(s.get("budgetUnits") or 0),chain_id)
