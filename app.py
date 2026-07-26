@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-188-LIVE-RUNTIME-FINALIZE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-188-LIVE-RUNTIME-FINALIZE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-189-STALE-RESERVATION-RECOVERY-FIX"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-189-STALE-RESERVATION-RECOVERY-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -459,6 +459,131 @@ def api_nexus_engine_runtime_status():
     if not wa:
         return err("wallet required", 401)
     return jsonify({"status": "ok", "wallet": _norm_addr(wa), "engines": _live_engine_health_payload(wa), "ts": int(time.time())})
+
+
+# ENGINE-189: safe recovery for CoreVault allocations left behind by builds that
+# did not persist the on-chain session id. It discovers only this wallet's NKR
+# sessions, refuses sessions with open assets, and finalizes via the existing
+# Privy delegated wallet. No display-only balance mutation is performed.
+def _core_selector(signature: str) -> str:
+    return "0x" + _keccak256(str(signature).encode("ascii"))[:4].hex()
+_CORE_SYSTEM_ID = {"NKR": 0, "TRADER": 1, "GRID": 2}
+
+def _core_words(raw):
+    h = str(raw or "0x")[2:]
+    if len(h) % 64:
+        return []
+    try:
+        return [int(h[i:i+64], 16) for i in range(0, len(h), 64)]
+    except Exception:
+        return []
+
+def _word_addr(word):
+    return "0x" + int(word or 0).to_bytes(32, "big")[-20:].hex()
+
+def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
+    wa = _norm_addr(wallet)
+    vault_addr = _norm_addr(vault or os.getenv("NEXUS_CORE_VAULT_ETH_ADDRESS") or "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1")
+    if not wa or not _looks_like_evm_addr(vault_addr):
+        raise RuntimeError("wallet_or_vault_invalid")
+    raw_next = _eth_call(int(chain_id), vault_addr, _core_selector("nextSessionId()"))
+    next_words = _core_words(raw_next)
+    if not next_words:
+        raise RuntimeError("next_session_id_decode_failed")
+    next_id = int(next_words[0])
+    # Scan a bounded recent range. This prevents an unbounded RPC loop later.
+    first_id = max(1, next_id - 500)
+    wanted_system = int(_CORE_SYSTEM_ID.get(str(engine).upper(), 0))
+    found = []
+    for sid in range(first_id, max(first_id, next_id)):
+        try:
+            raw = _eth_call(int(chain_id), vault_addr, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            words = _core_words(raw)
+            if len(words) < 13:
+                continue
+            owner = _norm_addr(_word_addr(words[0]))
+            token = _norm_addr(_word_addr(words[1]))
+            system_id = int(words[2])
+            status_id = int(words[3])
+            open_asset_count = int(words[12])
+            if owner.lower() != wa.lower() or system_id != wanted_system:
+                continue
+            found.append({
+                "sessionId": sid, "owner": owner, "settlementToken": token,
+                "systemId": system_id, "statusId": status_id,
+                "startsAt": int(words[4]), "endsAt": int(words[5]),
+                "budgetUnits": str(int(words[8])), "settlementCashUnits": str(int(words[9])),
+                "realizedProfitUnits": str(int(words[10])), "realizedLossUnits": str(int(words[11])),
+                "openAssetCount": open_asset_count,
+            })
+        except Exception:
+            continue
+    return vault_addr, next_id, found
+
+@app.route("/api/nexus/live-reservation/recover", methods=["GET", "POST"])
+def api_nexus_live_reservation_recover():
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    body = request.get_json(silent=True) or {}
+    engine = str(body.get("engine") or request.args.get("engine") or "NKR").upper()
+    if engine == "TRADING": engine = "TRADER"
+    if engine not in _CORE_SYSTEM_ID:
+        return err("invalid engine", 400)
+    chain_id = int(body.get("chainId") or request.args.get("chainId") or 1)
+    vault = str(body.get("vault") or request.args.get("vault") or "")
+    vault_addr, next_id, sessions = _discover_wallet_core_sessions(wa, engine, chain_id, vault)
+
+    # Status 0 is the zero/uninitialized value. Finalized sessions normally have
+    # no allocation and are skipped after the transaction reverts or by status.
+    candidates = [s for s in sessions if int(s.get("statusId") or 0) != 0 and int(s.get("openAssetCount") or 0) == 0]
+    blocked = [s for s in sessions if int(s.get("openAssetCount") or 0) > 0]
+    preview = request.method == "GET" or not bool(body.get("execute"))
+    if preview:
+        return jsonify({"status":"ok","mode":"preview","wallet":_norm_addr(wa),"engine":engine,"vault":vault_addr,"nextSessionId":next_id,"candidates":candidates,"blockedOpenPositions":blocked,"ts":now_ts()})
+
+    # Recovery is allowed only when the local engine has no active run. This avoids
+    # finalizing a legitimate current session from the owner tool.
+    local_sessions, _, _ = _db_get_rotation_sessions(wa) if engine == "NKR" else ([], "", 0)
+    if engine == "NKR":
+        active_local = [x for x in local_sessions if isinstance(x, dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
+        if active_local:
+            return jsonify({"status":"blocked","error":"active_local_nkr_session_exists","count":len(active_local)}), 409
+    if blocked:
+        return jsonify({"status":"blocked","error":"open_core_vault_position_exists","sessions":blocked}), 409
+    if not candidates:
+        return jsonify({"status":"ok","mode":"execute","message":"No recoverable stale reservation found.","recovered":[],"ts":now_ts()})
+
+    wallet_id = _privy_wallet_id_for_user(wa)
+    if not wallet_id:
+        return jsonify({"status":"blocked","error":"privy_wallet_id_required"}), 409
+    recovered=[]
+    errors=[]
+    for s in candidates:
+        sid=int(s["sessionId"])
+        try:
+            ref=f"nexus-{engine.lower()}-stale-recover-{sid}-{int(time.time())}"
+            _live_engine_mark(engine,status="closing",decision="RECOVERING_STALE_RESERVATION",pending_tx="submitting")
+            sent=_send_vault_tx(wallet_id,_norm_addr(wa),vault_addr,_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),ref)
+            txh=str(sent.get("hash") or "")
+            _live_session_register(wa,engine,wallet_id,vault_addr,sid,txh,int(s.get("budgetUnits") or 0),chain_id)
+            con=_db()
+            try:
+                with DB_WRITE_LOCK:
+                    con.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",(txh,now_ts(),chain_id,vault_addr.lower(),str(sid)))
+                    con.commit()
+            finally:
+                con.close()
+            recovered.append({"sessionId":sid,"txHash":txh})
+        except Exception as exc:
+            errors.append({"sessionId":sid,"error":str(exc)[:1000]})
+    if recovered and not errors:
+        _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",reason="CoreVault session finalized and capital returned to free base",pending_tx="",last_error="")
+        if engine == "NKR":
+            _db_set_user_app_state(wa,{"ui":{"nkrControlState":"STOPPED"}})
+    elif errors:
+        _live_engine_mark(engine,status="error",decision="STALE_RECOVERY_FAILED",pending_tx="",last_error=errors[0]["error"])
+    return jsonify({"status":"ok" if recovered and not errors else "partial" if recovered else "error","mode":"execute","wallet":_norm_addr(wa),"engine":engine,"recovered":recovered,"errors":errors,"ts":now_ts()}), (200 if recovered else 409)
 
 
 # ENGINE-093: regime hysteresis / anti-flicker memory.
