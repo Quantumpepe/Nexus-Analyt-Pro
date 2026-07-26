@@ -9,6 +9,7 @@ import time
 import threading
 import json
 import re
+import hashlib
 import sqlite3
 import threading
 DB_WRITE_LOCK = threading.RLock()
@@ -184,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-181-PRIVY-TIMEOUT-IDEMPOTENCY"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-182-PRIVY-REFERENCE-ID-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-182-PRIVY-TX-LIFECYCLE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -28267,6 +28268,16 @@ def _privy_authorization_signature(url, body, extra_headers=None):
 
 
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id=""):
+    # Privy accepts at most 64 characters for reference_id. Keep the value
+    # deterministic so the same operation also keeps the same idempotency key.
+    raw_reference = str(reference_id or "").strip()
+    if raw_reference and len(raw_reference) > 64:
+        digest = hashlib.sha256(raw_reference.encode("utf-8")).hexdigest()[:24]
+        prefix = re.sub(r"[^A-Za-z0-9._:-]+", "-", raw_reference)[:39].rstrip("-._:")
+        reference_id = f"{prefix}-{digest}" if prefix else digest
+    else:
+        reference_id = raw_reference
+
     cfg = _privy_trading_cfg()
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
