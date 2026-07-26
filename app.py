@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-194-NKR-WORKER-PAUSE-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-194-NKR-WORKER-PAUSE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-195-NKR-DECISION-DIAGNOSTICS"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-195-NKR-DECISION-DIAGNOSTICS"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -324,7 +324,7 @@ SHADOW_LAST_TICK_SOURCE = "boot"
 # CoreVault session so STOP can finalize the correct session and release allocated capital.
 _LIVE_ENGINE_RUNTIME_LOCK = threading.RLock()
 _LIVE_ENGINE_RUNTIME = {
-    "NKR": {"status": "idle", "last_tick_ts": 0, "tick_count": 0, "assets_scanned": 0, "tradable_assets": 0, "best_candidate": "", "decision": "IDLE", "reason": "", "last_error": "", "pending_tx": ""},
+    "NKR": {"status": "idle", "last_tick_ts": 0, "tick_count": 0, "assets_scanned": 0, "tradable_assets": 0, "best_candidate": "", "candidate_score": 0.0, "candidate_momentum_24h": 0.0, "candidate_price": 0.0, "decision": "IDLE", "reason": "", "decision_detail": "", "gate_status": "", "last_error": "", "pending_tx": ""},
     "GRID": {"status": "idle", "last_tick_ts": 0, "tick_count": 0, "assets_scanned": 0, "tradable_assets": 0, "best_candidate": "", "decision": "IDLE", "reason": "", "last_error": "", "pending_tx": ""},
     "TRADER": {"status": "idle", "last_tick_ts": 0, "tick_count": 0, "assets_scanned": 0, "tradable_assets": 0, "best_candidate": "", "decision": "IDLE", "reason": "", "last_error": "", "pending_tx": ""},
 }
@@ -31953,6 +31953,65 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool) -> list[dict]:
     return results
 
 
+def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=None) -> dict:
+    """Build owner-visible diagnostics without changing NKR trading decisions."""
+    summary = summary if isinstance(summary, dict) else {}
+    settings = settings if isinstance(settings, dict) else {}
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    dispatch_min = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    ranked = []
+    for row in market_rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or row.get("sym") or "").strip().upper()
+        price = _nkr_row_price_usd(row)
+        if not sym or price <= 0:
+            continue
+        change = _nkr_row_change_pct(row)
+        score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
+        ranked.append({"symbol": sym, "score": score, "change": change, "price": price})
+    ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    best = ranked[0] if ranked else {"symbol": "", "score": 0.0, "change": 0.0, "price": 0.0}
+
+    best_sym = best["symbol"]
+    related = []
+    for sess in processed or []:
+        if isinstance(sess, dict) and _nkr_is_session(sess) and _nkr_session_symbol(sess) == best_sym:
+            related.append(sess)
+    open_trade = any(bool((x.get("openRotation") or {}).get("tradeId")) for x in related if isinstance(x.get("openRotation"), dict))
+    position_state = next((str(x.get("positionState") or "").upper() for x in related if x.get("positionState")), "")
+
+    changed = bool(summary.get("changed"))
+    messages = summary.get("messages") if isinstance(summary.get("messages"), list) else []
+    summary_reason = str(summary.get("reason") or "")
+    if not best_sym:
+        decision, gate, detail = "NO_DATA", "BLOCKED", "No priced watchlist candidate was available."
+    elif best["score"] < dispatch_min:
+        decision, gate = "WAIT", "SCORE_BLOCKED"
+        detail = f"{best_sym} score {best['score']:.1f} is below {mode} entry gate {dispatch_min:.1f}."
+    elif best["change"] <= -0.25:
+        decision, gate = "WAIT", "MOMENTUM_BLOCKED"
+        detail = f"{best_sym} cleared score but 24h momentum is {best['change']:+.2f}%."
+    elif open_trade or position_state == "OPEN":
+        decision, gate = "HOLD", "POSITION_ACTIVE"
+        detail = f"{best_sym} has an active NKR position and is being tracked."
+    elif changed:
+        decision, gate = "ACTION", "PASSED"
+        detail = str(messages[0]) if messages else f"NKR changed allocation after {best_sym} cleared the gate."
+    else:
+        decision, gate = "READY", "PASSED_NO_ACTION"
+        detail = summary_reason or f"{best_sym} cleared the score gate; no allocation change was required this tick."
+    return {
+        "best_candidate": best_sym,
+        "candidate_score": round(float(best["score"]), 2),
+        "candidate_momentum_24h": round(float(best["change"]), 4),
+        "candidate_price": round(float(best["price"]), 10),
+        "decision": decision,
+        "gate_status": gate,
+        "decision_detail": detail[:300],
+    }
+
+
 def _nkr_live_worker_cycle() -> None:
     _live_engine_tables_init()
     conn = _db()
@@ -31980,8 +32039,20 @@ def _nkr_live_worker_cycle() -> None:
             settings = {"nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"), "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"), "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"), "nkrPeriodDays": ui.get("nkrPeriodDays", "10"), "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0)}
             processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
-            best = str((summary or {}).get("bestCandidate") or (summary or {}).get("best_candidate") or (summary or {}).get("topAsset") or "")
-            _live_engine_mark("NKR", tick=True, status="running", assets_scanned=len(market_rows), tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0), best_candidate=best, decision="UPDATED" if (summary or {}).get("changed") else "WAITING", reason="backend worker tick completed", last_error="")
+            diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
+            _live_engine_mark(
+                "NKR", tick=True, status="running",
+                assets_scanned=len(market_rows),
+                tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0),
+                best_candidate=diag.get("best_candidate", ""),
+                candidate_score=diag.get("candidate_score", 0.0),
+                candidate_momentum_24h=diag.get("candidate_momentum_24h", 0.0),
+                candidate_price=diag.get("candidate_price", 0.0),
+                decision=diag.get("decision", "WAIT"),
+                gate_status=diag.get("gate_status", ""),
+                decision_detail=diag.get("decision_detail", ""),
+                reason="backend worker tick completed", last_error=""
+            )
         except Exception as exc:
             _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
 
