@@ -184,8 +184,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.25-ENGINE-180-MULTI-EVM-TOKEN-REGISTRY"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.25-ENGINE-176-EVM-TOKEN-OWNER-REVIEW"
+BACKEND_BUILD_ID = "B-2026.07.26-ENGINE-181-PRIVY-TIMEOUT-IDEMPOTENCY"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.26-ENGINE-182-PRIVY-TX-LIFECYCLE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -4823,9 +4823,24 @@ def coingecko_token_price(platform: str):
     except Exception as e:
         return jsonify({"error": "coingecko_proxy_failed", "detail": str(e)}), 502
 
-# Flask secret key for signing tokens (set FLASK_SECRET_KEY in env for production)
-app.secret_key = os.getenv("FLASK_SECRET_KEY") or secrets.token_hex(32)
-_serializer = URLSafeTimedSerializer(app.secret_key)
+# Stable backend auth secret. Token issuing and token verification MUST use the
+# exact same serializer instance. A random secret on every process restart would
+# invalidate all Nexus login tokens and cause create-auto to return 401.
+_AUTH_SECRET = (
+    (os.getenv("FLASK_SECRET_KEY") or "").strip()
+    or (os.getenv("NEXUS_AUTH_SECRET") or "").strip()
+    or (os.getenv("PRIVY_APP_SECRET") or "").strip()
+    or (os.getenv("NEXUS_API_KEY") or "").strip()
+)
+if not _AUTH_SECRET:
+    # Keep the service bootable for local development, but production must set a
+    # persistent secret. The warning is intentionally explicit without exposing it.
+    _AUTH_SECRET = secrets.token_hex(32)
+    print("[NEXUS AUTH] WARNING: no persistent auth secret configured; tokens will be invalid after restart")
+
+app.secret_key = _AUTH_SECRET
+_AUTH_SERIALIZER = URLSafeTimedSerializer(_AUTH_SECRET)
+_serializer = _AUTH_SERIALIZER  # compatibility alias; never create a second serializer
 
 # Planning / fallback capital basis for grid budgeting (USD).
 # This is only used as a conservative fallback when no wallet/vault-derived budget is available yet.
@@ -6980,16 +6995,22 @@ def _require_auth() -> Optional[str]:
             return _norm_addr(wa)
         return None
 
-    # (2) Legacy signed token issued by this backend
+    # (2) Signed Nexus token issued by this backend. Token creation and
+    # verification intentionally share _AUTH_SERIALIZER. Log only the failure
+    # class/path; never log the token itself.
     try:
-        if _AUTH_SERIALIZER is not None:
-            payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
-            if isinstance(payload, dict):
-                wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
-                if isinstance(wa, str) and _looks_like_evm_addr(wa):
-                    return _norm_addr(wa)
-    except Exception:
-        pass
+        payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
+        if isinstance(payload, dict):
+            wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
+            if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                return _norm_addr(wa)
+            print(f"[NEXUS AUTH] token payload has no valid wallet path={request.path}")
+    except SignatureExpired:
+        print(f"[NEXUS AUTH] token expired path={request.path}")
+    except BadSignature:
+        print(f"[NEXUS AUTH] bad token signature path={request.path}")
+    except Exception as auth_exc:
+        print(f"[NEXUS AUTH] token verification error path={request.path} type={type(auth_exc).__name__}")
 
     # (3) Privy-style JWT (best-effort decode without verification)
     wa = _extract_wallet_from_jwt_best_effort(token)
@@ -7189,16 +7210,22 @@ def api_nexus_nkr_aggressive_ack():
         wa = _pick_wallet_from_request()
         return wa  # wa is already normalized or None
 
-    # (2) Legacy signed token issued by this backend
+    # (2) Signed Nexus token issued by this backend. Token creation and
+    # verification intentionally share _AUTH_SERIALIZER. Log only the failure
+    # class/path; never log the token itself.
     try:
-        if _AUTH_SERIALIZER is not None:
-            payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
-            if isinstance(payload, dict):
-                wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
-                if isinstance(wa, str) and _looks_like_evm_addr(wa):
-                    return _norm_addr(wa)
-    except Exception:
-        pass
+        payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
+        if isinstance(payload, dict):
+            wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
+            if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                return _norm_addr(wa)
+            print(f"[NEXUS AUTH] token payload has no valid wallet path={request.path}")
+    except SignatureExpired:
+        print(f"[NEXUS AUTH] token expired path={request.path}")
+    except BadSignature:
+        print(f"[NEXUS AUTH] bad token signature path={request.path}")
+    except Exception as auth_exc:
+        print(f"[NEXUS AUTH] token verification error path={request.path} type={type(auth_exc).__name__}")
 
     # (3) Privy-style JWT (best-effort: decode without verification)
     wa = _extract_wallet_from_jwt_best_effort(token)
@@ -7234,16 +7261,22 @@ def api_nexus_nkr_aggressive_ack():
             return _norm_addr(wa)
         return None
 
-    # (2) Legacy signed token issued by this backend
+    # (2) Signed Nexus token issued by this backend. Token creation and
+    # verification intentionally share _AUTH_SERIALIZER. Log only the failure
+    # class/path; never log the token itself.
     try:
-        if _AUTH_SERIALIZER is not None:
-            payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
-            if isinstance(payload, dict):
-                wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
-                if isinstance(wa, str) and _looks_like_evm_addr(wa):
-                    return _norm_addr(wa)
-    except Exception:
-        pass
+        payload = _AUTH_SERIALIZER.loads(token, max_age=60 * 60 * 24 * 30)  # 30d
+        if isinstance(payload, dict):
+            wa = payload.get("wallet") or payload.get("wallet_address") or payload.get("walletAddress")
+            if isinstance(wa, str) and _looks_like_evm_addr(wa):
+                return _norm_addr(wa)
+            print(f"[NEXUS AUTH] token payload has no valid wallet path={request.path}")
+    except SignatureExpired:
+        print(f"[NEXUS AUTH] token expired path={request.path}")
+    except BadSignature:
+        print(f"[NEXUS AUTH] bad token signature path={request.path}")
+    except Exception as auth_exc:
+        print(f"[NEXUS AUTH] token verification error path={request.path} type={type(auth_exc).__name__}")
 
     # (3) Privy-style JWT (best-effort: decode without verification)
     wa = _extract_wallet_from_jwt_best_effort(token)
@@ -7253,8 +7286,12 @@ def api_nexus_nkr_aggressive_ack():
     return None
 
 def issue_token(wallet_address: str) -> str:
-    return _serializer.dumps({
-        "wallet_address": _norm_addr(wallet_address)
+    wa = _norm_addr(wallet_address)
+    if not _looks_like_evm_addr(wa):
+        raise ValueError("valid wallet address required for auth token")
+    return _AUTH_SERIALIZER.dumps({
+        "wallet_address": wa,
+        "issued_at": now_ts(),
     })
 def upsert_user(wallet_address: str):
     wa = _norm_addr(wallet_address)
@@ -28258,14 +28295,39 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     }
     if reference_id:
         headers["privy-idempotency-key"] = reference_id
-    response = requests.post(url, json=body, headers=headers, auth=(cfg["appId"], cfg["appSecret"]), timeout=45)
-    data = response.json() if response.content else {}
+    # A read timeout can happen after Privy has already accepted and broadcast the
+    # transaction. Retry once with the identical idempotency key so Privy returns
+    # the original result instead of creating a duplicate transaction.
+    response = None
+    last_timeout = None
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                url,
+                json=body,
+                headers=headers,
+                auth=(cfg["appId"], cfg["appSecret"]),
+                timeout=(10, 45),
+            )
+            break
+        except requests.exceptions.Timeout as exc:
+            last_timeout = exc
+            if not reference_id or attempt >= 1:
+                raise RuntimeError(f"privy_rpc_timeout_after_submit:{reference_id or 'no_reference'}") from exc
+            time.sleep(1.0)
+
+    if response is None:
+        raise RuntimeError(f"privy_rpc_timeout_after_submit:{reference_id or 'no_reference'}") from last_timeout
+    try:
+        data = response.json() if response.content else {}
+    except Exception:
+        data = {"raw": (response.text or "")[:2000]}
     if response.status_code >= 300:
         raise RuntimeError(f"privy_rpc_{response.status_code}:{data}")
     tx_hash = str(((data or {}).get("data") or {}).get("hash") or (data or {}).get("hash") or "")
     if not tx_hash:
         raise RuntimeError(f"privy_rpc_missing_hash:{data}")
-    return {"hash": tx_hash, "response": data}
+    return {"hash": tx_hash, "response": data, "idempotencyKey": reference_id}
 
 
 def _privy_wait_receipt(tx_hash, timeout_sec=180):
