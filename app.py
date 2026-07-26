@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-210-NKR-WORKER-HEARTBEAT-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-211-NKR-RECOVER-ERROR-SESSION-TICKS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32537,35 +32537,100 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     }
 
 def _nkr_live_worker_cycle() -> None:
+    """Process every recoverable NKR registry row.
+
+    ERROR is intentionally recoverable: a failed pause/close request must not remove an
+    otherwise still-active on-chain session from the trading worker.  Earlier builds
+    selected only ACTIVE/PAUSED rows, so a single failed StartClosing transaction changed
+    the registry row to ERROR and the worker completed empty cycles forever.
+    """
     _live_engine_tables_init()
     conn = _db()
     try:
-        rows = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE engine='NKR' AND status IN ('ACTIVE','PAUSED') ORDER BY updated_ts DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM nexus_live_core_vault_sessions "
+            "WHERE engine='NKR' AND status IN ('ACTIVE','PAUSED','ERROR','CLOSING') "
+            "ORDER BY updated_ts DESC"
+        ).fetchall()
         live_rows = [dict(r) for r in rows]
     finally:
         conn.close()
+
+    if not live_rows:
+        _live_engine_mark(
+            "NKR", status="idle", decision="NO_REGISTERED_SESSION",
+            reason="No recoverable NKR CoreVault session was found", last_error=""
+        )
+        return
+
     by_wallet = {}
     for row in live_rows:
-        by_wallet.setdefault(_norm_addr(row.get("wallet_address")), []).append(row)
+        wallet = _norm_addr(row.get("wallet_address"))
+        if wallet:
+            by_wallet.setdefault(wallet, []).append(row)
+
     for wallet, wallet_rows in by_wallet.items():
-        active_rows = [r for r in wallet_rows if str(r.get("status") or "").upper() == "ACTIVE"]
-        if not active_rows:
+        runnable_rows = [
+            r for r in wallet_rows
+            if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+        ]
+        if not runnable_rows:
             _live_engine_mark("NKR", status="paused", decision="PAUSED", reason="User paused NKR", pending_tx="")
             continue
+
         try:
-            for row in active_rows:
+            for row in runnable_rows:
                 _nkr_ensure_local_live_session(wallet, row)
+
             sessions, active_id, _ = _db_get_rotation_sessions(wallet)
-            nkr_sessions = [x for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}]
+            nkr_sessions = [
+                x for x in sessions
+                if isinstance(x, dict) and _nkr_is_session(x)
+                and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}
+            ]
             market_rows = _nkr_live_market_rows(wallet)
             state, _ = _db_get_user_app_state(wallet)
             ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-            settings = {"nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"), "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"), "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"), "nkrPeriodDays": ui.get("nkrPeriodDays", "10"), "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0)}
-            processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
+            settings = {
+                "nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"),
+                "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"),
+                "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"),
+                "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
+                "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0),
+            }
+            processed, summary = _nkr_backend_process_executor_tick(
+                nkr_sessions, market_rows=market_rows, settings=settings
+            )
             _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
-            with _NKR_LIVE_TRADE_LOCK:
-                execution = _nkr_live_execute_existing_eth_route(wallet, active_rows[0], market_rows, settings)
+
+            # Process every registry session rather than silently using active_rows[0].
+            executions = []
+            for live_row in runnable_rows:
+                with _NKR_LIVE_TRADE_LOCK:
+                    execution = _nkr_live_execute_existing_eth_route(wallet, live_row, market_rows, settings)
+                executions.append((live_row, execution))
+
+                # A successful on-chain read/tick proves that a previous local ERROR was
+                # recoverable. Restore ACTIVE, but never override an intentional CLOSING row.
+                if str(live_row.get("status") or "").upper() == "ERROR":
+                    conn = _db()
+                    try:
+                        with DB_WRITE_LOCK:
+                            conn.execute(
+                                "UPDATE nexus_live_core_vault_sessions "
+                                "SET status='ACTIVE', updated_ts=?, last_error=NULL WHERE id=?",
+                                (int(time.time()), live_row.get("id")),
+                            )
+                            conn.commit()
+                    finally:
+                        conn.close()
+
+            # Runtime panel remains a summary; prefer an open/executed session result.
+            execution = next(
+                (e for _, e in executions if e.get("executed") or e.get("gate") == "POSITION_ACTIVE"),
+                executions[-1][1] if executions else {},
+            )
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             _live_engine_mark(
                 "NKR", tick=True, status="running",
@@ -32582,7 +32647,10 @@ def _nkr_live_worker_cycle() -> None:
                 pending_tx=execution.get("txHash", ""), last_error=""
             )
         except Exception as exc:
-            _live_engine_mark("NKR", tick=True, status="error", decision="TICK_FAILED", reason="backend worker tick failed", last_error=str(exc)[:1000])
+            _live_engine_mark(
+                "NKR", tick=True, status="error", decision="TICK_FAILED",
+                reason="backend worker tick failed", last_error=str(exc)[:1000]
+            )
 
 
 def _nkr_live_worker_loop() -> None:
