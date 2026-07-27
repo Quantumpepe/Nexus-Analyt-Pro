@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-215-NKR-DYNAMIC-EXIT-COST-ENGINE"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-216-COREVAULT-V4-FINAL-INTEGRATION"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -196,7 +196,7 @@ NEXUS_CAPITAL_CORE_MODE = "STABLECOIN_CAPITAL_CORE_V1"
 NEXUS_DEFAULT_CAPITAL_STATE = "USDC_USDT"
 NEXUS_TOKEN_POSITION_POLICY = "TOKEN_ONLY_DURING_ACTIVE_TRADE"
 NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_USDT_UNLESS_USER_REQUESTS_ORIGINAL_ASSET"
-NEXUS_CORE_VAULT_ABI_VERSION = "NEXUS_CORE_VAULT_V3_SLIM_ABI_V1"
+NEXUS_CORE_VAULT_ABI_VERSION = "NEXUS_CORE_MULTIVAULT_V4_FINAL_ABI_V1"
 
 # ENGINE-161: audited, deterministic Ethereum route presets for the already deployed
 # CoreVault. No additional contract is required. Oracle remains optional/disabled
@@ -208,12 +208,12 @@ ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 UNISWAP_EXACT_INPUT_SINGLE_SELECTOR = "0x04e45aaf"
 ETH_USDC_WETH_BUY_ROUTE_ID = "0x4554485f555344435f574554485f425559000000000000000000000000000000"
 ETH_WETH_USDC_SELL_ROUTE_ID = "0x4554485f574554485f555344435f53454c4c0000000000000000000000000000"
-# Canonical verified NexusCoreVaultV3Slim ABI for the deployed Ethereum CoreVault.
-NEXUS_CORE_VAULT_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"initialOwner","type":"address"},{"internalType":"address","name":"initialGuardian","type":"address"},{"internalType":"address","name":"initialRevenueWallet","type":"address"},{"internalType":"address","name":"initialLiquidityDestination","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"EnforcedPause","type":"error"},{"inputs":[],"name":"ExpectedPause","type":"error"},{"inputs":[],"name":"InsufficientBalance","type":"error"},{"inputs":[],"name":"InvalidConfig","type":"error"},{"inputs":[],"name":"InvalidState","type":"error"},{"inputs":[],"name":"LimitExceeded","type":"error"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},{"inputs":[],"name":"ReentrancyGuardReentrantCall","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},{"inputs":[],"name":"TooEarly","type":"error"},{"inputs":[],"name":"Unauthorized","type":"error"},{"inputs":[],"name":"UnsafeExecution","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"actionHash","type":"bytes32"},{"indexed":false,"internalType":"uint48","name":"executeAfter","type":"uint48"}],"name":"ActionScheduled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"BaseWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"Deposited","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"guardian","type":"address"}],"name":"GuardianUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"destination","type":"address"}],"name":"LiquidityDestinationUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"LiquidityReserveSettled","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"loss","type":"uint256"}],"name":"LossRealized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"OwnerReserveWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferStarted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Paused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"grossProfitBatch","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"liquidityAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"ownerAmount","type":"uint256"}],"name":"ProfitFeeAllocated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"grossProfit","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"netProfit","type":"uint256"}],"name":"ProfitRealized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"uint256","name":"gross","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"net","type":"uint256"}],"name":"ProfitWithdrawn","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"wallet","type":"address"}],"name":"RevenueWalletUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":true,"internalType":"address","name":"target","type":"address"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"address","name":"tokenOut","type":"address"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"}],"name":"RouteConfigured","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"indexed":false,"internalType":"address","name":"settlementToken","type":"address"},{"indexed":false,"internalType":"uint256","name":"budget","type":"uint256"},{"indexed":false,"internalType":"uint64","name":"endsAt","type":"uint64"}],"name":"SessionCreated","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"returnedBase","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"securedProfit","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"realizedLoss","type":"uint256"}],"name":"SessionFinalized","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":false,"internalType":"enum NexusCoreVaultV3Slim.SessionStatus","name":"status","type":"uint8"}],"name":"SessionStatusChanged","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":true,"internalType":"bytes32","name":"planId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"},{"indexed":false,"internalType":"address","name":"revenueWallet","type":"address"}],"name":"SubscriptionPaid","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"bool","name":"depositEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"executionEnabled","type":"bool"},{"indexed":false,"internalType":"bool","name":"paymentEnabled","type":"bool"}],"name":"TokenConfigured","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"sessionId","type":"uint256"},{"indexed":true,"internalType":"bytes32","name":"routeId","type":"bytes32"},{"indexed":false,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":false,"internalType":"address","name":"tokenOut","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amountOut","type":"uint256"}],"name":"TradeExecuted","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Unpaused","type":"event"},{"inputs":[],"name":"BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"LIQUIDITY_SHARE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SESSION_DURATION","outputs":[{"internalType":"uint32","name":"","type":"uint32"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SESSION_ROUTES","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SLIPPAGE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"OWNER_SHARE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"PROFIT_FEE_BPS","outputs":[{"internalType":"uint16","name":"","type":"uint16"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"acceptOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"accountOf","outputs":[{"components":[{"internalType":"uint128","name":"baseCapital","type":"uint128"},{"internalType":"uint128","name":"securedNkrProfit","type":"uint128"},{"internalType":"uint128","name":"securedTraderProfit","type":"uint128"},{"internalType":"uint128","name":"securedGridProfit","type":"uint128"},{"internalType":"uint128","name":"allocatedNkr","type":"uint128"},{"internalType":"uint128","name":"allocatedTrader","type":"uint128"},{"internalType":"uint128","name":"allocatedGrid","type":"uint128"},{"internalType":"uint128","name":"lifetimeRealizedProfit","type":"uint128"},{"internalType":"uint128","name":"unchargedProfit","type":"uint128"},{"internalType":"bool","name":"feeActivated","type":"bool"}],"internalType":"struct NexusCoreVaultV3Slim.Account","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"components":[{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"},{"internalType":"address","name":"target","type":"address"},{"internalType":"address","name":"oracle","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"bytes4","name":"selector","type":"bytes4"}],"internalType":"struct NexusCoreVaultV3Slim.RouteConfig","name":"cfg","type":"tuple"}],"name":"configureRoute","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"components":[{"internalType":"bool","name":"configured","type":"bool"},{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"},{"internalType":"bool","name":"paymentEnabled","type":"bool"},{"internalType":"bool","name":"settlementToken","type":"bool"},{"internalType":"uint8","name":"decimals","type":"uint8"},{"internalType":"uint128","name":"maxSingleDeposit","type":"uint128"},{"internalType":"uint128","name":"maxSessionBudget","type":"uint128"},{"internalType":"uint128","name":"profitThreshold","type":"uint128"}],"internalType":"struct NexusCoreVaultV3Slim.TokenConfig","name":"cfg","type":"tuple"}],"name":"configureToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"address","name":"settlementToken","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"uint128","name":"budget","type":"uint128"},{"internalType":"uint32","name":"duration","type":"uint32"},{"internalType":"uint16","name":"maxSlippageBps","type":"uint16"},{"internalType":"uint16","name":"maxLossBps","type":"uint16"}],"internalType":"struct NexusCoreVaultV3Slim.SessionRequest","name":"r","type":"tuple"},{"internalType":"bytes32[]","name":"allowedRoutes","type":"bytes32[]"}],"name":"createSession","outputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"deposit","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"routeId","type":"bytes32"}],"name":"disableRoute","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"disableToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"components":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minAmountOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"internalType":"struct NexusCoreVaultV3Slim.TradeRequest","name":"t","type":"tuple"}],"name":"executeTrade","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"finalizeSession","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"flushLiquidityReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"freeBase","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"guardian","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"liquidityDestination","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"liquidityReserve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"nextSessionId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"ownerReserve","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"paused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bytes32","name":"planId","type":"bytes32"}],"name":"paySubscription","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"pendingAction","outputs":[{"internalType":"uint48","name":"executeAfter","type":"uint48"},{"internalType":"bool","name":"exists","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pendingOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"address","name":"token","type":"address"}],"name":"positionOf","outputs":[{"components":[{"internalType":"uint128","name":"amount","type":"uint128"},{"internalType":"uint128","name":"costBasis","type":"uint128"}],"internalType":"struct NexusCoreVaultV3Slim.Position","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"revenueWallet","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"routeConfig","outputs":[{"internalType":"bool","name":"enabled","type":"bool"},{"internalType":"enum NexusCoreVaultV3Slim.RouteKind","name":"kind","type":"uint8"},{"internalType":"address","name":"target","type":"address"},{"internalType":"address","name":"oracle","type":"address"},{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"bytes4","name":"selector","type":"bytes4"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"actionHash","type":"bytes32"},{"internalType":"uint48","name":"executeAfter","type":"uint48"}],"name":"scheduleAction","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"sessionOf","outputs":[{"components":[{"internalType":"address","name":"owner","type":"address"},{"internalType":"address","name":"settlementToken","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"enum NexusCoreVaultV3Slim.SessionStatus","name":"status","type":"uint8"},{"internalType":"uint64","name":"startsAt","type":"uint64"},{"internalType":"uint64","name":"endsAt","type":"uint64"},{"internalType":"uint16","name":"maxSlippageBps","type":"uint16"},{"internalType":"uint16","name":"maxLossBps","type":"uint16"},{"internalType":"uint128","name":"budget","type":"uint128"},{"internalType":"uint128","name":"settlementCash","type":"uint128"},{"internalType":"uint128","name":"realizedProfit","type":"uint128"},{"internalType":"uint128","name":"realizedLoss","type":"uint128"},{"internalType":"uint16","name":"openAssetCount","type":"uint16"}],"internalType":"struct NexusCoreVaultV3Slim.Session","name":"","type":"tuple"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"sessionRouteAllowed","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setGuardian","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setLiquidityDestination","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setRevenueWallet","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"},{"internalType":"bool","name":"value","type":"bool"}],"name":"setSessionPaused","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"bytes32","name":"planId","type":"bytes32"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"setSubscriptionPrice","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"bytes32","name":"routeId","type":"bytes32"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"settleLiquidityReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"solvency","outputs":[{"internalType":"uint256","name":"assets","type":"uint256"},{"internalType":"uint256","name":"obligations","type":"uint256"},{"internalType":"bool","name":"solvent","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"sessionId","type":"uint256"}],"name":"startClosing","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"subscriptionPrice","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"tokenConfig","outputs":[{"internalType":"bool","name":"configured","type":"bool"},{"internalType":"bool","name":"depositEnabled","type":"bool"},{"internalType":"bool","name":"withdrawEnabled","type":"bool"},{"internalType":"bool","name":"executionEnabled","type":"bool"},{"internalType":"bool","name":"paymentEnabled","type":"bool"},{"internalType":"bool","name":"settlementToken","type":"bool"},{"internalType":"uint8","name":"decimals","type":"uint8"},{"internalType":"uint128","name":"maxSingleDeposit","type":"uint128"},{"internalType":"uint128","name":"maxSessionBudget","type":"uint128"},{"internalType":"uint128","name":"profitThreshold","type":"uint128"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"totalPositionCostBasis","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"totalUserLiability","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"unpause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawBase","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawOwnerReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"enum NexusCoreVaultV3Slim.SystemId","name":"system","type":"uint8"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"}],"name":"withdrawProfit","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
+# Canonical verified NexusCoreMultiVaultV4 Final ABI for the deployed Ethereum V4 Vault.
+NEXUS_CORE_VAULT_ABI = json.loads("[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"initialOwner\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"initialGuardian\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"initialRevenueWallet\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"initialLiquidityDestination\",\"type\":\"address\"}],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"EnforcedPause\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ExpectedPause\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"InsufficientBalance\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"InvalidConfig\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"InvalidState\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"LimitExceeded\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"owner\",\"type\":\"address\"}],\"name\":\"OwnableInvalidOwner\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"account\",\"type\":\"address\"}],\"name\":\"OwnableUnauthorizedAccount\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"ReentrancyGuardReentrantCall\",\"type\":\"error\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"SafeERC20FailedOperation\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"Unauthorized\",\"type\":\"error\"},{\"inputs\":[],\"name\":\"UnsafeExecution\",\"type\":\"error\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"BaseWithdrawn\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"Deposited\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"guardian\",\"type\":\"address\"}],\"name\":\"GuardianUpdated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"destination\",\"type\":\"address\"}],\"name\":\"LiquidityDestinationUpdated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"tokenIn\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"tokenOut\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"name\":\"LiquidityReserveSettled\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"loss\",\"type\":\"uint256\"}],\"name\":\"LossRealized\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"OwnerReserveWithdrawn\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"previousOwner\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"newOwner\",\"type\":\"address\"}],\"name\":\"OwnershipTransferStarted\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"previousOwner\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"newOwner\",\"type\":\"address\"}],\"name\":\"OwnershipTransferred\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"address\",\"name\":\"account\",\"type\":\"address\"}],\"name\":\"Paused\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"grossProfitBatch\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"liquidityAmount\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"ownerAmount\",\"type\":\"uint256\"}],\"name\":\"ProfitFeeAllocated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"grossProfit\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"netProfit\",\"type\":\"uint256\"}],\"name\":\"ProfitRealized\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SystemId\",\"name\":\"system\",\"type\":\"uint8\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"gross\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"net\",\"type\":\"uint256\"}],\"name\":\"ProfitWithdrawn\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"wallet\",\"type\":\"address\"}],\"name\":\"RevenueWalletUpdated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"enabled\",\"type\":\"bool\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"oracle\",\"type\":\"address\"}],\"name\":\"RouterConfigured\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"bytes4\",\"name\":\"selector\",\"type\":\"bytes4\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"allowed\",\"type\":\"bool\"}],\"name\":\"RouterSelectorConfigured\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SystemId\",\"name\":\"system\",\"type\":\"uint8\"},{\"indexed\":false,\"internalType\":\"address\",\"name\":\"settlementToken\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"budget\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint64\",\"name\":\"endsAt\",\"type\":\"uint64\"}],\"name\":\"SessionCreated\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"returnedBase\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"securedProfit\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"realizedLoss\",\"type\":\"uint256\"}],\"name\":\"SessionFinalized\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SessionStatus\",\"name\":\"status\",\"type\":\"uint8\"}],\"name\":\"SessionStatusChanged\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"bytes32\",\"name\":\"planId\",\"type\":\"bytes32\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"address\",\"name\":\"revenueWallet\",\"type\":\"address\"}],\"name\":\"SubscriptionPaid\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"depositEnabled\",\"type\":\"bool\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"withdrawEnabled\",\"type\":\"bool\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"executionEnabled\",\"type\":\"bool\"},{\"indexed\":false,\"internalType\":\"bool\",\"name\":\"paymentEnabled\",\"type\":\"bool\"}],\"name\":\"TokenConfigured\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"indexed\":true,\"internalType\":\"address\",\"name\":\"tokenIn\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"address\",\"name\":\"tokenOut\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"name\":\"TradeExecuted\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"address\",\"name\":\"account\",\"type\":\"address\"}],\"name\":\"Unpaused\",\"type\":\"event\"},{\"inputs\":[],\"name\":\"BPS\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"LIQUIDITY_SHARE_BPS\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"MAX_SESSION_DURATION\",\"outputs\":[{\"internalType\":\"uint32\",\"name\":\"\",\"type\":\"uint32\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"MAX_SLIPPAGE_BPS\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"OWNER_SHARE_BPS\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"PROFIT_FEE_BPS\",\"outputs\":[{\"internalType\":\"uint16\",\"name\":\"\",\"type\":\"uint16\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"acceptOwnership\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"accountOf\",\"outputs\":[{\"components\":[{\"internalType\":\"uint128\",\"name\":\"baseCapital\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"securedNkrProfit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"securedTraderProfit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"securedGridProfit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"allocatedNkr\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"allocatedTrader\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"allocatedGrid\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"lifetimeRealizedProfit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"unchargedProfit\",\"type\":\"uint128\"},{\"internalType\":\"bool\",\"name\":\"feeActivated\",\"type\":\"bool\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.Account\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"components\":[{\"internalType\":\"bool\",\"name\":\"enabled\",\"type\":\"bool\"},{\"internalType\":\"address\",\"name\":\"oracle\",\"type\":\"address\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.RouterConfig\",\"name\":\"cfg\",\"type\":\"tuple\"}],\"name\":\"configureRouter\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"internalType\":\"bytes4\",\"name\":\"selector\",\"type\":\"bytes4\"},{\"internalType\":\"bool\",\"name\":\"allowed\",\"type\":\"bool\"}],\"name\":\"configureRouterSelector\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"components\":[{\"internalType\":\"bool\",\"name\":\"configured\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"depositEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"withdrawEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"executionEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"paymentEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"settlementToken\",\"type\":\"bool\"},{\"internalType\":\"uint8\",\"name\":\"decimals\",\"type\":\"uint8\"},{\"internalType\":\"uint128\",\"name\":\"maxSingleDeposit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"maxSessionBudget\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"profitThreshold\",\"type\":\"uint128\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.TokenConfig\",\"name\":\"cfg\",\"type\":\"tuple\"}],\"name\":\"configureToken\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"components\":[{\"internalType\":\"address\",\"name\":\"settlementToken\",\"type\":\"address\"},{\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SystemId\",\"name\":\"system\",\"type\":\"uint8\"},{\"internalType\":\"uint128\",\"name\":\"budget\",\"type\":\"uint128\"},{\"internalType\":\"uint32\",\"name\":\"duration\",\"type\":\"uint32\"},{\"internalType\":\"uint16\",\"name\":\"maxSlippageBps\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"maxLossBps\",\"type\":\"uint16\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.SessionRequest\",\"name\":\"r\",\"type\":\"tuple\"}],\"name\":\"createSession\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"deposit\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"}],\"name\":\"disableRouter\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"disableToken\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"components\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"tokenIn\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"tokenOut\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"minAmountOut\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"deadline\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"data\",\"type\":\"bytes\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.TradeRequest\",\"name\":\"t\",\"type\":\"tuple\"}],\"name\":\"executeTrade\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"}],\"name\":\"finalizeSession\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"flushLiquidityReserve\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"user\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"freeBase\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"guardian\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"liquidityDestination\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"liquidityReserve\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"nextSessionId\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"owner\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"ownerReserve\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"pause\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"paused\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"bytes32\",\"name\":\"planId\",\"type\":\"bytes32\"}],\"name\":\"paySubscription\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"pendingOwner\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"positionOf\",\"outputs\":[{\"components\":[{\"internalType\":\"uint128\",\"name\":\"amount\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"costBasis\",\"type\":\"uint128\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.Position\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"renounceOwnership\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"revenueWallet\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"routerConfig\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"enabled\",\"type\":\"bool\"},{\"internalType\":\"address\",\"name\":\"oracle\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"bytes4\",\"name\":\"\",\"type\":\"bytes4\"}],\"name\":\"routerSelectorAllowed\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"}],\"name\":\"sessionOf\",\"outputs\":[{\"components\":[{\"internalType\":\"address\",\"name\":\"owner\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"settlementToken\",\"type\":\"address\"},{\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SystemId\",\"name\":\"system\",\"type\":\"uint8\"},{\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SessionStatus\",\"name\":\"status\",\"type\":\"uint8\"},{\"internalType\":\"uint64\",\"name\":\"startsAt\",\"type\":\"uint64\"},{\"internalType\":\"uint64\",\"name\":\"endsAt\",\"type\":\"uint64\"},{\"internalType\":\"uint16\",\"name\":\"maxSlippageBps\",\"type\":\"uint16\"},{\"internalType\":\"uint16\",\"name\":\"maxLossBps\",\"type\":\"uint16\"},{\"internalType\":\"uint128\",\"name\":\"budget\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"settlementCash\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"realizedProfit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"realizedLoss\",\"type\":\"uint128\"},{\"internalType\":\"uint16\",\"name\":\"openAssetCount\",\"type\":\"uint16\"}],\"internalType\":\"struct NexusCoreMultiVaultV4_Final.Session\",\"name\":\"\",\"type\":\"tuple\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"value\",\"type\":\"address\"}],\"name\":\"setGuardian\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"value\",\"type\":\"address\"}],\"name\":\"setLiquidityDestination\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"value\",\"type\":\"address\"}],\"name\":\"setRevenueWallet\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"},{\"internalType\":\"bool\",\"name\":\"value\",\"type\":\"bool\"}],\"name\":\"setSessionPaused\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"bytes32\",\"name\":\"planId\",\"type\":\"bytes32\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"setSubscriptionPrice\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"tokenIn\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"tokenOut\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"minAmountOut\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"router\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"deadline\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"data\",\"type\":\"bytes\"}],\"name\":\"settleLiquidityReserve\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"}],\"name\":\"solvency\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"assets\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"obligations\",\"type\":\"uint256\"},{\"internalType\":\"bool\",\"name\":\"solvent\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"sessionId\",\"type\":\"uint256\"}],\"name\":\"startClosing\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"bytes32\",\"name\":\"\",\"type\":\"bytes32\"}],\"name\":\"subscriptionPrice\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"tokenConfig\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"configured\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"depositEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"withdrawEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"executionEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"paymentEnabled\",\"type\":\"bool\"},{\"internalType\":\"bool\",\"name\":\"settlementToken\",\"type\":\"bool\"},{\"internalType\":\"uint8\",\"name\":\"decimals\",\"type\":\"uint8\"},{\"internalType\":\"uint128\",\"name\":\"maxSingleDeposit\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"maxSessionBudget\",\"type\":\"uint128\"},{\"internalType\":\"uint128\",\"name\":\"profitThreshold\",\"type\":\"uint128\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"totalPositionCostBasis\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"name\":\"totalUserLiability\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"newOwner\",\"type\":\"address\"}],\"name\":\"transferOwnership\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"unpause\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"}],\"name\":\"withdrawBase\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"}],\"name\":\"withdrawOwnerReserve\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"token\",\"type\":\"address\"},{\"internalType\":\"enum NexusCoreMultiVaultV4_Final.SystemId\",\"name\":\"system\",\"type\":\"uint8\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"recipient\",\"type\":\"address\"}],\"name\":\"withdrawProfit\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}]")
 NEXUS_NKR_LIQUIDITY_VAULT_ABI_VERSION = "NEXUS_NKR_LIQUIDITY_VAULT_ABI_V1"
 # Canonical verified ABI for the deployed Ethereum NKR liquidity vault.
 NEXUS_NKR_LIQUIDITY_VAULT_ABI = json.loads('[{"inputs":[{"internalType":"address","name":"initialOwner","type":"address"},{"internalType":"address","name":"initialOperator","type":"address"},{"internalType":"address","name":"nkrToken","type":"address"},{"internalType":"address","name":"wethToken","type":"address"},{"internalType":"address","name":"usdcToken","type":"address"},{"internalType":"address","name":"usdtToken","type":"address"},{"internalType":"address","name":"swapRouter","type":"address"},{"internalType":"address","name":"nftPositionManager","type":"address"},{"internalType":"uint24","name":"nkrWethPoolFee","type":"uint24"}],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"name":"BelowThreshold","type":"error"},{"inputs":[],"name":"EnforcedPause","type":"error"},{"inputs":[],"name":"ExpectedPause","type":"error"},{"inputs":[],"name":"InvalidConfig","type":"error"},{"inputs":[],"name":"InvalidState","type":"error"},{"inputs":[{"internalType":"address","name":"owner","type":"address"}],"name":"OwnableInvalidOwner","type":"error"},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"OwnableUnauthorizedAccount","type":"error"},{"inputs":[],"name":"ProtectedAsset","type":"error"},{"inputs":[],"name":"ReentrancyGuardReentrantCall","type":"error"},{"inputs":[{"internalType":"address","name":"token","type":"address"}],"name":"SafeERC20FailedOperation","type":"error"},{"inputs":[],"name":"Unauthorized","type":"error"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"ethSide","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"buybackSide","type":"uint256"}],"name":"LiquidityFundingReceived","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethAmount","type":"uint256"},{"indexed":false,"internalType":"uint128","name":"liquidity","type":"uint128"}],"name":"LockedPositionIncreased","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrAmount","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethAmount","type":"uint256"},{"indexed":false,"internalType":"uint128","name":"liquidity","type":"uint128"}],"name":"LockedPositionMinted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"nkrOut","type":"uint256"}],"name":"NkrBoughtBack","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"user","type":"address"},{"indexed":true,"internalType":"bytes32","name":"planId","type":"bytes32"},{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"NkrSubscriptionPaid","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"operator","type":"address"}],"name":"OperatorUpdated","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint256","name":"amount","type":"uint256"}],"name":"OriginalReserveFunded","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferStarted","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":true,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Paused","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"uint256","name":"tokenId","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount0","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"amount1","type":"uint256"}],"name":"PositionFeesCollected","type":"event"},{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"wethOut","type":"uint256"}],"name":"StableConvertedToWeth","type":"event"},{"anonymous":false,"inputs":[{"indexed":false,"internalType":"address","name":"account","type":"address"}],"name":"Unpaused","type":"event"},{"inputs":[],"name":"USD_100_E18","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"USD_50_E18","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"acceptOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minWethOut","type":"uint256"},{"internalType":"uint256","name":"minNkrOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"buyBackNkr","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"buybackStable","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"collectPositionFees","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"minWethOut","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"convertStableToWeth","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"}],"name":"ethSideStable","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"fundOriginalReserve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint256","name":"nkrDesired","type":"uint256"},{"internalType":"uint256","name":"wethDesired","type":"uint256"},{"internalType":"uint256","name":"nkrMin","type":"uint256"},{"internalType":"uint256","name":"wethMin","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"increaseLockedPosition","outputs":[{"internalType":"uint128","name":"liquidity","type":"uint128"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"uint256","name":"","type":"uint256"}],"name":"lockedPosition","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint256","name":"nkrDesired","type":"uint256"},{"internalType":"uint256","name":"wethDesired","type":"uint256"},{"internalType":"uint256","name":"nkrMin","type":"uint256"},{"internalType":"uint256","name":"wethMin","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"mintLockedPosition","outputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"},{"internalType":"uint128","name":"liquidity","type":"uint128"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"nkr","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"","type":"bytes32"}],"name":"nkrSubscriptionPrice","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes","name":"","type":"bytes"}],"name":"onERC721Received","outputs":[{"internalType":"bytes4","name":"","type":"bytes4"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"operator","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"originalReserveFunded","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"originalReserveRemaining","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"pause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"paused","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"planId","type":"bytes32"}],"name":"payNkrSubscription","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"pendingOwner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"poolFee","outputs":[{"internalType":"uint24","name":"","type":"uint24"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"positionIds","outputs":[{"internalType":"uint256[]","name":"","type":"uint256[]"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"positionManager","outputs":[{"internalType":"contract INonfungiblePositionManager","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"receiveLiquidityFunding","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"rescueUnsupportedToken","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"router","outputs":[{"internalType":"contract ISwapRouterV3","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"planId","type":"bytes32"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"setNkrSubscriptionPrice","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"value","type":"address"}],"name":"setOperator","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"}],"name":"setSwapFee","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"}],"name":"swapFee","outputs":[{"internalType":"uint24","name":"","type":"uint24"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"unpause","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"usdc","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"usdt","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"weth","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}]')
-NEXUS_CORE_VAULT_CONTRACT_NAME = "NexusCoreVaultV3Slim"
+NEXUS_CORE_VAULT_CONTRACT_NAME = "NexusCoreMultiVaultV4_Final"
 NEXUS_NKR_LIQUIDITY_VAULT_CONTRACT_NAME = "NexusNKRLiquidityVault"
 NEXUS_ASSET_ROUTER_MODE = "MULTI_EVM_EXECUTION_ASSET_ROUTER_V2"
 NEXUS_ASSET_ROUTER_ENGINES = ["GRID", "NKR", "TRADER"]
@@ -457,9 +457,6 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     amount_in = _position_amount(vault, session_id, cfg["weth"])
     if amount_in <= 0:
         return {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
-    sell_route = str(cfg.get("sellRouteId") or "").strip()
-    if not sell_route or not _nkr_route_allowed(vault, session_id, sell_route):
-        raise RuntimeError("session_sell_route_not_allowed")
 
     quote = _privy_quote(cfg, cfg["weth"], cfg["usdc"], amount_in)
     min_out = quote * (10_000 - int(cfg.get("slippageBps") or 0)) // 10_000
@@ -467,7 +464,7 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     router_data = _privy_exact_input_single_data(
         cfg["weth"], cfg["usdc"], vault, amount_in, min_out, cfg["poolFee"]
     )
-    call = _encode_execute_trade(session_id, sell_route, amount_in, min_out, deadline, router_data)
+    call = _encode_execute_trade(session_id, cfg["router"], cfg["weth"], cfg["usdc"], amount_in, min_out, deadline, router_data)
     _live_engine_mark(
         "NKR", status="closing", decision="EXIT_SUBMITTING", gate_status="ORDERLY_EXIT",
         reason="Selling open Ethereum position before CoreVault finalize", pending_tx="submitting", last_error=""
@@ -504,6 +501,19 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         raise RuntimeError("session_decode_failed_before_stop")
     status_id = int(words[3])
     open_assets = int(words[12])
+
+    close_tx = ""
+    if status_id in (1, 2):
+        _live_engine_mark(engine, status="closing", decision="STOPPING", reason="User stop: closing mode entered", pending_tx="submitting")
+        ref = f"nexus-{engine.lower()}-stop-{sid}-{int(time.time())}-close"
+        sent = _privy_send_delegated_transaction(wallet_id, {
+            "from": _norm_addr(wallet), "to": vault,
+            "data": _core_selector("startClosing(uint256)") + _uint_to_32(sid), "value": "0x0"
+        }, ref)
+        close_tx = str(sent.get("hash") or sent.get("txHash") or "")
+        _privy_wait_receipt(close_tx, timeout_sec=240)
+        status_id = 3
+
     exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
     if open_assets != 0:
         if str(engine or "").upper() != "NKR":
@@ -518,18 +528,6 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         if open_assets != 0:
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
 
-    close_tx = ""
-    if status_id in (1, 2):
-        _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Safe stop requested", pending_tx="submitting")
-        ref = f"nexus-{engine.lower()}-stop-{sid}-{int(time.time())}-close"
-        sent = _privy_send_delegated_transaction(wallet_id, {
-            "from": _norm_addr(wallet), "to": vault,
-            "data": _core_selector("startClosing(uint256)") + _uint_to_32(sid), "value": "0x0"
-        }, ref)
-        close_tx = str(sent.get("hash") or "")
-        _privy_wait_receipt(close_tx, timeout_sec=240)
-        status_id = 3
-
     finalize_tx = ""
     if status_id == 3:
         ref = f"nexus-{engine.lower()}-stop-{sid}-{int(time.time())}-finalize"
@@ -537,8 +535,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
             "from": _norm_addr(wallet), "to": vault,
             "data": _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid), "value": "0x0"
         }, ref)
-        finalize_tx = str(sent.get("hash") or "")
-        _live_engine_mark(engine, status="closing", decision="FINALIZING", reason="Waiting for safe release", pending_tx=finalize_tx or "submitted")
+        finalize_tx = str(sent.get("hash") or sent.get("txHash") or "")
+        _live_engine_mark(engine, status="closing", decision="FINALIZING", reason="All assets sold; finalizing session", pending_tx=finalize_tx or "submitted")
         _privy_wait_receipt(finalize_tx, timeout_sec=240)
 
     after = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
@@ -28857,12 +28855,14 @@ NEXUS_PRIVY_BUDGET_AUTHORITY = "COREVAULT_SESSION"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
 _PRIVY_EXACT_INPUT_SINGLE_SELECTOR = UNISWAP_EXACT_INPUT_SINGLE_SELECTOR
-_PRIVY_CREATE_SESSION_SELECTOR = "0x" + _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])")[:4].hex()
-_PRIVY_EXECUTE_TRADE_SELECTOR = "0x" + _keccak256(b"executeTrade((uint256,bytes32,uint256,uint256,uint256,bytes))")[:4].hex()
+# CoreVault V4 Final selectors. V4 has dynamic router/token execution and no route IDs.
+_PRIVY_CREATE_SESSION_SELECTOR = "0x" + _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16))")[:4].hex()
+_PRIVY_EXECUTE_TRADE_SELECTOR = "0x" + _keccak256(b"executeTrade((uint256,address,address,address,uint256,uint256,uint256,bytes))")[:4].hex()
 _PRIVY_START_CLOSING_SELECTOR = "0x" + _keccak256(b"startClosing(uint256)")[:4].hex()
 _PRIVY_FINALIZE_SESSION_SELECTOR = "0x" + _keccak256(b"finalizeSession(uint256)")[:4].hex()
 _PRIVY_POSITION_OF_SELECTOR = "0x" + _keccak256(b"positionOf(uint256,address)")[:4].hex()
-_PRIVY_ROUTE_CONFIG_SELECTOR = "0x" + _keccak256(b"routeConfig(bytes32)")[:4].hex()
+_PRIVY_ROUTER_CONFIG_SELECTOR = "0x" + _keccak256(b"routerConfig(address)")[:4].hex()
+_PRIVY_ROUTER_SELECTOR_ALLOWED_SELECTOR = "0x" + _keccak256(b"routerSelectorAllowed(address,bytes4)")[:4].hex()
 _PRIVY_SESSION_CREATED_TOPIC = "0x" + _keccak256(b"SessionCreated(uint256,address,uint8,address,uint256,uint64)").hex()
 UNISWAP_QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 
@@ -28872,6 +28872,7 @@ def _uint_to_32(value):
 
 
 def _privy_trading_cfg():
+    v4_vault = _norm_addr(os.getenv("CORE_VAULTV4_ADDRESS_ETH") or "")
     return {
         "appId": (os.getenv("PRIVY_APP_ID") or "").strip(),
         "appSecret": (os.getenv("PRIVY_APP_SECRET") or "").strip(),
@@ -28879,18 +28880,17 @@ def _privy_trading_cfg():
         "policyId": (os.getenv("PRIVY_TRADING_POLICY_ID") or "").strip(),
         "authorizationKey": (os.getenv("PRIVY_TRADING_AUTHORIZATION_PRIVATE_KEY") or "").strip(),
         "chainId": 1,
-        "vault": _norm_addr(_VAULT_BY_CHAIN.get(1) or os.getenv("CORE_VAULT_ADDRESS_ETH") or ""),
+        "vault": v4_vault,
+        "vaultVersion": "V4_FINAL",
         "nkrLiquidityVault": _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) or ""),
-        "routeId": str(os.getenv("NEXUS_ETH_USDC_WETH_ROUTE_ID") or ETH_USDC_WETH_BUY_ROUTE_ID).strip(),
-        "sellRouteId": str(os.getenv("NEXUS_ETH_WETH_USDC_ROUTE_ID") or ETH_WETH_USDC_SELL_ROUTE_ID).strip(),
         "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        "usdt": _norm_addr(os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"),
         "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
         "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or UNISWAP_SWAP_ROUTER_02),
         "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or UNISWAP_QUOTER_V2),
         "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
         "slippageBps": max(1, min(500, int(os.getenv("NEXUS_EXECUTOR_MAX_SLIPPAGE_BPS", "100")))),
         "holdSec": max(0, min(300, int(os.getenv("NEXUS_EXECUTOR_TEST_HOLD_SEC", "10")))),
-        "routeVerified": _env_bool("NEXUS_ETH_USDC_EXECUTION_ROUTE_VERIFIED", False),
         "liveEnabled": _env_bool("NEXUS_LIVE_EXECUTION_ENABLED", False),
         "systemIds": {
             "NKR": int(os.getenv("NEXUS_SYSTEM_ID_NKR", "0")),
@@ -29374,58 +29374,42 @@ def _read_token_config(vault, token):
     }
 
 
-def _read_route_config(vault, route_id):
-    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(route_id or "")):
-        raise RuntimeError("invalid_route_id")
-    raw = _eth_call(1, vault, _PRIVY_ROUTE_CONFIG_SELECTOR + str(route_id)[2:].lower())
+def _read_router_config(vault, router):
+    raw = _eth_call(1, vault, _PRIVY_ROUTER_CONFIG_SELECTOR + _addr_to_32(router))
     w = _abi_hex_words(raw)
-    if len(w) < 7:
-        raise RuntimeError("route_config_decode_failed")
-    return {
-        "enabled": int(w[0], 16) != 0,
-        "kind": int(w[1], 16),
-        "target": _word_address(w[2]),
-        "oracle": _word_address(w[3]),
-        "tokenIn": _word_address(w[4]),
-        "tokenOut": _word_address(w[5]),
-        "selector": _word_bytes4(w[6]),
-    }
+    if len(w) < 2:
+        raise RuntimeError("router_config_decode_failed")
+    return {"enabled": int(w[0], 16) != 0, "oracle": _word_address(w[1])}
 
 
-def _route_matches(route, *, target, token_in, token_out, selector):
-    return bool(
-        route.get("enabled") and int(route.get("kind", -1)) == 0 and
-        _norm_addr(route.get("target")).lower() == _norm_addr(target).lower() and
-        _norm_addr(route.get("tokenIn")).lower() == _norm_addr(token_in).lower() and
-        _norm_addr(route.get("tokenOut")).lower() == _norm_addr(token_out).lower() and
-        str(route.get("selector") or "").lower() == str(selector or "").lower()
-    )
+def _read_router_selector_allowed(vault, router, selector):
+    selector_hex = str(selector or "").lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{8}", selector_hex):
+        raise RuntimeError("invalid_router_selector")
+    selector_word = selector_hex + ("0" * 56)
+    raw = _eth_call(1, vault, _PRIVY_ROUTER_SELECTOR_ALLOWED_SELECTOR + _addr_to_32(router) + selector_word)
+    w = _abi_hex_words(raw)
+    return bool(w and int(w[0], 16) != 0)
 
 
 def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, max_slippage_bps=100, max_loss_bps=1500):
-    route_ids = [cfg["routeId"], cfg["sellRouteId"]]
-    for route_id in route_ids:
-        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(route_id or "")):
-            raise RuntimeError("invalid_session_route_id")
     system_id = int(cfg["systemIds"].get(system_name, 1))
-    head = [
+    tuple_words = [
         _addr_to_32(cfg["usdc"]), _uint_to_32(system_id), _uint_to_32(budget_units),
         _uint_to_32(duration_sec), _uint_to_32(max_slippage_bps), _uint_to_32(max_loss_bps),
-        _uint_to_32(7 * 32),
     ]
-    tail = [_uint_to_32(len(route_ids))] + [x[2:].lower() for x in route_ids]
-    return _PRIVY_CREATE_SESSION_SELECTOR + "".join(head + tail)
+    return _PRIVY_CREATE_SESSION_SELECTOR + _uint_to_32(32) + "".join(tuple_words)
 
 
-def _encode_execute_trade(session_id, route_id, amount_in, min_amount_out, deadline, router_data):
+def _encode_execute_trade(session_id, router, token_in, token_out, amount_in, min_amount_out, deadline, router_data):
     data_hex = str(router_data or "").removeprefix("0x")
     if len(data_hex) % 2 or not re.fullmatch(r"[0-9a-fA-F]*", data_hex):
         raise RuntimeError("invalid_router_calldata")
     raw = bytes.fromhex(data_hex)
     padded = raw + b"\x00" * ((32 - len(raw) % 32) % 32)
     tuple_head = [
-        _uint_to_32(session_id), str(route_id)[2:].lower(), _uint_to_32(amount_in),
-        _uint_to_32(min_amount_out), _uint_to_32(deadline), _uint_to_32(6 * 32),
+        _uint_to_32(session_id), _addr_to_32(router), _addr_to_32(token_in), _addr_to_32(token_out),
+        _uint_to_32(amount_in), _uint_to_32(min_amount_out), _uint_to_32(deadline), _uint_to_32(8 * 32),
     ]
     tuple_tail = _uint_to_32(len(raw)) + padded.hex()
     return _PRIVY_EXECUTE_TRADE_SELECTOR + _uint_to_32(32) + "".join(tuple_head) + tuple_tail
@@ -29486,7 +29470,6 @@ def _privy_job_rows(wallet, limit=10):
 def _privy_delegated_readiness(wallet_address):
     cfg = _privy_trading_cfg()
     user = _norm_addr(wallet_address)
-    delegation = _privy_trading_delegation(user)
     privy_wallet_id = _privy_wallet_id_for_user(user)
     checks = {
         "privyAppConfigured": bool(cfg["appId"] and cfg["appSecret"]),
@@ -29495,75 +29478,86 @@ def _privy_delegated_readiness(wallet_address):
         "walletProvisioned": bool(privy_wallet_id),
         "walletDelegated": True,
         "userApprovalRequired": False,
-        "delegatedBudgetUnits": None,
-        "delegatedBudgetUsd": None,
         "budgetAuthority": "COREVAULT_SESSION",
         "vaultConnected": False, "vaultPaused": None, "solvent": False,
         "usdcConfigured": False, "usdcExecutionEnabled": False, "usdcSettlementToken": False, "usdcDecimalsCorrect": False,
-        "wethConfigured": False, "wethExecutionEnabled": False, "wethDecimalsCorrect": False,
-        "routerHasCode": False, "quoterHasCode": False, "quotePathWorks": False,
-        "buyRouteReady": False, "sellRouteReady": False, "routeReady": False,
-        "routeIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("routeId") or "")),
-        "sellRouteIdConfigured": bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", cfg.get("sellRouteId") or "")),
+        "usdtConfigured": False, "usdtExecutionEnabled": False, "usdtSettlementToken": False, "usdtDecimalsCorrect": False,
+        "routerHasCode": False, "routerEnabled": False, "routerSelectorAllowed": False,
+        "quoterHasCode": False, "quotePathWorks": False,
         "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
         "privyOnlyVaultCompatible": True,
-        "vaultCompatibilityReason": "COREVAULT_V3_SELF_SCOPED_SESSION_MODEL",
+        "vaultCompatibilityReason": "COREVAULT_V4_FINAL_DYNAMIC_ROUTER_MODEL",
     }
     blockers = []
-    try:
-        paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
-        checks["vaultConnected"] = True; checks["vaultPaused"] = paused
-        usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"])
-        weth_cfg = _read_token_config(cfg["vault"], cfg["weth"])
-        checks.update({
-            "usdcConfigured": usdc_cfg["configured"], "usdcExecutionEnabled": usdc_cfg["executionEnabled"],
-            "usdcSettlementToken": usdc_cfg["settlementToken"], "usdcDecimalsCorrect": usdc_cfg["decimals"] == 6,
-            "wethConfigured": weth_cfg["configured"], "wethExecutionEnabled": weth_cfg["executionEnabled"],
-            "wethDecimalsCorrect": weth_cfg["decimals"] == 18,
-        })
-        solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
-        checks["solvent"] = bool(solv[2])
-        checks["routerHasCode"] = _contract_has_code(cfg["router"])
-        checks["quoterHasCode"] = _contract_has_code(cfg["quoter"])
-        if checks["routeIdConfigured"]:
-            buy = _read_route_config(cfg["vault"], cfg["routeId"]); checks["buyRoute"] = buy
-            checks["buyRouteReady"] = _route_matches(buy, target=cfg["router"], token_in=cfg["usdc"], token_out=cfg["weth"], selector=_PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
-        if checks["sellRouteIdConfigured"]:
-            sell = _read_route_config(cfg["vault"], cfg["sellRouteId"]); checks["sellRoute"] = sell
-            checks["sellRouteReady"] = _route_matches(sell, target=cfg["router"], token_in=cfg["weth"], token_out=cfg["usdc"], selector=_PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
-        checks["routeReady"] = checks["buyRouteReady"] and checks["sellRouteReady"]
-        if checks["quoterHasCode"]:
-            q1 = _privy_quote(cfg, cfg["usdc"], cfg["weth"], 1_000_000)
-            q2 = _privy_quote(cfg, cfg["weth"], cfg["usdc"], max(1, q1))
-            checks["quotePathWorks"] = q1 > 0 and q2 > 0
-            checks["quoteProbe"] = {"buyAmountOut": q1, "roundTripAmountOut": q2}
-    except Exception as exc:
-        blockers.append("vault_rpc_or_decode_failed"); checks["rpcError"] = str(exc)
+    if not _looks_like_evm_addr(cfg.get("vault") or ""):
+        blockers.append("corevault_v4_address_missing")
+    else:
+        try:
+            paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+            checks["vaultConnected"] = True
+            checks["vaultPaused"] = paused
+            usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"])
+            usdt_cfg = _read_token_config(cfg["vault"], cfg["usdt"])
+            checks.update({
+                "usdcConfigured": usdc_cfg["configured"], "usdcExecutionEnabled": usdc_cfg["executionEnabled"],
+                "usdcSettlementToken": usdc_cfg["settlementToken"], "usdcDecimalsCorrect": usdc_cfg["decimals"] == 6,
+                "usdtConfigured": usdt_cfg["configured"], "usdtExecutionEnabled": usdt_cfg["executionEnabled"],
+                "usdtSettlementToken": usdt_cfg["settlementToken"], "usdtDecimalsCorrect": usdt_cfg["decimals"] == 6,
+            })
+            solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
+            checks["solvent"] = bool(solv[2])
+            checks["routerHasCode"] = _contract_has_code(cfg["router"])
+            checks["quoterHasCode"] = _contract_has_code(cfg["quoter"])
+            router_cfg = _read_router_config(cfg["vault"], cfg["router"])
+            checks["routerConfig"] = router_cfg
+            checks["routerEnabled"] = bool(router_cfg.get("enabled"))
+            checks["routerSelectorAllowed"] = _read_router_selector_allowed(
+                cfg["vault"], cfg["router"], _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+            )
+            if checks["quoterHasCode"]:
+                q1 = _privy_quote(cfg, cfg["usdc"], cfg["weth"], 1_000_000)
+                q2 = _privy_quote(cfg, cfg["weth"], cfg["usdc"], max(1, q1))
+                checks["quotePathWorks"] = q1 > 0 and q2 > 0
+                checks["quoteProbe"] = {"buyAmountOut": q1, "roundTripAmountOut": q2}
+        except Exception as exc:
+            blockers.append("vault_rpc_or_decode_failed")
+            checks["rpcError"] = str(exc)
     required = [
         ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
         ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletProvisioned","privy_wallet_mapping_pending"),
         ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
         ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
-        ("wethConfigured","weth_not_configured"),("wethExecutionEnabled","weth_execution_disabled"),
-        ("wethDecimalsCorrect","weth_decimals_invalid"),("routeIdConfigured","buy_route_id_missing"),
-        ("sellRouteIdConfigured","sell_route_id_missing"),("buyRouteReady","buy_route_not_active_or_mismatch"),
-        ("sellRouteReady","sell_route_not_active_or_mismatch"),("routerHasCode","router_contract_missing"),
+        ("usdtConfigured","usdt_not_configured"),("usdtExecutionEnabled","usdt_execution_disabled"),
+        ("usdtSettlementToken","usdt_not_settlement_token"),("usdtDecimalsCorrect","usdt_decimals_invalid"),
+        ("routerHasCode","router_contract_missing"),("routerEnabled","router_not_enabled"),
+        ("routerSelectorAllowed","router_selector_not_allowed"),
         ("quoterHasCode","quoter_contract_missing"),("quotePathWorks","quoter_path_failed"),
         ("systemIdConfirmed","system_mapping_invalid"),
     ]
-    if checks.get("vaultPaused"): blockers.append("vault_paused")
+    if checks.get("vaultPaused"):
+        blockers.append("vault_paused")
     for key, code in required:
-        if not checks.get(key): blockers.append(code)
-    if not cfg["liveEnabled"]: blockers.append("live_execution_env_disabled")
+        if not checks.get(key):
+            blockers.append(code)
+    if not cfg["liveEnabled"]:
+        blockers.append("live_execution_env_disabled")
     active = not blockers
     return {
         "status": "READY" if active else "SETUP_REQUIRED", "liveExecution": "ACTIVE" if active else "DISABLED",
         "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
+        "vaultVersion": cfg["vaultVersion"], "abiVersion": NEXUS_CORE_VAULT_ABI_VERSION,
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
+        "supportedSettlementTokens": [cfg["usdc"], cfg["usdt"]],
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
-        "blockers": list(dict.fromkeys(blockers)), "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
-        "privyWalletIdAvailable": bool(privy_wallet_id), "executionModel": {"contract":"NexusCoreVaultV3Slim","flow":["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],"legacyV2Active":False},
+        "blockers": list(dict.fromkeys(blockers)),
+        "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
+        "privyWalletIdAvailable": bool(privy_wallet_id),
+        "executionModel": {
+            "contract": "NexusCoreMultiVaultV4_Final",
+            "flow": ["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],
+            "dynamicRoutes": True, "legacyV3Active": False
+        },
         "ts": now_ts(),
     }
 
@@ -29692,7 +29686,7 @@ def _privy_delegated_test_worker(job_id, wallet, wallet_id):
         buy_min = buy_quote * (10_000-cfg["slippageBps"]) // 10_000
         deadline = now_ts()+300
         router_buy = _privy_exact_input_single_data(cfg["usdc"],cfg["weth"],cfg["vault"],amount,buy_min,cfg["poolFee"])
-        buy_call = _encode_execute_trade(session_id,cfg["routeId"],amount,buy_min,deadline,router_buy)
+        buy_call = _encode_execute_trade(session_id,cfg["router"],cfg["usdc"],cfg["weth"],amount,buy_min,deadline,router_buy)
         _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","EXECUTE_BUY","",txs)
         txs["buy"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],buy_call,job_id+":buy")
         if cfg["holdSec"]: time.sleep(cfg["holdSec"])
@@ -29704,7 +29698,7 @@ def _privy_delegated_test_worker(job_id, wallet, wallet_id):
         sell_quote = _privy_quote(cfg,cfg["weth"],cfg["usdc"],weth_amount)
         sell_min = sell_quote * (10_000-cfg["slippageBps"]) // 10_000
         router_sell = _privy_exact_input_single_data(cfg["weth"],cfg["usdc"],cfg["vault"],weth_amount,sell_min,cfg["poolFee"])
-        sell_call = _encode_execute_trade(session_id,cfg["sellRouteId"],weth_amount,sell_min,now_ts()+300,router_sell)
+        sell_call = _encode_execute_trade(session_id,cfg["router"],cfg["weth"],cfg["usdc"],weth_amount,sell_min,now_ts()+300,router_sell)
         _privy_job_write(job_id,wallet,wallet_id,"TRADER",amount,"RUNNING","EXECUTE_SELL","",txs)
         txs["sell"] = _send_vault_tx(wallet_id,wallet,cfg["vault"],sell_call,job_id+":sell")
 
@@ -29721,10 +29715,10 @@ def api_privy_trading_test_start():
     if denied: return denied
     rd = _privy_delegated_readiness(owner)
     if rd.get("liveExecution") != "ACTIVE":
-        return jsonify({"status":"blocked","error":"corevault_v3_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
+        return jsonify({"status":"blocked","error":"corevault_v4_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
     wallet_id = _privy_wallet_id_for_user(owner)
     if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
-    job_id = "v3test-" + uuid.uuid4().hex
+    job_id = "v4test-" + uuid.uuid4().hex
     _privy_job_write(job_id,owner,wallet_id,"TRADER",_PRIVY_TRADING_HARD_CAP_UNITS,"QUEUED","QUEUED","",{})
     threading.Thread(target=_privy_delegated_test_worker,args=(job_id,owner,wallet_id),daemon=True).start()
     return jsonify({"status":"queued","jobId":job_id,"amountUsdc":_PRIVY_TRADING_HARD_CAP_UNITS/1_000_000.0,"readiness":rd}),202
@@ -30110,96 +30104,9 @@ def api_nexus_system_info_owner_panel():
     return jsonify(payload)
 
 
-# ENGINE-160: CoreVault budget/session bridge for NKR, Trader and Grid.
-# The deployed CoreVault contract requires at least one enabled TRADE route when a session is created.
-# The backend prepares CoreVault calldata; Privy/Nexus executes automatically through the configured embedded-wallet policy.
-@app.post("/api/nexus/core-vault/session/prepare-create")
-def api_core_vault_prepare_system_session():
-    body = request.get_json(silent=True) or {}
-    wallet = _norm_addr(
-        body.get("wallet") or body.get("walletAddress") or
-        request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or ""
-    )
-    if not _looks_like_evm_addr(wallet):
-        return jsonify({"status":"error","error":"valid_wallet_required"}), 400
-
-    system_name = str(body.get("system") or "").upper().strip()
-    if system_name == "TRADING":
-        system_name = "TRADER"
-    cfg = _privy_trading_cfg()
-    if system_name not in ("NKR", "TRADER", "GRID"):
-        return jsonify({"status":"error","error":"invalid_system"}), 400
-
-    try:
-        amount_usd = float(body.get("amountUsd") or body.get("budgetUsd") or 0)
-    except Exception:
-        amount_usd = 0
-    if not (amount_usd > 0):
-        return jsonify({"status":"error","error":"positive_budget_required"}), 400
-
-    duration_hours = max(1, min(int(float(body.get("durationHours") or 24)), 24 * 30))
-    duration_sec = duration_hours * 3600
-    slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
-    max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
-    amount_units = int(round(amount_usd * 1_000_000))
-
-    route_ids = body.get("allowedRoutes") if isinstance(body.get("allowedRoutes"), list) else []
-    route_ids = [str(x).strip() for x in route_ids if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x).strip())]
-    if not route_ids:
-        configured_route_ids = [cfg.get("routeId"), cfg.get("sellRouteId")]
-        route_ids = [str(x).strip() for x in configured_route_ids
-                     if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(x or "").strip())]
-    if not route_ids:
-        return jsonify({
-            "status":"blocked",
-            "error":"verified_trade_route_required",
-            "message":"The deployed CoreVault requires at least one enabled TRADE route before a live NKR, Trader or Grid session can reserve capital. Configure the verified route in Owner Admin first; no contract redeployment is required.",
-            "contractRequirement":"createSession rejects an empty allowedRoutes array",
-            "ownerAction":"configure_verified_trade_route",
-            "observationModeAllowed":True,
-            "liveSessionAllowed":False
-        }), 409
-
-    vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
-    usdc = _norm_addr(_USDC_BY_CHAIN.get(1) or cfg.get("usdc") or "")
-    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
-        return jsonify({"status":"error","error":"ethereum_core_vault_not_configured"}), 409
-
-    # createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])
-    selector = _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16),bytes32[])")[:4].hex()
-    system_id = int(cfg.get("systemIds", {}).get(system_name, {"NKR":0,"TRADER":1,"GRID":2}[system_name]))
-    head_words = [
-        _addr_to_32(usdc),
-        _uint_to_32(system_id),
-        _uint_to_32(amount_units),
-        _uint_to_32(duration_sec),
-        _uint_to_32(slippage_bps),
-        _uint_to_32(max_loss_bps),
-        _uint_to_32(7 * 32),
-    ]
-    tail_words = [_uint_to_32(len(route_ids))] + [rid[2:].lower() for rid in route_ids]
-    calldata = "0x" + selector + "".join(head_words + tail_words)
-
-    return jsonify({
-        "status":"ok",
-        "chainId":1,
-        "from":wallet,
-        "to":vault,
-        "data":calldata,
-        "value":"0x0",
-        "session":{
-            "system":system_name,
-            "systemId":system_id,
-            "settlementToken":usdc,
-            "budgetUsd":round(amount_units / 1_000_000.0, 6),
-            "budgetUnits":amount_units,
-            "durationHours":duration_hours,
-            "maxSlippageBps":slippage_bps,
-            "maxLossBps":max_loss_bps,
-            "allowedRoutes":route_ids,
-        }
-    })
-
+# ENGINE-216: CoreVault V4 Final budget/session bridge for NKR, Trader and Grid.
+# V4 sessions contain only settlement token, system, budget and risk limits.
+# Routes are selected dynamically by the backend and validated on-chain by router + selector.
 # -------------------------
 # AI Pair Insight (backend-native)
 # -------------------------
@@ -31833,13 +31740,13 @@ def _nexus_execution_package_from_body(body: dict, wallet: str) -> dict:
 
 @app.route("/api/nexus/vault/execute-swap-package", methods=["POST"])
 def api_nexus_vault_execute_swap_package():
-    return jsonify({"status":"gone","error":"legacy_vault_v2_path_disabled","activeExecutionPath":"NexusCoreVaultV3Slim"}),410
+    return jsonify({"status":"gone","error":"legacy_vault_v2_path_disabled","activeExecutionPath":"NexusCoreMultiVaultV4_Final"}),410
 
 @app.route("/api/nexus/vault/submit-signed-swap", methods=["POST"])
 def api_nexus_vault_submit_signed_swap():
     return jsonify({
         "status":"gone", "error":"legacy_vault_v2_path_disabled",
-        "activeExecutionPath":"NexusCoreVaultV3Slim",
+        "activeExecutionPath":"NexusCoreMultiVaultV4_Final",
         "message":"Use the CoreVault V3 session/executor endpoints. This legacy endpoint is not part of user execution.",
         "ts":now_ts()
     }), 410
@@ -32640,9 +32547,6 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_SCORE_BLOCKED", "detail": f"ETH score {score:.1f} is below {mode} entry gate {threshold:.1f}.", "asset": "ETH", "score": score, "change": change, "price": price}
     if change <= -0.25:
         return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_MOMENTUM_BLOCKED", "detail": f"ETH cleared score but 24h momentum is {change:+.2f}%.", "asset": "ETH", "score": score, "change": change, "price": price}
-    if not _nkr_route_allowed(vault, sid, cfg["routeId"]):
-        raise RuntimeError("session_buy_route_not_allowed")
-
     budget_units = int(str(live_row.get("budget_units") or "0"))
     # No hard-coded per-asset percentage cap. The user already defines the total
     # NKR session budget. With one executable candidate, NKR may deploy the full
@@ -32658,7 +32562,7 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     min_out = quote * (10_000 - cfg["slippageBps"]) // 10_000
     deadline = now_ts() + 300
     router_data = _privy_exact_input_single_data(cfg["usdc"], cfg["weth"], vault, amount, min_out, cfg["poolFee"])
-    call = _encode_execute_trade(sid, cfg["routeId"], amount, min_out, deadline, router_data)
+    call = _encode_execute_trade(sid, cfg["router"], cfg["usdc"], cfg["weth"], amount, min_out, deadline, router_data)
     ref = f"nexus-nkr-live-buy-{sid}-{int(time.time())}"
     _live_engine_mark("NKR", status="running", decision="SUBMITTING", gate_status="EXECUTION", reason="Submitting CoreVault trade", pending_tx="submitting")
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
