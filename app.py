@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-218-COREVAULT-V4-CREATE-SESSION-STATIC-TUPLE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-219-AGGRESSIVE-ENTRY-GATE-51"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2149,7 +2149,7 @@ def _nkr_capital_allocation_plan(symbols: list[str], capital_usd: float, market:
     # Smart Dispatcher: max_active is only a ceiling, not a target.
     # Select only assets that clear quality, then weight capital by conviction.
     perf_mode = str(performance or "TACTICAL").strip().upper()
-    min_score_map = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
+    min_score_map = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     min_score = float(min_score_map.get(perf_mode, min_score_map.get("TACTICAL")))
     route_ranked = [x for x in ranked if x.get("routeOk")]
     best_score = max([_safe_float(x.get("score"), 0.0) for x in route_ranked] or [0.0])
@@ -32186,7 +32186,7 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
     summary = summary if isinstance(summary, dict) else {}
     settings = settings if isinstance(settings, dict) else {}
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
-    dispatch_min = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    dispatch_min = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
     ranked = []
     for row in market_rows or []:
         if not isinstance(row, dict):
@@ -32552,7 +32552,7 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     change = _nkr_row_change_pct(eth_row)
     score = _nkr_session_score({"score": eth_row.get("score") or eth_row.get("systemScore") or eth_row.get("ratingScore") or 0}, eth_row)
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
-    threshold = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
     if price <= 0:
         return {"executed": False, "decision": "WAIT", "gate": "PRICE_MISSING", "detail": "Ethereum price is unavailable.", "asset": "ETH", "score": score, "change": change, "price": price}
     if score < threshold:
@@ -33997,7 +33997,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     )
     campaign_expires = int((campaign_clock or {}).get("expiresAt") or 0)
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
-    min_score_by_mode = {"AGGRESSIVE": 58.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
+    min_score_by_mode = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
     dispatch_min = min_score_by_mode.get(mode, 62.0)
     profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
