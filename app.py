@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-214-NKR-LIVE-GROSS-COST-NET-SYNC"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-215-NKR-DYNAMIC-EXIT-COST-ENGINE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32388,6 +32388,64 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
         _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
 
 
+def _nkr_live_exit_cost_estimate(position_value_usd: float, current_price_usd: float, chain_id: int = 1) -> dict:
+    """Estimate the cost of closing the currently open live position.
+
+    Uses the current RPC gas price plus the configured route fee and a small
+    expected price-impact/slippage allowance. This is an estimate, not a
+    fabricated realized cost; realized profit is still written only after a
+    confirmed exit receipt.
+    """
+    value = max(0.0, _safe_float(position_value_usd, 0.0))
+    eth_price = max(0.0, _safe_float(current_price_usd, 0.0))
+    cfg = _privy_trading_cfg()
+
+    gas_units = max(21000, int(os.getenv("NEXUS_NKR_EXIT_GAS_UNITS_ETH", "210000")))
+    gas_price_wei = 0
+    try:
+        raw = _rpc_call(int(chain_id or 1), "eth_gasPrice", [])
+        if isinstance(raw, str):
+            gas_price_wei = int(raw, 16)
+        elif raw is not None:
+            gas_price_wei = int(raw)
+    except Exception:
+        gas_price_wei = 0
+
+    fallback_gwei = max(0.0, _safe_float(os.getenv("NEXUS_NKR_EXIT_FALLBACK_GWEI_ETH", "1.5"), 1.5))
+    if gas_price_wei <= 0:
+        gas_price_wei = int(fallback_gwei * 1_000_000_000)
+
+    gas_sponsored = str(os.getenv("NEXUS_NKR_GAS_SPONSORED", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    gas_native = (gas_units * gas_price_wei) / 1e18
+    gas_usd = 0.0 if gas_sponsored else gas_native * eth_price
+
+    pool_fee_bps = max(0.0, float(int(cfg.get("poolFee") or 500)) / 100.0)
+    router_fee_usd = value * (pool_fee_bps / 10000.0)
+
+    max_slippage_bps = max(1.0, float(int(cfg.get("slippageBps") or 100)))
+    expected_slippage_bps = max(0.5, min(max_slippage_bps, _safe_float(os.getenv("NEXUS_NKR_EXPECTED_EXIT_SLIPPAGE_BPS", "2"), 2.0)))
+    slippage_usd = value * (expected_slippage_bps / 10000.0)
+
+    reserve_bps = max(0.0, _safe_float(os.getenv("NEXUS_NKR_EXIT_COST_RESERVE_BPS", "1"), 1.0))
+    reserve_usd = value * (reserve_bps / 10000.0)
+    total = max(0.0, gas_usd + router_fee_usd + slippage_usd + reserve_usd)
+    return {
+        "model": "live_rpc_gas_route_fee_slippage_v1",
+        "gasSponsored": gas_sponsored,
+        "gasUnits": gas_units,
+        "gasPriceWei": str(gas_price_wei),
+        "gasPriceGwei": gas_price_wei / 1e9,
+        "gasUsd": gas_usd,
+        "poolFeeBps": pool_fee_bps,
+        "routerFeeUsd": router_fee_usd,
+        "expectedSlippageBps": expected_slippage_bps,
+        "slippageUsd": slippage_usd,
+        "reserveBps": reserve_bps,
+        "reserveUsd": reserve_usd,
+        "totalCostUsd": total,
+    }
+
+
 def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float) -> dict:
     """Synchronize the live CoreVault position and its unrealized economics.
 
@@ -32416,9 +32474,11 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
                 entry = capital / qty
             value = qty * max(0.0, float(current_price_usd or 0.0))
             gross = value - capital if capital > 0 and value > 0 else 0.0
-            cost_preview = _nexus_shadow_cost_model(capital, "ETH", {}) if capital > 0 else {}
-            costs = max(0.0, _safe_float((cost_preview or {}).get("total_cost_usd"), 0.0))
+            cost_preview = _nkr_live_exit_cost_estimate(value, current_price_usd, 1) if value > 0 else {}
+            costs = max(0.0, _safe_float((cost_preview or {}).get("totalCostUsd"), 0.0))
             net = gross - costs
+            exit_ready = bool(net > 0)
+            exit_reason = "Profit remains positive after estimated exit costs" if exit_ready else "Estimated exit costs exceed or consume the current gross profit"
             pnl = gross
             pnl_pct = (pnl / capital * 100.0) if capital > 0 else 0.0
             net_pct = (net / capital * 100.0) if capital > 0 else 0.0
@@ -32439,6 +32499,8 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
                 "unrealizedPnlUsd": pnl, "unrealizedPnlPct": pnl_pct,
                 "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
                 "liveGrossProfitUsd": gross, "liveCostsUsd": costs, "liveNetProfitUsd": net,
+                "exitReady": exit_ready, "exitReason": exit_reason,
+                "exitCostBreakdown": cost_preview,
                 "onchainStatus": "CONFIRMED", "updatedAt": nowi, "openRotation": open_pos,
             })
             meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
@@ -32450,7 +32512,9 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
                 "nkr_unrealized_pnl_pct": pnl_pct,
                 "nkr_live_gross_profit_usd": gross, "nkr_live_costs_usd": costs,
                 "nkr_live_net_profit_usd": net, "nkr_live_net_pct": net_pct,
-                "nkr_live_cost_model": (cost_preview or {}).get("model", "estimated_roundtrip_cost"),
+                "nkr_exit_ready": exit_ready, "nkr_exit_reason": exit_reason,
+                "nkr_exit_cost_breakdown": cost_preview,
+                "nkr_live_cost_model": (cost_preview or {}).get("model", "live_exit_cost_estimate"),
                 "onchain_status": "CONFIRMED",
                 "onchain_session_id": str(session_id), "execution_mode": "live",
             })
@@ -32461,6 +32525,7 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
         return {
             "quantity": qty, "positionValueUsd": value, "grossProfitUsd": gross,
             "costsUsd": costs, "netProfitUsd": net, "netPct": net_pct,
+            "exitReady": exit_ready, "exitReason": exit_reason, "exitCostBreakdown": cost_preview,
             "entryPriceUsd": entry, "currentPriceUsd": float(current_price_usd or 0.0),
         }
     return {}
