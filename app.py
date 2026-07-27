@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-213-NKR-LIVE-VALUE-POST-PERSIST-SYNC"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-214-NKR-LIVE-GROSS-COST-NET-SYNC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32388,7 +32388,13 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
         _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
 
 
-def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float) -> None:
+def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float) -> dict:
+    """Synchronize the live CoreVault position and its unrealized economics.
+
+    Gross, estimated costs and net are live previews while the position is open.
+    Collected profit remains realized-only and therefore stays unchanged until a
+    confirmed on-chain exit. No extra event is created by a price tick.
+    """
     """Keep the wallet-bound UI session synchronized with the real CoreVault position."""
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
     nowi = _nkr_now_ms()
@@ -32409,13 +32415,21 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
             if entry <= 0 and qty > 0 and capital > 0:
                 entry = capital / qty
             value = qty * max(0.0, float(current_price_usd or 0.0))
-            pnl = value - capital if capital > 0 and value > 0 else 0.0
+            gross = value - capital if capital > 0 and value > 0 else 0.0
+            cost_preview = _nexus_shadow_cost_model(capital, "ETH", {}) if capital > 0 else {}
+            costs = max(0.0, _safe_float((cost_preview or {}).get("total_cost_usd"), 0.0))
+            net = gross - costs
+            pnl = gross
             pnl_pct = (pnl / capital * 100.0) if capital > 0 else 0.0
+            net_pct = (net / capital * 100.0) if capital > 0 else 0.0
             open_pos.update({
                 "asset": symbol, "symbol": symbol, "amountOutRaw": str(int(amount_out_raw or 0)),
                 "quantity": qty, "positionQty": qty, "entryPriceUsd": entry,
                 "currentPriceUsd": float(current_price_usd or 0.0), "currentValueUsd": value,
-                "pnlUsd": pnl, "pnlPct": pnl_pct, "executionMode": "live",
+                "pnlUsd": pnl, "pnlPct": pnl_pct,
+                "currentGrossUsd": gross, "currentCostsUsd": costs,
+                "currentNetUsd": net, "currentNetPct": net_pct,
+                "executionMode": "live",
             })
             row.update({
                 "targetAsset": symbol, "asset": symbol, "symbol": symbol, "positionAsset": symbol,
@@ -32423,6 +32437,8 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
                 "positionQty": qty, "positionAmount": qty, "entryPriceUsd": entry,
                 "currentPriceUsd": float(current_price_usd or 0.0), "positionValueUsd": value,
                 "unrealizedPnlUsd": pnl, "unrealizedPnlPct": pnl_pct,
+                "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
+                "liveGrossProfitUsd": gross, "liveCostsUsd": costs, "liveNetProfitUsd": net,
                 "onchainStatus": "CONFIRMED", "updatedAt": nowi, "openRotation": open_pos,
             })
             meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
@@ -32431,13 +32447,23 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
                 "nkr_position_qty": qty, "nkr_entry_price_usd": entry,
                 "nkr_current_price_usd": float(current_price_usd or 0.0),
                 "nkr_position_value_usd": value, "nkr_unrealized_pnl_usd": pnl,
-                "nkr_unrealized_pnl_pct": pnl_pct, "onchain_status": "CONFIRMED",
+                "nkr_unrealized_pnl_pct": pnl_pct,
+                "nkr_live_gross_profit_usd": gross, "nkr_live_costs_usd": costs,
+                "nkr_live_net_profit_usd": net, "nkr_live_net_pct": net_pct,
+                "nkr_live_cost_model": (cost_preview or {}).get("model", "estimated_roundtrip_cost"),
+                "onchain_status": "CONFIRMED",
                 "onchain_session_id": str(session_id), "execution_mode": "live",
             })
             row["meta"] = meta
         updated.append(row)
     if patched:
         _db_set_rotation_sessions(wallet, updated, active_session_id=active_id or local_id, replace_missing=False)
+        return {
+            "quantity": qty, "positionValueUsd": value, "grossProfitUsd": gross,
+            "costsUsd": costs, "netProfitUsd": net, "netPct": net_pct,
+            "entryPriceUsd": entry, "currentPriceUsd": float(current_price_usd or 0.0),
+        }
+    return {}
 
 
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
@@ -32481,7 +32507,9 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
                 live_price = _safe_float(fallback.get("price") or fallback.get("priceUsd"), 0.0)
         live_change = _nkr_row_change_pct(eth_row) if isinstance(eth_row, dict) else 0.0
         live_score = _nkr_session_score({"score": (eth_row or {}).get("score") or (eth_row or {}).get("systemScore") or (eth_row or {}).get("ratingScore") or 0}, eth_row or {})
-        _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price)
+        live_metrics = _nkr_sync_local_open_position(
+            wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price
+        )
 
         # ENGINE-212: bridge the backend NKR decision into the real CoreVault route.
         # Earlier builds returned HOLD immediately for every open WETH position, so
@@ -32499,6 +32527,20 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
             or ds_position in {"CLOSED_PROFIT", "EXIT_PENDING", "EXITING"}
             or ds_action in {"CLOSED_PROFIT", "SELL", "EXIT"}
         )
+        # ENGINE-214: a normal profit exit is allowed only when the current
+        # on-chain position is net-positive after the live estimated costs shown
+        # in the UI. This prevents a sell whose costs are larger than its gain.
+        live_gross = _safe_float(live_metrics.get("grossProfitUsd"), 0.0)
+        live_costs = max(0.0, _safe_float(live_metrics.get("costsUsd"), 0.0))
+        live_net = _safe_float(live_metrics.get("netProfitUsd"), live_gross - live_costs)
+        if exit_requested and live_net <= 0:
+            return {
+                "executed": False, "decision": "HOLD", "gate": "NET_AFTER_COST_BLOCKED",
+                "detail": f"Exit signal is waiting: gross ${live_gross:.4f}, estimated costs ${live_costs:.4f}, net ${live_net:.4f}.",
+                "asset": "ETH", "score": live_score, "change": live_change,
+                "price": live_price, "amountOutRaw": current_weth,
+                "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
+            }
         if exit_requested:
             exit_result = _nkr_exit_open_eth_position(wallet, live_row, sid)
             return {
@@ -32512,7 +32554,13 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
                 "amountInRaw": int(exit_result.get("amountIn") or 0),
                 "amountOutRaw": int(exit_result.get("amountOut") or 0),
             }
-        return {"executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE", "detail": "Ethereum position is open and tracked by CoreVault; no backend exit decision is active.", "asset": "ETH", "score": live_score, "change": live_change, "price": live_price, "amountOutRaw": current_weth}
+        return {
+            "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
+            "detail": "Ethereum position is open and tracked by CoreVault; no backend exit decision is active.",
+            "asset": "ETH", "score": live_score, "change": live_change,
+            "price": live_price, "amountOutRaw": current_weth,
+            "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
+        }
 
     if not isinstance(eth_row, dict):
         return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
