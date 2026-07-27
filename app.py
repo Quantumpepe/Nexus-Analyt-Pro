@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-217-COREVAULT-V4-PRIMARY-READ-WRITE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-218-COREVAULT-V4-CREATE-SESSION-STATIC-TUPLE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -29408,7 +29408,9 @@ def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, m
         _addr_to_32(cfg["usdc"]), _uint_to_32(system_id), _uint_to_32(budget_units),
         _uint_to_32(duration_sec), _uint_to_32(max_slippage_bps), _uint_to_32(max_loss_bps),
     ]
-    return _PRIVY_CREATE_SESSION_SELECTOR + _uint_to_32(32) + "".join(tuple_words)
+    # CoreVault V4 Final SessionRequest contains only static ABI types.
+    # Therefore the tuple words follow the selector directly; no leading offset.
+    return _PRIVY_CREATE_SESSION_SELECTOR + "".join(tuple_words)
 
 
 def _encode_execute_trade(session_id, router, token_in, token_out, amount_in, min_amount_out, deadline, router_data):
