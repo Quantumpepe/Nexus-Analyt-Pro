@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-216-COREVAULT-V4-FINAL-INTEGRATION"
+BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-217-COREVAULT-V4-PRIMARY-READ-WRITE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -869,7 +869,13 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
 
 def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
     wa = _norm_addr(wallet)
-    vault_addr = _norm_addr(vault or os.getenv("NEXUS_CORE_VAULT_ETH_ADDRESS") or "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1")
+    vault_addr = _norm_addr(
+        vault
+        or os.getenv("CORE_VAULTV4_ADDRESS_ETH")
+        or os.getenv("NEXUS_CORE_VAULT_ETH_ADDRESS")
+        or os.getenv("CORE_VAULT_ADDRESS_ETH")
+        or "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1"
+    )
     if not wa or not _looks_like_evm_addr(vault_addr):
         raise RuntimeError("wallet_or_vault_invalid")
     raw_next = _eth_call(int(chain_id), vault_addr, _core_selector("nextSessionId()"))
@@ -8244,11 +8250,15 @@ _USDT_BY_CHAIN = {
 # Nexus Core Vault registry. One audited Core Vault implementation is deployed
 # separately on every enabled EVM chain. Old VAULT_ADDRESS_* names remain as a
 # migration fallback so current deployments do not break while addresses change.
-# Ethereum CoreVault is already deployed and verified. Do not allow a stale Render
-# environment variable to silently redirect reads/writes to an older contract.
-_VERIFIED_CORE_VAULT_ETH = "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1"
+# Ethereum V4 Final is the primary live Vault whenever CORE_VAULTV4_ADDRESS_ETH
+# is configured. The old V3 address remains only as an explicit migration fallback,
+# so both contracts can continue to exist in parallel without the dashboard/worker
+# silently reading the V3 balance.
+_LEGACY_VERIFIED_CORE_VAULT_ETH = "0xF1DAb87B35B6638d679853941B19d9f3637EEFC1"
+_CORE_VAULT_V4_ETH = (os.getenv("CORE_VAULTV4_ADDRESS_ETH") or "").strip()
+_CORE_VAULT_V3_ETH = (os.getenv("CORE_VAULT_ADDRESS_ETH") or _LEGACY_VERIFIED_CORE_VAULT_ETH).strip()
 _VAULT_BY_CHAIN = {
-    1: _VERIFIED_CORE_VAULT_ETH,
+    1: (_CORE_VAULT_V4_ETH or _CORE_VAULT_V3_ETH),
     56: (os.getenv("CORE_VAULT_ADDRESS_BNB") or os.getenv("CORE_VAULT_ADDRESS_56") or os.getenv("VAULT_ADDRESS_BNB") or os.getenv("VAULT_ADDRESS_56") or "").strip(),
     137: (os.getenv("CORE_VAULT_ADDRESS_POL") or os.getenv("CORE_VAULT_ADDRESS_POLYGON") or os.getenv("CORE_VAULT_ADDRESS_137") or os.getenv("VAULT_ADDRESS_POL") or os.getenv("VAULT_ADDRESS_POLYGON") or os.getenv("VAULT_ADDRESS_137") or "").strip(),
 }
@@ -16434,7 +16444,7 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
     explicit_core_vault_configured = any(
         bool(str(os.getenv(name) or "").strip())
         for name in (
-            "CORE_VAULT_ADDRESS_ETH", "CORE_VAULT_ADDRESS_1",
+            "CORE_VAULTV4_ADDRESS_ETH", "CORE_VAULT_ADDRESS_ETH", "CORE_VAULT_ADDRESS_1",
             "CORE_VAULT_ADDRESS_BNB", "CORE_VAULT_ADDRESS_56",
             "CORE_VAULT_ADDRESS_POL", "CORE_VAULT_ADDRESS_POLYGON", "CORE_VAULT_ADDRESS_137",
         )
@@ -16521,7 +16531,7 @@ def _shadow_core_vault_accounting(wallet_address: str) -> dict:
 
 
 # -----------------------------------------------------------------------------
-# Ethereum CoreVaultV3Slim - read-only on-chain bridge
+# Ethereum CoreVault V4 Final / V3 migration-compatible read-only bridge
 # -----------------------------------------------------------------------------
 # This bridge exposes eth_call state only. Mutating transactions remain behind
 # Privy delegated signing and explicit readiness checks.
@@ -28330,7 +28340,7 @@ def _require_owner_system_info():
 
 
 
-# ENGINE-154: CoreVaultV3Slim session-based live-execution responsibility model.
+# ENGINE-217: CoreVault V4 Final primary session-based live-execution model.
 # - Privy wallet is the user wallet.
 # - A separately configured Nexus executor contract/service is the executor.
 # - The user may only set/revoke their own executor allowance.
@@ -28354,7 +28364,7 @@ def _bytes32_word(value: str) -> str:
 def _live_vault_execution_readiness(wallet_address: str) -> dict:
     user_wallet = _norm_addr(wallet_address)
     chain_id = 1
-    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or os.getenv("CORE_VAULT_ADDRESS_ETH") or "")
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or os.getenv("CORE_VAULTV4_ADDRESS_ETH") or os.getenv("CORE_VAULT_ADDRESS_ETH") or "")
     usdc = _norm_addr(_USDC_BY_CHAIN.get(chain_id) or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
     executor = _norm_addr(os.getenv("NEXUS_EXECUTOR_ADDRESS_ETH") or "")
     executor_service_ready = _env_bool("NEXUS_EXECUTOR_SERVICE_READY", False)
