@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-225-NKR-SHADOW-LOGIC-LIVE-ADAPTER"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-226-NKR-BACKEND-SOURCE-OF-TRUTH-ALCHEMY-RPC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -4933,23 +4933,31 @@ def _normalize_chain_key(raw: str) -> str:
     return alias.get(s, s)
 
 def _rpc_url_for_chain(chain_id: int) -> str:
-    """Return only an explicitly configured standard JSON-RPC endpoint.
+    """Return the configured primary JSON-RPC endpoint for a chain.
 
-    No provider-specific environment variables or API-key URL construction are
-    used. Public no-key fallbacks are added separately by _rpc_urls_for_chain().
+    Ethereum CoreVault V4 reads use Alchemy when ALCHEMY_KEY is configured.
+    An explicit RPC_URL_ETH/RPC_URL_1 remains supported and takes priority only
+    when intentionally set. No browser key or frontend provider is involved.
     """
     cid = int(chain_id or 0)
 
     def _accepted(url: str) -> str:
-        value = str(url or "").strip()
+        value = str(url or "").strip().rstrip("/")
         lowered = value.lower()
-        if not value or "alchemy.com" in lowered or "rpc.ankr.com" in lowered:
+        if not value or "rpc.ankr.com" in lowered or "flashbots.net" in lowered:
+            return ""
+        if not (lowered.startswith("https://") or lowered.startswith("http://")):
             return ""
         return value
 
     direct = _accepted(_RPC_URL_BY_CHAIN.get(cid) or "")
     if direct:
         return direct
+
+    if cid == 1:
+        alchemy_key = str(os.getenv("ALCHEMY_KEY") or "").strip()
+        if alchemy_key:
+            return f"https://eth-mainnet.g.alchemy.com/v2/{alchemy_key}"
 
     env_fallbacks = {
         1: [os.getenv("RPC_URL_ETH"), os.getenv("RPC_URL_1")],
@@ -8575,9 +8583,8 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
     """Return the single central RPC candidate list for an enabled EVM chain.
 
     All normal on-chain reads in Nexus go through _rpc_call(), which uses this
-    function. Provider-specific endpoints explicitly removed from Nexus
-    (Alchemy, ANKR and Flashbots) are rejected even if stale Render environment
-    variables still contain them.
+    function. Ethereum uses the server-side Alchemy endpoint first when configured.
+    Public endpoints are fallback-only and never replace a healthy primary provider.
     """
     cid = int(chain_id or 0)
     urls: list[str] = []
@@ -8588,7 +8595,6 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         if not url:
             return
         blocked = (
-            "alchemy.com",
             "rpc.ankr.com",
             "flashbots.net",
         )
@@ -8599,8 +8605,7 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         if url not in urls:
             urls.append(url)
 
-    # A deliberately configured standard RPC remains first, unless it belongs
-    # to a provider that Nexus has explicitly removed.
+    # The deliberately configured primary RPC remains first.
     _add(_rpc_url_for_chain(cid))
 
     # Public no-key fallbacks. Keep these limited to standard EVM JSON-RPC.
@@ -8609,7 +8614,6 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
             "https://ethereum-rpc.publicnode.com",
             "https://eth.llamarpc.com",
             "https://1rpc.io/eth",
-            "https://cloudflare-eth.com",
         ],
         56: [
             "https://bsc-rpc.publicnode.com",
@@ -14149,54 +14153,73 @@ def api_rotation_session_delete(session_id):
 
 @app.route("/api/rotation-sessions", methods=["GET", "POST"])
 def api_rotation_sessions():
+    """Return backend-owned live NKR sessions only.
+
+    The browser is not allowed to create, retain, hydrate or resurrect NKR session
+    rows. CoreVault/backend lifecycle data is the single source of truth.
+    """
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("wallet required", 401)
-    if request.method == "POST":
-        body = request.get_json(silent=True) or {}
-        sessions = body.get("sessions") if isinstance(body, dict) else []
-        # Compatibility: allow posting a single updated session as {session: {...}}.
-        # Single-session updates must not delete the other wallet sessions.
-        replace_missing = isinstance(sessions, list)
-        if not isinstance(sessions, list):
-            session = body.get("session") if isinstance(body, dict) else None
-            sessions = [session] if isinstance(session, dict) else []
-            replace_missing = False
-        active_id = str((body.get("activeRotationSessionId") or body.get("active_session_id") or "") if isinstance(body, dict) else "").strip()
-        saved, active, updated_ts = _db_set_rotation_sessions(wa, sessions, active_id, replace_missing=replace_missing)
-        active_rows = [x for x in saved if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
-        out = jsonify({
-            "status": "ok",
-            "wallet": wa,
-            "sessions": saved,
-            "activeRotationSessionId": active,
-            "summary": {
-                "active_count": len(active_rows),
-                "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
-                "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in saved), 6),
-                "execution_mode": "shadow",
-                "vault_ready": False,
-            },
-            "updated_ts": updated_ts,
-            "ts": now_ts(),
-        })
-        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return out
-    sessions, active, updated_ts = _db_get_rotation_sessions(wa)
-    active_rows = [x for x in sessions if str((x or {}).get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+
+    stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
+    live_rows = _live_active_sessions(wa, "NKR")
+    live_ids = {
+        str(int(str(row.get("onchain_session_id") or "0")))
+        for row in (live_rows or [])
+        if str(row.get("onchain_session_id") or "0").isdigit() and int(str(row.get("onchain_session_id") or "0")) > 0
+    }
+
+    def _onchain_id(sess: dict) -> str:
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        raw = sess.get("onchainSessionId") or sess.get("onchain_session_id") or sess.get("coreVaultSessionId") or meta.get("onchain_session_id") or meta.get("core_vault_session_id") or ""
+        if str(raw).isdigit() and int(str(raw)) > 0:
+            return str(int(str(raw)))
+        m = re.fullmatch(r"NKR-LIVE-(\d+)(?:-[A-Z0-9]+)?", str(sess.get("id") or sess.get("session_id") or ""), flags=re.I)
+        return m.group(1) if m else ""
+
+    sessions = []
+    seen = set()
+    for sess in stored or []:
+        if not isinstance(sess, dict) or not _nkr_is_session(sess):
+            continue
+        oid = _onchain_id(sess)
+        if not oid or oid not in live_ids or oid in seen:
+            continue
+        st = str(sess.get("status") or "").upper()
+        if st in ROTATION_TERMINAL_STATUSES:
+            continue
+        seen.add(oid)
+        sessions.append(sess)
+
+    # A live on-chain row without a local presentation row is created by the
+    # backend worker, never by the browser.
+    for row in live_rows or []:
+        oid = str(int(str(row.get("onchain_session_id") or "0"))) if str(row.get("onchain_session_id") or "0").isdigit() else ""
+        if oid and oid not in seen:
+            _nkr_ensure_local_live_session(wa, row)
+    if len(seen) < len(live_ids):
+        stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
+        sessions = [s for s in stored if isinstance(s, dict) and _onchain_id(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+
+    active = str(sessions[0].get("id") or sessions[0].get("session_id") or "") if sessions else ""
+    summary = {
+        "active_count": len(sessions),
+        "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in sessions), 6),
+        "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in sessions), 6),
+        "execution_mode": "live",
+        "vault_ready": True,
+        "runtime": "RUNNING" if sessions else "IDLE",
+    }
     out = jsonify({
         "status": "ok",
         "wallet": wa,
         "sessions": sessions,
         "activeRotationSessionId": active,
-        "summary": {
-            "active_count": len(active_rows),
-            "reserved_usd": round(sum(_rotation_float(x.get("reservedUsd") or x.get("budgetUsd"), 0.0) for x in active_rows), 6),
-            "collected_profit_usd": round(sum(_rotation_float(x.get("collectedProfitUsd"), 0.0) for x in sessions), 6),
-            "execution_mode": "shadow",
-            "vault_ready": False,
-        },
-        "updated_ts": updated_ts,
+        "summary": summary,
+        "readOnly": True,
+        "source": "backend_corevault",
+        "updated_ts": updated_ts or int(time.time() * 1000),
         "ts": now_ts(),
     })
     out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
