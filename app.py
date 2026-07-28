@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-227-TRADER-VAULT-FIRST-CONTROL"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-228-GRID-EXIT-MANAGER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -22168,6 +22168,12 @@ def api_nexus_funding_resolve():
     except Exception as e:
         return jsonify({"status": "error", "error": str(e), "ts": now_ts()}), 500
 
+
+GRID_STABLE_ASSETS = {"USDC", "USDT", "DAI", "FRAX", "FDUSD", "TUSD", "PYUSD", "USDP", "LUSD", "GUSD"}
+
+def _grid_asset_symbol(item_id: str) -> str:
+    return str(item_id or "").split(":")[-1].upper().strip()
+
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
     """Add a manual order (OPEN) into an existing grid session.
@@ -22199,8 +22205,17 @@ def api_grid_manual_add():
             return jsonify({"error": "missing item"}), 400
         item_id, chain = _grid_canonical_item_chain(item_id, payload.get("chain") or "")
 
+        source = str(payload.get("source") or payload.get("origin") or "MANUAL").upper().strip()
+        if source not in ("MANUAL", "GRID", "ROTATION", "TRADING", "STRATEGIST"):
+            source = "MANUAL"
+
         side = str(payload.get("side") or "").upper().strip()
-        if side not in ("BUY", "SELL"):
+        if source == "GRID":
+            side = "SELL"
+            asset_symbol = _grid_asset_symbol(item_id)
+            if asset_symbol in GRID_STABLE_ASSETS:
+                return jsonify({"error": "grid_asset_must_be_non_stable", "detail": "Nexus Grid only manages an already-held non-stable asset."}), 400
+        elif side not in ("BUY", "SELL"):
             return jsonify({"error": "side must be BUY or SELL"}), 400
 
         price = payload.get("price")
@@ -22245,16 +22260,36 @@ def api_grid_manual_add():
         except Exception:
             deadline_i = int(DEFAULT_DEADLINE_MINUTES)
 
-        funding_report = _nexus_funding_resolver_report({**payload, "item": item_id, "chain": chain, "price": price_f, "qty": qty_f}, wa)
         funding_approved = str(payload.get("funding_approved") or payload.get("fundingApproved") or "").strip().lower() in ("1", "true", "yes", "on")
-        if funding_report.get("funding_required") and not funding_approved:
-            return jsonify({
-                "status": "funding_required",
-                "error": "insufficient_direct_funding",
-                "funding": funding_report,
-                "message": funding_report.get("message") or "Funding approval required.",
-                "ts": now_ts(),
-            }), 409
+        if source == "GRID":
+            conn_check = _db()
+            try:
+                vault_total = float(_grid_best_vault_total(conn_check, wa, item_id, chain=chain) or 0.0)
+                already_reserved = float(_grid_db_reserved(conn_check, wa, item_id, chain=chain) or 0.0)
+            finally:
+                conn_check.close()
+            available_qty = max(0.0, vault_total - already_reserved)
+            if qty_f > available_qty + 1e-12:
+                return jsonify({
+                    "status": "blocked",
+                    "error": "insufficient_vault_asset",
+                    "asset": _grid_asset_symbol(item_id),
+                    "requested_qty": qty_f,
+                    "available_qty": available_qty,
+                    "message": "Grid can only reserve token quantity already available in the Vault.",
+                    "ts": now_ts(),
+                }), 409
+            funding_report = {"funding_required": False, "status": "vault_asset_ready", "availableQty": available_qty}
+        else:
+            funding_report = _nexus_funding_resolver_report({**payload, "item": item_id, "chain": chain, "price": price_f, "qty": qty_f}, wa)
+            if funding_report.get("funding_required") and not funding_approved:
+                return jsonify({
+                    "status": "funding_required",
+                    "error": "insufficient_direct_funding",
+                    "funding": funding_report,
+                    "message": funding_report.get("message") or "Funding approval required.",
+                    "ts": now_ts(),
+                }), 409
 
         # Create order. client_order_id makes retries/double-clicks idempotent when the frontend sends it.
         client_order_id = str(
@@ -22264,10 +22299,6 @@ def api_grid_manual_add():
             or ""
         ).strip()
         order_id = client_order_id if client_order_id else str(uuid.uuid4())
-
-        source = str(payload.get("source") or payload.get("origin") or "MANUAL").upper().strip()
-        if source not in ("MANUAL", "GRID", "ROTATION", "TRADING", "STRATEGIST"):
-            source = "MANUAL"
 
         order = {
             "id": order_id,
@@ -22282,6 +22313,10 @@ def api_grid_manual_add():
             "origin_module": str(payload.get("origin_module") or source.lower()).strip(),
             "session_id": str(payload.get("session_id") or "").strip(),
             "strategy_id": str(payload.get("strategy_id") or "").strip(),
+            "payout_asset": str(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC").upper().strip(),
+            "original_asset": str(payload.get("original_asset") or _grid_asset_symbol(item_id)).upper().strip(),
+            "max_loss_pct": max(0.0, min(100.0, float(payload.get("max_loss_pct") or payload.get("maxLossPct") or 0.0))),
+            "rule_mode": "EXIT_ONLY" if source == "GRID" else "ORDER",
             "funding_approved": bool(funding_approved),
             "funding_source_asset": str(payload.get("funding_source_asset") or payload.get("fundingSourceAsset") or "").upper().strip(),
             "funding_required": bool(funding_report.get("funding_required")),
