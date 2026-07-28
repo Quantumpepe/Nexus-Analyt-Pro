@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.27-ENGINE-219-AGGRESSIVE-ENTRY-GATE-51"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-220-NKR-STOP-EXIT-PAUSED-SESSION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -394,7 +394,7 @@ def _live_active_sessions(wallet, engine):
     _live_engine_tables_init()
     conn = _db()
     try:
-        rows = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine=? AND status IN ('ACTIVE','CLOSING','ERROR') ORDER BY created_ts DESC", (_norm_addr(wallet), str(engine).upper())).fetchall()
+        rows = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine=? AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') ORDER BY created_ts DESC", (_norm_addr(wallet), str(engine).upper())).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -597,8 +597,24 @@ def _live_finalize_engine_sessions(wallet, engine):
     """
     rows = _live_active_sessions(wallet, engine)
     if str(engine).upper() == "NKR":
-        _nkr_set_local_stop_state(wallet, "STOPPING", "NKR is being safely stopped")
-    _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Safe stop requested", pending_tx="queued")
+        _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
+    # Keep every paused/open session visible and mark the live registry as closing
+    # before the asynchronous worker starts. This prevents the UI from falling
+    # back to PAUSED or hiding the session while an exit is pending.
+    if rows:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                ids = [int(x.get("id")) for x in rows if x.get("id") is not None]
+                for row_id in ids:
+                    conn.execute(
+                        "UPDATE nexus_live_core_vault_sessions SET status='CLOSING', updated_ts=?, last_error=NULL WHERE id=?",
+                        (int(time.time()), row_id),
+                    )
+                conn.commit()
+        finally:
+            conn.close()
+    _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Stop & Exit requested", pending_tx="queued")
     threading.Thread(
         target=_live_stop_worker,
         args=(_norm_addr(wallet), str(engine).upper(), [dict(x) for x in rows]),
@@ -31916,12 +31932,12 @@ def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
         next_status = "ACTIVE"
         src["resumedAt"] = nowi
         msg = "RESUMED_BY_USER"
-    elif action_u in {"STOP", "PANIC_STOP"}:
+    elif action_u in {"STOP", "STOP_EXIT", "PANIC_STOP"}:
         next_status = "STOPPED"
         src["stoppedAt"] = nowi
         src["reservedUsd"] = 0
         src["active"] = False
-        msg = "STOPPED_BY_USER" if action_u == "STOP" else "PANIC_STOP_PROTECT"
+        msg = "STOPPED_BY_USER" if action_u in {"STOP", "STOP_EXIT"} else "PANIC_STOP_PROTECT"
     else:
         next_status = status or "WAITING"
         msg = "CONTROL_NOOP"
@@ -32866,7 +32882,7 @@ def api_nkr_control():
         return err("wallet required", 401)
     body = request.get_json(silent=True) or {}
     action = str(body.get("action") or "").strip().upper()
-    if action not in {"PAUSE", "RESUME", "STOP", "DELETE", "PANIC_STOP"}:
+    if action not in {"PAUSE", "RESUME", "STOP", "STOP_EXIT", "DELETE", "PANIC_STOP"}:
         return err("invalid action", 400)
     nowi = _nkr_now_ms()
     sessions, active, _ = _db_get_rotation_sessions(wa)
@@ -32900,7 +32916,7 @@ def api_nkr_control():
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return out
     finalize_results = []
-    if action in {"STOP", "PANIC_STOP"}:
+    if action in {"STOP", "STOP_EXIT", "PANIC_STOP"}:
         # Safe live stop is asynchronous. Do not erase the local session or mark it
         # STOPPED until CoreVault status 4 (FINALIZED) is confirmed on-chain.
         finalize_results = _live_finalize_engine_sessions(wa, "NKR")
@@ -32923,12 +32939,13 @@ def api_nkr_control():
         _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
     bundle = _nkr_get_wallet_bundle(wa)
-    if action in {"STOP", "PANIC_STOP"}:
+    if action in {"STOP", "STOP_EXIT", "PANIC_STOP"}:
         bundle["coreVaultFinalize"] = finalize_results
     bundle["message"] = {
         "PAUSE": "NKR paused and stored wallet-bound in backend.",
         "RESUME": "NKR resumed by explicit user action.",
         "STOP": "NKR is being safely stopped. Capital is released automatically after confirmation.",
+        "STOP_EXIT": "Stop & Exit started. Open positions are sold to the settlement asset before the session is finalized.",
         "PANIC_STOP": "NKR safe stop started. New trades are blocked and capital is released automatically.",
     }.get(action, "NKR control updated.")
     out = jsonify(bundle)
