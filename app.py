@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-220-NKR-STOP-EXIT-PAUSED-SESSION-FIX"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-221-NKR-ONCHAIN-SESSION-ACTIONS-RETRY-EXIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32882,7 +32882,7 @@ def api_nkr_control():
         return err("wallet required", 401)
     body = request.get_json(silent=True) or {}
     action = str(body.get("action") or "").strip().upper()
-    if action not in {"PAUSE", "RESUME", "STOP", "STOP_EXIT", "DELETE", "PANIC_STOP"}:
+    if action not in {"PAUSE", "RESUME", "STOP", "STOP_EXIT", "RETRY_EXIT", "DELETE", "PANIC_STOP"}:
         return err("invalid action", 400)
     nowi = _nkr_now_ms()
     sessions, active, _ = _db_get_rotation_sessions(wa)
@@ -32916,7 +32916,7 @@ def api_nkr_control():
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return out
     finalize_results = []
-    if action in {"STOP", "STOP_EXIT", "PANIC_STOP"}:
+    if action in {"STOP", "STOP_EXIT", "RETRY_EXIT", "PANIC_STOP"}:
         # Safe live stop is asynchronous. Do not erase the local session or mark it
         # STOPPED until CoreVault status 4 (FINALIZED) is confirmed on-chain.
         finalize_results = _live_finalize_engine_sessions(wa, "NKR")
@@ -32939,13 +32939,14 @@ def api_nkr_control():
         _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
     bundle = _nkr_get_wallet_bundle(wa)
-    if action in {"STOP", "STOP_EXIT", "PANIC_STOP"}:
+    if action in {"STOP", "STOP_EXIT", "RETRY_EXIT", "PANIC_STOP"}:
         bundle["coreVaultFinalize"] = finalize_results
     bundle["message"] = {
         "PAUSE": "NKR paused and stored wallet-bound in backend.",
         "RESUME": "NKR resumed by explicit user action.",
         "STOP": "NKR is being safely stopped. Capital is released automatically after confirmation.",
         "STOP_EXIT": "Stop & Exit started. Open positions are sold to the settlement asset before the session is finalized.",
+        "RETRY_EXIT": "Exit retry started. The remaining open CoreVault position is sold before finalization.",
         "PANIC_STOP": "NKR safe stop started. New trades are blocked and capital is released automatically.",
     }.get(action, "NKR control updated.")
     out = jsonify(bundle)
