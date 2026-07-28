@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-221-NKR-ONCHAIN-SESSION-ACTIONS-RETRY-EXIT-FIX"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-222-NKR-TARGETED-EXIT-TX-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -590,12 +590,19 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
         _live_engine_mark(engine, status="error", decision="STOP_FAILED", reason="Safe stop requires owner review", pending_tx="", last_error=str(exc)[:1000])
 
 
-def _live_finalize_engine_sessions(wallet, engine):
-    """Queue a browser-independent safe stop and return immediately.
+def _live_finalize_engine_sessions(wallet, engine, target_session_id=None):
+    """Queue a browser-independent safe stop for one exact CoreVault session.
 
-    The local NKR session stays STOPPING until the CoreVault confirms FINALIZED.
+    When target_session_id is supplied, only that on-chain session is processed.
+    The local NKR session stays STOPPING until a real exit transaction and the
+    CoreVault FINALIZED receipt are confirmed.
     """
     rows = _live_active_sessions(wallet, engine)
+    target_sid = str(target_session_id or "").strip()
+    if target_sid:
+        rows = [x for x in rows if str(x.get("onchain_session_id") or "").strip() == target_sid]
+        if not rows:
+            return [{"sessionId": int(target_sid) if target_sid.isdigit() else target_sid, "status": "not_found", "error": "target_onchain_session_not_found"}]
     if str(engine).upper() == "NKR":
         _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
     # Keep every paused/open session visible and mark the live registry as closing
@@ -614,14 +621,14 @@ def _live_finalize_engine_sessions(wallet, engine):
                 conn.commit()
         finally:
             conn.close()
-    _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Stop & Exit requested", pending_tx="queued")
+    _live_engine_mark(engine, status="closing", decision="STOPPING", reason="Stop & Exit requested", pending_tx=(f"exit_requested:{target_sid}" if target_sid else "exit_requested"))
     threading.Thread(
         target=_live_stop_worker,
         args=(_norm_addr(wallet), str(engine).upper(), [dict(x) for x in rows]),
         daemon=True,
         name=f"live-stop-{str(engine).lower()}-{int(time.time())}",
     ).start()
-    return [{"sessionId": int(str(x.get("onchain_session_id") or "0")), "status": "queued"} for x in rows]
+    return [{"sessionId": int(str(x.get("onchain_session_id") or "0")), "status": "EXIT_REQUESTED", "txHash": "", "receiptStatus": "not_submitted"} for x in rows]
 
 def _live_engine_health_payload(wallet=""):
     """Return one authoritative live state for System Info and the main NKR UI.
@@ -32917,9 +32924,11 @@ def api_nkr_control():
         return out
     finalize_results = []
     if action in {"STOP", "STOP_EXIT", "RETRY_EXIT", "PANIC_STOP"}:
-        # Safe live stop is asynchronous. Do not erase the local session or mark it
-        # STOPPED until CoreVault status 4 (FINALIZED) is confirmed on-chain.
-        finalize_results = _live_finalize_engine_sessions(wa, "NKR")
+        # Safe live stop is asynchronous and is bound to the exact on-chain session
+        # selected by the user. Never finalize or mutate unrelated historical rows.
+        finalize_results = _live_finalize_engine_sessions(wa, "NKR", target_id or None)
+        if target_id and finalize_results and finalize_results[0].get("status") == "not_found":
+            return jsonify({"status":"error","error":"target_onchain_session_not_found","sessionId":target_id,"coreVaultFinalize":finalize_results}), 404
     elif action in {"PAUSE", "RESUME"}:
         # Pause/resume is not stop. Keep the session visible and keep its Vault
         # allocation reserved while blocking/unblocking new engine actions.
