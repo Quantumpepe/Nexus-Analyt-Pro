@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-223-NKR-SCALE-ADAPTIVE-TRAILING-EXIT-FIX"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-225-NKR-SHADOW-LOGIC-LIVE-ADAPTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -518,7 +518,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
     if open_assets != 0:
         if str(engine or "").upper() != "NKR":
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
-        exit_result = _nkr_exit_open_eth_position(wallet, row, sid)
+        exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
         raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
         words = _core_words(raw)
         if len(words) < 13:
@@ -29345,11 +29345,11 @@ def _privy_erc20_balance(token, wallet):
     return int(words[0]) if words else 0
 
 
-def _privy_quote(cfg, token_in, token_out, amount_in):
+def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
     if not _looks_like_evm_addr(cfg.get("quoter")):
         raise RuntimeError("quoter_not_configured")
     selector = "0xc6a5026a"
-    data = selector + _addr_to_32(token_in) + _addr_to_32(token_out) + _uint_to_32(amount_in) + _uint_to_32(cfg["poolFee"]) + _uint_to_32(0)
+    data = selector + _addr_to_32(token_in) + _addr_to_32(token_out) + _uint_to_32(amount_in) + _uint_to_32(int(fee if fee is not None else cfg["poolFee"])) + _uint_to_32(0)
     raw = _eth_call(1, cfg["quoter"], data)
     words = _core_vault_words(raw)
     if not words or int(words[0]) <= 0:
@@ -32039,6 +32039,8 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
             "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"),
             "nkrProfitMode": ui.get("nkrProfitMode", "HOLD_STABLE"),
             "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
+            "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)),
+            "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", 80),
         },
         "sessions": nkr_sessions,
         "campaignClock": campaign_clock,
@@ -32049,8 +32051,8 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
             "paused_survives_reload": True,
             "stopped_does_not_auto_resume": True,
             "deleted_never_returns": True,
-            "live_execution": False,
-            "vault_ready": False,
+            "live_execution": True,
+            "vault_ready": True,
             "private_keys_in_backend": False,
         },
         "updated_ts": max(int(state_ts or 0), int(sess_ts or 0)),
@@ -32072,6 +32074,8 @@ def api_nkr_state():
                 ("nkrBudgetUsd", "rotationBudgetRelease"), ("budgetUsd", "rotationBudgetRelease"),
                 ("nkrCapitalMode", "nkrCapitalMode"), ("nkrObservationWindow", "nkrObservationWindow"),
                 ("nkrProfitMode", "nkrProfitMode"), ("nkrPeriodDays", "nkrPeriodDays"),
+                ("maxActiveAssets", "maxActiveAssets"), ("rotationMaxActiveSessions", "maxActiveAssets"),
+                ("maxCapitalPerAssetPct", "maxCapitalPerAssetPct"),
                 ("nkrControlState", "nkrControlState"), ("controlState", "nkrControlState"),
             ]:
                 if src in body:
@@ -32079,6 +32083,7 @@ def api_nkr_state():
             if isinstance(body.get("ui"), dict):
                 ui.update({k: v for k, v in body.get("ui", {}).items() if k in {
                     "rotationBudgetRelease", "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays", "nkrControlState",
+                    "maxActiveAssets", "rotationMaxActiveSessions", "maxCapitalPerAssetPct",
                     "rotationShadowSnapshot", "rotationShadowEvents"
                 }})
         if ui:
@@ -32473,6 +32478,353 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
     return {}
 
 
+
+# ENGINE-225: Live adapter for the established NKR/Shadow decision model.
+# Strategy decisions remain in the existing NKR logic; this layer only translates
+# the resulting target state into confirmed CoreVault OPEN/ADD/REDUCE/CLOSE deltas.
+_NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ASSET_COOLDOWN_SEC", "60")))
+_NKR_LIVE_MIN_REBALANCE_USD = max(0.25, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "1.00")))
+_NKR_LIVE_LAST_ASSET_TRADE_TS: dict[tuple[str, int, str], int] = {}
+
+
+def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
+    """Resolve executable Ethereum token routes automatically.
+
+    The V4 Vault deliberately does NOT require per-token registration for
+    executeTrade(). Therefore this adapter does not use enabledForLive flags,
+    per-asset owner approvals, or a per-asset environment allow-list.
+
+    The only unavoidable translation is symbol -> token contract/router/pool fee,
+    because Shadow decisions use symbols while an on-chain swap requires concrete
+    addresses. Those technical values are read from the existing Nexus asset-router
+    registry. Router/selector authorization remains the one-time Vault-wide DEX
+    permission enforced by the contract itself.
+    """
+    routes = {
+        "ETH": {
+            "symbol": "ETH",
+            "token": _norm_addr(cfg["weth"]),
+            "decimals": 18,
+            "router": _norm_addr(cfg["router"]),
+            "fee": int(cfg["poolFee"]),
+            "live": True,
+            "source": "canonical_weth_route",
+        }
+    }
+    try:
+        technical = (_nexus_asset_router_registry(include_technical=True).get("technicalRoutes") or {})
+    except Exception:
+        technical = {}
+
+    for sym, asset in technical.items():
+        route = ((asset or {}).get("routes") or {}).get("ETH") or {}
+        token = _norm_addr(route.get("tokenContract") or route.get("tokenAddress") or "")
+        router = _norm_addr(route.get("routerAddress") or cfg.get("router") or "")
+        try:
+            fee = int(route.get("poolFee") or route.get("fee") or cfg["poolFee"])
+            decimals = max(0, min(36, int(route.get("decimals") or 18)))
+        except Exception:
+            continue
+        if not (_looks_like_evm_addr(token) and _looks_like_evm_addr(router) and fee > 0):
+            continue
+        symbol = str(sym or "").strip().upper()
+        if not symbol:
+            continue
+        routes[symbol] = {
+            "symbol": symbol,
+            "token": token,
+            "decimals": decimals,
+            "router": router,
+            "fee": fee,
+            "live": True,
+            "source": "automatic_asset_router_registry",
+        }
+    return routes
+
+
+def _nkr_position_snapshot(vault: str, sid: int, route: dict, cfg: dict) -> dict:
+    token = route["token"]
+    raw = _eth_call(1, vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(sid) + _addr_to_32(token))
+    words = _abi_hex_words(raw)
+    amount = int(words[0], 16) if words else 0
+    cost_basis = int(words[1], 16) if len(words) > 1 else 0
+    value_units = 0
+    if amount > 0:
+        try:
+            value_units = _privy_quote(cfg, token, cfg["usdc"], amount, fee=int(route["fee"]))
+        except Exception:
+            value_units = 0
+    return {"amount": amount, "costBasisUnits": cost_basis, "valueUnits": value_units,
+            "valueUsd": value_units / 1_000_000.0, "costBasisUsd": cost_basis / 1_000_000.0}
+
+
+def _nkr_live_market_regime(rows: list[dict]) -> tuple[str, float]:
+    changes = [_nkr_row_change_pct(r) for r in rows if _nkr_row_price_usd(r) > 0]
+    avg = sum(changes) / len(changes) if changes else 0.0
+    return ("GREEN" if avg >= 1.0 else "RED" if avg <= -1.0 else "NEUTRAL", avg)
+
+
+def _nkr_observation_minutes(value) -> int:
+    text = str(value or "1h").strip().lower()
+    mapping = {"15m": 15, "1h": 60, "4h": 240, "12h": 720, "24h": 1440}
+    if text in mapping:
+        return mapping[text]
+    try:
+        return max(15, min(1440, int(float(text))))
+    except Exception:
+        return 60
+
+
+def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: float, settings: dict) -> dict:
+    row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
+    max_active = max(1, min(50, int(_safe_float(settings.get("maxActiveAssets"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT))))
+    threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    ranked = []
+    for sym, route in routes.items():
+        row = row_by_symbol.get(sym)
+        if not isinstance(row, dict):
+            continue
+        price = _nkr_row_price_usd(row); change = _nkr_row_change_pct(row)
+        score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
+        if price > 0 and score >= threshold and change > -4.0:
+            ranked.append({"symbol": sym, "score": score, "change": change, "price": price, "route": route})
+    ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    if ranked:
+        cut = max(threshold, ranked[0]["score"] - 14.0)
+        selected = [x for x in ranked if x["score"] >= cut][:max_active]
+    else:
+        selected = []
+    regime, avg_change = _nkr_live_market_regime(market_rows)
+    best_score = selected[0]["score"] if selected else 0.0
+    release = _nkr_capital_release_decision(
+        market_regime=regime, performance=mode,
+        observation_minutes=_nkr_observation_minutes(settings.get("nkrObservationWindow")),
+        recovery_score=max(0.0, min(100.0, 50.0 + avg_change * 8.0)),
+        momentum_score=max(-5.0, min(5.0, avg_change)), opportunity_score=best_score,
+        capital_usd=budget_usd,
+    )
+    invest_usd = min(budget_usd, max(0.0, _safe_float(release.get("releaseUsd"), 0.0)))
+    targets = {}
+    if selected and invest_usd >= _NKR_LIVE_MIN_REBALANCE_USD:
+        powers = [max(1.0, (x["score"] - threshold + 8.0) ** 2) for x in selected]
+        total_power = sum(powers)
+        max_weight = max(35.0, min(90.0, _safe_float(settings.get("maxCapitalPerAssetPct"), 80.0))) / 100.0
+        remaining = invest_usd
+        pending = list(zip(selected, powers))
+        # Capped weighted water-fill; permits concentration such as 70/30 while
+        # preventing one weakly differentiated candidate from consuming everything.
+        while pending and remaining > 0.005:
+            power_sum = sum(p for _, p in pending)
+            next_pending = []
+            spent = 0.0
+            for item, power in pending:
+                proposed = remaining * power / power_sum if power_sum > 0 else remaining / len(pending)
+                cap = invest_usd * max_weight
+                already = targets.get(item["symbol"], 0.0)
+                add = min(proposed, max(0.0, cap - already))
+                targets[item["symbol"]] = already + add; spent += add
+                if targets[item["symbol"]] + 0.005 < cap:
+                    next_pending.append((item, power))
+            if spent <= 0.005:
+                break
+            remaining -= spent
+            pending = next_pending
+        if remaining > 0.005:
+            targets[selected[0]["symbol"]] = targets.get(selected[0]["symbol"], 0.0) + remaining
+    return {"mode": mode, "regime": regime, "avgChange": avg_change, "maxActiveAssets": max_active,
+            "selected": selected, "targetsUsd": targets, "investUsd": invest_usd,
+            "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release}
+
+
+def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
+                          amount_in: int, *, action: str) -> dict:
+    cfg = _privy_trading_cfg(); sid = int(str(live_row.get("onchain_session_id") or "0"))
+    wallet_id = str(live_row.get("privy_wallet_id") or "").strip(); vault = _norm_addr(live_row.get("vault_address") or "")
+    fee = int(route["fee"]); router = _norm_addr(route.get("router") or cfg["router"])
+    router_cfg = _read_router_config(vault, router)
+    if not router_cfg.get("enabled"):
+        raise RuntimeError(f"live_router_not_enabled:{route['symbol']}")
+    if not _read_router_selector_allowed(vault, router, _PRIVY_EXACT_INPUT_SINGLE_SELECTOR):
+        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}")
+    quote = _privy_quote(cfg, token_in, token_out, amount_in, fee=fee)
+    min_out = quote * (10_000 - int(cfg["slippageBps"])) // 10_000
+    deadline = now_ts() + 300
+    router_data = _privy_exact_input_single_data(token_in, token_out, vault, amount_in, min_out, fee)
+    call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
+    ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
+    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
+    txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
+    return {"txHash": txh, "quoteOut": quote, "minOut": min_out}
+
+
+def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapshots: dict, market_rows: list[dict], plan: dict) -> None:
+    sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    sid = str(live_row.get("onchain_session_id") or ""); master_id = f"NKR-LIVE-{sid}"; nowi = _nkr_now_ms()
+    row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
+    kept = []
+    previous_children = {}
+    for src in sessions:
+        if not isinstance(src, dict):
+            continue
+        meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+        if str(meta.get("parent_nkr_session_id") or "") == master_id:
+            previous_children[str(src.get("symbol") or src.get("targetAsset") or "").upper()] = dict(src)
+            continue  # rebuild active child cards; closed assets disappear immediately
+        row = dict(src)
+        if str(row.get("id") or row.get("session_id") or "") == master_id:
+            row["strategistReserveUsd"] = round(plan.get("reserveUsd", 0.0), 4)
+            row["investedUsd"] = round(sum(v.get("valueUsd", 0.0) for v in snapshots.values()), 4)
+            row["maxActiveAssets"] = int(plan.get("maxActiveAssets") or 1)
+            row["activeAssetCount"] = sum(1 for v in snapshots.values() if v.get("amount", 0) > 0)
+            row["positionState"] = "PORTFOLIO_ACTIVE" if row["activeAssetCount"] else "WAITING"
+            row["updatedAt"] = nowi
+        kept.append(row)
+    for sym, snap in snapshots.items():
+        if int(snap.get("amount") or 0) <= 0:
+            continue
+        route = routes[sym]; mrow = row_by_symbol.get(sym) or {}; price = _nkr_row_price_usd(mrow)
+        cost = _safe_float(snap.get("costBasisUsd"), 0.0); value = _safe_float(snap.get("valueUsd"), 0.0)
+        gross = value - cost; costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, 1).get("totalCostUsd"), 0.0); net = gross - costs
+        cid = f"{master_id}-{sym}"
+        previous = previous_children.get(sym) or {}
+        prior_meta = dict(previous.get("meta") if isinstance(previous.get("meta"), dict) else {})
+        metric = (plan.get("metrics") or {}).get(sym) or {}
+        prior_meta.update({"nkr_session": True, "nkr_asset_session": True, "parent_nkr_session_id": master_id,
+                     "onchain_session_id": sid, "token_address": route["token"], "token_decimals": route.get("decimals", 18),
+                     "pool_fee": route.get("fee"), "router_address": route.get("router"), "position_state": "OPEN",
+                     "execution_mode": "live", "visible_in_active_sessions": True,
+                     "nkr_peak_net_profit_usd": metric.get("peakNetUsd", prior_meta.get("nkr_peak_net_profit_usd", 0)),
+                     "nkr_peak_net_profit_pct": metric.get("peakNetPct", prior_meta.get("nkr_peak_net_profit_pct", 0)),
+                     "nkr_peak_drawdown_pct": metric.get("peakDrawdownPct", 0),
+                     "nkr_target_allocation_usd": (plan.get("targetsUsd") or {}).get(sym, 0)})
+        card = dict(previous)
+        card.update({"id": cid, "session_id": cid, "type": "NKR_ASSET", "engineType": "NKR",
+            "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "OPEN", "active": True,
+            "visibleInActiveSessions": True, "executionMode": "live", "targetAsset": sym, "symbol": sym,
+            "budgetUsd": cost, "workingCapitalUsd": cost, "investedUsd": value, "positionValueUsd": value,
+            "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
+            "currentPriceUsd": price, "score": _nkr_session_score({}, mrow), "updatedAt": nowi,
+            "createdAt": previous.get("createdAt") or nowi, "meta": prior_meta})
+        kept.append(card)
+    _db_set_rotation_sessions(wallet, kept, active_session_id=active_id or master_id, replace_missing=True)
+
+
+def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dict:
+    cfg = _privy_trading_cfg(); routes = _nkr_live_eth_route_registry(cfg)
+    executed = []; vault = _norm_addr(row.get("vault_address") or "")
+    for sym, route in routes.items():
+        amount = _position_amount(vault, session_id, route["token"])
+        if amount <= 0:
+            continue
+        result = _nkr_live_trade_route(wallet, row, route, route["token"], cfg["usdc"], amount, action="EXIT")
+        if _position_amount(vault, session_id, route["token"]) != 0:
+            raise RuntimeError(f"position_not_zero_after_exit:{sym}")
+        executed.append({"asset": sym, **result, "amountIn": amount})
+    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(session_id)); words = _core_words(raw)
+    open_assets = int(words[12]) if len(words) >= 13 else -1
+    if open_assets != 0:
+        raise RuntimeError(f"unmapped_open_assets_after_orderly_exit:{open_assets}")
+    return {"executed": bool(executed), "trades": executed,
+            "txHash": str(executed[-1].get("txHash") if executed else ""), "amountIn": sum(int(x.get("amountIn") or 0) for x in executed), "amountOut": 0}
+
+
+def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
+    cfg = _privy_trading_cfg(); sid = int(str(live_row.get("onchain_session_id") or "0")); vault = _norm_addr(live_row.get("vault_address") or "")
+    if int(live_row.get("chain_id") or 1) != 1:
+        return {"executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_EXECUTABLE", "detail": "This portfolio executor is bound to the Ethereum CoreVault."}
+    if not cfg.get("liveEnabled"):
+        raise RuntimeError("live_execution_env_disabled")
+    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
+    if len(words) < 13:
+        raise RuntimeError("session_decode_failed")
+    if int(words[3]) != 1:
+        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {int(words[3])}."}
+    settlement_cash = int(words[9]); budget_usd = int(str(live_row.get("budget_units") or words[8] or "0")) / 1_000_000.0
+    routes = _nkr_live_eth_route_registry(cfg)
+    snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
+    plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
+    targets = dict(plan["targetsUsd"])
+    # Preserve Build223's scale-adaptive, cost-aware trailing protection in the
+    # direct live portfolio path. Peaks are stored on each active asset card.
+    sessions_now, _, _ = _db_get_rotation_sessions(wallet)
+    master_id = f"NKR-LIVE-{sid}"
+    previous_meta = {}
+    for sess in sessions_now:
+        if not isinstance(sess, dict):
+            continue
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        if str(meta.get("parent_nkr_session_id") or "") == master_id:
+            previous_meta[str(sess.get("symbol") or sess.get("targetAsset") or "").upper()] = meta
+    row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
+    profit_lock = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}.get(mode, 2.0)
+    activation = {"AGGRESSIVE": 0.80, "DYNAMIC": 0.65, "TACTICAL": 0.50, "DEFENSIVE": 0.40}.get(mode, 0.65)
+    trail_base = {"AGGRESSIVE": 0.55, "DYNAMIC": 0.40, "TACTICAL": 0.30, "DEFENSIVE": 0.22}.get(mode, 0.40)
+    cost_multiple = {"AGGRESSIVE": 1.75, "DYNAMIC": 2.0, "TACTICAL": 2.25, "DEFENSIVE": 2.5}.get(mode, 2.0)
+    metrics = {}; forced_exits = {}
+    for sym, snap in snapshots.items():
+        if snap["amount"] <= 0:
+            continue
+        value = snap["valueUsd"]; cost = snap["costBasisUsd"]; gross = value - cost
+        price = _nkr_row_price_usd(row_by_symbol.get(sym) or {})
+        exit_costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, 1).get("totalCostUsd"), 0.0)
+        net = gross - exit_costs; net_pct = (net / cost * 100.0) if cost > 0 else 0.0
+        pm = previous_meta.get(sym) or {}
+        peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net)
+        peak_pct = max(_safe_float(pm.get("nkr_peak_net_profit_pct"), 0.0), net_pct)
+        drawdown = max(0.0, peak_pct - net_pct)
+        min_protected = max(0.01, exit_costs * cost_multiple, cost * activation / 100.0)
+        protected = peak_pct >= activation and peak_net >= min_protected
+        adaptive_trail = trail_base * (0.60 if peak_pct >= profit_lock * 2 else 0.78 if peak_pct >= profit_lock else 1.0)
+        adaptive_trail = max(0.12, adaptive_trail)
+        change = _nkr_row_change_pct(row_by_symbol.get(sym) or {})
+        full_lock = net > 0 and net_pct >= profit_lock and net >= min_protected
+        trailing = protected and net > 0 and drawdown >= adaptive_trail
+        reversal = protected and net > 0 and change <= -0.35 and drawdown >= max(0.12, adaptive_trail * 0.55)
+        metrics[sym] = {"netUsd": net, "netPct": net_pct, "peakNetUsd": peak_net,
+                        "peakNetPct": peak_pct, "peakDrawdownPct": drawdown, "exitCostsUsd": exit_costs}
+        if full_lock or trailing or reversal:
+            targets[sym] = 0.0
+            forced_exits[sym] = "target_profit_lock" if full_lock else "peak_profit_trailing_protection" if trailing else "profit_momentum_reversal"
+    plan["targetsUsd"] = targets; plan["metrics"] = metrics; plan["forcedExits"] = forced_exits
+    actions = []
+    for sym, snap in snapshots.items():
+        current = snap["valueUsd"]; target = targets.get(sym, 0.0); delta = target - current
+        if current >= _NKR_LIVE_MIN_REBALANCE_USD and target < _NKR_LIVE_MIN_REBALANCE_USD:
+            actions.append((0, abs(delta), "CLOSE", sym, snap["amount"]))
+        elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
+            fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
+            actions.append((1, abs(delta), "REDUCE", sym, amount))
+        elif delta > _NKR_LIVE_MIN_REBALANCE_USD and settlement_cash >= int(_NKR_LIVE_MIN_REBALANCE_USD * 1_000_000):
+            actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(settlement_cash, int(delta * 1_000_000))))
+    actions.sort(key=lambda x: (x[0], -x[1]))
+    execution = None
+    for _, delta, action, sym, amount in actions:
+        key = (_norm_addr(wallet), sid, sym); last = _NKR_LIVE_LAST_ASSET_TRADE_TS.get(key, 0)
+        if int(time.time()) - last < _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC:
+            continue
+        route = routes[sym]
+        if action in {"CLOSE", "REDUCE"}:
+            result = _nkr_live_trade_route(wallet, live_row, route, route["token"], cfg["usdc"], int(amount), action=action)
+        else:
+            result = _nkr_live_trade_route(wallet, live_row, route, cfg["usdc"], route["token"], int(amount), action=action)
+        _NKR_LIVE_LAST_ASSET_TRADE_TS[key] = int(time.time())
+        reason = (plan.get("forcedExits") or {}).get(sym, "portfolio_target_rebalance")
+        execution = {"executed": True, "decision": action, "gate": "ONCHAIN_CONFIRMED", "asset": sym,
+                     "detail": f"{action} {sym} confirmed for approximately ${delta:.2f} target delta ({reason}).", **result}
+        break
+    # Re-read every position after mutation and build one active card per asset.
+    snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
+    _nkr_sync_live_asset_cards(wallet, live_row, routes, snapshots, market_rows, plan)
+    if execution:
+        return execution | {"plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
+    active = [sym for sym, snap in snapshots.items() if snap["amount"] > 0]
+    return {"executed": False, "decision": "HOLD" if active else "WAIT", "gate": "PORTFOLIO_BALANCED" if active else "WAITING_ENTRY",
+            "asset": active[0] if active else (plan["selected"][0]["symbol"] if plan["selected"] else ""),
+            "detail": f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve.",
+            "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
+
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
     """Execute the already configured USDC/WETH CoreVault route for NKR.
 
@@ -32726,10 +33078,13 @@ def _nkr_live_worker_cycle() -> None:
                 "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"),
                 "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
                 "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0),
+                "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)),
+                "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", 80),
             }
-            processed, summary = _nkr_backend_process_executor_tick(
-                nkr_sessions, market_rows=market_rows, settings=settings
-            )
+            # ENGINE-224: the production worker does not call the Shadow/backend
+            # simulator. Local rows remain the UI/control projection of on-chain state.
+            processed = list(nkr_sessions)
+            summary = {"mode": "LIVE_PORTFOLIO", "sessions": len(processed)}
             diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
 
             # Process every registry session rather than silently using active_rows[0].
@@ -32739,8 +33094,8 @@ def _nkr_live_worker_cycle() -> None:
             for live_row in runnable_rows:
                 decision_session = _nkr_processed_session_for_live_row(processed, live_row)
                 with _NKR_LIVE_TRADE_LOCK:
-                    execution = _nkr_live_execute_existing_eth_route(
-                        wallet, live_row, market_rows, settings, decision_session=decision_session
+                    execution = _nkr_live_execute_portfolio(
+                        wallet, live_row, market_rows, settings
                     )
                 _nkr_confirm_processed_live_exit(processed, live_row, execution)
                 executions.append((live_row, execution))
@@ -32760,7 +33115,9 @@ def _nkr_live_worker_cycle() -> None:
                     finally:
                         conn.close()
 
-            _db_set_rotation_sessions(wallet, processed, active_session_id=active_id, replace_missing=False)
+            # ENGINE-224: _nkr_live_execute_portfolio already persisted the
+            # authoritative master/asset-card projection after its final on-chain read.
+            # Never overwrite it with the stale pre-execution snapshot.
 
             # ENGINE-213: the executor synchronizes the live on-chain position before this
             # processed-session batch is persisted.  The batch was calculated from the
@@ -32769,6 +33126,8 @@ def _nkr_live_worker_cycle() -> None:
             # CoreVault amount and current market price after the batch write so the UI
             # receives a moving live value on every completed worker cycle.
             for live_row, execution_row in executions:
+                if True:  # ENGINE-224 portfolio executor already synchronized every configured asset
+                    continue
                 if str(execution_row.get("gate") or "").upper() != "POSITION_ACTIVE":
                     continue
                 if int(live_row.get("chain_id") or 1) != 1:
