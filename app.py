@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-226-NKR-BACKEND-SOURCE-OF-TRUTH-ALCHEMY-RPC"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-227-TRADER-VAULT-FIRST-CONTROL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1870,12 +1870,19 @@ def api_core_vault_create_system_session_auto():
     duration_sec = duration_hours * 3600
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
-    amount_units = int(round(amount_usd * 1_000_000))
+    chain_key = str(body.get("chain") or "ETH").upper().strip()
+    if chain_key != "ETH":
+        return jsonify({"status": "blocked", "error": "core_vault_chain_not_live", "chain": chain_key}), 409
+    settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
+    settlement_map = {"USDC": _USDC_BY_CHAIN.get(1), "USDT": _USDT_BY_CHAIN.get(1)}
+    settlement_token = _norm_addr(settlement_map.get(settlement_symbol) or "")
+    decimals = 6 if settlement_symbol in ("USDC", "USDT") else 18
+    amount_units = int(round(amount_usd * (10 ** decimals)))
 
     vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
-    usdc = _norm_addr(_USDC_BY_CHAIN.get(1) or cfg.get("usdc") or "")
+    usdc = settlement_token
     if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
-        return jsonify({"status": "error", "error": "ethereum_core_vault_not_configured"}), 409
+        return jsonify({"status": "error", "error": "ethereum_core_vault_or_settlement_not_configured", "settlementAsset": settlement_symbol}), 409
 
     try:
         free_words = _core_vault_words(_core_vault_call(1, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, usdc))
@@ -1887,8 +1894,8 @@ def api_core_vault_create_system_session_auto():
         return jsonify({
             "status": "blocked",
             "error": "insufficient_free_vault_budget",
-            "requestedUsd": round(amount_units / 1_000_000.0, 6),
-            "availableUsd": round(free_units / 1_000_000.0, 6),
+            "requestedUsd": round(amount_units / float(10 ** decimals), 6),
+            "availableUsd": round(free_units / float(10 ** decimals), 6),
         }), 409
 
     try:
@@ -1914,7 +1921,9 @@ def api_core_vault_create_system_session_auto():
             "system": system_name,
             "sessionId": session_id,
             "txHash": sent.get("hash"),
-            "budgetUsd": round(amount_units / 1_000_000.0, 6),
+            "budgetUsd": round(amount_units / float(10 ** decimals), 6),
+            "settlementAsset": settlement_symbol,
+            "settlementToken": settlement_token,
             "durationHours": duration_hours,
             "maxSlippageBps": slippage_bps,
             "maxLossBps": max_loss_bps,
@@ -16758,6 +16767,40 @@ def api_nexus_core_vault_accounting():
         return err("wallet required", 401)
     accounting = _shadow_core_vault_accounting(wa)
     return jsonify({"status": "ok", "accounting": accounting, **accounting, "ts": now_ts()})
+
+
+@app.route("/api/nexus/trading/control", methods=["POST"])
+def api_nexus_trading_control():
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "").lower().strip()
+    session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
+    if action not in ("start", "pause", "resume", "stop"):
+        return err("unsupported trader control action", 400)
+    if not session_id:
+        return err("session_id required", 400)
+    status_map = {"start": "ACTIVE", "resume": "ACTIVE", "pause": "PAUSED", "stop": "STOPPING"}
+    with DB_WRITE_LOCK:
+        conn = _db()
+        cur = conn.cursor()
+        now = now_ts()
+        cur.execute("""
+            UPDATE nexus_execution_queue
+               SET state=?, updated_ts=?
+             WHERE wallet_address=? AND (session_id=? OR trade_session_id=?)
+        """, (status_map[action], now, wa, session_id, session_id))
+        affected = cur.rowcount
+        conn.commit()
+        execution = _nexus_execution_summary(cur, wa)
+        conn.close()
+    return jsonify({
+        "status": "ok", "wallet": wa, "action": action,
+        "session_id": session_id, "runtime_status": status_map[action],
+        "affected_queue_rows": affected, "execution": execution,
+        "backend_is_state_master": True, "ts": now_ts(),
+    })
 
 
 @app.route("/api/nexus/trading/state", methods=["GET"])
