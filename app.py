@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-222-NKR-TARGETED-EXIT-TX-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.28-ENGINE-223-NKR-SCALE-ADAPTIVE-TRAILING-EXIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.27-ENGINE-206-NKR-REQUEST-DRIVEN-WATCHDOG-LIVE-VALUE"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34026,8 +34026,17 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
     min_score_by_mode = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
+    # ENGINE-223: all exit thresholds are percentage- and cost-based so the same
+    # Strategist logic works for tiny live tests and large production allocations.
+    # No fixed $50/$5 profit gates are allowed in the live decision path.
+    trailing_activation_by_mode = {"AGGRESSIVE": 0.80, "DYNAMIC": 0.65, "TACTICAL": 0.50, "DEFENSIVE": 0.40}
+    trailing_drawdown_by_mode = {"AGGRESSIVE": 0.55, "DYNAMIC": 0.40, "TACTICAL": 0.30, "DEFENSIVE": 0.22}
+    cost_cover_multiple_by_mode = {"AGGRESSIVE": 1.75, "DYNAMIC": 2.00, "TACTICAL": 2.25, "DEFENSIVE": 2.50}
     dispatch_min = min_score_by_mode.get(mode, 62.0)
     profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
+    trailing_activation_pct = trailing_activation_by_mode.get(mode, 0.65)
+    trailing_drawdown_pct = trailing_drawdown_by_mode.get(mode, 0.40)
+    cost_cover_multiple = cost_cover_multiple_by_mode.get(mode, 2.0)
     total_budget = _safe_float(settings.get("totalNkrBudgetUsd") or settings.get("nkrBudgetUsd") or 0, 0.0)
     active = []
     changed = False
@@ -34093,13 +34102,54 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         executable = approved and has_open_trade
         last_close = _safe_float(meta.get("nkr_last_profit_close_ts") or 0, 0.0)
         cooldown_ok = (not last_close) or (nowi - last_close >= 20 * 60 * 1000)
-        min_collect = max(5.0, min(25.0, budget * 0.0025))
-        full_lock = executable and net_pct >= profit_lock_pct and net >= max(50.0, budget * (profit_lock_pct / 100.0))
-        net_collect = executable and cooldown_ok and net >= min_collect and net_pct >= 0.25
-        closes = bool(full_lock or net_collect)
+
+        # Scale-adaptive profit protection. Store the best NET result, not gross,
+        # because gas/DEX costs matter proportionally more on small positions.
+        previous_peak_net = max(0.0, _safe_float(meta.get("nkr_peak_net_profit_usd") or 0.0, 0.0))
+        previous_peak_pct = max(0.0, _safe_float(meta.get("nkr_peak_net_profit_pct") or 0.0, 0.0))
+        peak_net = max(previous_peak_net, net if executable else 0.0)
+        peak_net_pct = max(previous_peak_pct, net_pct if executable else 0.0)
+        peak_drawdown_usd = max(0.0, peak_net - net) if executable else 0.0
+        peak_drawdown_pct = max(0.0, peak_net_pct - net_pct) if executable else 0.0
+
+        # Minimum protected profit scales with both position size and actual costs.
+        # The tiny absolute floor only avoids dust/noise; it never dominates a
+        # normal or large allocation.
+        min_protected_profit_usd = max(0.01, costs * cost_cover_multiple, budget * (trailing_activation_pct / 100.0))
+        profit_protection_active = bool(
+            executable and peak_net > 0 and peak_net_pct >= trailing_activation_pct
+            and peak_net >= min_protected_profit_usd
+        )
+
+        # Once a larger peak is reached, tighten protection gradually. This keeps
+        # winners alive but prevents a strong gain from round-tripping to a loss.
+        adaptive_trail_pct = trailing_drawdown_pct
+        if peak_net_pct >= profit_lock_pct * 2.0:
+            adaptive_trail_pct *= 0.60
+        elif peak_net_pct >= profit_lock_pct:
+            adaptive_trail_pct *= 0.78
+        adaptive_trail_pct = max(0.12, adaptive_trail_pct)
+
+        full_lock = bool(
+            executable and cooldown_ok and net > 0
+            and net_pct >= profit_lock_pct
+            and net >= min_protected_profit_usd
+        )
+        trailing_exit = bool(
+            profit_protection_active and cooldown_ok and net > 0
+            and peak_drawdown_pct >= adaptive_trail_pct
+        )
+        # A clear momentum reversal may secure profit sooner, but only after the
+        # cost-aware protection activation has been reached.
+        momentum_reversal_exit = bool(
+            profit_protection_active and cooldown_ok and net > 0
+            and change <= -0.35 and peak_drawdown_pct >= max(0.12, adaptive_trail_pct * 0.55)
+        )
+        closes = bool(full_lock or trailing_exit or momentum_reversal_exit)
         opens_new_trade = bool(approved and not has_open_trade)
         if closes:
-            ev_status, action, pos_state, reason = "CLOSED_PROFIT", "CLOSED_PROFIT", "CLOSED_PROFIT", "backend_real_price_pnl_secured_after_costs"
+            close_reason = "target_profit_lock" if full_lock else ("peak_profit_trailing_protection" if trailing_exit else "profit_momentum_reversal")
+            ev_status, action, pos_state, reason = "CLOSED_PROFIT", "CLOSED_PROFIT", "CLOSED_PROFIT", close_reason
         elif executable:
             ev_status, action, pos_state, reason = "POSITION_TRACKING", "EXECUTOR_ACTIVE", "OPEN", "backend_real_price_pnl_tracking"
         elif opens_new_trade:
@@ -34211,7 +34261,16 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
             "nkr_executor_net_positive": bool(executable),
             "nkr_cost_model": "backend_aligned_shadow_trader_cost_cap_0_05pct",
             "nkr_last_profit_close_ts": nowi if closes else last_close,
-            "nkr_profit_close_reason": "full_profit_lock" if full_lock else ("net_profit_after_costs" if net_collect else next_meta.get("nkr_profit_close_reason", "")),
+            "nkr_profit_close_reason": ("target_profit_lock" if full_lock else ("peak_profit_trailing_protection" if trailing_exit else ("profit_momentum_reversal" if momentum_reversal_exit else next_meta.get("nkr_profit_close_reason", "")))),
+            "nkr_peak_net_profit_usd": round(0.0 if closes else peak_net, 6),
+            "nkr_peak_net_profit_pct": round(0.0 if closes else peak_net_pct, 6),
+            "nkr_peak_drawdown_usd": round(peak_drawdown_usd, 6),
+            "nkr_peak_drawdown_pct": round(peak_drawdown_pct, 6),
+            "nkr_profit_protection_active": bool(profit_protection_active and not closes),
+            "nkr_trailing_activation_pct": round(trailing_activation_pct, 4),
+            "nkr_trailing_drawdown_pct": round(adaptive_trail_pct, 4),
+            "nkr_min_protected_profit_usd": round(min_protected_profit_usd, 6),
+            "nkr_cost_cover_multiple": round(cost_cover_multiple, 4),
             "raw_edge_pct": round(raw_edge_pct, 4),
             "price_pnl_pct": round(price_pnl_pct, 4),
             "net_edge_pct": round(net_pct, 4),
@@ -34297,6 +34356,10 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         "campaignExpiresAt": int((campaign_clock or {}).get("expiresAt") or 0),
         "runtimeSource": "NKR_PERIOD_DAYS_ONLY",
         "profitLockPct": profit_lock_pct,
+        "trailingActivationPct": trailing_activation_pct,
+        "trailingDrawdownPct": trailing_drawdown_pct,
+        "costCoverMultiple": cost_cover_multiple,
+        "exitSizingMode": "SCALE_ADAPTIVE_PERCENT_AND_COST_BASED",
         "aggressiveReallocation": reallocation_summary,
         "watchlistGreenPromotion": promotion_summary if 'promotion_summary' in locals() else {"changed": False},
         "availableCapitalDeployment": deploy_summary if 'deploy_summary' in locals() else {"changed": False},
