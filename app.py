@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-230-V5-NATIVE-SETTLEMENT"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD268-V5-NATIVE-SETTLEMENT"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-231-V5-ALL-WITHDRAW-PATHS"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD273-V5-ALL-WITHDRAW-PATHS"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -14045,7 +14045,7 @@ def _profit_payout_settings_for_wallet(wallet_address: str) -> dict:
     except Exception:
         secured_profit_usd = 0.0
     asset = str(ui.get("profitPayoutAsset") or "USDT").strip().upper()
-    if asset not in {"USDT", "USDC"}:
+    if asset not in {"USDT", "USDC", "ETH", "BNB", "POL"}:
         asset = "USDT"
     enabled = bool(ui.get("profitPayoutEnabled", False)) and schedule != "MANUAL_ONLY"
     last_ts = int(ui.get("profitPayoutLastTs") or 0)
@@ -14106,7 +14106,7 @@ def api_vault_profit_payout_settings():
         except Exception:
             return err("invalid payout amount setting", 400)
         asset = str(body.get("asset") or "USDT").strip().upper()
-        if asset not in {"USDT", "USDC"}:
+        if asset not in {"USDT", "USDC", "ETH", "BNB", "POL"}:
             return err("unsupported payout asset", 400)
         enabled = bool(body.get("enabled", False)) and schedule != "MANUAL_ONLY"
         _db_set_user_app_state(wa, {"ui": {
@@ -14125,7 +14125,7 @@ def api_vault_profit_payout_settings():
         "status": "ok",
         "settings": settings,
         **settings,
-        "note": "Payout scheduling is stored wallet-by-wallet. On-chain automatic execution stays disabled until the audited Core Vault contracts and ABI are connected.",
+        "note": "Payout scheduling is stored wallet-by-wallet. V5 payout preferences support ERC20 and native settlement assets. Automatic execution remains disabled until a separate audited scheduler signs the on-chain withdrawProfit calls.",
         "ts": int(time.time()),
     })
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -16632,6 +16632,8 @@ _CORE_VAULT_SELECTORS = {
     "withdrawNative": "0xb8ca8dd8",
     "paySubscriptionNative": "0xbf07d24a",
     "subscriptionPrice": "0x59bcb422",
+    "withdrawBase": "0xad151a50",
+    "withdrawProfit": "0x1cd9ca8d",
 }
 
 
@@ -16904,6 +16906,99 @@ def api_core_vault_native_prepare_transaction():
         return jsonify({"status":"error","error":str(exc),"chain":chain_key,"chainId":chain_id}), 400
     except Exception as exc:
         return jsonify({"status":"error","error":"native_v5_rpc_or_decode_failed","detail":str(exc)}), 502
+
+
+
+def _vault_asset_spec_for_chain(chain_id: int, symbol: str) -> tuple[str, int, bool]:
+    sym = str(symbol or "").strip().upper()
+    native_symbol = str(_NATIVE_SYMBOL_BY_CHAIN.get(chain_id) or "NATIVE").upper()
+    if sym in {"NATIVE", native_symbol}:
+        return NEXUS_NATIVE_TOKEN, int(_NATIVE_DECIMALS_BY_CHAIN.get(chain_id) or 18), True
+    if sym == "USDC":
+        return _norm_addr(_USDC_BY_CHAIN.get(chain_id) or ""), 6, False
+    if sym == "USDT":
+        return _norm_addr(_USDT_BY_CHAIN.get(chain_id) or ""), 6, False
+    raise ValueError("unsupported_vault_asset")
+
+
+def _parse_asset_units(value, decimals: int) -> int:
+    return _parse_native_units(value, decimals)
+
+
+@app.post("/api/nexus/core-vault/withdraw/prepare-transaction")
+def api_core_vault_withdraw_prepare_transaction():
+    """Prepare every user-signed V5 withdrawal path without broadcasting.
+
+    BASE_CAPITAL maps to withdrawNative or withdrawBase. SECURED_PROFIT maps
+    to withdrawProfit for NKR, TRADER or GRID and also supports the native coin.
+    Executor actions never use this endpoint and are never stored as Privy wallet
+    transactions.
+    """
+    authenticated_wallet = _require_auth()
+    if not authenticated_wallet:
+        return err("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    wallet = _norm_addr(body.get("wallet") or body.get("walletAddress") or authenticated_wallet)
+    if not _looks_like_evm_addr(wallet) or wallet.lower() != _norm_addr(authenticated_wallet).lower():
+        return jsonify({"status":"error","error":"wallet_mismatch"}), 403
+    chain_key = _normalize_chain_key(body.get("chain") or "ETH") or "ETH"
+    chain_id = int(_CHAIN_ID_BY_KEY.get(chain_key, 0) or 0)
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or "")
+    if not _looks_like_evm_addr(vault):
+        return jsonify({"status":"error","error":"core_vault_v5_not_configured","chain":chain_key}), 409
+    try:
+        symbol = str(body.get("asset") or body.get("symbol") or "").strip().upper()
+        token_address, fallback_decimals, is_native = _vault_asset_spec_for_chain(chain_id, symbol)
+        cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token_address))
+        acct = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["accountOf"], wallet, token_address))
+        free = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, token_address))
+        cfg += [0] * (10-len(cfg)); acct += [0] * (10-len(acct))
+        decimals = int(cfg[6] or fallback_decimals)
+        if not bool(cfg[0]) or not bool(cfg[2]):
+            raise ValueError("asset_withdraw_not_enabled")
+        amount_units = int(body.get("amountUnits") or 0) or _parse_asset_units(body.get("amount"), decimals)
+        recipient = _norm_addr(body.get("recipient") or wallet)
+        if not _looks_like_evm_addr(recipient):
+            raise ValueError("invalid_recipient")
+        source = str(body.get("source") or "BASE_CAPITAL").strip().upper()
+        system_map = {"NKR":0, "TRADER":1, "GRID":2}
+        tx = {"from":wallet, "to":vault, "value":"0x0", "data":"0x"}
+        available_units = 0
+        system = None
+        if source == "BASE_CAPITAL":
+            available_units = int((free or [0])[0])
+            if amount_units > available_units:
+                raise ValueError("insufficient_free_base")
+            if is_native:
+                tx["data"] = _CORE_VAULT_SELECTORS["withdrawNative"] + _uint_to_32(amount_units) + _addr_to_32(recipient)
+                function_name = "withdrawNative"
+            else:
+                tx["data"] = _CORE_VAULT_SELECTORS["withdrawBase"] + _addr_to_32(token_address) + _uint_to_32(amount_units) + _addr_to_32(recipient)
+                function_name = "withdrawBase"
+        elif source == "SECURED_PROFIT":
+            system = str(body.get("system") or "NKR").strip().upper()
+            if system not in system_map:
+                raise ValueError("invalid_profit_system")
+            available_units = int(acct[{"NKR":1,"TRADER":2,"GRID":3}[system]])
+            if amount_units > available_units:
+                raise ValueError("insufficient_secured_profit")
+            tx["data"] = _CORE_VAULT_SELECTORS["withdrawProfit"] + _addr_to_32(token_address) + _uint_to_32(system_map[system]) + _uint_to_32(amount_units) + _addr_to_32(recipient)
+            function_name = "withdrawProfit"
+        else:
+            raise ValueError("unsupported_withdraw_source")
+        return jsonify({
+            "status":"ok", "vaultVersion":"V5_NATIVE_FINAL", "abiVersion":NEXUS_CORE_VAULT_ABI_VERSION,
+            "chain":chain_key, "chainId":chain_id, "asset":symbol, "token":token_address, "native":is_native,
+            "decimals":decimals, "source":source, "system":system, "amountUnits":str(amount_units),
+            "availableUnits":str(available_units), "recipient":recipient, "function":function_name,
+            "transaction":tx, "signingPath":"DIRECT_USER_PRIVY_WALLET", "recordInPrivyTransactions":True,
+            "executorAction":False, "ts":now_ts(),
+        })
+    except (ValueError, TypeError, OverflowError) as exc:
+        return jsonify({"status":"error","error":str(exc),"chain":chain_key,"chainId":chain_id}), 400
+    except Exception as exc:
+        return jsonify({"status":"error","error":"v5_withdraw_prepare_failed","detail":str(exc)}), 502
+
 
 @app.route("/api/nexus/core-vault/accounting", methods=["GET"])
 def api_nexus_core_vault_accounting():
