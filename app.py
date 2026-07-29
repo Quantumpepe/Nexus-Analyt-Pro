@@ -986,7 +986,15 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
         if open_assets != 0:
             raise RuntimeError(f"open_assets_block_recovery:{open_assets}")
         if raw_status == 4:
-            _recovery_job_write(job_id, job_status="SUCCESS", step=5, step_label="ALREADY_FINALIZED", receipt_status="confirmed")
+            con=_db()
+            try:
+                with DB_WRITE_LOCK:
+                    con.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', updated_ts=?, last_error=NULL WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",(now_ts(),chain_id,vault_addr.lower(),str(sid))); con.commit()
+            finally: con.close()
+            if engine == "NKR":
+                _nkr_set_local_stop_state(wallet,"FINALIZED",f"CoreVault session {sid} already finalized")
+            _live_engine_mark(engine,status="stopped",decision="FINALIZED",gate_status="",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
+            _recovery_job_write(job_id, job_status="SUCCESS", step=5, step_label="ALREADY_FINALIZED", receipt_status="confirmed", last_error="")
             return
         if raw_status in (1,2):
             _recovery_job_write(job_id, step=3, step_label="START_CLOSING_SUBMIT", receipt_status="submitting")
@@ -1002,20 +1010,36 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
         txh=str(sent.get("hash") or "")
         _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
         _privy_wait_receipt(txh,timeout_sec=180)
-        after_raw=_eth_call(int(chain_id),vault_addr,_core_selector("sessionOf(uint256)")+_uint_to_32(sid))
-        after_words=_core_words(after_raw)
-        after_status=int(after_words[3]) if len(after_words)>=4 else -1
-        after_label={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(after_status,f"UNKNOWN_{after_status}")
+        # A confirmed finalize receipt can be visible before the RPC used for sessionOf
+        # has caught up. Poll the authoritative contract state instead of declaring a
+        # false failure while the session is still reported as CLOSING.
+        after_status = -1
+        after_label = "UNKNOWN_-1"
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            after_raw=_eth_call(int(chain_id),vault_addr,_core_selector("sessionOf(uint256)")+_uint_to_32(sid))
+            after_words=_core_words(after_raw)
+            after_status=int(after_words[3]) if len(after_words)>=4 else -1
+            after_label={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(after_status,f"UNKNOWN_{after_status}")
+            _recovery_job_write(job_id,raw_status_id=after_status,status_label=after_label,receipt_status="finalize_confirmed_state_sync",step_label="FINALIZE_STATE_SYNC")
+            if after_status == 4:
+                break
+            time.sleep(3)
         if after_status != 4:
-            raise RuntimeError(f"finalize_receipt_confirmed_but_status_{after_status}")
-        _live_session_register(wallet,engine,wallet_id,vault_addr,sid,txh,int(session_snapshot.get("budgetUnits") or 0),chain_id)
+            # Do not report a reverted transaction when the receipt was confirmed.
+            # Keep the recovery pending so the normal reconciliation can finish it.
+            _recovery_job_write(job_id,job_status="PENDING",step=4,step_label="FINALIZE_CONFIRMED_AWAITING_STATE",receipt_status="confirmed_awaiting_state",last_error="")
+            _live_engine_mark(engine,status="closing",decision="FINALIZE_CONFIRMED_AWAITING_STATE",gate_status="EXIT_PENDING",reason=f"CoreVault session {sid} finalize confirmed; waiting for status sync",pending_tx="",last_error="")
+            return
         con=_db()
         try:
             with DB_WRITE_LOCK:
                 con.execute("UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', finalized_tx_hash=?, updated_ts=?, last_error=NULL WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",(txh,now_ts(),chain_id,vault_addr.lower(),str(sid))); con.commit()
         finally: con.close()
+        if engine == "NKR":
+            _nkr_set_local_stop_state(wallet,"FINALIZED",f"CoreVault session {sid} finalized")
         _recovery_job_write(job_id,raw_status_id=after_status,status_label=after_label,job_status="SUCCESS",step=5,step_label="FINALIZED_CONFIRMED",receipt_status="confirmed",last_error="")
-        _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
+        _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",gate_status="",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
     except Exception as exc:
         msg=str(exc)[:1500]
         _recovery_job_write(job_id,job_status="FAILED",step_label="FAILED",receipt_status="failed",last_error=msg)
