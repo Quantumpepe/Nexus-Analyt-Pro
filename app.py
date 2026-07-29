@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-240-GRID-MANUAL-ORDER-WORKER-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-241-NKR-TRADER-V5-SESSION-START-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1999,6 +1999,14 @@ def api_core_vault_create_system_session_auto():
         return jsonify({
             "status": "blocked",
             "error": "insufficient_free_vault_budget",
+            "system": system_name,
+            "chain": chain_key,
+            "chainId": chain_id,
+            "vault": vault,
+            "settlementToken": settlement_token,
+            "decimals": decimals,
+            "requestedUnits": str(amount_units),
+            "availableUnits": str(free_units),
             "requestedAmount": round(amount_units / float(10 ** decimals), 8),
             "availableAmount": round(free_units / float(10 ** decimals), 8),
             "asset": settlement_symbol,
@@ -2020,6 +2028,18 @@ def api_core_vault_create_system_session_auto():
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
         _live_session_register(wallet, system_name, wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
+        # Start/advertise the matching live engine immediately after the authoritative
+        # on-chain V5 session exists. NKR owns a permanent worker; Trader is consumed
+        # by the existing executor tick path but must no longer remain visually IDLE.
+        if system_name == "NKR":
+            try:
+                _ensure_nkr_live_worker_started()
+            except Exception as worker_exc:
+                _live_engine_mark("NKR", status="error", decision="WORKER_START_FAILED", reason="NKR session created but worker start failed", last_error=str(worker_exc)[:1000])
+                raise
+            _live_engine_mark("NKR", status="running", decision="SESSION_READY", reason=f"V5 session {session_id} registered on chain {chain_id}", active_asset=settlement_symbol, pending_tx="", last_error="")
+        elif system_name == "TRADER":
+            _live_engine_mark("TRADER", status="running", decision="SESSION_READY", reason=f"V5 session {session_id} registered on chain {chain_id}", active_asset=settlement_symbol, pending_tx="", last_error="")
         return jsonify({
             "status": "ok",
             "execution": "server_side_privy",
