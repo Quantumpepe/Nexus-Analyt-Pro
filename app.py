@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-231-V5-ALL-WITHDRAW-PATHS"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD273-V5-ALL-WITHDRAW-PATHS"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-232-V5-BNB-MULTICHAIN"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD278-V5-BNB-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -369,7 +369,7 @@ def _live_engine_mark(engine: str, **patch):
             row["tick_count"] = int(row.get("tick_count") or 0) + 1
         _LIVE_ENGINE_RUNTIME[eng] = row
 
-def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1):
+def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=chain_id):
     _live_engine_tables_init()
     conn = _db()
     nowi = int(time.time())
@@ -1867,8 +1867,12 @@ def api_core_vault_create_system_session_auto():
     if not (amount_usd > 0):
         return jsonify({"status": "error", "error": "positive_budget_required"}), 400
 
-    cfg = _privy_trading_cfg()
-    readiness = _privy_delegated_readiness(wallet)
+    chain_key = str(body.get("chain") or "ETH").upper().strip()
+    chain_id = {"ETH": 1, "BNB": 56, "BSC": 56, "POL": 137, "POLYGON": 137}.get(chain_key)
+    if not chain_id:
+        return jsonify({"status": "blocked", "error": "core_vault_chain_not_supported", "chain": chain_key}), 409
+    cfg = _privy_trading_cfg(chain_id)
+    readiness = _privy_delegated_readiness(wallet, chain_id)
     blockers = list(readiness.get("blockers") or [])
     if blockers:
         return jsonify({
@@ -1886,26 +1890,24 @@ def api_core_vault_create_system_session_auto():
     duration_sec = duration_hours * 3600
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
-    chain_key = str(body.get("chain") or "ETH").upper().strip()
-    if chain_key != "ETH":
-        return jsonify({"status": "blocked", "error": "core_vault_chain_not_live", "chain": chain_key}), 409
     settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
-    settlement_map = {"USDC": _USDC_BY_CHAIN.get(1), "USDT": _USDT_BY_CHAIN.get(1), "ETH": NATIVE_TOKEN_ADDRESS, "NATIVE": NATIVE_TOKEN_ADDRESS}
+    native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, "ETH")
+    settlement_map = {"USDC": _USDC_BY_CHAIN.get(chain_id), "USDT": _USDT_BY_CHAIN.get(chain_id), native_symbol: NATIVE_TOKEN_ADDRESS, "NATIVE": NATIVE_TOKEN_ADDRESS}
     settlement_token = _norm_addr(settlement_map.get(settlement_symbol) or "")
     decimals = 6 if settlement_symbol in ("USDC", "USDT") else 18
-    if settlement_symbol in ("ETH", "NATIVE"):
+    if settlement_symbol in (native_symbol, "NATIVE"):
         raw_native_amount = body.get("budgetAmount") or body.get("amount") or body.get("amountNative") or amount_usd
         amount_units = int(round(float(raw_native_amount) * (10 ** decimals)))
     else:
         amount_units = int(round(amount_usd * (10 ** decimals)))
 
-    vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or cfg.get("vault") or "")
     usdc = settlement_token
     if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
-        return jsonify({"status": "error", "error": "ethereum_core_vault_or_settlement_not_configured", "settlementAsset": settlement_symbol}), 409
+        return jsonify({"status": "error", "error": "core_vault_or_settlement_not_configured", "settlementAsset": settlement_symbol}), 409
 
     try:
-        free_words = _core_vault_words(_core_vault_call(1, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, usdc))
+        free_words = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, usdc))
         free_units = int(free_words[0]) if free_words else 0
     except Exception as exc:
         return jsonify({"status": "error", "error": f"free_base_read_failed:{exc}"}), 502
@@ -1930,7 +1932,7 @@ def api_core_vault_create_system_session_auto():
             settlement_token=settlement_token,
         )
         reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
-        sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference)
+        sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference, chain_id=chain_id)
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
@@ -1940,6 +1942,9 @@ def api_core_vault_create_system_session_auto():
             "execution": "server_side_privy",
             "userApprovalRequired": False,
             "wallet": wallet,
+            "chain": _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, chain_key),
+            "chainId": chain_id,
+            "vault": vault,
             "system": system_name,
             "sessionId": session_id,
             "txHash": sent.get("hash"),
@@ -8352,7 +8357,7 @@ _ROUTER_V3_BY_CHAIN = {
 # Wrapped native token per chain (useful for auto-path building & validation)
 _WNATIVE_BY_CHAIN = {
     1: (os.getenv("WNATIVE_ADDRESS_ETH") or os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").strip(),
-    56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "").strip(),  # WBNB expected
+    56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c").strip(),
     137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "").strip(),  # WMATIC expected
 }
 
@@ -29248,27 +29253,41 @@ def _uint_to_32(value):
     return hex(max(0, int(value or 0)))[2:].rjust(64, "0")
 
 
-def _privy_trading_cfg():
-    v5_vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or "")
+def _privy_trading_cfg(chain_id=1):
+    cid = int(chain_id or 1)
+    if cid not in (1, 56, 137):
+        raise RuntimeError(f"unsupported_live_chain:{cid}")
+    native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(cid, "ETH")
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(cid) or "")
+    router = _norm_addr(_ROUTER_V3_BY_CHAIN.get(cid) or _ROUTER_BY_CHAIN.get(cid) or "")
+    quoter_defaults = {
+        1: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+        56: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+    }
+    quoter = _norm_addr(
+        os.getenv(f"NEXUS_EXECUTOR_QUOTER_{native_symbol}") or
+        os.getenv(f"QUOTER_V3_ADDRESS_{cid}") or quoter_defaults.get(cid, "")
+    )
     return {
         "appId": (os.getenv("PRIVY_APP_ID") or "").strip(),
         "appSecret": (os.getenv("PRIVY_APP_SECRET") or "").strip(),
         "signerId": (os.getenv("PRIVY_TRADING_KEY_QUORUM_ID") or "").strip(),
         "policyId": (os.getenv("PRIVY_TRADING_POLICY_ID") or "").strip(),
         "authorizationKey": (os.getenv("PRIVY_TRADING_AUTHORIZATION_PRIVATE_KEY") or "").strip(),
-        "chainId": 1,
-        "vault": v5_vault,
+        "chainId": cid,
+        "chainKey": native_symbol,
+        "vault": vault,
         "vaultVersion": "V5_NATIVE_FINAL",
-        "nkrLiquidityVault": _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) or ""),
-        "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-        "usdt": _norm_addr(os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"),
-        "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        "nkrLiquidityVault": _norm_addr(_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(cid) or ""),
+        "usdc": _norm_addr(_USDC_BY_CHAIN.get(cid) or ""),
+        "usdt": _norm_addr(_USDT_BY_CHAIN.get(cid) or ""),
+        "weth": _norm_addr(_WNATIVE_BY_CHAIN.get(cid) or ""),
         "native": NATIVE_TOKEN_ADDRESS,
-        "nativeSymbol": "ETH",
+        "nativeSymbol": native_symbol,
         "nativeDecimals": 18,
-        "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or UNISWAP_SWAP_ROUTER_02),
-        "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or UNISWAP_QUOTER_V2),
-        "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
+        "router": router,
+        "quoter": quoter,
+        "poolFee": int(os.getenv(f"NEXUS_EXECUTOR_POOL_FEE_{native_symbol}", "500")),
         "slippageBps": max(1, min(500, int(os.getenv("NEXUS_EXECUTOR_MAX_SLIPPAGE_BPS", "100")))),
         "holdSec": max(0, min(300, int(os.getenv("NEXUS_EXECUTOR_TEST_HOLD_SEC", "10")))),
         "liveEnabled": _env_bool("NEXUS_LIVE_EXECUTION_ENABLED", False),
@@ -29599,7 +29618,7 @@ def _privy_signer_diagnostics(wallet_address, wallet_id=None):
     return result
 
 
-def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id=""):
+def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id="", chain_id=1):
     # Privy accepts at most 64 characters for reference_id. Keep the value
     # deterministic so the same operation also keeps the same idempotency key.
     raw_reference = str(reference_id or "").strip()
@@ -29610,13 +29629,13 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     else:
         reference_id = raw_reference
 
-    cfg = _privy_trading_cfg()
+    cfg = _privy_trading_cfg(chain_id)
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
         "method": "eth_sendTransaction",
-        "caip2": "eip155:1",
+        "caip2": f"eip155:{int(chain_id)}",
         "chain_type": "ethereum",
         "params": {"transaction": transaction},
     }
@@ -29673,10 +29692,10 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     return {"hash": tx_hash, "response": data, "idempotencyKey": reference_id}
 
 
-def _privy_wait_receipt(tx_hash, timeout_sec=180):
+def _privy_wait_receipt(tx_hash, timeout_sec=180, chain_id=1):
     end = time.time() + timeout_sec
     while time.time() < end:
-        receipt = _rpc_call(1, "eth_getTransactionReceipt", [tx_hash])
+        receipt = _rpc_call(int(chain_id), "eth_getTransactionReceipt", [tx_hash])
         if receipt:
             status = int(str(receipt.get("status") or "0x0"), 16)
             if status != 1:
@@ -29697,7 +29716,7 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
         raise RuntimeError("quoter_not_configured")
     selector = "0xc6a5026a"
     data = selector + _addr_to_32(token_in) + _addr_to_32(token_out) + _uint_to_32(amount_in) + _uint_to_32(int(fee if fee is not None else cfg["poolFee"])) + _uint_to_32(0)
-    raw = _eth_call(1, cfg["quoter"], data)
+    raw = _eth_call(int(cfg.get("chainId") or 1), cfg["quoter"], data)
     words = _core_vault_words(raw)
     if not words or int(words[0]) <= 0:
         raise RuntimeError("quoter_returned_zero")
@@ -29772,15 +29791,15 @@ def _word_bytes4(word):
     return "0x" + str(word or "")[:8].lower()
 
 
-def _contract_has_code(address):
+def _contract_has_code(address, chain_id=1):
     if not _looks_like_evm_addr(address):
         return False
-    code = str(_rpc_call(1, "eth_getCode", [_norm_addr(address), "latest"]) or "0x")
+    code = str(_rpc_call(int(chain_id), "eth_getCode", [_norm_addr(address), "latest"]) or "0x")
     return code not in ("0x", "0x0", "")
 
 
-def _read_token_config(vault, token):
-    raw = _core_vault_call(1, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token)
+def _read_token_config(vault, token, chain_id=1):
+    raw = _core_vault_call(int(chain_id), vault, _CORE_VAULT_SELECTORS["tokenConfig"], token)
     w = _abi_hex_words(raw)
     if len(w) < 10:
         raise RuntimeError("token_config_decode_failed")
@@ -29798,20 +29817,20 @@ def _read_token_config(vault, token):
     }
 
 
-def _read_router_config(vault, router):
-    raw = _eth_call(1, vault, _PRIVY_ROUTER_CONFIG_SELECTOR + _addr_to_32(router))
+def _read_router_config(vault, router, chain_id=1):
+    raw = _eth_call(int(chain_id), vault, _PRIVY_ROUTER_CONFIG_SELECTOR + _addr_to_32(router))
     w = _abi_hex_words(raw)
     if len(w) < 2:
         raise RuntimeError("router_config_decode_failed")
     return {"enabled": int(w[0], 16) != 0, "oracle": _word_address(w[1])}
 
 
-def _read_router_selector_allowed(vault, router, selector):
+def _read_router_selector_allowed(vault, router, selector, chain_id=1):
     selector_hex = str(selector or "").lower().removeprefix("0x")
     if not re.fullmatch(r"[0-9a-f]{8}", selector_hex):
         raise RuntimeError("invalid_router_selector")
     selector_word = selector_hex + ("0" * 56)
-    raw = _eth_call(1, vault, _PRIVY_ROUTER_SELECTOR_ALLOWED_SELECTOR + _addr_to_32(router) + selector_word)
+    raw = _eth_call(int(chain_id), vault, _PRIVY_ROUTER_SELECTOR_ALLOWED_SELECTOR + _addr_to_32(router) + selector_word)
     w = _abi_hex_words(raw)
     return bool(w and int(w[0], 16) != 0)
 
@@ -29857,19 +29876,19 @@ def _session_id_from_receipt(receipt, vault):
     raise RuntimeError("session_created_event_not_found")
 
 
-def _position_amount(vault, session_id, token):
-    raw = _eth_call(1, vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(session_id) + _addr_to_32(token))
+def _position_amount(vault, session_id, token, chain_id=1):
+    raw = _eth_call(int(chain_id), vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(session_id) + _addr_to_32(token))
     w = _abi_hex_words(raw)
     if len(w) < 2:
         raise RuntimeError("position_decode_failed")
     return int(w[0], 16)
 
 
-def _send_vault_tx(wallet_id, wallet, vault, data, reference):
+def _send_vault_tx(wallet_id, wallet, vault, data, reference, chain_id=1):
     sent = _privy_send_delegated_transaction(wallet_id, {
         "from": _norm_addr(wallet), "to": _norm_addr(vault), "data": data, "value": "0x0"
-    }, reference)
-    receipt = _privy_wait_receipt(sent["hash"])
+    }, reference, chain_id=int(chain_id))
+    receipt = _privy_wait_receipt(sent["hash"], chain_id=int(chain_id))
     return {"hash": sent["hash"], "receipt": receipt}
 
 def _privy_job_write(job_id, wallet, wallet_id, system, amount, status, stage, error="", txs=None):
@@ -29894,8 +29913,8 @@ def _privy_job_rows(wallet, limit=10):
     finally: con.close()
 
 
-def _privy_delegated_readiness(wallet_address):
-    cfg = _privy_trading_cfg()
+def _privy_delegated_readiness(wallet_address, chain_id=1):
+    cfg = _privy_trading_cfg(chain_id)
     user = _norm_addr(wallet_address)
     privy_wallet_id = _privy_wallet_id_for_user(user)
     checks = {
@@ -29921,12 +29940,12 @@ def _privy_delegated_readiness(wallet_address):
         blockers.append("corevault_v5_address_missing")
     else:
         try:
-            paused = bool((_core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+            paused = bool((_core_vault_words(_core_vault_call(int(cfg["chainId"]), cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
             checks["vaultConnected"] = True
             checks["vaultPaused"] = paused
-            usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"])
-            usdt_cfg = _read_token_config(cfg["vault"], cfg["usdt"])
-            native_cfg = _read_token_config(cfg["vault"], NATIVE_TOKEN_ADDRESS)
+            usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"], cfg["chainId"])
+            usdt_cfg = _read_token_config(cfg["vault"], cfg["usdt"], cfg["chainId"])
+            native_cfg = _read_token_config(cfg["vault"], NATIVE_TOKEN_ADDRESS, cfg["chainId"])
             checks.update({
                 "usdcConfigured": usdc_cfg["configured"], "usdcExecutionEnabled": usdc_cfg["executionEnabled"],
                 "usdcSettlementToken": usdc_cfg["settlementToken"], "usdcDecimalsCorrect": usdc_cfg["decimals"] == 6,
@@ -29935,15 +29954,15 @@ def _privy_delegated_readiness(wallet_address):
                 "nativeConfigured": native_cfg["configured"], "nativeExecutionEnabled": native_cfg["executionEnabled"],
                 "nativeSettlementToken": native_cfg["settlementToken"], "nativeDecimalsCorrect": native_cfg["decimals"] == 18,
             })
-            solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
+            solv = _core_vault_words(_core_vault_call(int(cfg["chainId"]), cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
             checks["solvent"] = bool(solv[2])
-            checks["routerHasCode"] = _contract_has_code(cfg["router"])
-            checks["quoterHasCode"] = _contract_has_code(cfg["quoter"])
-            router_cfg = _read_router_config(cfg["vault"], cfg["router"])
+            checks["routerHasCode"] = _contract_has_code(cfg["router"], cfg["chainId"])
+            checks["quoterHasCode"] = _contract_has_code(cfg["quoter"], cfg["chainId"])
+            router_cfg = _read_router_config(cfg["vault"], cfg["router"], cfg["chainId"])
             checks["routerConfig"] = router_cfg
             checks["routerEnabled"] = bool(router_cfg.get("enabled"))
             checks["routerSelectorAllowed"] = _read_router_selector_allowed(
-                cfg["vault"], cfg["router"], _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+                cfg["vault"], cfg["router"], _PRIVY_EXACT_INPUT_SINGLE_SELECTOR, cfg["chainId"]
             )
             if checks["quoterHasCode"]:
                 q1 = _privy_quote(cfg, cfg["usdc"], cfg["weth"], 1_000_000)
@@ -29982,7 +30001,7 @@ def _privy_delegated_readiness(wallet_address):
         "vaultVersion": cfg["vaultVersion"], "abiVersion": NEXUS_CORE_VAULT_ABI_VERSION,
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
         "supportedSettlementTokens": [cfg["usdc"], cfg["usdt"], NATIVE_TOKEN_ADDRESS],
-        "supportedSettlementAssets": ["USDC", "USDT", "ETH"],
+        "supportedSettlementAssets": ["USDC", "USDT", cfg["nativeSymbol"]],
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
         "blockers": list(dict.fromkeys(blockers)),
         "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
@@ -30018,7 +30037,7 @@ def api_privy_trading_config():
     if not wallet:
         return err("unauthorized", 401)
     cfg = _privy_trading_cfg(); rd = _privy_delegated_readiness(wallet)
-    return jsonify({"status":"ok","signerId":cfg["signerId"],"policyId":cfg["policyId"],"chainType":"ethereum","chainId":1,
+    return jsonify({"status":"ok","signerId":cfg["signerId"],"policyId":cfg["policyId"],"chainType":"ethereum","chainId":cfg["chainId"],
                     "configured":bool(cfg["signerId"] and cfg["policyId"]),"readiness":rd,"ts":now_ts()})
 
 
