@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-239-GRID-AUTORUN-RUNTIME-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-240-GRID-MANUAL-ORDER-WORKER-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -22705,6 +22705,55 @@ def api_grid_manual_add():
                 conn_ui.close()
         except Exception:
             pass
+
+        # Start/restore the Grid runtime for orders created through the actual UI path.
+        # The frontend uses /api/grid/manual/add (source=GRID), not /api/grid/start.
+        # Build 239 only started autorun in /api/grid/start, so visible OPEN orders
+        # never reached the ticker and System Info stayed GRID IDLE.
+        if source == "GRID" and db_saved:
+            try:
+                live_item = item_id
+                live_session = _hydrate_grid_session_from_db(live_item, wa)
+                if not isinstance(live_session, dict):
+                    live_session = {
+                        "wallet_address": _norm_addr(wa),
+                        "item": live_item,
+                        "item_id": live_item,
+                        "orders": [order],
+                        "running": True,
+                        "stopped": False,
+                        "ticks": 0,
+                        "order_mode": "MANUAL",
+                        "price": price_f,
+                        "last_price": price_f,
+                    }
+                else:
+                    live_session["wallet_address"] = _norm_addr(wa)
+                    live_session["item"] = live_item
+                    live_session["item_id"] = live_item
+                    live_session["running"] = True
+                    live_session["stopped"] = False
+                    live_session["autorun"] = True
+                    live_session["price"] = float(live_session.get("price") or price_f)
+                    live_session["last_price"] = float(live_session.get("last_price") or price_f)
+                interval = max(2.0, float(payload.get("tickInterval") or payload.get("interval") or 10.0))
+                live_session["autorun_interval"] = interval
+                _grid_sessions_set(live_item, _trim_grid_session(live_session))
+                _persist_grid_state()
+                _ensure_grid_autorun(live_item, interval)
+                _live_engine_mark(
+                    "GRID", status="running", decision="STARTED",
+                    reason=f"Grid worker started for manual order {order_id} on {chain}",
+                    assets_scanned=1, tradable_assets=1,
+                    best_candidate=_grid_asset_symbol(live_item),
+                    candidate_price=price_f, last_error="", pending_tx=""
+                )
+            except Exception as worker_exc:
+                _live_engine_mark(
+                    "GRID", status="error", decision="START_FAILED",
+                    reason="Grid manual-order worker could not start",
+                    last_error=str(worker_exc)[:1000]
+                )
 
         return jsonify({
             "status": "ok",
