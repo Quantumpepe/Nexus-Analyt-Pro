@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-234-PRIVY-POLICY-MANAGER"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-235-PRIVY-POLICY-BNB-V3-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD281-PRIVY-POLICY-MANAGER"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -29653,9 +29653,22 @@ def _privy_policy_rule_targets_for_chain(chain_id):
     cid = int(chain_id)
     cfg = _privy_trading_cfg(cid)
     chain_key = str(cfg.get("chainKey") or cid).upper()
+
+    # Policy safety: BNB V5 trading must use PancakeSwap V3 only. Never fall
+    # back to ROUTER_ADDRESS_56 (PancakeSwap V2) for policy generation.
+    policy_router = cfg.get("router")
+    if cid == 56:
+        policy_router = _norm_addr(
+            os.getenv("ROUTER_V3_ADDRESS_BNB") or
+            os.getenv("ROUTER_V3_ADDRESS_56") or
+            ""
+        )
+        if not _looks_like_evm_addr(policy_router) or policy_router == NATIVE_TOKEN_ADDRESS:
+            raise RuntimeError("bnb_v3_router_env_missing: set ROUTER_V3_ADDRESS_56")
+
     candidates = [
         (f"Allow Nexus V5 Vault {chain_key}", cfg.get("vault"), "CoreVault"),
-        (f"Allow {chain_key} V3 Router", cfg.get("router"), "Router"),
+        (f"Allow {chain_key} V3 Router", policy_router, "Router"),
         (f"Allow {chain_key} Wrapped Native", cfg.get("weth"), "Wrapped native"),
         (f"Allow {chain_key} USDC", cfg.get("usdc"), "USDC"),
         (f"Allow {chain_key} USDT", cfg.get("usdt"), "USDT"),
