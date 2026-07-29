@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-243-STABLE-VAULT-READ-CACHE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-244-LIVE-SESSION-REGISTRY-RECONCILIATION"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -422,14 +422,92 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
         conn.close()
     _live_engine_mark(engine, status="running", decision="STARTED", reason="CoreVault session created", pending_tx="")
 
+def _reconcile_live_registry_from_corevault(wallet, engine):
+    """Rebuild the local live-session registry from confirmed V5 CoreVault state.
+
+    A successful on-chain createSession transaction must remain discoverable even when
+    the request and the next read are served by different Gunicorn workers or when a
+    previous deploy did not persist the local registry row. This is shared by NKR,
+    GRID and TRADER so all engines recover cards/runtime from the same source of truth.
+    """
+    wa = _norm_addr(wallet)
+    eng = str(engine or "").upper()
+    if eng == "TRADING":
+        eng = "TRADER"
+    if not wa or eng not in _CORE_SYSTEM_ID:
+        return 0
+    wallet_id = ""
+    try:
+        wallet_id = str(_privy_wallet_id_for_user(wa) or "")
+    except Exception:
+        wallet_id = ""
+    found_count = 0
+    chain_vaults = []
+    for cid in (1, 56, 137, 8453, 42161):
+        vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(cid) or "")
+        if _looks_like_evm_addr(vault):
+            chain_vaults.append((cid, vault))
+    for chain_id, vault in chain_vaults:
+        try:
+            _vault, _next_id, sessions = _discover_wallet_core_sessions(wa, eng, chain_id, vault)
+        except Exception:
+            continue
+        for sess in sessions or []:
+            status_id = int(sess.get("statusId") or 0)
+            if status_id not in (1, 2, 3):
+                continue
+            sid = int(sess.get("sessionId") or 0)
+            if sid <= 0:
+                continue
+            budget_units = int(str(sess.get("budgetUnits") or "0"))
+            _live_session_register(
+                wa, eng, wallet_id, vault, sid, "", budget_units, chain_id
+            )
+            # Preserve the actual on-chain lifecycle instead of forcing ACTIVE.
+            db_status = {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING"}.get(status_id, "ACTIVE")
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    conn.execute(
+                        "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL "
+                        "WHERE wallet_address=? AND engine=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                        (db_status, int(time.time()), wa, eng, int(chain_id), vault.lower(), str(sid)),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            found_count += 1
+    return found_count
+
+
 def _live_active_sessions(wallet, engine):
     _live_engine_tables_init()
-    conn = _db()
-    try:
-        rows = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine=? AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') ORDER BY created_ts DESC", (_norm_addr(wallet), str(engine).upper())).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+    wa = _norm_addr(wallet)
+    eng = str(engine).upper()
+
+    def _read_rows():
+        conn = _db()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine=? "
+                "AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') ORDER BY created_ts DESC",
+                (wa, eng),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    rows = _read_rows()
+    if not rows:
+        try:
+            _reconcile_live_registry_from_corevault(wa, eng)
+            rows = _read_rows()
+        except Exception as exc:
+            try:
+                _live_engine_mark(eng, last_error=f"session registry reconciliation failed: {exc}")
+            except Exception:
+                pass
+    return rows
 
 def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
     """Persist the user-visible NKR lifecycle without exposing blockchain details."""
