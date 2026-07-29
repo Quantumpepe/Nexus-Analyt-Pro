@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-244-LIVE-SESSION-REGISTRY-RECONCILIATION"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-244-NKR-SESSION-ID-TOTAL-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -497,17 +497,20 @@ def _live_active_sessions(wallet, engine):
         finally:
             conn.close()
 
-    rows = _read_rows()
-    if not rows:
+    # Always reconcile against the CoreVault. A stale/malformed local row (for
+    # example an old row with an empty onchain_session_id) must never prevent a
+    # confirmed on-chain session from being discovered and shown as a card.
+    try:
+        _reconcile_live_registry_from_corevault(wa, eng)
+    except Exception as exc:
         try:
-            _reconcile_live_registry_from_corevault(wa, eng)
-            rows = _read_rows()
-        except Exception as exc:
-            try:
-                _live_engine_mark(eng, last_error=f"session registry reconciliation failed: {exc}")
-            except Exception:
-                pass
-    return rows
+            _live_engine_mark(eng, last_error=f"session registry reconciliation failed: {exc}")
+        except Exception:
+            pass
+    rows = _read_rows()
+    # Only rows linked to a real V5 session are presentation/runtime truth.
+    # Invalid legacy rows remain ignored and cannot hide the valid session.
+    return [r for r in rows if str(r.get("onchain_session_id") or "").isdigit() and int(str(r.get("onchain_session_id") or "0")) > 0]
 
 def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
     """Persist the user-visible NKR lifecycle without exposing blockchain details."""
@@ -1098,7 +1101,21 @@ def api_nexus_live_reservation_recover():
     local_sessions,_,_=_db_get_rotation_sessions(wa) if engine=="NKR" else ([],"",0)
     if engine=="NKR":
         active_local=[x for x in local_sessions if isinstance(x,dict) and _nkr_is_session(x) and _nkr_active_session_status_ok(x)]
-        if active_local: return jsonify({"status":"blocked","error":"active_local_nkr_session_exists","count":len(active_local)}),409
+        def _local_core_sid(row):
+            meta=row.get("meta") if isinstance(row.get("meta"),dict) else {}
+            raw=(row.get("onchainSessionId") or row.get("onchain_session_id") or row.get("coreVaultSessionId") or
+                 meta.get("onchain_session_id") or meta.get("core_vault_session_id") or "")
+            return int(str(raw)) if str(raw).isdigit() else 0
+        # The System Info action is the authoritative way to stop/finalize the
+        # selected on-chain session. Its matching local card must not block it.
+        # Only a different active NKR session remains a real conflict.
+        conflicting=[x for x in active_local if _local_core_sid(x) not in (0,target_id)]
+        if conflicting:
+            return jsonify({"status":"blocked","error":"different_active_local_nkr_session_exists","count":len(conflicting)}),409
+        try:
+            _nkr_set_local_stop_state(wa,"STOPPING",f"Owner requested recovery/finalize for CoreVault session #{target_id}")
+        except Exception:
+            pass
     wallet_id=_privy_wallet_id_for_user(wa)
     if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
     _recovery_jobs_init(); jid=f"recovery-{engine.lower()}-{target_id}-{uuid.uuid4().hex[:12]}"; nowi=now_ts()
@@ -14391,26 +14408,29 @@ def api_rotation_sessions():
 
     stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
     live_rows = _live_active_sessions(wa, "NKR")
-    live_ids = {
-        str(int(str(row.get("onchain_session_id") or "0")))
-        for row in (live_rows or [])
-        if str(row.get("onchain_session_id") or "0").isdigit() and int(str(row.get("onchain_session_id") or "0")) > 0
-    }
+    def _live_key_from_row(row: dict) -> str:
+        sid = str(row.get("onchain_session_id") or "")
+        if not sid.isdigit() or int(sid) <= 0:
+            return ""
+        return f"{int(row.get('chain_id') or 0)}:{_norm_addr(row.get('vault_address') or '').lower()}:{int(sid)}"
 
-    def _onchain_id(sess: dict) -> str:
+    live_ids = {_live_key_from_row(row) for row in (live_rows or []) if _live_key_from_row(row)}
+
+    def _onchain_key(sess: dict) -> str:
         meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
         raw = sess.get("onchainSessionId") or sess.get("onchain_session_id") or sess.get("coreVaultSessionId") or meta.get("onchain_session_id") or meta.get("core_vault_session_id") or ""
-        if str(raw).isdigit() and int(str(raw)) > 0:
-            return str(int(str(raw)))
-        m = re.fullmatch(r"NKR-LIVE-(\d+)(?:-[A-Z0-9]+)?", str(sess.get("id") or sess.get("session_id") or ""), flags=re.I)
-        return m.group(1) if m else ""
+        if not str(raw).isdigit() or int(str(raw)) <= 0:
+            return ""
+        chain_id = int(sess.get("chainId") or sess.get("chain_id") or meta.get("chain_id") or 0)
+        vault = _norm_addr(sess.get("vault") or sess.get("vaultAddress") or sess.get("vault_address") or meta.get("vault") or "").lower()
+        return f"{chain_id}:{vault}:{int(str(raw))}"
 
     sessions = []
     seen = set()
     for sess in stored or []:
         if not isinstance(sess, dict) or not _nkr_is_session(sess):
             continue
-        oid = _onchain_id(sess)
+        oid = _onchain_key(sess)
         if not oid or oid not in live_ids or oid in seen:
             continue
         st = str(sess.get("status") or "").upper()
@@ -14422,23 +14442,63 @@ def api_rotation_sessions():
     # A live on-chain row without a local presentation row is created by the
     # backend worker, never by the browser.
     for row in live_rows or []:
-        oid = str(int(str(row.get("onchain_session_id") or "0"))) if str(row.get("onchain_session_id") or "0").isdigit() else ""
+        oid = _live_key_from_row(row)
         if oid and oid not in seen:
             _nkr_ensure_local_live_session(wa, row)
     if len(seen) < len(live_ids):
         stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
-        sessions = [s for s in stored if isinstance(s, dict) and _onchain_id(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+        sessions = [s for s in stored if isinstance(s, dict) and _onchain_key(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
 
     # Last-resort deterministic synthesis: a confirmed V5 NKR session must always
     # produce a card, even before the first worker tick or position exists.
-    present_ids = {_onchain_id(s) for s in sessions}
+    present_ids = {_onchain_key(s) for s in sessions}
     for row in live_rows or []:
-        oid = str(row.get("onchain_session_id") or "")
+        oid = _live_key_from_row(row)
         if oid and oid not in present_ids:
             _nkr_ensure_local_live_session(wa, row)
     if len(sessions) < len(live_ids):
         stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
-        sessions = [s for s in stored if isinstance(s, dict) and _onchain_id(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+        sessions = [s for s in stored if isinstance(s, dict) and _onchain_key(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+
+    # Absolute fallback: synthesize presentation rows directly from confirmed registry
+    # rows. This guarantees a card even if a DB write is delayed across workers.
+    present = {_onchain_key(s) for s in sessions}
+    for live_row in live_rows or []:
+        key = _live_key_from_row(live_row)
+        if not key or key in present:
+            continue
+        sid = str(live_row.get("onchain_session_id") or "")
+        chain_id = int(live_row.get("chain_id") or 1)
+        chain_key = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARB"}.get(chain_id, str(chain_id))
+        vault_addr = _norm_addr(live_row.get("vault_address") or "")
+        budget_units = int(str(live_row.get("budget_units") or "0"))
+        settlement_token = "0x0000000000000000000000000000000000000000"
+        decimals = 18
+        try:
+            snap = _read_core_session_snapshot(chain_id, vault_addr, int(sid))
+            settlement_token = _norm_addr(snap.get("settlementToken") or snap.get("settlement_token") or settlement_token)
+            decimals = int((_v5_read_token_config(chain_id, vault_addr, settlement_token) or {}).get("decimals") or 18)
+        except Exception:
+            decimals = 18 if settlement_token == "0x0000000000000000000000000000000000000000" else (6 if chain_id in (1,137) else 18)
+        budget = budget_units / float(10 ** decimals)
+        asset_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, chain_key) if settlement_token == "0x0000000000000000000000000000000000000000" else _symbol_for_chain_token(chain_id, settlement_token)
+        status = str(live_row.get("status") or "ACTIVE").upper()
+        local_id = f"NKR-LIVE-{chain_key}-{sid}"
+        sessions.append({
+            "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
+            "status": status, "lifecycleState": status, "positionState": "WAITING",
+            "active": True, "visibleInActiveSessions": True, "executionMode": "live",
+            "budgetUsd": budget, "budgetAmount": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
+            "chain": chain_key, "chainId": chain_id, "vault": vault_addr, "vaultAddress": vault_addr,
+            "settlementAsset": asset_symbol, "asset": asset_symbol,
+            "onchainSessionId": sid, "coreVaultSessionId": sid,
+            "createdAt": int(live_row.get("created_ts") or time.time()) * 1000,
+            "updatedAt": int(live_row.get("updated_ts") or time.time()) * 1000,
+            "meta": {"nkr_session": True, "onchain_session_id": sid, "chain": chain_key,
+                     "chain_id": chain_id, "vault": vault_addr, "settlement_asset": asset_symbol,
+                     "settlement_token": settlement_token, "decimals": decimals, "reserved_usd": budget}
+        })
+        present.add(key)
 
     active = str(sessions[0].get("id") or sessions[0].get("session_id") or "") if sessions else ""
     summary = {
@@ -33135,11 +33195,26 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
 def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
     sid = str(live_row.get("onchain_session_id") or "")
-    local_id = f"NKR-LIVE-{sid}"
-    if any(str((x or {}).get("id") or (x or {}).get("session_id") or "") == local_id for x in sessions if isinstance(x, dict)):
-        return
-    nowi = _nkr_now_ms()
     chain_id = int(live_row.get("chain_id") or 1)
+    chain_key = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARB"}.get(chain_id, str(chain_id))
+    # Session ids are local to each CoreVault. Include the chain in the UI id so
+    # ETH session #1 can never hide POL/BNB session #1 (and vice versa).
+    local_id = f"NKR-LIVE-{chain_key}-{sid}"
+    def _same_live_session(x):
+        if not isinstance(x, dict):
+            return False
+        meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+        x_sid = str(x.get("onchainSessionId") or x.get("onchain_session_id") or x.get("coreVaultSessionId") or meta.get("onchain_session_id") or "")
+        x_chain = int(x.get("chainId") or x.get("chain_id") or meta.get("chain_id") or 0)
+        return x_sid == sid and x_chain == chain_id
+    existing = next((x for x in sessions if _same_live_session(x)), None)
+    if existing:
+        # Do not let an old terminal/local row suppress a confirmed active session.
+        st = str(existing.get("status") or existing.get("lifecycleState") or "").upper()
+        if st not in ROTATION_TERMINAL_STATUSES and str(existing.get("id") or existing.get("session_id") or "") == local_id:
+            return
+        sessions = [x for x in sessions if not _same_live_session(x)]
+    nowi = _nkr_now_ms()
     vault_addr = _norm_addr(live_row.get("vault_address") or "")
     budget_units = int(str(live_row.get("budget_units") or "0"))
     # Read the settlement token/decimals from the V5 session whenever possible.
@@ -33154,7 +33229,6 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     except Exception:
         decimals = 18 if settlement_token == "0x0000000000000000000000000000000000000000" else (6 if chain_id in (1,137) else 18)
     budget = budget_units / float(10 ** decimals)
-    chain_key = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARB"}.get(chain_id, str(chain_id))
     asset_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, chain_key) if settlement_token == "0x0000000000000000000000000000000000000000" else _symbol_for_chain_token(chain_id, settlement_token)
     state, _ = _db_get_user_app_state(wallet)
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
