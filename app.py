@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-237-POL-USDT-POLICY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-238-V5-ENGINE-FUNDING-VALIDATION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1832,6 +1832,39 @@ def api_nexus_core_vault_admin_prepare_action():
         return jsonify({'status': 'error', 'error': str(exc)}), 400
 
 
+
+def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
+    """Authoritative V5 funding state shared by Grid, NKR and Trader.
+
+    Reads tokenConfig and freeBase directly from the selected chain's V5 Vault.
+    No SQLite balance, rounded UI value, USD proxy, or legacy Vault fallback is
+    allowed for an engine funding decision.
+    """
+    chain_key = _normalize_chain_key(chain_value or "ETH") or "ETH"
+    chain_id = int((_CHAIN_ID_BY_KEY or {}).get(chain_key, 0) or 0)
+    if chain_id <= 0:
+        raise ValueError("core_vault_chain_not_supported")
+    vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+    if not _looks_like_evm_addr(vault):
+        raise ValueError("core_vault_v5_not_configured")
+    token, fallback_decimals, is_native = _vault_asset_spec_for_chain(chain_id, symbol)
+    if not is_native and not _looks_like_evm_addr(token):
+        raise ValueError("settlement_asset_not_configured")
+    cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token))
+    free = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, token))
+    cfg += [0] * (10 - len(cfg))
+    decimals = int(cfg[6] or fallback_decimals)
+    return {
+        "chain": chain_key, "chainId": chain_id, "vault": vault,
+        "symbol": str(symbol or "").upper(), "token": token,
+        "native": bool(is_native), "decimals": decimals,
+        "configured": bool(cfg[0]), "depositEnabled": bool(cfg[1]),
+        "withdrawEnabled": bool(cfg[2]), "executionEnabled": bool(cfg[3]),
+        "paymentEnabled": bool(cfg[4]), "settlementToken": bool(cfg[5]),
+        "maxSessionBudgetUnits": int(cfg[8] or 0),
+        "freeBaseUnits": int((free or [0])[0]),
+    }
+
 @app.post("/api/nexus/core-vault/session/create-auto")
 def api_core_vault_create_system_session_auto():
     """Create a CoreVault session through the server-side Privy wallet API.
@@ -1890,27 +1923,27 @@ def api_core_vault_create_system_session_auto():
     duration_sec = duration_hours * 3600
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
-    settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
-    native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, "ETH")
-    settlement_map = {"USDC": _USDC_BY_CHAIN.get(chain_id), "USDT": _USDT_BY_CHAIN.get(chain_id), native_symbol: NATIVE_TOKEN_ADDRESS, "NATIVE": NATIVE_TOKEN_ADDRESS}
-    settlement_token = _norm_addr(settlement_map.get(settlement_symbol) or "")
-    decimals = 6 if settlement_symbol in ("USDC", "USDT") else 18
-    if settlement_symbol in (native_symbol, "NATIVE"):
-        raw_native_amount = body.get("budgetAmount") or body.get("amount") or body.get("amountNative") or amount_usd
-        amount_units = int(round(float(raw_native_amount) * (10 ** decimals)))
-    else:
-        amount_units = int(round(amount_usd * (10 ** decimals)))
-
-    vault = _norm_addr(_VAULT_BY_CHAIN.get(chain_id) or cfg.get("vault") or "")
-    usdc = settlement_token
-    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(usdc)):
-        return jsonify({"status": "error", "error": "core_vault_or_settlement_not_configured", "settlementAsset": settlement_symbol}), 409
-
+    settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, "ETH")).upper().strip()
     try:
-        free_words = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, usdc))
-        free_units = int(free_words[0]) if free_words else 0
+        funding = _v5_engine_funding_state(wallet, chain_key, settlement_symbol)
+    except ValueError as exc:
+        return jsonify({"status":"blocked","error":str(exc),"chain":chain_key,"settlementAsset":settlement_symbol}), 409
     except Exception as exc:
-        return jsonify({"status": "error", "error": f"free_base_read_failed:{exc}"}), 502
+        return jsonify({"status":"error","error":f"v5_funding_read_failed:{exc}"}), 502
+    if not funding["configured"] or not funding["executionEnabled"] or not funding["settlementToken"]:
+        return jsonify({"status":"blocked","error":"settlement_asset_not_execution_ready","funding":funding}), 409
+    settlement_token = funding["token"]
+    decimals = int(funding["decimals"])
+    raw_budget = body.get("budgetAmount") or body.get("amount") or body.get("amountNative") or body.get("amountUsd") or body.get("budgetUsd")
+    try:
+        amount_units = _parse_asset_units(raw_budget, decimals)
+    except Exception as exc:
+        return jsonify({"status":"error","error":str(exc),"settlementAsset":settlement_symbol}), 400
+    vault = funding["vault"]
+    free_units = int(funding["freeBaseUnits"])
+    max_budget_units = int(funding.get("maxSessionBudgetUnits") or 0)
+    if max_budget_units and amount_units > max_budget_units:
+        return jsonify({"status":"blocked","error":"session_budget_limit_exceeded","requestedUnits":str(amount_units),"maxUnits":str(max_budget_units),"asset":settlement_symbol}), 409
 
     if amount_units > free_units:
         return jsonify({
@@ -22507,24 +22540,28 @@ def api_grid_manual_add():
 
         funding_approved = str(payload.get("funding_approved") or payload.get("fundingApproved") or "").strip().lower() in ("1", "true", "yes", "on")
         if source == "GRID":
-            conn_check = _db()
+            asset_symbol = _grid_asset_symbol(item_id)
             try:
-                vault_total = float(_grid_best_vault_total(conn_check, wa, item_id, chain=chain) or 0.0)
-                already_reserved = float(_grid_db_reserved(conn_check, wa, item_id, chain=chain) or 0.0)
-            finally:
-                conn_check.close()
-            available_qty = max(0.0, vault_total - already_reserved)
-            if qty_f > available_qty + 1e-12:
+                funding_state = _v5_engine_funding_state(wa, chain, asset_symbol)
+            except ValueError as exc:
+                return jsonify({"status":"blocked","error":str(exc),"asset":asset_symbol,"chain":chain,"ts":now_ts()}), 409
+            except Exception as exc:
+                return jsonify({"status":"error","error":f"grid_v5_funding_read_failed:{exc}","asset":asset_symbol,"chain":chain,"ts":now_ts()}), 502
+            if not funding_state["configured"] or not funding_state["executionEnabled"] or not funding_state["settlementToken"]:
+                return jsonify({"status":"blocked","error":"grid_asset_not_execution_ready","funding":funding_state,"ts":now_ts()}), 409
+            requested_units = _parse_asset_units(qty_f, int(funding_state["decimals"]))
+            available_units = int(funding_state["freeBaseUnits"])
+            if requested_units > available_units:
+                scale = float(10 ** int(funding_state["decimals"]))
                 return jsonify({
-                    "status": "blocked",
-                    "error": "insufficient_vault_asset",
-                    "asset": _grid_asset_symbol(item_id),
-                    "requested_qty": qty_f,
-                    "available_qty": available_qty,
-                    "message": "Grid can only reserve token quantity already available in the Vault.",
+                    "status": "blocked", "error": "insufficient_vault_asset",
+                    "asset": asset_symbol, "requested_qty": qty_f,
+                    "available_qty": available_units / scale,
+                    "requested_units": str(requested_units), "available_units": str(available_units),
+                    "message": "Grid can only reserve the exact freeBase quantity available in the selected V5 Vault.",
                     "ts": now_ts(),
                 }), 409
-            funding_report = {"funding_required": False, "status": "vault_asset_ready", "availableQty": available_qty}
+            funding_report = {"funding_required": False, "status": "vault_asset_ready", "availableQty": available_units / float(10 ** int(funding_state["decimals"])), "funding": funding_state}
         else:
             funding_report = _nexus_funding_resolver_report({**payload, "item": item_id, "chain": chain, "price": price_f, "qty": qty_f}, wa)
             if funding_report.get("funding_required") and not funding_approved:
