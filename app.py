@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-233-V5-BNB-MULTICHAIN-STARTUP-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD278-V5-BNB-MULTICHAIN"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-234-PRIVY-POLICY-MANAGER"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD281-PRIVY-POLICY-MANAGER"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -29616,6 +29616,195 @@ def _privy_signer_diagnostics(wallet_address, wallet_id=None):
     signer_visible = bool(result["checks"].get("configuredSignerMentionedOnWallet"))
     result["status"] = "MATCH" if critical and signer_visible else ("CONFIG_OK_SIGNER_NOT_VISIBLE" if critical else "MISMATCH")
     return result
+
+
+
+
+def _privy_signed_post(path, body, timeout=(10, 45)):
+    """POST to Privy using app Basic Auth plus the configured owner signature.
+
+    Secrets stay server-side. This helper is used only by owner-only policy
+    administration endpoints and never returns credentials or private-key data.
+    """
+    cfg = _privy_trading_cfg()
+    if not cfg.get("appId") or not cfg.get("appSecret"):
+        raise RuntimeError("privy_app_credentials_missing")
+    url = f"{_PRIVY_TRADING_API}{path}"
+    expiry = str(int(time.time() * 1000) + 60_000)
+    signed_headers = {"privy-request-expiry": expiry}
+    signature = _privy_authorization_signature(url, body, signed_headers)
+    headers = {
+        "Content-Type": "application/json",
+        "privy-app-id": cfg["appId"],
+        "privy-authorization-signature": signature,
+        "privy-request-expiry": expiry,
+    }
+    response = requests.post(url, json=body, headers=headers, auth=(cfg["appId"], cfg["appSecret"]), timeout=timeout)
+    try:
+        data = response.json() if response.content else {}
+    except Exception:
+        data = {"raw": (response.text or "")[:2000]}
+    if response.status_code >= 300:
+        raise RuntimeError(f"privy_api_{response.status_code}:{data}")
+    return data
+
+
+def _privy_policy_rule_targets_for_chain(chain_id):
+    cid = int(chain_id)
+    cfg = _privy_trading_cfg(cid)
+    chain_key = str(cfg.get("chainKey") or cid).upper()
+    candidates = [
+        (f"Allow Nexus V5 Vault {chain_key}", cfg.get("vault"), "CoreVault"),
+        (f"Allow {chain_key} V3 Router", cfg.get("router"), "Router"),
+        (f"Allow {chain_key} Wrapped Native", cfg.get("weth"), "Wrapped native"),
+        (f"Allow {chain_key} USDC", cfg.get("usdc"), "USDC"),
+        (f"Allow {chain_key} USDT", cfg.get("usdt"), "USDT"),
+    ]
+    rules = []
+    for name, address, label in candidates:
+        addr = _norm_addr(address or "")
+        if not _looks_like_evm_addr(addr) or addr == NATIVE_TOKEN_ADDRESS:
+            continue
+        rules.append({
+            "name": name[:50],
+            "method": "eth_sendTransaction",
+            "conditions": [{
+                "field_source": "ethereum_transaction",
+                "field": "to",
+                "operator": "eq",
+                "value": addr,
+            }],
+            "action": "ALLOW",
+            "target": addr,
+            "label": label,
+            "chainId": cid,
+            "chain": chain_key,
+        })
+    return rules
+
+
+def _privy_policy_current():
+    cfg = _privy_trading_cfg()
+    policy_id = str(cfg.get("policyId") or "").strip()
+    if not policy_id:
+        raise RuntimeError("privy_trading_policy_id_missing")
+    response = _privy_basic_get(f"/v1/policies/{policy_id}")
+    if not response.get("ok"):
+        raise RuntimeError(f"privy_policy_lookup_failed:{response.get('statusCode')}:{response.get('error')}")
+    data = response.get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("privy_policy_invalid_response")
+    return data
+
+
+def _privy_policy_rule_target(rule):
+    if not isinstance(rule, dict):
+        return ""
+    for condition in rule.get("conditions") or []:
+        if not isinstance(condition, dict):
+            continue
+        if str(condition.get("field_source") or "").lower() == "ethereum_transaction" and str(condition.get("field") or "").lower() == "to":
+            return _norm_addr(condition.get("value") or "")
+    return ""
+
+
+def _privy_policy_preview(chain_id=56):
+    policy = _privy_policy_current()
+    existing_rules = policy.get("rules") if isinstance(policy.get("rules"), list) else []
+    existing_targets = {_privy_policy_rule_target(r).lower() for r in existing_rules if _privy_policy_rule_target(r)}
+    existing_names = {str(r.get("name") or "").strip().lower() for r in existing_rules if isinstance(r, dict)}
+    requested = _privy_policy_rule_targets_for_chain(chain_id)
+    add = [r for r in requested if r["target"].lower() not in existing_targets and r["name"].lower() not in existing_names]
+    present = [r for r in requested if r not in add]
+    digest_source = json.dumps([{k: r[k] for k in ("name", "method", "conditions", "action")} for r in add], sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+    serializer = URLSafeTimedSerializer((os.getenv("SECRET_KEY") or app.secret_key or "nexus-policy-preview"), salt="privy-policy-preview-v1")
+    token = serializer.dumps({"policyId": str(policy.get("id") or _privy_trading_cfg().get("policyId") or ""), "chainId": int(chain_id), "digest": digest})
+    return {
+        "status": "ok",
+        "policy": {
+            "id": policy.get("id"), "name": policy.get("name"), "ownerId": policy.get("owner_id"),
+            "chainType": policy.get("chain_type"), "ruleCount": len(existing_rules),
+        },
+        "environment": {
+            "appIdConfigured": bool(_privy_trading_cfg().get("appId")),
+            "appSecretConfigured": bool(_privy_trading_cfg().get("appSecret")),
+            "policyIdConfigured": bool(_privy_trading_cfg().get("policyId")),
+            "keyQuorumIdConfigured": bool(_privy_trading_cfg().get("signerId")),
+            "authorizationPrivateKeyConfigured": bool(_privy_trading_cfg().get("authorizationKey")),
+        },
+        "chainId": int(chain_id),
+        "requested": requested,
+        "alreadyPresent": present,
+        "toAdd": add,
+        "confirmationToken": token,
+        "expiresInSec": 600,
+        "ts": now_ts(),
+    }
+
+
+@app.route("/api/nexus/system-info/privy-policy", methods=["GET"])
+def nexus_system_info_privy_policy():
+    _, error = _require_owner_system_info()
+    if error:
+        return error
+    try:
+        chain_id = int(request.args.get("chainId") or 56)
+        return jsonify(_privy_policy_preview(chain_id))
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc), "ts": now_ts()}), 400
+
+
+@app.route("/api/nexus/system-info/privy-policy/preview", methods=["POST"])
+def nexus_system_info_privy_policy_preview():
+    _, error = _require_owner_system_info()
+    if error:
+        return error
+    try:
+        body = request.get_json(silent=True) or {}
+        chain_id = int(body.get("chainId") or 56)
+        return jsonify(_privy_policy_preview(chain_id))
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc), "ts": now_ts()}), 400
+
+
+@app.route("/api/nexus/system-info/privy-policy/apply", methods=["POST"])
+def nexus_system_info_privy_policy_apply():
+    _, error = _require_owner_system_info()
+    if error:
+        return error
+    try:
+        body = request.get_json(silent=True) or {}
+        chain_id = int(body.get("chainId") or 56)
+        confirmation_token = str(body.get("confirmationToken") or "").strip()
+        if not confirmation_token:
+            raise ValueError("confirmation_token_required")
+        preview = _privy_policy_preview(chain_id)
+        serializer = URLSafeTimedSerializer((os.getenv("SECRET_KEY") or app.secret_key or "nexus-policy-preview"), salt="privy-policy-preview-v1")
+        signed = serializer.loads(confirmation_token, max_age=600)
+        digest_source = json.dumps([{k: r[k] for k in ("name", "method", "conditions", "action")} for r in preview["toAdd"]], sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+        if int(signed.get("chainId") or 0) != chain_id or str(signed.get("policyId") or "") != str(preview["policy"].get("id") or "") or str(signed.get("digest") or "") != digest:
+            raise ValueError("preview_changed_reload_required")
+        policy_id = str(preview["policy"].get("id") or "")
+        created = []
+        for rule in preview["toAdd"]:
+            payload = {k: rule[k] for k in ("name", "method", "conditions", "action")}
+            result = _privy_signed_post(f"/v1/policies/{policy_id}/rules", payload)
+            created.append({"name": rule["name"], "target": rule["target"], "resultId": (result or {}).get("id")})
+        final_preview = _privy_policy_preview(chain_id)
+        return jsonify({
+            "status": "ok", "created": created, "createdCount": len(created),
+            "alreadyPresentCount": len(final_preview.get("alreadyPresent") or []),
+            "remainingCount": len(final_preview.get("toAdd") or []),
+            "policy": final_preview.get("policy"), "ts": now_ts(),
+        })
+    except SignatureExpired:
+        return jsonify({"status": "error", "error": "confirmation_expired_reload_preview", "ts": now_ts()}), 400
+    except BadSignature:
+        return jsonify({"status": "error", "error": "invalid_confirmation_token", "ts": now_ts()}), 400
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc), "ts": now_ts()}), 400
 
 
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id="", chain_id=1):
