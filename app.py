@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-247-NKR-FINALIZE-STATE-SYNC-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-248-NKR-RESTART-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -14533,6 +14533,17 @@ def api_rotation_sessions():
         "vault_ready": True,
         "runtime": "RUNNING" if sessions else "IDLE",
     }
+    # Finalized/empty on-chain state is authoritative. Clear stale runtime and
+    # wallet UI lifecycle so a new NKR session can be started immediately.
+    if not sessions:
+        try:
+            _live_engine_mark("NKR", status="idle", decision="IDLE", gate_status="", reason="No active CoreVault NKR session", active_asset="", pending_tx="", last_error="")
+        except Exception:
+            pass
+        try:
+            _db_set_user_app_state(wa, {"ui": {"nkrControlState": "WAITING"}})
+        except Exception:
+            pass
     out = jsonify({
         "status": "ok",
         "wallet": wa,
