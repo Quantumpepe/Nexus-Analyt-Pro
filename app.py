@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-229-V5-NATIVE"
-FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD266-RESTORE-NKR-COLLECTED-PROFIT"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-230-V5-NATIVE-SETTLEMENT"
+FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD268-V5-NATIVE-SETTLEMENT"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1890,10 +1890,14 @@ def api_core_vault_create_system_session_auto():
     if chain_key != "ETH":
         return jsonify({"status": "blocked", "error": "core_vault_chain_not_live", "chain": chain_key}), 409
     settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
-    settlement_map = {"USDC": _USDC_BY_CHAIN.get(1), "USDT": _USDT_BY_CHAIN.get(1)}
+    settlement_map = {"USDC": _USDC_BY_CHAIN.get(1), "USDT": _USDT_BY_CHAIN.get(1), "ETH": NATIVE_TOKEN_ADDRESS, "NATIVE": NATIVE_TOKEN_ADDRESS}
     settlement_token = _norm_addr(settlement_map.get(settlement_symbol) or "")
     decimals = 6 if settlement_symbol in ("USDC", "USDT") else 18
-    amount_units = int(round(amount_usd * (10 ** decimals)))
+    if settlement_symbol in ("ETH", "NATIVE"):
+        raw_native_amount = body.get("budgetAmount") or body.get("amount") or body.get("amountNative") or amount_usd
+        amount_units = int(round(float(raw_native_amount) * (10 ** decimals)))
+    else:
+        amount_units = int(round(amount_usd * (10 ** decimals)))
 
     vault = _norm_addr(_VAULT_BY_CHAIN.get(1) or cfg.get("vault") or "")
     usdc = settlement_token
@@ -1910,8 +1914,9 @@ def api_core_vault_create_system_session_auto():
         return jsonify({
             "status": "blocked",
             "error": "insufficient_free_vault_budget",
-            "requestedUsd": round(amount_units / float(10 ** decimals), 6),
-            "availableUsd": round(free_units / float(10 ** decimals), 6),
+            "requestedAmount": round(amount_units / float(10 ** decimals), 8),
+            "availableAmount": round(free_units / float(10 ** decimals), 8),
+            "asset": settlement_symbol,
         }), 409
 
     try:
@@ -1922,6 +1927,7 @@ def api_core_vault_create_system_session_auto():
             duration_sec=duration_sec,
             max_slippage_bps=slippage_bps,
             max_loss_bps=max_loss_bps,
+            settlement_token=settlement_token,
         )
         reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
         sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference)
@@ -1937,7 +1943,7 @@ def api_core_vault_create_system_session_auto():
             "system": system_name,
             "sessionId": session_id,
             "txHash": sent.get("hash"),
-            "budgetUsd": round(amount_units / float(10 ** decimals), 6),
+            "budgetAmount": round(amount_units / float(10 ** decimals), 8),
             "settlementAsset": settlement_symbol,
             "settlementToken": settlement_token,
             "durationHours": duration_hours,
@@ -29138,6 +29144,9 @@ _PRIVY_ROUTER_CONFIG_SELECTOR = "0x" + _keccak256(b"routerConfig(address)")[:4].
 _PRIVY_ROUTER_SELECTOR_ALLOWED_SELECTOR = "0x" + _keccak256(b"routerSelectorAllowed(address,bytes4)")[:4].hex()
 _PRIVY_SESSION_CREATED_TOPIC = "0x" + _keccak256(b"SessionCreated(uint256,address,uint8,address,uint256,uint64)").hex()
 UNISWAP_QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+NATIVE_TOKEN_ADDRESS = "0x0000000000000000000000000000000000000000"
+_PRIVY_MULTICALL_SELECTOR = "0xac9650d8"  # multicall(bytes[])
+_PRIVY_UNWRAP_WETH9_SELECTOR = "0x49404b7c"  # unwrapWETH9(uint256,address)
 
 
 def _uint_to_32(value):
@@ -29159,6 +29168,9 @@ def _privy_trading_cfg():
         "usdc": _norm_addr(_USDC_BY_CHAIN.get(1) or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
         "usdt": _norm_addr(os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"),
         "weth": _norm_addr(os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        "native": NATIVE_TOKEN_ADDRESS,
+        "nativeSymbol": "ETH",
+        "nativeDecimals": 18,
         "router": _norm_addr(os.getenv("ROUTER_V3_ADDRESS_1") or UNISWAP_SWAP_ROUTER_02),
         "quoter": _norm_addr(os.getenv("NEXUS_EXECUTOR_QUOTER_ETH") or os.getenv("QUOTER_V3_ADDRESS_1") or UNISWAP_QUOTER_V2),
         "poolFee": int(os.getenv("NEXUS_EXECUTOR_POOL_FEE_ETH", "500")),
@@ -29606,6 +29618,50 @@ def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, am
 
 
 
+def _abi_encode_bytes_array(items):
+    raw_items = [bytes.fromhex(str(x or "").removeprefix("0x")) for x in items]
+    head_size = 32 * len(raw_items)
+    offsets = []
+    tails = []
+    cursor = head_size
+    for raw in raw_items:
+        padded = raw + b"\x00" * ((32 - len(raw) % 32) % 32)
+        part = bytes.fromhex(_uint_to_32(len(raw))) + padded
+        offsets.append(bytes.fromhex(_uint_to_32(cursor)))
+        tails.append(part)
+        cursor += len(part)
+    body = bytes.fromhex(_uint_to_32(len(raw_items))) + b"".join(offsets) + b"".join(tails)
+    return body
+
+
+def _privy_multicall_data(calls):
+    body = _abi_encode_bytes_array(calls)
+    return _PRIVY_MULTICALL_SELECTOR + _uint_to_32(32) + body.hex()
+
+
+def _privy_unwrap_weth9_data(amount_min, recipient):
+    return _PRIVY_UNWRAP_WETH9_SELECTOR + _uint_to_32(amount_min) + _addr_to_32(recipient)
+
+
+def _native_router_trade_data(cfg, token_in, token_out, recipient, amount_in, amount_out_min, fee):
+    token_in_n = _norm_addr(token_in)
+    token_out_n = _norm_addr(token_out)
+    native = NATIVE_TOKEN_ADDRESS
+    if token_in_n.lower() == native.lower():
+        # SwapRouter02 accepts msg.value and internally pays the WETH input.
+        return _privy_exact_input_single_data(cfg["weth"], token_out_n, recipient, amount_in, amount_out_min, fee), _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+    if token_out_n.lower() == native.lower():
+        # Swap to WETH inside the router, then unwrap and return native ETH to the Vault.
+        swap = _privy_exact_input_single_data(token_in_n, cfg["weth"], cfg["router"], amount_in, amount_out_min, fee)
+        unwrap = _privy_unwrap_weth9_data(amount_out_min, recipient)
+        return _privy_multicall_data([swap, unwrap]), _PRIVY_MULTICALL_SELECTOR
+    return _privy_exact_input_single_data(token_in_n, token_out_n, recipient, amount_in, amount_out_min, fee), _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+
+
+def _quote_token_for_router(cfg, token):
+    return cfg["weth"] if _norm_addr(token).lower() == NATIVE_TOKEN_ADDRESS.lower() else _norm_addr(token)
+
+
 def _abi_hex_words(raw):
     h = str(raw or "").removeprefix("0x")
     if len(h) % 64:
@@ -29665,10 +29721,11 @@ def _read_router_selector_allowed(vault, router, selector):
     return bool(w and int(w[0], 16) != 0)
 
 
-def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, max_slippage_bps=100, max_loss_bps=1500):
+def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, max_slippage_bps=100, max_loss_bps=1500, settlement_token=None):
     system_id = int(cfg["systemIds"].get(system_name, 1))
+    settlement = _norm_addr(settlement_token or cfg["usdc"])
     tuple_words = [
-        _addr_to_32(cfg["usdc"]), _uint_to_32(system_id), _uint_to_32(budget_units),
+        _addr_to_32(settlement), _uint_to_32(system_id), _uint_to_32(budget_units),
         _uint_to_32(duration_sec), _uint_to_32(max_slippage_bps), _uint_to_32(max_loss_bps),
     ]
     # CoreVault V5 Native Final SessionRequest contains only static ABI types.
@@ -29757,6 +29814,7 @@ def _privy_delegated_readiness(wallet_address):
         "vaultConnected": False, "vaultPaused": None, "solvent": False,
         "usdcConfigured": False, "usdcExecutionEnabled": False, "usdcSettlementToken": False, "usdcDecimalsCorrect": False,
         "usdtConfigured": False, "usdtExecutionEnabled": False, "usdtSettlementToken": False, "usdtDecimalsCorrect": False,
+        "nativeConfigured": False, "nativeExecutionEnabled": False, "nativeSettlementToken": False, "nativeDecimalsCorrect": False,
         "routerHasCode": False, "routerEnabled": False, "routerSelectorAllowed": False,
         "quoterHasCode": False, "quotePathWorks": False,
         "systemIdConfirmed": cfg["systemIds"] == {"NKR": 0, "TRADER": 1, "GRID": 2},
@@ -29773,11 +29831,14 @@ def _privy_delegated_readiness(wallet_address):
             checks["vaultPaused"] = paused
             usdc_cfg = _read_token_config(cfg["vault"], cfg["usdc"])
             usdt_cfg = _read_token_config(cfg["vault"], cfg["usdt"])
+            native_cfg = _read_token_config(cfg["vault"], NATIVE_TOKEN_ADDRESS)
             checks.update({
                 "usdcConfigured": usdc_cfg["configured"], "usdcExecutionEnabled": usdc_cfg["executionEnabled"],
                 "usdcSettlementToken": usdc_cfg["settlementToken"], "usdcDecimalsCorrect": usdc_cfg["decimals"] == 6,
                 "usdtConfigured": usdt_cfg["configured"], "usdtExecutionEnabled": usdt_cfg["executionEnabled"],
                 "usdtSettlementToken": usdt_cfg["settlementToken"], "usdtDecimalsCorrect": usdt_cfg["decimals"] == 6,
+                "nativeConfigured": native_cfg["configured"], "nativeExecutionEnabled": native_cfg["executionEnabled"],
+                "nativeSettlementToken": native_cfg["settlementToken"], "nativeDecimalsCorrect": native_cfg["decimals"] == 18,
             })
             solv = _core_vault_words(_core_vault_call(1, cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
             checks["solvent"] = bool(solv[2])
@@ -29805,6 +29866,8 @@ def _privy_delegated_readiness(wallet_address):
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
         ("usdtConfigured","usdt_not_configured"),("usdtExecutionEnabled","usdt_execution_disabled"),
         ("usdtSettlementToken","usdt_not_settlement_token"),("usdtDecimalsCorrect","usdt_decimals_invalid"),
+        ("nativeConfigured","native_not_configured"),("nativeExecutionEnabled","native_execution_disabled"),
+        ("nativeSettlementToken","native_not_settlement_token"),("nativeDecimalsCorrect","native_decimals_invalid"),
         ("routerHasCode","router_contract_missing"),("routerEnabled","router_not_enabled"),
         ("routerSelectorAllowed","router_selector_not_allowed"),
         ("quoterHasCode","quoter_contract_missing"),("quotePathWorks","quoter_path_failed"),
@@ -29823,7 +29886,8 @@ def _privy_delegated_readiness(wallet_address):
         "privyOnly": True, "wallet": user, "userWallet": user, "vault": cfg["vault"],
         "vaultVersion": cfg["vaultVersion"], "abiVersion": NEXUS_CORE_VAULT_ABI_VERSION,
         "nkrLiquidityVault": cfg.get("nkrLiquidityVault"), "token": cfg["usdc"], "tokenSymbol": "USDC",
-        "supportedSettlementTokens": [cfg["usdc"], cfg["usdt"]],
+        "supportedSettlementTokens": [cfg["usdc"], cfg["usdt"], NATIVE_TOKEN_ADDRESS],
+        "supportedSettlementAssets": ["USDC", "USDT", "ETH"],
         "signerId": cfg["signerId"], "policyId": cfg["policyId"], "checks": checks,
         "blockers": list(dict.fromkeys(blockers)),
         "delegation": {"automatic": True, "userActionRequired": False, "walletProvisioned": bool(privy_wallet_id)},
@@ -29831,7 +29895,7 @@ def _privy_delegated_readiness(wallet_address):
         "executionModel": {
             "contract": "NexusCoreMultiVaultV5_Native_Final",
             "flow": ["createSession","executeTrade BUY","startClosing","executeTrade SELL","finalizeSession"],
-            "dynamicRoutes": True, "legacyVaultFallbackActive": False, "nativeSupport": True
+            "dynamicRoutes": True, "legacyVaultFallbackActive": False, "nativeSupport": True, "nativeSettlementExecution": True
         },
         "ts": now_ts(),
     }
@@ -29990,7 +30054,7 @@ def api_privy_trading_test_start():
     if denied: return denied
     rd = _privy_delegated_readiness(owner)
     if rd.get("liveExecution") != "ACTIVE":
-        return jsonify({"status":"blocked","error":"corevault_v4_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
+        return jsonify({"status":"blocked","error":"corevault_v5_setup_incomplete","blockers":rd.get("blockers"),"readiness":rd}),409
     wallet_id = _privy_wallet_id_for_user(owner)
     if not wallet_id: return jsonify({"status":"blocked","error":"privy_wallet_id_required"}),409
     job_id = "v4test-" + uuid.uuid4().hex
@@ -32877,6 +32941,12 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release}
 
 
+def _live_session_settlement_token(vault: str, sid: int, fallback: str) -> str:
+    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    return _norm_addr(words[1] if len(words) > 1 else fallback)
+
+
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
     cfg = _privy_trading_cfg(); sid = int(str(live_row.get("onchain_session_id") or "0"))
@@ -32885,12 +32955,14 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     router_cfg = _read_router_config(vault, router)
     if not router_cfg.get("enabled"):
         raise RuntimeError(f"live_router_not_enabled:{route['symbol']}")
-    if not _read_router_selector_allowed(vault, router, _PRIVY_EXACT_INPUT_SINGLE_SELECTOR):
-        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}")
-    quote = _privy_quote(cfg, token_in, token_out, amount_in, fee=fee)
+    quote_in = _quote_token_for_router(cfg, token_in)
+    quote_out = _quote_token_for_router(cfg, token_out)
+    quote = _privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee)
     min_out = quote * (10_000 - int(cfg["slippageBps"])) // 10_000
     deadline = now_ts() + 300
-    router_data = _privy_exact_input_single_data(token_in, token_out, vault, amount_in, min_out, fee)
+    router_data, required_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee)
+    if not _read_router_selector_allowed(vault, router, required_selector):
+        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}:{required_selector}")
     call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
     ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
@@ -32957,7 +33029,8 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
         amount = _position_amount(vault, session_id, route["token"])
         if amount <= 0:
             continue
-        result = _nkr_live_trade_route(wallet, row, route, route["token"], cfg["usdc"], amount, action="EXIT")
+        settlement = _live_session_settlement_token(_norm_addr(row.get("vault_address") or cfg["vault"]), int(str(row.get("onchain_session_id") or "0")), cfg["usdc"])
+        result = _nkr_live_trade_route(wallet, row, route, route["token"], settlement, amount, action="EXIT")
         if _position_amount(vault, session_id, route["token"]) != 0:
             raise RuntimeError(f"position_not_zero_after_exit:{sym}")
         executed.append({"asset": sym, **result, "amountIn": amount})
@@ -33046,9 +33119,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             continue
         route = routes[sym]
         if action in {"CLOSE", "REDUCE"}:
-            result = _nkr_live_trade_route(wallet, live_row, route, route["token"], cfg["usdc"], int(amount), action=action)
+            settlement = _live_session_settlement_token(_norm_addr(live_row.get("vault_address") or cfg["vault"]), int(str(live_row.get("onchain_session_id") or "0")), cfg["usdc"])
+            result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
         else:
-            result = _nkr_live_trade_route(wallet, live_row, route, cfg["usdc"], route["token"], int(amount), action=action)
+            settlement = _live_session_settlement_token(_norm_addr(live_row.get("vault_address") or cfg["vault"]), int(str(live_row.get("onchain_session_id") or "0")), cfg["usdc"])
+            result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
         _NKR_LIVE_LAST_ASSET_TRADE_TS[key] = int(time.time())
         reason = (plan.get("forcedExits") or {}).get(sym, "portfolio_target_rebalance")
         execution = {"executed": True, "decision": action, "gate": "ONCHAIN_CONFIRMED", "asset": sym,
