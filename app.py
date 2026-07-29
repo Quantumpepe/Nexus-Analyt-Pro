@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-232-V5-BNB-MULTICHAIN"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-233-V5-BNB-MULTICHAIN-STARTUP-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD278-V5-BNB-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -369,7 +369,7 @@ def _live_engine_mark(engine: str, **patch):
             row["tick_count"] = int(row.get("tick_count") or 0) + 1
         _LIVE_ENGINE_RUNTIME[eng] = row
 
-def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=chain_id):
+def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1):
     _live_engine_tables_init()
     conn = _db()
     nowi = int(time.time())
@@ -1936,7 +1936,7 @@ def api_core_vault_create_system_session_auto():
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
-        _live_session_register(wallet, system_name, wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=1)
+        _live_session_register(wallet, system_name, wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
         return jsonify({
             "status": "ok",
             "execution": "server_side_privy",
