@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-242-SESSION-CARDS-ENGINE-HISTORY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-243-STABLE-VAULT-READ-CACHE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16924,13 +16924,49 @@ def api_nexus_nkr_liquidity_vault_onchain_state():
     return jsonify(payload)
 
 
+# Short-lived per-wallet/per-chain cache for the dashboard. Five parallel chain reads
+# plus multiple gunicorn workers previously produced transient RPC failures and out-of-
+# order snapshots. Keep a last confirmed state and never turn a momentary RPC failure
+# into a zero/disconnected balance in the UI.
+_CORE_VAULT_STATE_CACHE = {}
+_CORE_VAULT_STATE_CACHE_LOCK = threading.RLock()
+_CORE_VAULT_STATE_CACHE_TTL_SEC = 8
+_CORE_VAULT_STATE_LAST_GOOD_SEC = 90
+
 @app.get("/api/nexus/core-vault/onchain-state")
 def api_nexus_core_vault_onchain_state():
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
         return err("wallet required", 401)
-    chain = request.args.get("chain") or "ETH"
-    state = _core_vault_read_onchain(wa, chain)
+    chain = _normalize_chain_key(request.args.get("chain") or "ETH") or "ETH"
+    force = str(request.args.get("refresh") or "").strip().lower() in {"1", "true", "yes"}
+    cache_key = (str(wa).lower(), chain)
+    now_i = time.time()
+    with _CORE_VAULT_STATE_CACHE_LOCK:
+        cached = _CORE_VAULT_STATE_CACHE.get(cache_key)
+        if not force and cached and now_i - float(cached.get("read_ts") or 0) <= _CORE_VAULT_STATE_CACHE_TTL_SEC:
+            state = dict(cached.get("state") or {})
+            state["cached"] = True
+            return jsonify({"status": state.get("status"), "onchain": state, **state}), 200
+    try:
+        state = _core_vault_read_onchain(wa, chain)
+    except Exception as exc:
+        state = {"status": "error", "connected": False, "chain": chain, "error": str(exc)}
+    good = state.get("status") == "ok" and bool(state.get("connected"))
+    with _CORE_VAULT_STATE_CACHE_LOCK:
+        cached = _CORE_VAULT_STATE_CACHE.get(cache_key)
+        if good:
+            _CORE_VAULT_STATE_CACHE[cache_key] = {"read_ts": now_i, "good_ts": now_i, "state": dict(state)}
+        elif cached and now_i - float(cached.get("good_ts") or 0) <= _CORE_VAULT_STATE_LAST_GOOD_SEC:
+            fallback = dict(cached.get("state") or {})
+            fallback.update({
+                "stale": True,
+                "staleError": state.get("error") or state.get("status") or "temporary_rpc_read_failed",
+                "staleSince": int(cached.get("good_ts") or now_i),
+                "status": "ok",
+                "connected": True,
+            })
+            state = fallback
     code = 200 if state.get("status") in ("ok", "not_configured", "rpc_missing") else 502
     return jsonify({"status": state.get("status"), "onchain": state, **state}), code
 
