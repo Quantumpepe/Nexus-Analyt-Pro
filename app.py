@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-236-V5-POL-MULTICHAIN"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-237-POL-USDT-POLICY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -29666,12 +29666,23 @@ def _privy_policy_rule_targets_for_chain(chain_id):
         if not _looks_like_evm_addr(policy_router) or policy_router == NATIVE_TOKEN_ADDRESS:
             raise RuntimeError("bnb_v3_router_env_missing: set ROUTER_V3_ADDRESS_56")
 
+    policy_usdt = cfg.get("usdt")
+    if cid == 137:
+        policy_usdt = _norm_addr(
+            os.getenv("USDT_ADDRESS_POL") or
+            os.getenv("USDT_ADDRESS_POLYGON") or
+            os.getenv("USDT_ADDRESS_137") or
+            "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+        )
+        if not _looks_like_evm_addr(policy_usdt) or policy_usdt == NATIVE_TOKEN_ADDRESS:
+            raise RuntimeError("pol_usdt_address_missing: set USDT_ADDRESS_137")
+
     candidates = [
         (f"Allow Nexus V5 Vault {chain_key}", cfg.get("vault"), "CoreVault"),
         (f"Allow {chain_key} V3 Router", policy_router, "Router"),
         (f"Allow {chain_key} Wrapped Native", cfg.get("weth"), "Wrapped native"),
         (f"Allow {chain_key} USDC", cfg.get("usdc"), "USDC"),
-        (f"Allow {chain_key} USDT", cfg.get("usdt"), "USDT"),
+        (f"Allow {chain_key} USDT", policy_usdt, "USDT"),
     ]
     rules = []
     for name, address, label in candidates:
