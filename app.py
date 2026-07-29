@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-241-NKR-TRADER-V5-SESSION-START-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-242-SESSION-CARDS-ENGINE-HISTORY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2028,6 +2028,16 @@ def api_core_vault_create_system_session_auto():
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
         _live_session_register(wallet, system_name, wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
+        # Build the user-visible NKR card immediately from the authoritative V5 row.
+        # Do not wait for the next polling cycle or for the first opened position.
+        if system_name == "NKR":
+            try:
+                live_rows_now = _live_active_sessions(wallet, "NKR")
+                live_row_now = next((r for r in live_rows_now if str(r.get("onchain_session_id") or "") == str(session_id)), None)
+                if live_row_now:
+                    _nkr_ensure_local_live_session(wallet, live_row_now)
+            except Exception as card_exc:
+                _live_engine_mark("NKR", status="running", decision="SESSION_CARD_PENDING", reason="V5 session exists; presentation card will be rebuilt from live session storage", last_error=str(card_exc)[:1000])
         # Start/advertise the matching live engine immediately after the authoritative
         # on-chain V5 session exists. NKR owns a permanent worker; Trader is consumed
         # by the existing executor tick path but must no longer remain visually IDLE.
@@ -14338,6 +14348,17 @@ def api_rotation_sessions():
         if oid and oid not in seen:
             _nkr_ensure_local_live_session(wa, row)
     if len(seen) < len(live_ids):
+        stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
+        sessions = [s for s in stored if isinstance(s, dict) and _onchain_id(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
+
+    # Last-resort deterministic synthesis: a confirmed V5 NKR session must always
+    # produce a card, even before the first worker tick or position exists.
+    present_ids = {_onchain_id(s) for s in sessions}
+    for row in live_rows or []:
+        oid = str(row.get("onchain_session_id") or "")
+        if oid and oid not in present_ids:
+            _nkr_ensure_local_live_session(wa, row)
+    if len(sessions) < len(live_ids):
         stored, _stored_active, updated_ts = _db_get_rotation_sessions(wa)
         sessions = [s for s in stored if isinstance(s, dict) and _onchain_id(s) in live_ids and str(s.get("status") or "").upper() not in ROTATION_TERMINAL_STATUSES]
 
@@ -33004,7 +33025,23 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     if any(str((x or {}).get("id") or (x or {}).get("session_id") or "") == local_id for x in sessions if isinstance(x, dict)):
         return
     nowi = _nkr_now_ms()
-    budget = int(str(live_row.get("budget_units") or "0")) / 1_000_000.0
+    chain_id = int(live_row.get("chain_id") or 1)
+    vault_addr = _norm_addr(live_row.get("vault_address") or "")
+    budget_units = int(str(live_row.get("budget_units") or "0"))
+    # Read the settlement token/decimals from the V5 session whenever possible.
+    # Native assets and BNB stablecoins are 18 decimals; ETH/POL stablecoins can be 6.
+    decimals = 18
+    settlement_token = "0x0000000000000000000000000000000000000000"
+    try:
+        snap = _read_core_session_snapshot(chain_id, vault_addr, int(sid)) if sid.isdigit() else {}
+        settlement_token = _norm_addr(snap.get("settlementToken") or snap.get("settlement_token") or settlement_token)
+        cfg = _v5_read_token_config(chain_id, vault_addr, settlement_token)
+        decimals = int(cfg.get("decimals") or 18)
+    except Exception:
+        decimals = 18 if settlement_token == "0x0000000000000000000000000000000000000000" else (6 if chain_id in (1,137) else 18)
+    budget = budget_units / float(10 ** decimals)
+    chain_key = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARB"}.get(chain_id, str(chain_id))
+    asset_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, chain_key) if settlement_token == "0x0000000000000000000000000000000000000000" else _symbol_for_chain_token(chain_id, settlement_token)
     state, _ = _db_get_user_app_state(wallet)
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or 10)
@@ -33012,11 +33049,15 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
         "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
         "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "WAITING",
         "active": True, "executionMode": "live", "liveVaultReady": True,
-        "budgetUsd": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
+        "budgetUsd": budget, "budgetAmount": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
+        "chain": chain_key, "chainId": chain_id, "vault": vault_addr, "vaultAddress": vault_addr,
+        "settlementAsset": asset_symbol, "asset": asset_symbol, "onchainSessionId": sid, "coreVaultSessionId": sid,
         "createdAt": nowi, "startedAt": nowi, "campaignStartedAt": nowi,
         "campaignExpiresAt": nowi + days * 86400000, "periodDays": days,
         "meta": {"nkr_session": True, "wallet_bound": True, "execution_mode": "live",
-                 "live_vault_ready": True, "onchain_session_id": sid,
+                 "live_vault_ready": True, "onchain_session_id": sid, "core_vault_session_id": sid,
+                 "chain": chain_key, "chain_id": chain_id, "vault": vault_addr,
+                 "settlement_asset": asset_symbol, "settlement_token": settlement_token, "decimals": decimals,
                  "reserved_usd": budget, "lifecycle_state": "ACTIVE", "position_state": "WAITING"},
     }
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
