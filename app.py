@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-238-V5-ENGINE-FUNDING-VALIDATION-FIX"
+BACKEND_BUILD_ID = "B-2026.07.29-ENGINE-239-GRID-AUTORUN-RUNTIME-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -353,21 +353,53 @@ def _live_engine_tables_init():
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_live_vault_wallet_engine_status ON nexus_live_core_vault_sessions(wallet_address, engine, status, updated_ts DESC)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_live_engine_runtime_health (
+                    engine TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    updated_ts INTEGER NOT NULL
+                )
+            """)
             conn.commit()
     finally:
         conn.close()
 
 def _live_engine_mark(engine: str, **patch):
+    """Update process-local and SQLite-backed runtime health.
+
+    SQLite persistence keeps System Info accurate across Gunicorn workers. A Grid
+    worker can tick in one process while the health request is served by another.
+    """
     eng = str(engine or "").upper()
-    if eng == "TRADING": eng = "TRADER"
-    if eng not in _LIVE_ENGINE_RUNTIME: return
+    if eng == "TRADING":
+        eng = "TRADER"
+    if eng not in _LIVE_ENGINE_RUNTIME:
+        return
     with _LIVE_ENGINE_RUNTIME_LOCK:
         row = dict(_LIVE_ENGINE_RUNTIME.get(eng) or {})
         row.update({k: v for k, v in patch.items() if v is not None})
         if patch.get("tick"):
             row["last_tick_ts"] = int(time.time())
             row["tick_count"] = int(row.get("tick_count") or 0) + 1
+        row.pop("tick", None)
         _LIVE_ENGINE_RUNTIME[eng] = row
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute(
+                    """INSERT INTO nexus_live_engine_runtime_health(engine,payload_json,updated_ts)
+                       VALUES(?,?,?)
+                       ON CONFLICT(engine) DO UPDATE SET
+                         payload_json=excluded.payload_json, updated_ts=excluded.updated_ts""",
+                    (eng, json.dumps(row, default=str), int(time.time())),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1):
     _live_engine_tables_init()
@@ -643,6 +675,24 @@ def _live_engine_health_payload(wallet=""):
     out = {}
     with _LIVE_ENGINE_RUNTIME_LOCK:
         runtime_snapshot = {k: dict(v or {}) for k, v in _LIVE_ENGINE_RUNTIME.items()}
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            for dbrow in conn.execute("SELECT engine,payload_json,updated_ts FROM nexus_live_engine_runtime_health").fetchall():
+                eng = str(dbrow["engine"] or "").upper()
+                try:
+                    persisted = json.loads(dbrow["payload_json"] or "{}")
+                except Exception:
+                    persisted = {}
+                local = runtime_snapshot.get(eng) or {}
+                # Prefer whichever copy has the newest completed tick.
+                if int(persisted.get("last_tick_ts") or 0) >= int(local.get("last_tick_ts") or 0):
+                    runtime_snapshot[eng] = persisted
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
     for eng, src in runtime_snapshot.items():
         row = dict(src or {})
@@ -21361,6 +21411,24 @@ def api_grid_start():
         except Exception:
             visible_orders = []
 
+        # Grid is a running engine, so Start must also start its automatic ticker.
+        # Previously the order was created but /api/grid/autorun was never called,
+        # leaving System Info permanently at GRID IDLE / tick count 0.
+        try:
+            interval = max(2.0, float(body.get("tickInterval") or body.get("interval") or 10.0))
+            session["autorun"] = True
+            session["autorun_interval"] = interval
+            _grid_sessions_set(item_id, session)
+            _persist_grid_state()
+            _ensure_grid_autorun(item_id, interval)
+            _live_engine_mark(
+                "GRID", status="running", decision="STARTED",
+                reason=f"Grid worker started for {item_id} on {chain_key_req or _grid_chain_key(item_id)}",
+                assets_scanned=0, tradable_assets=len(visible_orders), best_candidate=_symbol_from_item(item_id), last_error=""
+            )
+        except Exception as exc:
+            _live_engine_mark("GRID", status="error", decision="START_FAILED", reason="Grid worker could not start", last_error=str(exc)[:1000])
+
         return jsonify({
             "status": "ok",
             "item": item_id,
@@ -22295,10 +22363,8 @@ def api_grid_autorun():
     if not enable:
         return jsonify({"status": "ok", "item": item_id, "autorun": False, "interval": interval})
 
-    stop_evt = threading.Event()
-    th = threading.Thread(target=_autorun_loop, args=(item_id, stop_evt, interval), daemon=True)
-    GRID_AUTORUN[item_id] = {"stop": stop_evt, "thread": th, "interval": interval}
-    th.start()
+    _ensure_grid_autorun(item_id, interval)
+    _live_engine_mark("GRID", status="running", decision="AUTORUN_ENABLED", reason=f"Automatic Grid tick enabled every {interval:g}s", last_error="")
 
     return jsonify({"status": "ok", "item": item_id, "autorun": True, "interval": interval})
 
@@ -28360,22 +28426,57 @@ def _get_live_price_for_item(item_id: str) -> Optional[float]:
     return None
 
 
+def _ensure_grid_autorun(item_id: str, interval: float = 10.0) -> None:
+    """Start exactly one process-local Grid ticker for this item."""
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        return
+    current = GRID_AUTORUN.get(item_id)
+    if current and current.get("thread") and current["thread"].is_alive():
+        return
+    stop_evt = threading.Event()
+    th = threading.Thread(
+        target=_autorun_loop,
+        args=(item_id, stop_evt, max(2.0, float(interval or 10.0))),
+        daemon=True,
+        name=f"grid-live-worker-{item_id}-{int(time.time())}",
+    )
+    GRID_AUTORUN[item_id] = {"stop": stop_evt, "thread": th, "interval": max(2.0, float(interval or 10.0))}
+    th.start()
+
+
 def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
-    """Background loop: refresh live price and tick the current grid engine."""
+    """Background loop: refresh live price, tick Grid, and publish health."""
     while not stop_evt.is_set():
         try:
             session = GRID_SESSIONS.get(item_id)
             if session and bool(session.get("running", True)) and not bool(session.get("stopped", False)):
                 p = _get_live_price_for_item(item_id)
-                _sim_tick(session, new_price=p)
-                _grid_sessions_set(item_id, _trim_grid_session(session))
+                updated = _sim_tick(session, new_price=p)
+                _grid_sessions_set(item_id, _trim_grid_session(updated))
                 try:
-                    _grid_sync_session_orders_to_db(session.get("wallet_address") or "", item_id, session.get("orders") or [], chain=_grid_chain_key(item_id))
+                    _grid_sync_session_orders_to_db(
+                        session.get("wallet_address") or "", item_id,
+                        updated.get("orders") or [], chain=_grid_chain_key(item_id)
+                    )
                 except Exception:
                     pass
                 _persist_grid_state()
-        except Exception:
-            pass
+                open_orders = [o for o in (updated.get("orders") or []) if isinstance(o, dict) and str(o.get("status") or "").upper() == "OPEN"]
+                symbol = _symbol_from_item(item_id)
+                _live_engine_mark(
+                    "GRID", tick=True, status="running", assets_scanned=1,
+                    tradable_assets=(1 if open_orders else 0), best_candidate=symbol,
+                    candidate_price=float(updated.get("price") or p or 0),
+                    decision=("MONITOR" if open_orders else "IDLE"),
+                    reason=(f"Monitoring {len(open_orders)} active Grid order(s) on {_grid_chain_key(item_id)}" if open_orders else "No open Grid orders"),
+                    last_error="", pending_tx="",
+                )
+            else:
+                _live_engine_mark("GRID", status="idle", decision="IDLE", reason="No running Grid session")
+                break
+        except Exception as exc:
+            _live_engine_mark("GRID", tick=True, status="error", decision="ERROR", reason="Grid worker tick failed", last_error=str(exc)[:1000])
         stop_evt.wait(interval)
 
 
