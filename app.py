@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-253-NKR-HISTORY-CLARITY"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-254-NKR-LIVE-CHAIN-FILTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33141,12 +33141,29 @@ def _engine_strategist_user_snapshot(engine: str = "NKR", fallback_status: str =
             else:
                 user_summary = detail or f"Trader status: {decision or status_u} · Gate: {gate or '—'} · Asset: {best or '—'}"
         else:
-            # NKR (default)
-            if gate in {"WAITING_ENTRY", ""} and decision in {"WAIT", "STARTED", "HOLD", "IDLE", ""}:
+            # NKR (default) — multi-EVM aware copy
+            session_chain = str(rt.get("session_chain") or "").upper()
+            best_overall = str(rt.get("best_overall") or "").upper()
+            best_overall_chain = str(rt.get("best_overall_chain") or "").upper()
+            recommendation = str(rt.get("recommendation") or "").strip()
+            if gate in {"CHAIN_NO_CANDIDATE", "CHAIN_NOT_LIVE"}:
+                user_summary = detail or recommendation or (
+                    f"No tradable candidate on this session chain ({session_chain or '—'}). "
+                    f"Strategist only scans live vault chains: ETH, BNB, POL."
+                )
+            elif gate in {"WAITING_ENTRY", "SCORE_BLOCKED", "MOMENTUM_BLOCKED", ""} and decision in {"WAIT", "STARTED", "HOLD", "IDLE", ""}:
                 user_summary = (
-                    f"Scanning watchlist. Best candidate: {best or '—'} "
+                    f"Scanning live chains (ETH/BNB/POL). Best on this session"
+                    f"{f' ({session_chain})' if session_chain else ''}: {best or '—'} "
                     f"(score {score:.1f}). No on-chain buy yet — waiting for entry conditions."
                 )
+                if recommendation:
+                    user_summary = f"{user_summary} {recommendation}"
+                elif best_overall and best_overall_chain and session_chain and best_overall_chain != session_chain:
+                    user_summary = (
+                        f"{user_summary} Overall leader {best_overall} is on {best_overall_chain} — "
+                        f"open/fund a session there to trade it."
+                    )
             elif gate in {"POSITION_ACTIVE", "ONCHAIN_CONFIRMED"} or (
                 decision in {"OPEN", "ADD", "HOLD"} and position in {"OPEN", "POSITION_ACTIVE", "ACTIVE"}
             ):
@@ -33172,6 +33189,12 @@ def _engine_strategist_user_snapshot(engine: str = "NKR", fallback_status: str =
             "position": position or "",
             "detail": detail,
             "summary": user_summary,
+            "sessionChain": str(rt.get("session_chain") or ""),
+            "bestOverall": str(rt.get("best_overall") or ""),
+            "bestOverallChain": str(rt.get("best_overall_chain") or ""),
+            "bestOverallScore": _safe_float(rt.get("best_overall_score"), 0.0),
+            "recommendation": str(rt.get("recommendation") or "")[:400],
+            "liveChains": sorted(list(_nkr_live_chain_keys())),
             "assetsScanned": int(rt.get("assets_scanned") or 0),
             "tradableAssets": int(rt.get("tradable_assets") or 0),
             "lastTickTs": int(rt.get("last_tick_ts") or 0),
@@ -33322,19 +33345,113 @@ _NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC",
 _NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
 
 
+def _nkr_live_chain_keys() -> set:
+    """Only chains with a deployed CoreVault are live for the Strategist.
+
+    Today: ETH, BNB, POL (see NEXUS_VAULT_ALLOWED_CHAINS). Base/ARB etc. stay
+    out of scan/rank until a vault is live there.
+    """
+    allowed = []
+    try:
+        allowed = list(NEXUS_VAULT_ALLOWED_CHAINS or [])
+    except Exception:
+        allowed = []
+    if not allowed:
+        allowed = ["ETH", "BNB", "POL"]
+    out = set()
+    for c in allowed:
+        k = str(c or "").strip().upper()
+        if k in {"ETHEREUM"}:
+            k = "ETH"
+        elif k in {"BSC"}:
+            k = "BNB"
+        elif k in {"POLYGON", "MATIC"}:
+            k = "POL"
+        if k:
+            out.add(k)
+    return out or {"ETH", "BNB", "POL"}
+
+
+def _nkr_chain_key_from_id(chain_id) -> str:
+    return {1: "ETH", 56: "BNB", 137: "POL", 8453: "BASE", 42161: "ARB"}.get(int(chain_id or 0), str(chain_id or ""))
+
+
+def _nkr_chain_id_from_key(chain_key) -> int:
+    return {"ETH": 1, "ETHEREUM": 1, "BNB": 56, "BSC": 56, "POL": 137, "POLYGON": 137, "MATIC": 137, "BASE": 8453, "ARB": 42161, "ARBITRUM": 42161}.get(str(chain_key or "").upper(), 0)
+
+
+def _nkr_normalize_watch_chain_key(value) -> str:
+    k = str(value or "").strip().upper()
+    if k in {"ETHEREUM", "ETH"}:
+        return "ETH"
+    if k in {"BSC", "BNB"}:
+        return "BNB"
+    if k in {"POLYGON", "MATIC", "POL"}:
+        return "POL"
+    if k in {"ARBITRUM", "ARB"}:
+        return "ARB"
+    if k in {"BASE"}:
+        return "BASE"
+    return k
+
+
+def _nkr_symbol_home_chain(symbol: str) -> str:
+    """Primary EVM home chain for a symbol (heuristic + major natives)."""
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        return ""
+    if sym in {"ETH", "WETH"}:
+        return "ETH"
+    if sym in {"BNB", "WBNB"}:
+        return "BNB"
+    if sym in {"POL", "MATIC", "WMATIC"}:
+        return "POL"
+    if sym in {"ARB"}:
+        return "ARB"
+    if sym in {"BASE"}:
+        return "BASE"
+    return ""
+
+
 def _nkr_live_market_rows(wallet: str) -> list[dict]:
+    """Watchlist → market rows for Strategist.
+
+    Policy: only scan assets on live vault chains (ETH/BNB/POL).
+    Watchlist entries tagged BASE/ARB (or other non-live chains) are skipped
+    until that chain has a deployed CoreVault.
+    """
     items, _ = _db_get_user_watchlist(wallet)
+    live_chains = _nkr_live_chain_keys()
     rows = []
+    skipped_non_live = 0
     for item in (items or [])[:40]:
+        chain_from_item = ""
         if isinstance(item, str):
             sym = item.strip().upper()
         elif isinstance(item, dict):
             sym = str(item.get("symbol") or item.get("sym") or "").strip().upper()
+            chain_from_item = _nkr_normalize_watch_chain_key(
+                item.get("chain") or item.get("chain_key") or item.get("network")
+                or (item.get("meta") or {}).get("chain") or ""
+            )
         else:
             sym = ""
         if not sym or sym in {"USDC", "USDT", "USD"}:
             continue
-        row = {"symbol": sym, "mode": "market"}
+        home = chain_from_item or _nkr_symbol_home_chain(sym) or ""
+        # Hard skip: known non-live home chain (e.g. Base/ARB watchlist items).
+        if home and home not in live_chains:
+            skipped_non_live += 1
+            continue
+        # Unknown home (generic token): still scannable — session/route filter
+        # decides tradability later. Do not invent BASE/ARB.
+        row = {
+            "symbol": sym,
+            "mode": "market",
+            "chain": home,
+            "chainKey": home,
+            "liveChain": bool(not home or home in live_chains),
+        }
         try:
             ticker24 = _binance_24h_for_symbol(sym)
             px = ticker24 or _price_multi(sym)
@@ -33355,7 +33472,13 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
         except Exception:
             pass
         rows.append(row)
-    return _binance_enrich_market_rows(rows)
+    enriched = _binance_enrich_market_rows(rows)
+    # Attach scan meta for diagnostics (does not affect ranking keys).
+    if isinstance(enriched, list) and skipped_non_live > 0:
+        for r in enriched:
+            if isinstance(r, dict):
+                r.setdefault("skippedNonLiveWatchlist", skipped_non_live)
+    return enriched
 
 
 def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
@@ -33442,13 +33565,48 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool) -> list[dict]:
     return results
 
 
-def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=None) -> dict:
-    """Build owner-visible diagnostics without changing NKR trading decisions."""
+def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=None, session_chain_id=1, tradable_symbols=None) -> dict:
+    """Build Strategist diagnostics with multi-EVM chain awareness.
+
+    - best_overall: top score across the whole watchlist (any EVM home chain)
+    - best_on_session: top score among assets tradable on the active session chain
+    Execution decisions must follow best_on_session, never a foreign-chain symbol.
+    """
     summary = summary if isinstance(summary, dict) else {}
     settings = settings if isinstance(settings, dict) else {}
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
     dispatch_min = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
-    ranked = []
+    session_chain = _nkr_chain_key_from_id(session_chain_id) or "ETH"
+    tradable = {str(s).upper() for s in (tradable_symbols or []) if str(s).strip()}
+    # Always treat native/wrapped of the session chain as in-scope for ranking.
+    if session_chain == "ETH":
+        tradable |= {"ETH", "WETH"}
+    elif session_chain == "BNB":
+        tradable |= {"BNB", "WBNB"}
+    elif session_chain == "POL":
+        tradable |= {"POL", "MATIC", "WMATIC"}
+
+    live_chains = _nkr_live_chain_keys()
+    # Session chain itself must be live; otherwise no executable candidate.
+    if session_chain not in live_chains:
+        return {
+            "best_candidate": "",
+            "candidate_score": 0.0,
+            "candidate_momentum_24h": 0.0,
+            "candidate_price": 0.0,
+            "candidate_chain": session_chain,
+            "best_overall": "",
+            "best_overall_score": 0.0,
+            "best_overall_chain": "",
+            "session_chain": session_chain,
+            "recommendation": f"Session chain {session_chain} is not a live CoreVault chain. Live chains: {', '.join(sorted(live_chains))}.",
+            "decision": "WAIT",
+            "gate_status": "CHAIN_NOT_LIVE",
+            "decision_detail": f"No trading on {session_chain} until CoreVault is live there.",
+        }
+
+    ranked_all = []
+    ranked_session = []
     for row in market_rows or []:
         if not isinstance(row, dict):
             continue
@@ -33458,9 +33616,23 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
             continue
         change = _nkr_row_change_pct(row)
         score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
-        ranked.append({"symbol": sym, "score": score, "change": change, "price": price})
-    ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
-    best = ranked[0] if ranked else {"symbol": "", "score": 0.0, "change": 0.0, "price": 0.0}
+        home = str(row.get("chain") or row.get("chainKey") or _nkr_symbol_home_chain(sym) or "").upper()
+        # Overall ranking only across live vault chains (ETH/BNB/POL).
+        if home and home not in live_chains:
+            continue
+        entry = {"symbol": sym, "score": score, "change": change, "price": price, "chain": home or session_chain}
+        ranked_all.append(entry)
+        # Session-tradable: explicit route set OR same home chain as session.
+        on_session = (sym in tradable) or (home == session_chain) or (not home and sym in tradable)
+        # Never treat a known foreign native as tradable on this session.
+        if home and home != session_chain and sym not in tradable:
+            on_session = False
+        if on_session:
+            ranked_session.append(entry)
+    ranked_all.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    ranked_session.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    best_all = ranked_all[0] if ranked_all else {"symbol": "", "score": 0.0, "change": 0.0, "price": 0.0, "chain": ""}
+    best = ranked_session[0] if ranked_session else {"symbol": "", "score": 0.0, "change": 0.0, "price": 0.0, "chain": session_chain}
 
     best_sym = best["symbol"]
     related = []
@@ -33473,11 +33645,30 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
     changed = bool(summary.get("changed"))
     messages = summary.get("messages") if isinstance(summary.get("messages"), list) else []
     summary_reason = str(summary.get("reason") or "")
-    if not best_sym:
+
+    recommendation = ""
+    overall_sym = best_all.get("symbol") or ""
+    overall_chain = str(best_all.get("chain") or "").upper()
+    if overall_sym and overall_chain and overall_chain != session_chain and overall_sym != best_sym:
+        recommendation = (
+            f"{overall_sym} leads overall (score {best_all['score']:.1f}) on {overall_chain}, "
+            f"but this session is on {session_chain}. Open or fund an NKR session on {overall_chain} "
+            f"to trade {overall_sym}; this session only buys {session_chain}-tradable assets."
+        )
+
+    if not ranked_all:
         decision, gate, detail = "NO_DATA", "BLOCKED", "No priced watchlist candidate was available."
+    elif not best_sym:
+        decision, gate = "WAIT", "CHAIN_NO_CANDIDATE"
+        detail = (
+            f"No tradable candidate on {session_chain} this tick. "
+            + (recommendation or f"Best overall is {overall_sym or '—'} on {overall_chain or 'another chain'}.")
+        )
     elif best["score"] < dispatch_min:
         decision, gate = "WAIT", "SCORE_BLOCKED"
-        detail = f"{best_sym} score {best['score']:.1f} is below {mode} entry gate {dispatch_min:.1f}."
+        detail = f"{best_sym} ({session_chain}) score {best['score']:.1f} is below {mode} entry gate {dispatch_min:.1f}."
+        if recommendation:
+            detail = f"{detail} {recommendation}"
     elif best["change"] <= -0.25:
         decision, gate = "WAIT", "MOMENTUM_BLOCKED"
         detail = f"{best_sym} cleared score but 24h momentum is {best['change']:+.2f}%."
@@ -33489,15 +33680,24 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
         detail = str(messages[0]) if messages else f"NKR changed allocation after {best_sym} cleared the gate."
     else:
         decision, gate = "READY", "PASSED_NO_ACTION"
-        detail = summary_reason or f"{best_sym} cleared the score gate; no allocation change was required this tick."
+        detail = summary_reason or f"{best_sym} cleared the score gate on {session_chain}; no allocation change this tick."
+
     return {
+        # Execution-facing best = session-chain only
         "best_candidate": best_sym,
-        "candidate_score": round(float(best["score"]), 2),
-        "candidate_momentum_24h": round(float(best["change"]), 4),
-        "candidate_price": round(float(best["price"]), 10),
+        "candidate_score": round(float(best.get("score") or 0), 2),
+        "candidate_momentum_24h": round(float(best.get("change") or 0), 4),
+        "candidate_price": round(float(best.get("price") or 0), 10),
+        "candidate_chain": session_chain,
+        # Multi-EVM awareness
+        "best_overall": overall_sym,
+        "best_overall_score": round(float(best_all.get("score") or 0), 2),
+        "best_overall_chain": overall_chain,
+        "session_chain": session_chain,
+        "recommendation": recommendation[:400],
         "decision": decision,
         "gate_status": gate,
-        "decision_detail": detail[:300],
+        "decision_detail": detail[:400],
     }
 
 
@@ -34329,7 +34529,17 @@ def _nkr_live_worker_cycle() -> None:
             # simulator. Local rows remain the UI/control projection of on-chain state.
             processed = list(nkr_sessions)
             summary = {"mode": "LIVE_PORTFOLIO", "sessions": len(processed)}
-            diag = _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary)
+            # Chain-aware Strategist: use the primary runnable session chain + ETH route set.
+            primary_chain_id = int((runnable_rows[0] or {}).get("chain_id") or 1)
+            try:
+                tradable_syms = list((_nkr_live_eth_route_registry(_privy_trading_cfg()) or {}).keys()) if primary_chain_id == 1 else []
+            except Exception:
+                tradable_syms = ["ETH", "WETH"] if primary_chain_id == 1 else []
+            diag = _nkr_runtime_decision_diagnostics(
+                processed, market_rows, settings, summary,
+                session_chain_id=primary_chain_id,
+                tradable_symbols=tradable_syms,
+            )
 
             # Process every registry session rather than silently using active_rows[0].
             # Persist the processed session only after any requested on-chain action
@@ -34398,20 +34608,31 @@ def _nkr_live_worker_cycle() -> None:
                 (e for _, e in executions if e.get("executed") or e.get("gate") == "POSITION_ACTIVE"),
                 executions[-1][1] if executions else {},
             )
+            # Prefer session-chain candidate for display; fall back to execution asset.
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
+            detail = str(execution.get("detail") or diag.get("decision_detail") or "")
+            if diag.get("recommendation") and "Open or fund" in str(diag.get("recommendation")):
+                if diag.get("recommendation") not in detail:
+                    detail = f"{detail} {diag.get('recommendation')}".strip()
             _live_engine_mark(
                 "NKR", tick=True, status="running",
                 assets_scanned=len(market_rows),
                 tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0),
-                best_candidate=exec_asset,
+                best_candidate=exec_asset or diag.get("best_candidate") or "",
                 candidate_score=execution.get("score", diag.get("candidate_score", 0.0)),
                 candidate_momentum_24h=execution.get("change", diag.get("candidate_momentum_24h", 0.0)),
                 candidate_price=execution.get("price", diag.get("candidate_price", 0.0)),
-                decision=execution.get("decision", "WAIT"),
-                gate_status=execution.get("gate", ""),
-                decision_detail=execution.get("detail", ""),
+                decision=execution.get("decision") or diag.get("decision") or "WAIT",
+                gate_status=execution.get("gate") or diag.get("gate_status") or "",
+                decision_detail=detail[:400],
                 reason="CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed",
-                pending_tx=execution.get("txHash", ""), last_error=""
+                pending_tx=execution.get("txHash", ""), last_error="",
+                # Multi-EVM Strategist fields (user panel + System Info)
+                best_overall=diag.get("best_overall") or "",
+                best_overall_score=diag.get("best_overall_score") or 0,
+                best_overall_chain=diag.get("best_overall_chain") or "",
+                session_chain=diag.get("session_chain") or _nkr_chain_key_from_id(primary_chain_id),
+                recommendation=diag.get("recommendation") or "",
             )
         except Exception as exc:
             _live_engine_mark(
