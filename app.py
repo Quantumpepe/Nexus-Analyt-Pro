@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-252-NKR-TRADER-USER-STATUS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-253-NKR-HISTORY-CLARITY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35039,7 +35039,7 @@ def _nkr_session_score(sess, row=None):
     return max(0.0, min(100.0, score))
 
 
-def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason, entry_price_usd=0.0, exit_price_usd=0.0):
+def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross, costs, net, net_pct, score, status, action, reason, entry_price_usd=0.0, exit_price_usd=0.0, tx_hash="", on_chain=None):
     meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
     open_rotation = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
     session_id = str(sess.get("id") or sess.get("session_id") or meta.get("session_id") or "")
@@ -35050,13 +35050,30 @@ def _nkr_backend_tick_event(nowi, sess, symbol, base_asset, chain, budget, gross
     is_closed = str(status or "").upper().startswith("CLOSED")
     entry_px = _safe_float(entry_price_usd or open_rotation.get("entryPriceUsd") or meta.get("nkr_entry_price_usd") or 0.0, 0.0)
     exit_px = _safe_float(exit_price_usd or 0.0, 0.0) if is_closed else 0.0
+    tx = str(tx_hash or open_rotation.get("txHash") or meta.get("nkr_live_buy_tx_hash") or meta.get("last_tx_hash") or sess.get("lastTxHash") or "").strip()
+    status_u = str(status or "").upper()
+    action_u = str(action or "").upper()
+    # Only real confirmed trades are ON-CHAIN. WAIT/MONITOR/tick noise stays SHADOW.
+    if on_chain is None:
+        on_chain = bool(tx) and (
+            status_u in {"OPEN_POSITION", "BUY_OPEN", "CLOSED_PROFIT", "CLOSED_LOSS", "CLOSED_LOSS_REALLOCATE", "ONCHAIN_CONFIRMED"}
+            or action_u in {"BUY", "SELL", "OPEN", "CLOSE", "ADD", "REDUCE"}
+        )
+    event_kind = "ON_CHAIN" if on_chain else (
+        "MONITOR" if status_u in {"POSITION_TRACKING", "WAITING_ENTRY", "WAIT", "HOLD", "MONITOR", "READY_DISPATCHED", "DISPATCHED"}
+        or action_u in {"WAIT", "HOLD", "MONITOR", "TICK"}
+        else "SHADOW"
+    )
     return {
         "id": event_id,
         "event_id": event_id,
         "trade_id": trade_id,
         "session_id": session_id,
         "ts": nowi,
-        "mode": "shadow",
+        "mode": "live" if on_chain else "shadow",
+        "onChain": bool(on_chain),
+        "eventKind": event_kind,
+        "txHash": tx or "",
         "status": status,
         "action": action,
         "executorState": "EXECUTOR_ACTIVE" if status in {"POSITION_TRACKING", "CLOSED_PROFIT", "CLOSED_LOSS", "CLOSED_LOSS_REALLOCATE"} else "READY_DISPATCHED",
