@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-284-BUDGET-AND-REASON"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-285-EXEC-ERROR-SURFACE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35300,9 +35300,21 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             "detail": "Live execution env is disabled (NEXUS_LIVE_EXECUTION_ENABLED). Session stays active; no on-chain buy until enabled.",
             "asset": "",
         }
-    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
+    try:
+        raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+        words = _core_words(raw)
+    except Exception as call_exc:
+        return {
+            "executed": False, "decision": "WAIT", "gate": "RPC_SESSION_READ",
+            "detail": f"Could not read CoreVault session on {chain_key}: {str(call_exc)[:160]}",
+            "asset": "", "error": str(call_exc)[:400],
+        }
     if len(words) < 13:
-        raise RuntimeError("session_decode_failed")
+        return {
+            "executed": False, "decision": "WAIT", "gate": "SESSION_DECODE_FAILED",
+            "detail": f"CoreVault session decode failed on {chain_key} (sid={sid}).",
+            "asset": "", "error": "session_decode_failed",
+        }
     status_id = int(words[3])
     if status_id != 1:
         # Status 4 = FINALIZED: local/UI must not keep showing RUNNING.
@@ -35425,10 +35437,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             cfg["usdc"],
             chain_id=chain_id,
         )
-        if action in {"CLOSE", "REDUCE"}:
-            result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
-        else:
-            result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
+        try:
+            if action in {"CLOSE", "REDUCE"}:
+                result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
+            else:
+                result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
+        except Exception as trade_exc:
+            err = str(trade_exc)[:240]
+            return {
+                "executed": False, "decision": "WAIT", "gate": "TRADE_ROUTE_ERROR",
+                "asset": sym,
+                "detail": f"{action} {sym} failed on {chain_key}: {err}",
+                "error": err,
+                "plan": {"investUsd": plan.get("investUsd"), "reserveUsd": plan.get("reserveUsd"), "targetsUsd": targets},
+            }
         _NKR_LIVE_LAST_ASSET_TRADE_TS[key] = int(time.time())
         reason = (plan.get("forcedExits") or {}).get(sym, "portfolio_target_rebalance")
         execution = {"executed": True, "decision": action, "gate": "ONCHAIN_CONFIRMED", "asset": sym,
@@ -35922,17 +35944,33 @@ def _nkr_live_worker_cycle() -> None:
                 except Exception as sync_exc:
                     _live_engine_mark("NKR", last_error=f"live_value_sync:{str(sync_exc)[:300]}")
 
-            # Runtime panel remains a summary; prefer an open/executed session result.
+            # Prefer executed trade; else surface first error so SESSION_EXEC_ERROR is debuggable;
+            # else last result.
             execution = next(
                 (e for _, e in executions if e.get("executed") or e.get("gate") == "POSITION_ACTIVE"),
-                executions[-1][1] if executions else {},
+                None,
             )
-            # Prefer session-chain candidate for display; fall back to execution asset.
+            if execution is None:
+                execution = next(
+                    (e for _, e in executions if e.get("error") or str(e.get("gate") or "").endswith("ERROR")),
+                    executions[-1][1] if executions else {},
+                )
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             detail = str(execution.get("detail") or diag.get("decision_detail") or "")
+            err_keep = str(execution.get("error") or "")
             if diag.get("recommendation") and "Open or fund" in str(diag.get("recommendation")):
                 if diag.get("recommendation") not in detail:
                     detail = f"{detail} {diag.get('recommendation')}".strip()
+            # Aggregate brief multi-session status into detail when no trade filled
+            if not execution.get("executed") and len(executions) > 1:
+                bits = []
+                for lr, er in executions:
+                    ch = _nkr_chain_key_from_id((lr or {}).get("chain_id") or 1)
+                    g = str((er or {}).get("gate") or "?")
+                    a = str((er or {}).get("asset") or "")
+                    bits.append(f"{ch}:{g}" + (f"/{a}" if a else ""))
+                if bits:
+                    detail = (detail + " | " + ", ".join(bits)).strip(" |")[:400]
             _live_engine_mark(
                 "NKR", tick=True, status="running",
                 assets_scanned=len(market_rows),
@@ -35945,7 +35983,8 @@ def _nkr_live_worker_cycle() -> None:
                 gate_status=execution.get("gate") or diag.get("gate_status") or "",
                 decision_detail=detail[:400],
                 reason="CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed",
-                pending_tx=execution.get("txHash", ""), last_error="",
+                pending_tx=execution.get("txHash", ""),
+                last_error=err_keep,
                 # Multi-EVM Strategist fields (user panel + System Info)
                 best_overall=diag.get("best_overall") or "",
                 best_overall_score=diag.get("best_overall_score") or 0,
