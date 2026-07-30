@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-279-LIVE-MARKET-FALLBACK"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-280-LIVE-ENTRY-DIAGNOSTICS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -848,12 +848,31 @@ def _live_engine_health_payload(wallet=""):
                     "status": "paused" if paused else "running",
                     "last_tick_ts": int(row.get("last_tick_ts") or latest_sec or live[0].get("updated_ts") or nowi),
                     "tick_count": max(int(row.get("tick_count") or 0), int(current.get("eventCount") or current.get("totalEventCount") or 0), 1),
+                    # Preserve worker tick diagnostics (assets_scanned, scores, WAIT/OPEN gates).
+                    # Only override decision/gate when there is a real on-chain position or pause.
                     "best_candidate": asset or str(row.get("best_candidate") or ""),
                     "candidate_price": price or float(row.get("candidate_price") or 0),
-                    "decision": "PAUSED" if paused else ("EXITING" if exit_pending else ("HOLD" if has_position else str(row.get("decision") or "WAIT"))),
-                    "gate_status": "PAUSED" if paused else ("EXIT_PENDING" if exit_pending else ("POSITION_ACTIVE" if has_position else str(row.get("gate_status") or "SESSION_ACTIVE"))),
-                    "decision_detail": (f"{asset} position is open and tracked by CoreVault." if has_position else str(row.get("decision_detail") or "CoreVault session is active.")),
-                    "reason": "wallet-bound CoreVault state synchronized",
+                    "decision": (
+                        "PAUSED" if paused else
+                        ("EXITING" if exit_pending else
+                         ("HOLD" if has_position else
+                          str(row.get("decision") or "WAIT")))
+                    ),
+                    "gate_status": (
+                        "PAUSED" if paused else
+                        ("EXIT_PENDING" if exit_pending else
+                         ("POSITION_ACTIVE" if has_position else
+                          str(row.get("gate_status") or row.get("gate") or "SESSION_ACTIVE")))
+                    ),
+                    "decision_detail": (
+                        f"{asset} position is open and tracked by CoreVault." if has_position else
+                        str(row.get("decision_detail") or row.get("detail") or "CoreVault session is active.")
+                    ),
+                    # Never wipe a meaningful worker reason with a generic sync label when still scanning.
+                    "reason": (
+                        "wallet-bound CoreVault state synchronized" if (has_position or paused or exit_pending)
+                        else str(row.get("reason") or "wallet-bound CoreVault state synchronized")
+                    ),
                     "pending_tx": "",
                     "last_error": "",
                     "active_asset": asset,
@@ -35037,6 +35056,30 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         selected = [x for x in ranked if x["score"] >= cut][:max_active]
     else:
         selected = []
+    # ENGINE-280: never stay blank when a native route has a live price + green momentum.
+    # Score-only ratings may be missing from backend market rows; momentum fills the gap.
+    if not selected:
+        native_fallback = []
+        for sym, route in routes.items():
+            display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
+            row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
+            if not isinstance(row, dict):
+                continue
+            price = _nkr_row_price_usd(row)
+            change = _nkr_row_change_pct(row)
+            if price <= 0:
+                continue
+            score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or 0}, row)
+            if change >= 2.0:
+                score = max(score, 70.0)
+            elif change >= 0.5:
+                score = max(score, 58.0)
+            elif change >= 0.0:
+                score = max(score, 52.0)
+            if score >= effective_threshold and change > -0.25:
+                native_fallback.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
+        native_fallback.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+        selected = native_fallback[:max_active]
     best_score = selected[0]["score"] if selected else 0.0
     release = _nkr_capital_release_decision(
         market_regime=regime, performance=mode,
@@ -35212,7 +35255,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             "detail": f"No CoreVault address configured for {chain_key}.",
         }
     if not cfg.get("liveEnabled"):
-        raise RuntimeError("live_execution_env_disabled")
+        return {
+            "executed": False, "decision": "WAIT", "gate": "LIVE_EXECUTION_DISABLED",
+            "detail": "Live execution env is disabled (NEXUS_LIVE_EXECUTION_ENABLED). Session stays active; no on-chain buy until enabled.",
+            "asset": "",
+        }
     raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
     if len(words) < 13:
         raise RuntimeError("session_decode_failed")
@@ -35356,7 +35403,11 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     # is verified from the current CoreVault session and on-chain route config below.
     # Do not block the worker because of a stale/manual environment flag.
     if not cfg.get("liveEnabled"):
-        raise RuntimeError("live_execution_env_disabled")
+        return {
+            "executed": False, "decision": "WAIT", "gate": "LIVE_EXECUTION_DISABLED",
+            "detail": "Live execution env is disabled (NEXUS_LIVE_EXECUTION_ENABLED). Session stays active; no on-chain buy until enabled.",
+            "asset": "",
+        }
 
     raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
     words = _core_words(raw)
