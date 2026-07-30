@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-282-TICK-ERROR-VISIBLE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-283-AGGRESSIVE-ENTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2777,10 +2777,11 @@ def _nkr_release_profile_for_mode(performance: str) -> dict:
             "observation": {"15m": 25, "1h": 45, "4h": 65, "12h": 80, "24h": 85},
         },
         "AGGRESSIVE": {
-            "RED": {"min": 25, "max": 45, "requiresRecovery": True},
-            "NEUTRAL": {"min": 55, "max": 75, "requiresRecovery": False},
-            "GREEN": {"min": 80, "max": 100, "requiresRecovery": False},
-            "observation": {"15m": 40, "1h": 65, "4h": 85, "12h": 100, "24h": 100},
+            "RED": {"min": 30, "max": 55, "requiresRecovery": True},
+            "NEUTRAL": {"min": 70, "max": 90, "requiresRecovery": False},
+            "GREEN": {"min": 90, "max": 100, "requiresRecovery": False},
+            # Front-loaded: Aggressive may deploy most capital quickly when a candidate clears.
+            "observation": {"15m": 75, "1h": 90, "4h": 100, "12h": 100, "24h": 100},
         },
     }
     if mode == "DYNAMIC":
@@ -35049,14 +35050,15 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
     }
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
     max_active = max(1, min(50, int(_safe_float(settings.get("maxActiveAssets"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT))))
-    threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    # ENGINE-283: Aggressive must feel aggressive — lower gate, stronger softener.
+    threshold = {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
     regime, avg_change = _nkr_live_market_regime(market_rows)
-    # Green / risk-on markets: allow a small threshold softener so strong relative
-    # candidates are not blocked just below the hard mode gate (e.g. 59.7 vs 62).
     soft = 0.0
-    if str(regime or "").upper() in {"GREEN", "RISK_ON", "BULL", "RISKON"} or avg_change >= 0.35:
-        soft = {"AGGRESSIVE": 4.0, "DYNAMIC": 3.0, "TACTICAL": 2.0, "DEFENSIVE": 0.0}.get(mode, 2.0)
-    effective_threshold = max(48.0, threshold - soft)
+    if str(regime or "").upper() in {"GREEN", "RISK_ON", "BULL", "RISKON"} or avg_change >= 0.20:
+        soft = {"AGGRESSIVE": 8.0, "DYNAMIC": 3.0, "TACTICAL": 2.0, "DEFENSIVE": 0.0}.get(mode, 2.0)
+    elif avg_change >= 0.0:
+        soft = {"AGGRESSIVE": 4.0, "DYNAMIC": 1.0, "TACTICAL": 0.0, "DEFENSIVE": 0.0}.get(mode, 0.0)
+    effective_threshold = max(42.0 if mode == "AGGRESSIVE" else 48.0, threshold - soft)
     ranked = []
     for sym, route in routes.items():
         display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
@@ -35065,7 +35067,12 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             continue
         price = _nkr_row_price_usd(row); change = _nkr_row_change_pct(row)
         score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
-        if price > 0 and score >= effective_threshold and change > -4.0:
+        mom_floor = -1.0 if mode == "AGGRESSIVE" else -4.0
+        if change >= 0.5:
+            score = max(score, 58.0 if mode == "AGGRESSIVE" else score)
+        if change >= 2.0:
+            score = max(score, 70.0)
+        if price > 0 and score >= effective_threshold and change > mom_floor:
             ranked.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
     ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
     if ranked:
@@ -35092,11 +35099,26 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             elif change >= 0.5:
                 score = max(score, 58.0)
             elif change >= 0.0:
-                score = max(score, 52.0)
-            if score >= effective_threshold and change > -0.25:
+                score = max(score, 55.0 if mode == "AGGRESSIVE" else 52.0)
+            # Aggressive: accept flat-to-green natives; other modes keep mild floor.
+            mom_ok = change > (-0.50 if mode == "AGGRESSIVE" else -0.25)
+            if score >= effective_threshold and mom_ok:
                 native_fallback.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
         native_fallback.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
         selected = native_fallback[:max_active]
+        # Aggressive last resort: any priced native with non-crash momentum
+        if not selected and mode == "AGGRESSIVE":
+            for sym, route in routes.items():
+                display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
+                row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
+                if not isinstance(row, dict):
+                    continue
+                price = _nkr_row_price_usd(row)
+                change = _nkr_row_change_pct(row)
+                if price > 0 and change > -1.0:
+                    score = max(55.0, _nkr_session_score({"score": row.get("score") or 0}, row))
+                    selected = [{"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route}]
+                    break
     best_score = selected[0]["score"] if selected else 0.0
     release = _nkr_capital_release_decision(
         market_regime=regime, performance=mode,
@@ -35106,10 +35128,11 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         capital_usd=budget_usd,
     )
     invest_usd = min(budget_usd, max(0.0, _safe_float(release.get("releaseUsd"), 0.0)))
-    # If a candidate already cleared the entry gate, deploy available session cash.
-    # Do not leave the whole budget idle just because the release curve is conservative.
-    if selected and invest_usd < max(_NKR_LIVE_MIN_REBALANCE_USD, budget_usd * 0.35):
-        invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.85))
+    if selected:
+        if mode == "AGGRESSIVE":
+            invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.92))
+        elif invest_usd < max(_NKR_LIVE_MIN_REBALANCE_USD, budget_usd * 0.35):
+            invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.85))
     targets = {}
     if selected and invest_usd >= _NKR_LIVE_MIN_REBALANCE_USD:
         powers = [max(1.0, (x["score"] - threshold + 8.0) ** 2) for x in selected]
@@ -35395,10 +35418,36 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     if execution:
         return execution | {"plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
     active = [sym for sym, snap in snapshots.items() if snap["amount"] > 0]
-    return {"executed": False, "decision": "HOLD" if active else "WAIT", "gate": "PORTFOLIO_BALANCED" if active else "WAITING_ENTRY",
-            "asset": active[0] if active else (plan["selected"][0]["symbol"] if plan["selected"] else ""),
-            "detail": f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve.",
-            "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
+    sel = plan.get("selected") or []
+    if active:
+        detail = f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve."
+        gate = "PORTFOLIO_BALANCED"
+        decision = "HOLD"
+    elif not sel:
+        detail = (
+            f"No entry candidate cleared the {mode} gate on this chain "
+            f"(need score/momentum on a routed asset). Reserve ${plan['reserveUsd']:.2f}."
+        )
+        gate = "WAITING_ENTRY"
+        decision = "WAIT"
+    elif settlement_cash < int(_NKR_LIVE_MIN_REBALANCE_USD * 1_000_000):
+        detail = (
+            f"Candidate ready ({sel[0].get('symbol')}) but settlement cash too low "
+            f"({settlement_cash/1_000_000:.2f} USDC). Check vault allocation."
+        )
+        gate = "SETTLEMENT_LOW"
+        decision = "WAIT"
+    else:
+        detail = (
+            f"Candidate {sel[0].get('symbol')} selected; waiting next rebalance tick "
+            f"(invest ${plan['investUsd']:.2f}, reserve ${plan['reserveUsd']:.2f})."
+        )
+        gate = "WAITING_ENTRY"
+        decision = "WAIT"
+    return {"executed": False, "decision": decision, "gate": gate,
+            "asset": active[0] if active else (sel[0]["symbol"] if sel else ""),
+            "detail": detail,
+            "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets, "selected": [x.get("symbol") for x in sel]}}
 
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
     """Execute the already configured USDC/WETH CoreVault route for NKR.
