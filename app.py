@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-255-NKR-WRAP-RESOLVE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-257-NKR-STRATEGIST-AUTONOMY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33193,8 +33193,10 @@ def _engine_strategist_user_snapshot(engine: str = "NKR", fallback_status: str =
             "bestOverall": str(rt.get("best_overall") or ""),
             "bestOverallChain": str(rt.get("best_overall_chain") or ""),
             "bestOverallScore": _safe_float(rt.get("best_overall_score"), 0.0),
-            "recommendation": str(rt.get("recommendation") or "")[:400],
-            "liveChains": sorted(list(_nkr_live_chain_keys())),
+            "recommendation": str(rt.get("recommendation") or rt.get("multi_chain_tip") or "")[:400],
+            "multiChainTip": str(rt.get("multi_chain_tip") or "")[:200],
+            "multiChainActions": list(rt.get("multi_chain_actions") or [])[:8],
+            "liveChains": list(rt.get("live_chains") or sorted(list(_nkr_live_chain_keys()))),
             "assetsScanned": int(rt.get("assets_scanned") or 0),
             "tradableAssets": int(rt.get("tradable_assets") or 0),
             "lastTickTs": int(rt.get("last_tick_ts") or 0),
@@ -34045,30 +34047,43 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
 _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ASSET_COOLDOWN_SEC", "60")))
 _NKR_LIVE_MIN_REBALANCE_USD = max(0.25, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "1.00")))
 _NKR_LIVE_LAST_ASSET_TRADE_TS: dict[tuple[str, int, str], int] = {}
+# Strategist idle tracker: wallet:chain:sid → consecutive ticks with no position & no entry candidate
+_NKR_STRATEGIST_IDLE_TICKS: dict[str, int] = {}
+_NKR_STRATEGIST_IDLE_RELEASE_TICKS = max(8, int(os.getenv("NEXUS_NKR_IDLE_RELEASE_TICKS", "20")))
+# Strategist mandate: within rules it may open sessions, buy, sell, and release idle sessions.
+# Set NEXUS_NKR_STRATEGIST_AUTO_SESSION=0 only to force recommendation-only mode.
+_NKR_STRATEGIST_AUTO_SESSION = _env_bool("NEXUS_NKR_STRATEGIST_AUTO_SESSION", True)
+_NKR_STRATEGIST_AUTO_RELEASE = _env_bool("NEXUS_NKR_STRATEGIST_AUTO_RELEASE", True)
+_NKR_STRATEGIST_MIN_SESSION_USD = max(5.0, _safe_float(os.getenv("NEXUS_NKR_STRATEGIST_MIN_SESSION_USD", "15"), 15.0))
+_NKR_STRATEGIST_LAST_ACTION_TS: dict[str, int] = {}
+_NKR_STRATEGIST_ACTION_COOLDOWN_SEC = max(30, int(os.getenv("NEXUS_NKR_STRATEGIST_ACTION_COOLDOWN_SEC", "90")))
 
 
-def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
-    """Resolve executable Ethereum token routes automatically.
+def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
+    """Resolve executable token routes for the session chain (ETH/BNB/POL/…).
 
-    The V5 Vault deliberately does NOT require per-token registration for
-    executeTrade(). Therefore this adapter does not use enabledForLive flags,
-    per-asset owner approvals, or a per-asset environment allow-list.
-
-    The only unavoidable translation is symbol -> token contract/router/pool fee,
-    because Shadow decisions use symbols while an on-chain swap requires concrete
-    addresses. Those technical values are read from the existing Nexus asset-router
-    registry. Router/selector authorization remains the one-time Vault-wide DEX
-    permission enforced by the contract itself.
+    Display symbols (BTC, SOL, …) map via the asset-router to wrap contracts on
+    this chain. Future live vault chains are included automatically when their
+    chain key appears in NEXUS_VAULT_ALLOWED_CHAINS and cfg is built for that id.
     """
+    chain_key = str(cfg.get("chainKey") or cfg.get("nativeSymbol") or "ETH").upper()
+    if chain_key in {"ETHEREUM"}:
+        chain_key = "ETH"
+    elif chain_key in {"BSC"}:
+        chain_key = "BNB"
+    elif chain_key in {"POLYGON", "MATIC"}:
+        chain_key = "POL"
+    native_sym = {"ETH": "ETH", "BNB": "BNB", "POL": "POL"}.get(chain_key, chain_key or "ETH")
     routes = {
-        "ETH": {
-            "symbol": "ETH",
-            "token": _norm_addr(cfg["weth"]),
+        native_sym: {
+            "symbol": native_sym,
+            "token": _norm_addr(cfg.get("weth") or ""),
             "decimals": 18,
-            "router": _norm_addr(cfg["router"]),
-            "fee": int(cfg["poolFee"]),
+            "router": _norm_addr(cfg.get("router") or ""),
+            "fee": int(cfg.get("poolFee") or 500),
             "live": True,
-            "source": "canonical_weth_route",
+            "source": "canonical_wrapped_native_route",
+            "chain": chain_key,
         }
     }
     try:
@@ -34077,11 +34092,11 @@ def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
         technical = {}
 
     for sym, asset in technical.items():
-        route = ((asset or {}).get("routes") or {}).get("ETH") or {}
+        route = ((asset or {}).get("routes") or {}).get(chain_key) or {}
         token = _norm_addr(route.get("tokenContract") or route.get("tokenAddress") or "")
         router = _norm_addr(route.get("routerAddress") or cfg.get("router") or "")
         try:
-            fee = int(route.get("poolFee") or route.get("fee") or cfg["poolFee"])
+            fee = int(route.get("poolFee") or route.get("fee") or cfg.get("poolFee") or 500)
             decimals = max(0, min(36, int(route.get("decimals") or 18)))
         except Exception:
             continue
@@ -34098,13 +34113,387 @@ def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
             "fee": fee,
             "live": True,
             "source": "automatic_asset_router_registry",
+            "chain": chain_key,
+            "internalSymbol": str(route.get("internalSymbol") or symbol).upper(),
         }
     return routes
 
 
+def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
+    """Backward-compatible alias — routes for the cfg chain (usually ETH)."""
+    return _nkr_live_route_registry(cfg)
+
+
+def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_rows: list, settings: dict) -> dict:
+    """Strategist orchestration across all live vault chains (ETH/BNB/POL + future).
+
+    Actions (decision layer — auto session create is env-gated):
+      OPEN_SESSION  — strong candidate on a live chain with no NKR session
+      SPLIT_CAPITAL — ≥2 live chains have entry-quality candidates
+      RELEASE_IDLE  — session has no position and no entry candidate for N ticks
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    live_chains = sorted(_nkr_live_chain_keys())
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+
+    # Best candidate per live chain (wrap must be configured on that chain).
+    per_chain: dict[str, list] = {ch: [] for ch in live_chains}
+    for row in market_rows or []:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").strip().upper()
+        price = _nkr_row_price_usd(row)
+        if not sym or price <= 0:
+            continue
+        score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or 0}, row)
+        change = _nkr_row_change_pct(row)
+        for ch in live_chains:
+            resolved = _nkr_resolve_display_asset(sym, ch)
+            ok = False
+            if resolved.get("configured") and str(resolved.get("chain") or "").upper() == ch:
+                ok = True
+            home = str(row.get("chain") or row.get("chainKey") or _nkr_symbol_home_chain(sym) or "").upper()
+            if home == ch:
+                ok = True
+            if sym in {"ETH", "WETH"} and ch == "ETH":
+                ok = True
+            if sym in {"BNB", "WBNB"} and ch == "BNB":
+                ok = True
+            if sym in {"POL", "MATIC", "WMATIC"} and ch == "POL":
+                ok = True
+            if not ok:
+                continue
+            per_chain[ch].append({
+                "symbol": sym,
+                "score": score,
+                "change": change,
+                "price": price,
+                "internalSymbol": str(resolved.get("internalSymbol") or sym).upper(),
+            })
+    best_per_chain = {}
+    for ch, items in per_chain.items():
+        items.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+        best_per_chain[ch] = items[0] if items else None
+
+    open_by_chain: dict[str, list] = {ch: [] for ch in live_chains}
+    for lr in runnable_rows or []:
+        if not isinstance(lr, dict):
+            continue
+        cid = int(lr.get("chain_id") or 1)
+        ch = _nkr_chain_key_from_id(cid)
+        if ch not in open_by_chain:
+            open_by_chain[ch] = []
+        open_by_chain[ch].append(lr)
+
+    actions = []
+    tips = []
+
+    # OPEN_SESSION when a live chain has an entry-quality leader and no session.
+    for ch in live_chains:
+        best = best_per_chain.get(ch)
+        if not best or best["score"] < threshold:
+            continue
+        if open_by_chain.get(ch):
+            continue
+        actions.append({
+            "type": "OPEN_SESSION",
+            "chain": ch,
+            "symbol": best["symbol"],
+            "score": round(best["score"], 2),
+            "detail": f"{best['symbol']} score {best['score']:.1f} on {ch} — open an NKR session on {ch} to trade it.",
+        })
+        tips.append(f"Open {ch} session for {best['symbol']}")
+
+    # SPLIT when multiple chains have entry candidates and sessions (or opens pending).
+    strong = [ch for ch in live_chains if best_per_chain.get(ch) and best_per_chain[ch]["score"] >= threshold]
+    if len(strong) >= 2:
+        actions.append({
+            "type": "SPLIT_CAPITAL",
+            "chains": strong,
+            "detail": (
+                "Multiple live chains qualify: "
+                + ", ".join(f"{ch}:{best_per_chain[ch]['symbol']} {best_per_chain[ch]['score']:.0f}" for ch in strong)
+                + ". Split capital across sessions."
+            ),
+        })
+        tips.append("Split capital · " + "/".join(strong))
+
+    # IDLE release tracking per session
+    release_candidates = []
+    wa = _norm_addr(wallet)
+    for lr in runnable_rows or []:
+        if not isinstance(lr, dict):
+            continue
+        cid = int(lr.get("chain_id") or 1)
+        ch = _nkr_chain_key_from_id(cid)
+        sid = str(lr.get("onchain_session_id") or "")
+        key = f"{wa}:{ch}:{sid}"
+        best = best_per_chain.get(ch)
+        # Heuristic: no budget-linked position signal from registry row fields if present
+        open_assets = int(lr.get("open_asset_count") or lr.get("openAssetCount") or 0)
+        has_pos = open_assets > 0
+        entry_ok = bool(best and best["score"] >= threshold)
+        if has_pos or entry_ok:
+            _NKR_STRATEGIST_IDLE_TICKS[key] = 0
+            continue
+        _NKR_STRATEGIST_IDLE_TICKS[key] = int(_NKR_STRATEGIST_IDLE_TICKS.get(key) or 0) + 1
+        ticks = _NKR_STRATEGIST_IDLE_TICKS[key]
+        if ticks >= _NKR_STRATEGIST_IDLE_RELEASE_TICKS:
+            actions.append({
+                "type": "RELEASE_IDLE",
+                "chain": ch,
+                "sessionId": sid,
+                "idleTicks": ticks,
+                "detail": (
+                    f"Session on {ch} has no position and no entry candidate for {ticks} ticks. "
+                    f"Consider Stop & Exit to free capital for stronger chains."
+                ),
+            })
+            release_candidates.append({"chain": ch, "sessionId": sid, "idleTicks": ticks})
+            tips.append(f"Release idle {ch} session")
+
+    short_tip = tips[0] if tips else ""
+    if len(tips) > 1:
+        short_tip = tips[0] + f" (+{len(tips)-1})"
+
+    return {
+        "liveChains": live_chains,
+        "bestPerChain": {
+            ch: ({"symbol": b["symbol"], "score": round(b["score"], 2), "change": round(b["change"], 4)} if b else None)
+            for ch, b in best_per_chain.items()
+        },
+        "openChains": [ch for ch, rows in open_by_chain.items() if rows],
+        "actions": actions,
+        "releaseCandidates": release_candidates,
+        "tip": short_tip,
+        "threshold": threshold,
+        "mode": mode,
+        "autoSessionEnabled": bool(_NKR_STRATEGIST_AUTO_SESSION),
+        "autoReleaseEnabled": bool(_NKR_STRATEGIST_AUTO_RELEASE),
+    }
+
+
+def _nkr_strategist_action_cooldown_ok(key: str) -> bool:
+    last = int(_NKR_STRATEGIST_LAST_ACTION_TS.get(key) or 0)
+    return (int(time.time()) - last) >= _NKR_STRATEGIST_ACTION_COOLDOWN_SEC
+
+
+def _nkr_strategist_mark_action(key: str) -> None:
+    _NKR_STRATEGIST_LAST_ACTION_TS[key] = int(time.time())
+
+
+def _nkr_strategist_open_session(wallet: str, chain_key: str, amount_usd: float, settings: dict | None = None) -> dict:
+    """Open an on-chain NKR CoreVault session within user rules + vault safety checks.
+
+    Same guards as create-auto API: Privy readiness, free vault balance, settlement
+    execution-enabled, max session budget. Mode is already chosen by the user.
+    """
+    settings = settings if isinstance(settings, dict) else {}
+    ch = _nkr_normalize_watch_chain_key(chain_key) or "ETH"
+    if ch not in _nkr_live_chain_keys():
+        return {"ok": False, "error": "chain_not_live", "chain": ch}
+    chain_id = _nkr_chain_id_from_key(ch)
+    if chain_id <= 0:
+        return {"ok": False, "error": "bad_chain", "chain": ch}
+    amount_usd = max(0.0, _safe_float(amount_usd, 0.0))
+    if amount_usd < _NKR_STRATEGIST_MIN_SESSION_USD:
+        return {"ok": False, "error": "below_min_session_usd", "min": _NKR_STRATEGIST_MIN_SESSION_USD, "requested": amount_usd}
+
+    cd_key = f"open:{_norm_addr(wallet)}:{ch}"
+    if not _nkr_strategist_action_cooldown_ok(cd_key):
+        return {"ok": False, "error": "cooldown"}
+
+    try:
+        cfg = _privy_trading_cfg(chain_id)
+    except Exception as exc:
+        return {"ok": False, "error": f"cfg:{exc}", "chain": ch}
+    if not cfg.get("liveEnabled"):
+        return {"ok": False, "error": "live_execution_disabled"}
+
+    readiness = _privy_delegated_readiness(wallet, chain_id)
+    blockers = list(readiness.get("blockers") or [])
+    if blockers:
+        return {"ok": False, "error": "privy_not_ready", "blockers": blockers[:6]}
+
+    wallet_id = _privy_wallet_id_for_user(wallet)
+    if not wallet_id:
+        return {"ok": False, "error": "privy_wallet_mapping_pending"}
+
+    settlement_symbol = "USDC"
+    try:
+        funding = _v5_engine_funding_state(wallet, ch, settlement_symbol)
+    except Exception as exc:
+        return {"ok": False, "error": f"funding:{exc}"}
+    if not funding.get("configured") or not funding.get("executionEnabled") or not funding.get("settlementToken"):
+        return {"ok": False, "error": "settlement_not_ready", "funding": {"configured": funding.get("configured"), "executionEnabled": funding.get("executionEnabled")}}
+
+    decimals = int(funding.get("decimals") or 6)
+    amount_units = int(round(amount_usd * (10 ** decimals)))
+    free_units = int(funding.get("freeBaseUnits") or 0)
+    max_budget_units = int(funding.get("maxSessionBudgetUnits") or 0)
+    if max_budget_units and amount_units > max_budget_units:
+        amount_units = max_budget_units
+    if amount_units > free_units:
+        amount_units = free_units
+    if amount_units <= 0 or (amount_units / float(10 ** decimals)) < _NKR_STRATEGIST_MIN_SESSION_USD:
+        return {
+            "ok": False,
+            "error": "insufficient_free_vault_budget",
+            "availableUsd": round(free_units / float(10 ** decimals), 4),
+            "requestedUsd": amount_usd,
+        }
+
+    duration_hours = max(1, min(int(_safe_float(settings.get("nkrPeriodDays"), 10) * 24), 24 * 30))
+    # Prefer UI period days as campaign length, capped reasonably.
+    try:
+        period_days = int(_safe_float(settings.get("nkrPeriodDays"), 10))
+        duration_sec = max(3600, min(period_days * 86400, 30 * 86400))
+    except Exception:
+        duration_sec = duration_hours * 3600
+
+    vault = funding["vault"]
+    settlement_token = funding["token"]
+    try:
+        calldata = _encode_create_session(
+            cfg, "NKR", amount_units,
+            duration_sec=duration_sec,
+            max_slippage_bps=int(cfg.get("slippageBps") or 100),
+            max_loss_bps=1500,
+            settlement_token=settlement_token,
+        )
+        reference = f"nexus-nkr-strategist-session-{_norm_addr(wallet).lower()}-{ch.lower()}-{int(time.time())}"
+        sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference, chain_id=chain_id)
+        session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
+        if session_id is None:
+            return {"ok": False, "error": "session_id_missing_from_receipt", "tx": sent.get("hash")}
+        _live_session_register(wallet, "NKR", wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
+        try:
+            live_rows_now = _live_active_sessions(wallet, "NKR")
+            live_row_now = next((r for r in live_rows_now if str(r.get("onchain_session_id") or "") == str(session_id)), None)
+            if live_row_now:
+                _nkr_ensure_local_live_session(wallet, live_row_now)
+        except Exception:
+            pass
+        _nkr_strategist_mark_action(cd_key)
+        return {
+            "ok": True,
+            "chain": ch,
+            "chainId": chain_id,
+            "sessionId": session_id,
+            "budgetUsd": round(amount_units / float(10 ** decimals), 4),
+            "txHash": sent.get("hash") or "",
+            "decision": "SESSION_OPENED",
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"create_failed:{str(exc)[:240]}"}
+
+
+def _nkr_strategist_release_idle_session(wallet: str, live_row: dict) -> dict:
+    """Finalize an idle NKR session with no open position (rules: free capital for better chains)."""
+    if not isinstance(live_row, dict):
+        return {"ok": False, "error": "bad_row"}
+    sid = int(str(live_row.get("onchain_session_id") or "0") or 0)
+    chain_id = int(live_row.get("chain_id") or 1)
+    ch = _nkr_chain_key_from_id(chain_id)
+    cd_key = f"release:{_norm_addr(wallet)}:{ch}:{sid}"
+    if not _nkr_strategist_action_cooldown_ok(cd_key):
+        return {"ok": False, "error": "cooldown"}
+    if sid <= 0:
+        return {"ok": False, "error": "bad_session_id"}
+
+    vault = _norm_addr(live_row.get("vault_address") or "")
+    wallet_id = str(live_row.get("privy_wallet_id") or "").strip()
+    if not wallet_id:
+        wallet_id = _privy_wallet_id_for_user(wallet) or ""
+    if not wallet_id or not _looks_like_evm_addr(vault):
+        return {"ok": False, "error": "incomplete_mapping"}
+
+    try:
+        raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+        words = _core_words(raw)
+        if len(words) < 13:
+            return {"ok": False, "error": "session_decode_failed"}
+        status_id = int(words[3])
+        open_assets = int(words[12])
+        if open_assets != 0:
+            return {"ok": False, "error": "has_open_position", "openAssets": open_assets}
+        if status_id == 4:
+            return {"ok": True, "already": "FINALIZED", "sessionId": sid}
+        # No open assets → safe to close + finalize without sell path.
+        result = _finalize_one_live_session(wallet, "NKR", live_row)
+        _nkr_strategist_mark_action(cd_key)
+        idle_key = f"{_norm_addr(wallet)}:{ch}:{sid}"
+        _NKR_STRATEGIST_IDLE_TICKS.pop(idle_key, None)
+        return {"ok": True, "sessionId": sid, "chain": ch, "result": result, "decision": "IDLE_RELEASED"}
+    except Exception as exc:
+        return {"ok": False, "error": f"release_failed:{str(exc)[:240]}"}
+
+
+def _nkr_strategist_apply_actions(wallet: str, multi_plan: dict, runnable_rows: list, settings: dict) -> list:
+    """Execute OPEN_SESSION / RELEASE_IDLE from the multi-chain plan under user mode rules."""
+    results = []
+    settings = settings if isinstance(settings, dict) else {}
+    actions = list((multi_plan or {}).get("actions") or [])
+    if not actions:
+        return results
+
+    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    # Capital split: when opening a new chain session, use a mode-aware share of free capital.
+    split_share = {"AGGRESSIVE": 0.55, "DYNAMIC": 0.45, "TACTICAL": 0.40, "DEFENSIVE": 0.30}.get(mode, 0.45)
+
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        atype = str(action.get("type") or "").upper()
+
+        if atype == "OPEN_SESSION" and _NKR_STRATEGIST_AUTO_SESSION:
+            ch = str(action.get("chain") or "").upper()
+            # Funding snapshot for budget sizing
+            try:
+                funding = _v5_engine_funding_state(wallet, ch, "USDC")
+                free_usd = int(funding.get("freeBaseUnits") or 0) / float(10 ** int(funding.get("decimals") or 6))
+            except Exception:
+                free_usd = 0.0
+            budget = max(_NKR_STRATEGIST_MIN_SESSION_USD, free_usd * split_share)
+            # Prefer UI budget hint if smaller free amount is intended
+            ui_budget = _safe_float(settings.get("nkrBudgetUsd"), 0.0)
+            if ui_budget > 0:
+                budget = min(budget, ui_budget) if free_usd >= ui_budget else min(budget, free_usd)
+            out = _nkr_strategist_open_session(wallet, ch, budget, settings)
+            results.append({"action": "OPEN_SESSION", "chain": ch, **out})
+            if out.get("ok"):
+                break  # one new session per tick — avoids rapid multi-opens
+
+        elif atype == "RELEASE_IDLE" and _NKR_STRATEGIST_AUTO_RELEASE:
+            sid = str(action.get("sessionId") or "")
+            ch = str(action.get("chain") or "").upper()
+            row = next(
+                (
+                    r for r in (runnable_rows or [])
+                    if str(r.get("onchain_session_id") or "") == sid
+                    and _nkr_chain_key_from_id(int(r.get("chain_id") or 1)) == ch
+                ),
+                None,
+            )
+            if not row:
+                # fallback: match session id only
+                row = next((r for r in (runnable_rows or []) if str(r.get("onchain_session_id") or "") == sid), None)
+            if not row:
+                results.append({"action": "RELEASE_IDLE", "ok": False, "error": "row_not_found", "sessionId": sid})
+                continue
+            out = _nkr_strategist_release_idle_session(wallet, row)
+            results.append({"action": "RELEASE_IDLE", "chain": ch, "sessionId": sid, **out})
+            if out.get("ok"):
+                break  # one release per tick
+
+    return results
+
+
 def _nkr_position_snapshot(vault: str, sid: int, route: dict, cfg: dict) -> dict:
-    token = route["token"]
-    raw = _eth_call(1, vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(sid) + _addr_to_32(token))
+    token = _norm_addr(route.get("token") or "")
+    chain_id = int(cfg.get("chainId") or 1)
+    raw = _eth_call(chain_id, vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(sid) + _addr_to_32(token))
     words = _abi_hex_words(raw)
     amount = int(words[0], 16) if words else 0
     cost_basis = int(words[1], 16) if len(words) > 1 else 0
@@ -34197,8 +34586,8 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release}
 
 
-def _live_session_settlement_token(vault: str, sid: int, fallback: str) -> str:
-    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id: int = 1) -> str:
+    raw = _eth_call(int(chain_id or 1), vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
     words = _core_words(raw)
     return _norm_addr(words[1] if len(words) > 1 else fallback)
 
@@ -34299,18 +34688,37 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
 
 
 def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
-    cfg = _privy_trading_cfg(); sid = int(str(live_row.get("onchain_session_id") or "0")); vault = _norm_addr(live_row.get("vault_address") or "")
-    if int(live_row.get("chain_id") or 1) != 1:
-        return {"executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_EXECUTABLE", "detail": "This portfolio executor is bound to the Ethereum CoreVault."}
+    chain_id = int(live_row.get("chain_id") or 1)
+    chain_key = _nkr_chain_key_from_id(chain_id)
+    # Only live vault chains (ETH/BNB/POL today; future chains when allowlisted + vault set).
+    if chain_key not in _nkr_live_chain_keys():
+        return {
+            "executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_LIVE",
+            "detail": f"Chain {chain_key or chain_id} is not a live CoreVault chain yet.",
+        }
+    try:
+        cfg = _privy_trading_cfg(chain_id)
+    except Exception as cfg_exc:
+        return {
+            "executed": False, "decision": "WAIT", "gate": "CHAIN_CFG_UNAVAILABLE",
+            "detail": f"Trading config unavailable for {chain_key}: {cfg_exc}",
+        }
+    sid = int(str(live_row.get("onchain_session_id") or "0"))
+    vault = _norm_addr(live_row.get("vault_address") or cfg.get("vault") or "")
+    if not vault:
+        return {
+            "executed": False, "decision": "WAIT", "gate": "VAULT_MISSING",
+            "detail": f"No CoreVault address configured for {chain_key}.",
+        }
     if not cfg.get("liveEnabled"):
         raise RuntimeError("live_execution_env_disabled")
-    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
     if len(words) < 13:
         raise RuntimeError("session_decode_failed")
     if int(words[3]) != 1:
-        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {int(words[3])}."}
+        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {int(words[3])} on {chain_key}."}
     settlement_cash = int(words[9]); budget_usd = int(str(live_row.get("budget_units") or words[8] or "0")) / 1_000_000.0
-    routes = _nkr_live_eth_route_registry(cfg)
+    routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
     plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
     targets = dict(plan["targetsUsd"])
@@ -34337,7 +34745,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             continue
         value = snap["valueUsd"]; cost = snap["costBasisUsd"]; gross = value - cost
         price = _nkr_row_price_usd(row_by_symbol.get(sym) or {})
-        exit_costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, 1).get("totalCostUsd"), 0.0)
+        exit_costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0)
         net = gross - exit_costs; net_pct = (net / cost * 100.0) if cost > 0 else 0.0
         pm = previous_meta.get(sym) or {}
         peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net)
@@ -34374,11 +34782,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         if int(time.time()) - last < _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC:
             continue
         route = routes[sym]
+        settlement = _live_session_settlement_token(
+            _norm_addr(live_row.get("vault_address") or cfg["vault"]),
+            int(str(live_row.get("onchain_session_id") or "0")),
+            cfg["usdc"],
+            chain_id=chain_id,
+        )
         if action in {"CLOSE", "REDUCE"}:
-            settlement = _live_session_settlement_token(_norm_addr(live_row.get("vault_address") or cfg["vault"]), int(str(live_row.get("onchain_session_id") or "0")), cfg["usdc"])
             result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
         else:
-            settlement = _live_session_settlement_token(_norm_addr(live_row.get("vault_address") or cfg["vault"]), int(str(live_row.get("onchain_session_id") or "0")), cfg["usdc"])
             result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
         _NKR_LIVE_LAST_ASSET_TRADE_TS[key] = int(time.time())
         reason = (plan.get("forcedExits") or {}).get(sym, "portfolio_target_rebalance")
@@ -34656,17 +35068,64 @@ def _nkr_live_worker_cycle() -> None:
             # simulator. Local rows remain the UI/control projection of on-chain state.
             processed = list(nkr_sessions)
             summary = {"mode": "LIVE_PORTFOLIO", "sessions": len(processed)}
-            # Chain-aware Strategist: use the primary runnable session chain + ETH route set.
-            primary_chain_id = int((runnable_rows[0] or {}).get("chain_id") or 1)
+            # Multi-EVM Strategist plan (all live chains + future allowlisted chains).
+            multi_plan = _nkr_strategist_multi_chain_plan(wallet, market_rows, runnable_rows, settings)
+            # Strategist autonomy within user mode rules: open sessions / release idle.
+            # Buy/Sell continue below via _nkr_live_execute_portfolio on each active session.
+            strategist_actions = []
             try:
-                tradable_syms = list((_nkr_live_eth_route_registry(_privy_trading_cfg()) or {}).keys()) if primary_chain_id == 1 else []
+                strategist_actions = _nkr_strategist_apply_actions(wallet, multi_plan, runnable_rows, settings)
+            except Exception as act_exc:
+                strategist_actions = [{"ok": False, "error": f"apply_actions:{str(act_exc)[:200]}"}]
+            if any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
+                # Refresh runnable set so the new session can trade in a later tick (or same if registered).
+                try:
+                    wallet_rows = _live_active_sessions(wallet, "NKR") or wallet_rows
+                    runnable_rows = [
+                        r for r in wallet_rows
+                        if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+                    ]
+                except Exception:
+                    pass
+            primary_chain_id = int((runnable_rows[0] or {}).get("chain_id") or 1) if runnable_rows else 1
+            try:
+                tradable_syms = list((_nkr_live_route_registry(_privy_trading_cfg(primary_chain_id)) or {}).keys())
             except Exception:
-                tradable_syms = ["ETH", "WETH"] if primary_chain_id == 1 else []
+                tradable_syms = []
             diag = _nkr_runtime_decision_diagnostics(
                 processed, market_rows, settings, summary,
                 session_chain_id=primary_chain_id,
                 tradable_symbols=tradable_syms,
             )
+            # Merge orchestration tip into diagnostics (compact UI uses recommendation/tip).
+            if multi_plan.get("tip"):
+                existing_rec = str(diag.get("recommendation") or "")
+                tip = str(multi_plan.get("tip") or "")
+                if tip and tip not in existing_rec:
+                    diag["recommendation"] = f"{tip}. {existing_rec}".strip()[:400]
+            for a in strategist_actions:
+                if a.get("ok") and a.get("action") == "OPEN_SESSION":
+                    diag["recommendation"] = (
+                        f"Opened {a.get('chain')} session #{a.get('sessionId')} "
+                        f"(${a.get('budgetUsd')}). {diag.get('recommendation') or ''}"
+                    ).strip()[:400]
+                    diag["decision"] = "SESSION_OPENED"
+                    diag["gate_status"] = "STRATEGIST_ACTION"
+                elif a.get("ok") and a.get("action") == "RELEASE_IDLE":
+                    diag["recommendation"] = (
+                        f"Released idle {a.get('chain')} session #{a.get('sessionId')}. "
+                        f"{diag.get('recommendation') or ''}"
+                    ).strip()[:400]
+                    diag["decision"] = "IDLE_RELEASED"
+                    diag["gate_status"] = "STRATEGIST_ACTION"
+            diag["multi_chain_plan"] = {
+                "liveChains": multi_plan.get("liveChains") or [],
+                "openChains": multi_plan.get("openChains") or [],
+                "bestPerChain": multi_plan.get("bestPerChain") or {},
+                "actions": multi_plan.get("actions") or [],
+                "tip": multi_plan.get("tip") or "",
+                "executed": strategist_actions,
+            }
 
             # Process every registry session rather than silently using active_rows[0].
             # Persist the processed session only after any requested on-chain action
@@ -34760,6 +35219,9 @@ def _nkr_live_worker_cycle() -> None:
                 best_overall_chain=diag.get("best_overall_chain") or "",
                 session_chain=diag.get("session_chain") or _nkr_chain_key_from_id(primary_chain_id),
                 recommendation=diag.get("recommendation") or "",
+                multi_chain_tip=(diag.get("multi_chain_plan") or {}).get("tip") or "",
+                multi_chain_actions=(diag.get("multi_chain_plan") or {}).get("actions") or [],
+                live_chains=list((diag.get("multi_chain_plan") or {}).get("liveChains") or sorted(_nkr_live_chain_keys())),
             )
         except Exception as exc:
             _live_engine_mark(
