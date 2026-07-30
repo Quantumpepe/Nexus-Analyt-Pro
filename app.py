@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-277-MULTI-SESSION-OVERVIEW"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-278-CHAIN-CANDIDATE-ASSIGN"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37162,6 +37162,89 @@ def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, d
         "reason": "available_stable_deployed_to_active_sessions",
     }
 
+
+def _nkr_is_placeholder_trade_symbol(sym: str) -> bool:
+    """True for settlement/scan placeholders that must never be treated as a trade target."""
+    u = str(sym or "").strip().upper().replace(" ", "")
+    if not u:
+        return True
+    if u in {"ASSET", "WAITING", "SCANNING", "NONE", "NULL", "USDC", "USDT", "USD", "DAI", "STABLE"}:
+        return True
+    if "USDC" in u or "USDT" in u:
+        return True
+    return False
+
+
+def _nkr_best_candidate_for_session_chain(market_by_sym, chain_key: str, dispatch_min: float, exclude=None):
+    """Pick the strongest watchlist asset tradable on this session's chain.
+
+    Used when a live CoreVault session is still in SCANNING and has no targetAsset yet.
+    Without this assignment, opens_new_trade never fires because symbol stays ASSET/WAITING.
+    """
+    if not isinstance(market_by_sym, dict) or not market_by_sym:
+        return None
+    chain = str(chain_key or "ETH").upper()
+    if chain in {"ETHEREUM", "1"}:
+        chain = "ETH"
+    elif chain in {"BSC", "56"}:
+        chain = "BNB"
+    elif chain in {"POLYGON", "MATIC", "137"}:
+        chain = "POL"
+    exclude = {str(x).upper() for x in (exclude or set()) if str(x).strip()}
+    native_ok = {"ETH": {"ETH", "WETH"}, "BNB": {"BNB", "WBNB"}, "POL": {"POL", "MATIC", "WMATIC"}}.get(chain, set())
+    ranked = []
+    for sym, row in market_by_sym.items():
+        sym_u = str(sym or "").strip().upper()
+        if not sym_u or _nkr_is_placeholder_trade_symbol(sym_u) or sym_u in exclude:
+            continue
+        if not isinstance(row, dict):
+            continue
+        price = _nkr_row_price_usd(row)
+        if price <= 0:
+            continue
+        change = _nkr_row_change_pct(row)
+        score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
+        if change >= 5.0:
+            score = max(score, 78.0)
+        elif change >= 2.0:
+            score = max(score, 70.0)
+        elif change >= 0.5:
+            score = max(score, 58.0)
+        home = str(row.get("chain") or row.get("chainKey") or "").upper()
+        try:
+            if not home and "_nkr_symbol_home_chain" in globals():
+                home = str(_nkr_symbol_home_chain(sym_u) or "").upper()
+        except Exception:
+            home = home or ""
+        on_chain = False
+        if sym_u in native_ok:
+            on_chain = True
+        if home == chain:
+            on_chain = True
+        resolved = {}
+        try:
+            resolved = _nkr_resolve_display_asset(sym_u, chain) if "_nkr_resolve_display_asset" in globals() else {}
+            if isinstance(resolved, dict) and resolved.get("configured") and str(resolved.get("chain") or "").upper() == chain:
+                on_chain = True
+        except Exception:
+            pass
+        try:
+            foreign = str(_nkr_symbol_home_chain(sym_u) or "").upper() if "_nkr_symbol_home_chain" in globals() else ""
+            if foreign and foreign != chain and sym_u not in native_ok:
+                if not (isinstance(resolved, dict) and resolved.get("configured")):
+                    on_chain = False
+        except Exception:
+            pass
+        if not on_chain:
+            continue
+        ranked.append({"sym": sym_u, "row": row, "score": float(score), "change": float(change), "price": float(price)})
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    cleared = [x for x in ranked if x["score"] >= float(dispatch_min or 0) and x["change"] > -0.25]
+    return cleared[0] if cleared else ranked[0]
+
+
 def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None):
     settings = settings if isinstance(settings, dict) else {}
     market_by_sym = _nkr_market_row_map(market_rows)
@@ -37221,17 +37304,47 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL"}:
             active.append(sess)
             continue
+        chain = str(sess.get("chain") or sess.get("chainKey") or (sess.get("meta") or {}).get("chain") or "ETH").upper()
+        if chain in {"ETHEREUM", "1"}: chain = "ETH"
+        elif chain in {"BSC", "56"}: chain = "BNB"
+        elif chain in {"POLYGON", "MATIC", "137"}: chain = "POL"
+        base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
+        open_rotation_early = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
+        has_open_trade_early = bool(open_rotation_early and open_rotation_early.get("tradeId"))
         sym = _nkr_session_symbol(sess)
-        row = market_by_sym.get(sym, {})
-        change = _nkr_row_change_pct(row)
-        current_price_usd = _nkr_row_price_usd(row)
-        score = _nkr_session_score(sess, row)
+        # Live sessions start as SCANNING with no trade target. Assign the best
+        # chain-tradable watchlist asset so entry can actually fire (BNB session → BNB, etc.).
+        if (not has_open_trade_early) and _nkr_is_placeholder_trade_symbol(sym):
+            pick = _nkr_best_candidate_for_session_chain(market_by_sym, chain, dispatch_min)
+            if pick and pick.get("sym"):
+                sym = str(pick["sym"]).upper()
+                sess = dict(sess)
+                sess["symbol"] = sym
+                sess["sourceSymbol"] = sym
+                sess["targetAsset"] = sym
+                meta_assign = dict(sess.get("meta") if isinstance(sess.get("meta"), dict) else {})
+                meta_assign.update({
+                    "nkr_active_asset": sym,
+                    "selected_symbol": sym,
+                    "source_symbol": sym,
+                    "nkr_candidate_assigned": True,
+                    "nkr_candidate_score": pick.get("score"),
+                    "nkr_candidate_change_24h": pick.get("change"),
+                })
+                sess["meta"] = meta_assign
+        row = market_by_sym.get(sym, {}) if isinstance(market_by_sym, dict) else {}
+        change = _nkr_row_change_pct(row) if row else 0.0
+        current_price_usd = _nkr_row_price_usd(row) if row else 0.0
+        score = _nkr_session_score(sess, row) if row else 0.0
+        # Momentum-aware floor so a clearly green assigned candidate is not blocked by a stale rating
+        if row and change >= 2.0:
+            score = max(score, 70.0)
+        elif row and change >= 0.5:
+            score = max(score, 58.0)
         budget = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0.0, 0.0)
         if budget <= 0:
             active.append(sess)
             continue
-        chain = str(sess.get("chain") or "POL").upper()
-        base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
         # ENGINE-081 IMPORTANT:
         # raw_edge_pct is only a decision/quality signal. It must NEVER be used as realized P&L.
         # Real shadow P&L is calculated from the stored entry price versus the current live price.
