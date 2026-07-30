@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-265-PAUSE-STOP-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-268-POL-USDC-ADMISSION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -7520,10 +7520,16 @@ def _vault_approved_token_contracts() -> set[tuple[int, str]]:
             os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
         56: [os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83F1Ad97B32Cd580d",
              os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955"],
-        137: [os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+        137: [os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
               os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xC2132D05D31c914a87C6611C10748AEb04B58e8F"],
     }
     for cid, addresses in stable_env.items():
+        for address in addresses:
+            addr = _norm_addr(address)
+            if _looks_like_evm_addr(addr): out.add((int(cid), addr))
+    # Alternate official USDC contracts are also eligible, but the Vault's own
+    # tokenConfig still decides whether a concrete deposit is enabled on-chain.
+    for cid, addresses in _USDC_ALT_BY_CHAIN.items():
         for address in addresses:
             addr = _norm_addr(address)
             if _looks_like_evm_addr(addr): out.add((int(cid), addr))
@@ -8545,13 +8551,13 @@ _USDC_BY_CHAIN = {
     1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     # Polygon native Circle USDC. Old bridged USDC is accepted as alternate below.
-    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
 }
 
 _USDC_ALT_BY_CHAIN = {
     1: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_ETH") or os.getenv("USDC_ALT_ADDRESSES_1") or "").split(",") if x.strip()],
     56: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_BNB") or os.getenv("USDC_ALT_ADDRESSES_56") or "").split(",") if x.strip()],
-    137: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").split(",") if x.strip()],
+    137: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359").split(",") if x.strip()],
 }
 
 _USDT_BY_CHAIN = {
