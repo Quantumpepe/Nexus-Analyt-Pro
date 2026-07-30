@@ -33367,6 +33367,29 @@ def api_nkr_state():
     return out
 
 
+@app.route("/api/nkr/bridge/plan", methods=["GET"])
+def api_nkr_bridge_plan():
+    """NKR internal USDC bridge: free capital by chain + planned bridge jobs."""
+    wa = _require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("wallet required", 401)
+    free = _nkr_usdc_free_by_chain(wa)
+    jobs = _nkr_bridge_jobs_for_wallet(wa)
+    return jsonify({
+        "ok": True,
+        "asset": "USDC",
+        "liveChains": sorted(_nkr_live_chain_keys()),
+        "freeUsdcByChain": free,
+        "jobs": jobs,
+        "bridgeLiveEnabled": bool(_NKR_BRIDGE_LIVE),
+        "phase": 2 if _NKR_BRIDGE_LIVE else 1,
+        "note": (
+            "Phase 2 live bridge enabled."
+            if _NKR_BRIDGE_LIVE
+            else "Phase 1: Strategist detects capital on the wrong chain and plans a USDC bridge. "
+                 "Live auto-bridge (CCTP) is off until NEXUS_NKR_BRIDGE_LIVE=1 and the bridge path is wired."
+        ),
+    })
 
 
 # ENGINE-194: browser-independent NKR runtime.
@@ -33924,9 +33947,9 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
     overall_chain = str(best_all.get("chain") or "").upper()
     if overall_sym and overall_chain and overall_chain != session_chain and overall_sym != best_sym:
         recommendation = (
-            f"{overall_sym} leads overall (score {best_all['score']:.1f}) on {overall_chain}, "
-            f"but this session is on {session_chain}. Open or fund an NKR session on {overall_chain} "
-            f"to trade {overall_sym}; this session only buys {session_chain}-tradable assets."
+            f"{overall_sym} leads on {overall_chain} (score {best_all['score']:.1f}). "
+            f"This session is locked to {session_chain} — only {session_chain}-tradable assets are scanned. "
+            f"Open a separate NKR session on {overall_chain} to trade {overall_sym}."
         )
 
     if not ranked_all:
@@ -34196,9 +34219,13 @@ _NKR_LIVE_LAST_ASSET_TRADE_TS: dict[tuple[str, int, str], int] = {}
 _NKR_STRATEGIST_IDLE_TICKS: dict[str, int] = {}
 _NKR_STRATEGIST_IDLE_RELEASE_TICKS = max(8, int(os.getenv("NEXUS_NKR_IDLE_RELEASE_TICKS", "20")))
 # Strategist mandate: within rules it may open sessions, buy, sell, and release idle sessions.
-# Set NEXUS_NKR_STRATEGIST_AUTO_SESSION=0 only to force recommendation-only mode.
-_NKR_STRATEGIST_AUTO_SESSION = _env_bool("NEXUS_NKR_STRATEGIST_AUTO_SESSION", True)
+# User opens sessions per chain. Strategist does NOT auto-open cross-chain sessions.
+# Set NEXUS_NKR_STRATEGIST_AUTO_SESSION=1 only if you explicitly want auto-open again.
+_NKR_STRATEGIST_AUTO_SESSION = _env_bool("NEXUS_NKR_STRATEGIST_AUTO_SESSION", False)
+# Idle release stays on: only when THIS session chain has no entry for N ticks (not because another chain leads).
 _NKR_STRATEGIST_AUTO_RELEASE = _env_bool("NEXUS_NKR_STRATEGIST_AUTO_RELEASE", True)
+# Cross-chain USDC bridge deferred — product model is one session per chain.
+_NKR_BRIDGE_ACTIONS_ENABLED = _env_bool("NEXUS_NKR_BRIDGE_ACTIONS", False)
 _NKR_STRATEGIST_MIN_SESSION_USD = max(5.0, _safe_float(os.getenv("NEXUS_NKR_STRATEGIST_MIN_SESSION_USD", "15"), 15.0))
 _NKR_STRATEGIST_LAST_ACTION_TS: dict[str, int] = {}
 _NKR_STRATEGIST_ACTION_COOLDOWN_SEC = max(30, int(os.getenv("NEXUS_NKR_STRATEGIST_ACTION_COOLDOWN_SEC", "90")))
@@ -34269,13 +34296,77 @@ def _nkr_live_eth_route_registry(cfg: dict) -> dict[str, dict]:
     return _nkr_live_route_registry(cfg)
 
 
+# NKR USDC bridge jobs (Phase 1 = plan + status; Phase 2 = CCTP live when env enabled)
+_NKR_BRIDGE_LIVE = str(os.environ.get("NEXUS_NKR_BRIDGE_LIVE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+_NKR_BRIDGE_JOBS: dict = {}
+_NKR_BRIDGE_JOBS_LOCK = threading.RLock()
+
+
+def _nkr_usdc_free_by_chain(wallet: str) -> dict:
+    """Free USDC (vault base) per live chain for this wallet. Used by bridge planner."""
+    out = {}
+    wa = _norm_addr(wallet)
+    for ch in sorted(_nkr_live_chain_keys()):
+        try:
+            funding = _v5_engine_funding_state(wa, ch, "USDC")
+            dec = int(funding.get("decimals") or 6)
+            free_u = int(funding.get("freeBaseUnits") or 0)
+            out[ch] = round(free_u / float(10 ** dec), 6) if free_u > 0 else 0.0
+        except Exception:
+            out[ch] = 0.0
+    return out
+
+
+def _nkr_bridge_job_upsert(wallet: str, plan: dict) -> dict:
+    """Create or refresh a BRIDGE_CAPITAL job. Live CCTP execution is Phase 2."""
+    wa = _norm_addr(wallet)
+    job_id = f"nkr-bridge-{wa[-8:]}-{str(plan.get('fromChain') or '').lower()}-{str(plan.get('toChain') or '').lower()}"
+    with _NKR_BRIDGE_JOBS_LOCK:
+        prev = dict(_NKR_BRIDGE_JOBS.get(job_id) or {})
+        job = {
+            "id": job_id,
+            "wallet": wa,
+            "asset": "USDC",
+            "fromChain": str(plan.get("fromChain") or "").upper(),
+            "toChain": str(plan.get("toChain") or "").upper(),
+            "amountUsd": round(_safe_float(plan.get("amountUsd"), 0.0), 4),
+            "symbol": str(plan.get("symbol") or "").upper(),
+            "score": _safe_float(plan.get("score"), 0.0),
+            "status": "PLANNED" if not _NKR_BRIDGE_LIVE else str(prev.get("status") or "QUEUED"),
+            "detail": str(plan.get("detail") or ""),
+            "liveEnabled": bool(_NKR_BRIDGE_LIVE),
+            "updatedTs": int(time.time()),
+            "createdTs": int(prev.get("createdTs") or time.time()),
+            "txHash": str(prev.get("txHash") or ""),
+            "error": str(prev.get("error") or ""),
+        }
+        if not _NKR_BRIDGE_LIVE:
+            job["status"] = "NEEDS_MANUAL_OR_PHASE2"
+            job["error"] = ""
+            job["note"] = (
+                "Bridge plan ready. Live auto-bridge (Circle CCTP / equivalent) is not enabled yet "
+                "(NEXUS_NKR_BRIDGE_LIVE=0). Deposit USDC on the target chain or enable Phase 2."
+            )
+        _NKR_BRIDGE_JOBS[job_id] = job
+        return dict(job)
+
+
+def _nkr_bridge_jobs_for_wallet(wallet: str) -> list:
+    wa = _norm_addr(wallet)
+    with _NKR_BRIDGE_JOBS_LOCK:
+        rows = [dict(v) for v in _NKR_BRIDGE_JOBS.values() if str(v.get("wallet") or "").lower() == wa.lower()]
+    rows.sort(key=lambda x: int(x.get("updatedTs") or 0), reverse=True)
+    return rows[:12]
+
+
 def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_rows: list, settings: dict) -> dict:
     """Strategist orchestration across all live vault chains (ETH/BNB/POL + future).
 
     Actions (decision layer — auto session create is env-gated):
-      OPEN_SESSION  — strong candidate on a live chain with no NKR session
-      SPLIT_CAPITAL — ≥2 live chains have entry-quality candidates
-      RELEASE_IDLE  — session has no position and no entry candidate for N ticks
+      OPEN_SESSION   — strong candidate on a live chain with no NKR session
+      SPLIT_CAPITAL  — ≥2 live chains have entry-quality candidates
+      RELEASE_IDLE   — session has no position and no entry candidate for N ticks
+      BRIDGE_CAPITAL — best setup is on chain B but free USDC sits on chain A
     """
     settings = settings if isinstance(settings, dict) else {}
     live_chains = sorted(_nkr_live_chain_keys())
@@ -34334,7 +34425,7 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
     actions = []
     tips = []
 
-    # OPEN_SESSION when a live chain has an entry-quality leader and no session.
+    # SUGGEST_SESSION (info only): user opens sessions per chain — Strategist does not auto-open.
     for ch in live_chains:
         best = best_per_chain.get(ch)
         if not best or best["score"] < threshold:
@@ -34342,29 +34433,32 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         if open_by_chain.get(ch):
             continue
         actions.append({
-            "type": "OPEN_SESSION",
+            "type": "SUGGEST_SESSION",
             "chain": ch,
             "symbol": best["symbol"],
             "score": round(best["score"], 2),
-            "detail": f"{best['symbol']} score {best['score']:.1f} on {ch} — open an NKR session on {ch} to trade it.",
+            "detail": (
+                f"{best['symbol']} score {best['score']:.1f} on {ch}. "
+                f"Start an NKR session on {ch} if you want the Strategist to trade {ch} assets."
+            ),
         })
-        tips.append(f"Open {ch} session for {best['symbol']}")
+        tips.append(f"Tip: open {ch} session for {best['symbol']}")
 
-    # SPLIT when multiple chains have entry candidates and sessions (or opens pending).
+    # Info only when several chains look strong — user may open multiple sessions manually.
     strong = [ch for ch in live_chains if best_per_chain.get(ch) and best_per_chain[ch]["score"] >= threshold]
     if len(strong) >= 2:
         actions.append({
-            "type": "SPLIT_CAPITAL",
+            "type": "INFO_MULTI_CHAIN",
             "chains": strong,
             "detail": (
-                "Multiple live chains qualify: "
+                "Strong setups on: "
                 + ", ".join(f"{ch}:{best_per_chain[ch]['symbol']} {best_per_chain[ch]['score']:.0f}" for ch in strong)
-                + ". Split capital across sessions."
+                + ". Each chain needs its own NKR session and vault budget."
             ),
         })
-        tips.append("Split capital · " + "/".join(strong))
+        tips.append("Multi-chain tip · " + "/".join(strong))
 
-    # Global leader across live chains (e.g. BNB 65 on BNB while ETH session is idle).
+    # Global leader (informational only — never drives buy on a foreign session chain).
     global_best_ch, global_best = None, None
     for ch, b in best_per_chain.items():
         if not b:
@@ -34372,7 +34466,8 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         if global_best is None or (b["score"], b["change"]) > (global_best["score"], global_best["change"]):
             global_best_ch, global_best = ch, b
 
-    # IDLE release tracking per session
+    # IDLE release: only when THIS session has no position AND no entry on its own chain.
+    # Do NOT accelerate release because another chain leads (no auto capital chase / no bridge).
     release_candidates = []
     wa = _norm_addr(wallet)
     for lr in runnable_rows or []:
@@ -34383,43 +34478,44 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         sid = str(lr.get("onchain_session_id") or "")
         key = f"{wa}:{ch}:{sid}"
         best = best_per_chain.get(ch)
-        # Heuristic: no budget-linked position signal from registry row fields if present
         open_assets = int(lr.get("open_asset_count") or lr.get("openAssetCount") or 0)
         has_pos = open_assets > 0
         entry_ok = bool(best and best["score"] >= threshold)
-        # Faster release when another live chain clearly leads and this session is flat.
-        other_leads = bool(
-            global_best
-            and global_best_ch
-            and global_best_ch != ch
-            and global_best["score"] >= threshold
-            and (not best or global_best["score"] >= (best["score"] + 4.0))
-        )
-        if has_pos or (entry_ok and not other_leads):
+        if has_pos or entry_ok:
             _NKR_STRATEGIST_IDLE_TICKS[key] = 0
             continue
         _NKR_STRATEGIST_IDLE_TICKS[key] = int(_NKR_STRATEGIST_IDLE_TICKS.get(key) or 0) + 1
         ticks = _NKR_STRATEGIST_IDLE_TICKS[key]
-        # Normal idle release OR accelerated release when capital is stuck while BNB/etc leads.
-        need_ticks = 3 if other_leads else _NKR_STRATEGIST_IDLE_RELEASE_TICKS
+        need_ticks = int(_NKR_STRATEGIST_IDLE_RELEASE_TICKS or 8)
         if ticks >= need_ticks:
             actions.append({
                 "type": "RELEASE_IDLE",
                 "chain": ch,
                 "sessionId": sid,
                 "idleTicks": ticks,
-                "priority": 0 if other_leads else 1,
+                "priority": 1,
                 "detail": (
-                    f"Session on {ch} has no position"
-                    + (f" while {global_best_ch}:{global_best['symbol']} leads at {global_best['score']:.1f}" if other_leads else f" and no entry candidate for {ticks} ticks")
-                    + ". Release capital for the stronger chain."
+                    f"Session on {ch} has no position and no {ch}-tradable entry candidate "
+                    f"for {ticks} ticks. Release idle capital on {ch}."
                 ),
             })
-            release_candidates.append({"chain": ch, "sessionId": sid, "idleTicks": ticks, "otherLeads": other_leads})
-            tips.append(f"Release idle {ch} → fund {global_best_ch or 'leader'}")
+            release_candidates.append({"chain": ch, "sessionId": sid, "idleTicks": ticks, "otherLeads": False})
+            tips.append(f"Release idle {ch} session")
 
-    # Prefer RELEASE_IDLE before OPEN_SESSION when capital is locked on a weak/idle chain.
-    actions.sort(key=lambda a: (0 if str(a.get("type")).upper() == "RELEASE_IDLE" else 1, int(a.get("priority") or 1)))
+    # Optional bridge actions remain env-gated off (product: one session per chain, no auto bridge).
+    free_by_chain = _nkr_usdc_free_by_chain(wallet)
+    if _NKR_BRIDGE_ACTIONS_ENABLED:
+        # legacy path kept for future — not used in default product model
+        pass
+
+    def _action_rank(a):
+        t = str(a.get("type") or "").upper()
+        if t == "RELEASE_IDLE":
+            return (0, int(a.get("priority") or 1))
+        if t == "SUGGEST_SESSION":
+            return (2, int(a.get("priority") or 1))
+        return (3, int(a.get("priority") or 1))
+    actions.sort(key=_action_rank)
 
     short_tip = tips[0] if tips else ""
     if len(tips) > 1:
@@ -34432,6 +34528,7 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
             for ch, b in best_per_chain.items()
         },
         "openChains": [ch for ch, rows in open_by_chain.items() if rows],
+        "freeUsdcByChain": {ch: round(float(free_by_chain.get(ch) or 0.0), 4) for ch in live_chains},
         "actions": actions,
         "releaseCandidates": release_candidates,
         "tip": short_tip,
@@ -34439,6 +34536,7 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         "mode": mode,
         "autoSessionEnabled": bool(_NKR_STRATEGIST_AUTO_SESSION),
         "autoReleaseEnabled": bool(_NKR_STRATEGIST_AUTO_RELEASE),
+        "bridgeLiveEnabled": bool(globals().get("_NKR_BRIDGE_LIVE", False)),
     }
 
 
@@ -34599,7 +34697,7 @@ def _nkr_strategist_release_idle_session(wallet: str, live_row: dict) -> dict:
 
 
 def _nkr_strategist_apply_actions(wallet: str, multi_plan: dict, runnable_rows: list, settings: dict) -> list:
-    """Execute OPEN_SESSION / RELEASE_IDLE from the multi-chain plan under user mode rules."""
+    """Execute OPEN_SESSION / RELEASE_IDLE / BRIDGE_CAPITAL from the multi-chain plan under user mode rules."""
     results = []
     settings = settings if isinstance(settings, dict) else {}
     actions = list((multi_plan or {}).get("actions") or [])
@@ -34614,6 +34712,16 @@ def _nkr_strategist_apply_actions(wallet: str, multi_plan: dict, runnable_rows: 
         if not isinstance(action, dict):
             continue
         atype = str(action.get("type") or "").upper()
+
+        if atype == "BRIDGE_CAPITAL":
+            # Product model: no auto-bridge. Ignore unless explicitly re-enabled later.
+            results.append({"action": "BRIDGE_CAPITAL", "ok": False, "error": "bridge_disabled_session_per_chain"})
+            continue
+
+        if atype in {"SUGGEST_SESSION", "INFO_MULTI_CHAIN"}:
+            # Informational only — user starts the session on that chain.
+            results.append({"action": atype, "ok": True, "info": True, "chain": action.get("chain"), "detail": action.get("detail")})
+            continue
 
         if atype == "OPEN_SESSION" and _NKR_STRATEGIST_AUTO_SESSION:
             ch = str(action.get("chain") or "").upper()
