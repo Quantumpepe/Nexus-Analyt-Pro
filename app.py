@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-260-NKR-SETTINGS-LIVE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-261-NKR-AGGRESSIVE-STICKY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35123,9 +35123,27 @@ def _nkr_live_worker_cycle() -> None:
             market_rows = _nkr_live_market_rows(wallet)
             state, _ = _db_get_user_app_state(wallet)
             ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-            # Prefer explicit UI mode; never silently drop user Aggressive/Tactical/Defensive.
+            # Prefer mode stamped on live sessions (incl. PAUSED), then app-state UI.
+            # Prevents a post-start UI reset to Dynamic from overriding consented Aggressive.
+            session_mode = ""
+            try:
+                for _s in (sessions or []):
+                    if not isinstance(_s, dict) or not _nkr_is_session(_s):
+                        continue
+                    _st = str(_s.get("status") or "").upper()
+                    if _st in {"FINALIZED", "CLOSED", "DELETED", "ARCHIVED", "CANCELLED"}:
+                        continue
+                    _m = _s.get("meta") if isinstance(_s.get("meta"), dict) else {}
+                    session_mode = str(
+                        _s.get("nkrCapitalMode") or _s.get("capitalMode")
+                        or _m.get("nkr_capital_mode") or _m.get("capital_mode") or ""
+                    ).strip()
+                    if session_mode:
+                        break
+            except Exception:
+                session_mode = ""
             settings = {
-                "nkrCapitalMode": _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
+                "nkrCapitalMode": _nkr_normalize_performance_mode(session_mode or ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
                 "nkrProfitMode": str(ui.get("nkrProfitMode") or "REINVEST").upper(),
                 "nkrObservationWindow": str(ui.get("nkrObservationWindow") or "1h"),
                 "nkrPeriodDays": ui.get("nkrPeriodDays") or 10,
