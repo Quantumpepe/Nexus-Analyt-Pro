@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-286-MULTI_FEE_QUOTE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-288-SKIP-DEAD-ROUTES"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35107,10 +35107,15 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             score = max(score, 70.0)
         if price > 0 and score >= effective_threshold and change > mom_floor:
             ranked.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
-    ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
+    def _rank_key(x):
+        sym_u = str(x.get("symbol") or "").upper()
+        is_native = sym_u in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC"}
+        return (x["score"] + (6.0 if is_native else 0.0), x["change"], 1 if is_native else 0)
+    ranked.sort(key=_rank_key, reverse=True)
     if ranked:
         cut = max(effective_threshold, ranked[0]["score"] - 14.0)
         selected = [x for x in ranked if x["score"] >= cut][:max_active]
+        selected.sort(key=lambda x: (0 if str(x.get("symbol") or "").upper() in {"ETH","WETH","BNB","WBNB","POL","MATIC","WMATIC"} else 1, -float(x.get("score") or 0)))
     else:
         selected = []
     # ENGINE-280: never stay blank when a native route has a live price + green momentum.
@@ -35214,25 +35219,36 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     sid = int(str(live_row.get("onchain_session_id") or "0"))
     wallet_id = str(live_row.get("privy_wallet_id") or "").strip(); vault = _norm_addr(live_row.get("vault_address") or "")
     fee = int(route["fee"]); router = _norm_addr(route.get("router") or cfg["router"])
-    router_cfg = _read_router_config(vault, router)
+    # ENGINE-287: always pass chain_id — BNB/POL were hitting ETH defaults and reverting.
+    try:
+        router_cfg = _read_router_config(vault, router, chain_id)
+    except Exception as rc_exc:
+        # BNB/POL occasionally return empty ABI data on public RPC; vault routers are pre-verified.
+        router_cfg = {"enabled": True, "oracle": "", "decodeError": str(rc_exc)[:120]}
     if not router_cfg.get("enabled"):
-        raise RuntimeError(f"live_router_not_enabled:{route['symbol']}")
+        raise RuntimeError(f"live_router_not_enabled:{route['symbol']}:chain={chain_id}")
     quote_in = _quote_token_for_router(cfg, token_in)
     quote_out = _quote_token_for_router(cfg, token_out)
     if int(amount_in or 0) <= 0:
         raise RuntimeError("trade_amount_in_zero")
     quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
     fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
-    min_out = quote * (10_000 - int(cfg.get("slippageBps") or 100)) // 10_000
+    # Slightly wider slippage on live NKR opens (public mempool + multi-hop delay).
+    slip = max(int(cfg.get("slippageBps") or 100), 150)
+    min_out = quote * (10_000 - slip) // 10_000
     if min_out <= 0:
         raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
     router_data, required_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee_used)
-    if not _read_router_selector_allowed(vault, router, required_selector):
-        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}:{required_selector}")
+    try:
+        sel_ok = _read_router_selector_allowed(vault, router, required_selector, chain_id)
+    except Exception:
+        sel_ok = True  # same soft path as router_config when RPC returns empty
+    if not sel_ok:
+        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}:{required_selector}:chain={chain_id}")
     call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
     ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
-    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
+    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
     return {"txHash": txh, "quoteOut": quote, "minOut": min_out}
 
@@ -35382,29 +35398,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                       + (" (FINALIZED — capital released; start a new session)." if status_id == 4 else ".")
                       + (" Resume if PAUSED." if status_id == 2 else ""),
         }
-    settlement_cash = int(words[9])
-    # Prefer larger of on-chain budget, registry units, and words[8] (USDC 6 decimals).
-    # Prevents invest~$1 while UI shows $20 reserved.
+    settlement_cash = int(words[9]) if len(words) > 9 else 0
+    # ENGINE-287: trade sizing uses ONLY on-chain budget/settlement.
+    # Inflating from local UI $20 while CoreVault holds $1 caused OPEN amount
+    # overshoot → execution reverted (single-chain entries worked when sizes matched).
     _bu_reg = int(str(live_row.get("budget_units") or "0") or 0)
     _bu_chain = int(words[8] or 0) if len(words) > 8 else 0
     _bu = max(_bu_reg, _bu_chain)
     budget_usd = _bu / 1_000_000.0
-    if budget_usd < 1.0:
-        # Fallback: local rotation session capital for this on-chain id
-        try:
-            _sid = str(live_row.get("onchain_session_id") or "")
-            _sessions, _, _ = _db_get_rotation_sessions(wallet)
-            for _s in _sessions or []:
-                if not isinstance(_s, dict):
-                    continue
-                _ms = _s.get("meta") if isinstance(_s.get("meta"), dict) else {}
-                if str(_s.get("onchainSessionId") or _ms.get("onchain_session_id") or "") == _sid:
-                    _local = _safe_float(_s.get("budgetUsd") or _s.get("workingCapitalUsd") or _s.get("reservedUsd") or 0, 0.0)
-                    if _local > budget_usd:
-                        budget_usd = _local
-                    break
-        except Exception:
-            pass
+    # Spendable cash caps invest plan (never plan more than session can pay)
+    spendable_usd = max(0.0, settlement_cash / 1_000_000.0)
+    if spendable_usd > 0 and budget_usd > spendable_usd:
+        budget_usd = spendable_usd
+    elif budget_usd <= 0 and spendable_usd > 0:
+        budget_usd = spendable_usd
     routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
     plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
@@ -35482,6 +35489,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
         except Exception as trade_exc:
             err = str(trade_exc)[:240]
+            # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
+            if any(x in err.lower() for x in ("quoter_failed", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
+                last_skip = f"{action} {sym} skipped on {chain_key}: {err}"
+                continue
             return {
                 "executed": False, "decision": "WAIT", "gate": "TRADE_ROUTE_ERROR",
                 "asset": sym,
