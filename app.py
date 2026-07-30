@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-274-MULTI-START-ALL-CHAINS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-275-SESSION-LIGHT-READINESS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2091,25 +2091,44 @@ def api_core_vault_create_system_session_auto():
     if not chain_id:
         return jsonify({"status": "blocked", "error": "core_vault_chain_not_supported", "chain": chain_key}), 409
     cfg = _privy_trading_cfg(chain_id)
-    readiness = _privy_delegated_readiness(wallet, chain_id)
-    blockers = list(readiness.get("blockers") or [])
-    if blockers:
+    # Session CREATE only needs Privy wallet + the chosen settlement asset ready.
+    # Full multi-asset readiness (USDT+native+quoter for every path) is for live trades,
+    # not for opening a budget session — that blocked BNB/POL starts when only USDC was funded.
+    wallet_id = _privy_wallet_id_for_user(wallet)
+    session_blockers = []
+    if not (cfg.get("appId") and cfg.get("appSecret")):
+        session_blockers.append("privy_app_credentials_missing")
+    if not (cfg.get("signerId") and cfg.get("authorizationKey")):
+        session_blockers.append("privy_trading_signer_missing")
+    if not cfg.get("policyId"):
+        session_blockers.append("privy_trading_policy_missing")
+    if not wallet_id:
+        session_blockers.append("privy_wallet_mapping_pending")
+    if not _looks_like_evm_addr(cfg.get("vault") or ""):
+        session_blockers.append("corevault_v5_address_missing")
+    else:
+        try:
+            paused = bool((_core_vault_words(_core_vault_call(int(cfg["chainId"]), cfg["vault"], _CORE_VAULT_SELECTORS["paused"])) or [0])[0])
+            if paused:
+                session_blockers.append("vault_paused")
+        except Exception as exc:
+            session_blockers.append(f"vault_rpc_or_decode_failed:{str(exc)[:120]}")
+    if session_blockers:
         return jsonify({
             "status": "blocked",
             "error": "privy_live_execution_not_ready",
-            "blockers": blockers,
-            "readiness": readiness,
+            "blockers": session_blockers,
+            "chain": chain_key,
+            "note": "session_create_uses_light_readiness",
         }), 409
-
-    wallet_id = _privy_wallet_id_for_user(wallet)
-    if not wallet_id:
-        return jsonify({"status": "blocked", "error": "privy_wallet_mapping_pending"}), 409
 
     duration_hours = max(1, min(int(float(body.get("durationHours") or 24)), 24 * 30))
     duration_sec = duration_hours * 3600
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
-    settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, "ETH")).upper().strip()
+    settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
+    if settlement_symbol not in {"USDC", "USDT"} and system_name in {"NKR", "TRADER"}:
+        settlement_symbol = "USDC"
     try:
         funding = _v5_engine_funding_state(wallet, chain_key, settlement_symbol)
     except ValueError as exc:
@@ -2117,7 +2136,13 @@ def api_core_vault_create_system_session_auto():
     except Exception as exc:
         return jsonify({"status":"error","error":f"v5_funding_read_failed:{exc}"}), 502
     if not funding["configured"] or not funding["executionEnabled"] or not funding["settlementToken"]:
-        return jsonify({"status":"blocked","error":"settlement_asset_not_execution_ready","funding":funding}), 409
+        return jsonify({
+            "status": "blocked",
+            "error": "settlement_asset_not_execution_ready",
+            "chain": chain_key,
+            "settlementAsset": settlement_symbol,
+            "funding": funding,
+        }), 409
     settlement_token = funding["token"]
     decimals = int(funding["decimals"])
     raw_budget = body.get("budgetAmount") or body.get("amount") or body.get("amountNative") or body.get("amountUsd") or body.get("budgetUsd")
