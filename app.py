@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-288-SKIP-DEAD-ROUTES"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-290-BUDGET-DECIMALS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34473,7 +34473,8 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
 # Strategy decisions remain in the existing NKR logic; this layer only translates
 # the resulting target state into confirmed CoreVault OPEN/ADD/REDUCE/CLOSE deltas.
 _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ASSET_COOLDOWN_SEC", "60")))
-_NKR_LIVE_MIN_REBALANCE_USD = max(0.25, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "1.00")))
+# Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
+_NKR_LIVE_MIN_REBALANCE_USD = max(0.20, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "0.50")))
 _NKR_LIVE_LAST_ASSET_TRADE_TS: dict[tuple[str, int, str], int] = {}
 # Strategist idle tracker: wallet:chain:sid → consecutive ticks with no position & no entry candidate
 _NKR_STRATEGIST_IDLE_TICKS: dict[str, int] = {}
@@ -35171,8 +35172,12 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.92))
         elif invest_usd < max(_NKR_LIVE_MIN_REBALANCE_USD, budget_usd * 0.35):
             invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.85))
+        # Tiny sessions: if almost all capital is "invest" already, keep it
+        if budget_usd > 0 and budget_usd < 5.0 and invest_usd < budget_usd * 0.85:
+            invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.90))
     targets = {}
-    if selected and invest_usd >= _NKR_LIVE_MIN_REBALANCE_USD:
+    min_for_targets = min(_NKR_LIVE_MIN_REBALANCE_USD, max(0.20, budget_usd * 0.40)) if budget_usd > 0 else _NKR_LIVE_MIN_REBALANCE_USD
+    if selected and invest_usd >= min_for_targets:
         powers = [max(1.0, (x["score"] - threshold + 8.0) ** 2) for x in selected]
         total_power = sum(powers)
         max_weight = max(35.0, min(90.0, _safe_float(settings.get("maxCapitalPerAssetPct"), 80.0))) / 100.0
@@ -35399,19 +35404,69 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                       + (" Resume if PAUSED." if status_id == 2 else ""),
         }
     settlement_cash = int(words[9]) if len(words) > 9 else 0
-    # ENGINE-287: trade sizing uses ONLY on-chain budget/settlement.
-    # Inflating from local UI $20 while CoreVault holds $1 caused OPEN amount
-    # overshoot → execution reverted (single-chain entries worked when sizes matched).
     _bu_reg = int(str(live_row.get("budget_units") or "0") or 0)
     _bu_chain = int(words[8] or 0) if len(words) > 8 else 0
     _bu = max(_bu_reg, _bu_chain)
-    budget_usd = _bu / 1_000_000.0
-    # Spendable cash caps invest plan (never plan more than session can pay)
-    spendable_usd = max(0.0, settlement_cash / 1_000_000.0)
-    if spendable_usd > 0 and budget_usd > spendable_usd:
+    # ENGINE-290: scale by settlement token decimals (USDC=6). A wrong /1e6 on
+    # 18-decimal units produced invest=$1.7e12 style garbage in System Info.
+    _set_tok = _norm_addr(words[1]) if len(words) > 1 else _norm_addr(cfg.get("usdc") or "")
+    _dec = 6
+    try:
+        _tc = _read_token_config(vault, _set_tok or cfg.get("usdc"), chain_id)
+        _dec = int(_tc.get("decimals") or 6)
+    except Exception:
+        _dec = 6
+    if _dec < 0 or _dec > 24:
+        _dec = 6
+    _div = float(10 ** _dec)
+    budget_usd = (_bu / _div) if _bu > 0 else 0.0
+    spendable_usd = (settlement_cash / _div) if settlement_cash > 0 else 0.0
+    # Sanity: if /6-dec looks like trillions but /18-dec is a normal session size, use 18.
+    if budget_usd > 1_000_000.0 and _bu >= 10 ** 15:
+        alt = _bu / 1e18
+        if 0.01 <= alt <= 1_000_000.0:
+            budget_usd = alt
+            _div = 1e18
+            _dec = 18
+            spendable_usd = settlement_cash / _div if settlement_cash > 0 else 0.0
+    # Prefer local session budget when on-chain decode is absurd or near-zero
+    try:
+        _sid = str(live_row.get("onchain_session_id") or "")
+        _sessions, _, _ = _db_get_rotation_sessions(wallet)
+        _local = 0.0
+        for _s in _sessions or []:
+            if not isinstance(_s, dict):
+                continue
+            _ms = _s.get("meta") if isinstance(_s.get("meta"), dict) else {}
+            if str(_s.get("onchainSessionId") or _ms.get("onchain_session_id") or "") != _sid:
+                continue
+            _local = _safe_float(
+                _s.get("budgetUsd") or _s.get("nkrTotalBudgetUsd") or _s.get("workingCapitalUsd") or _s.get("reservedUsd") or 0,
+                0.0,
+            )
+            break
+        if _local > 0 and (budget_usd <= 0 or budget_usd > 1_000_000.0 or (budget_usd < 0.05 and _local >= 1.0)):
+            budget_usd = _local
+        if _local > 0 and spendable_usd > 1_000_000.0:
+            spendable_usd = min(spendable_usd, _local)
+        if _local > 0 and spendable_usd <= 0 and budget_usd > 0:
+            spendable_usd = budget_usd
+    except Exception:
+        pass
+    # Cap plan to spendable when both sane
+    if 0 < spendable_usd <= 1_000_000.0 and budget_usd > spendable_usd:
         budget_usd = spendable_usd
-    elif budget_usd <= 0 and spendable_usd > 0:
+    elif budget_usd <= 0 and 0 < spendable_usd <= 1_000_000.0:
         budget_usd = spendable_usd
+    # Keep settlement_cash in RAW token units for trade amount caps (must match token decimals)
+    if _dec != 6 and settlement_cash > 0:
+        # OPEN path multiplies USD by 1e6 assuming USDC-6; normalize raw to 6-dec units for that path
+        # when settlement is USDC-like. If truly 18-dec stable, convert to 6-dec equivalent.
+        try:
+            _settlement_usd = settlement_cash / _div
+            settlement_cash = int(max(0, round(_settlement_usd * 1_000_000)))
+        except Exception:
+            pass
     routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
     plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
@@ -35467,8 +35522,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
             fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
             actions.append((1, abs(delta), "REDUCE", sym, amount))
-        elif delta > _NKR_LIVE_MIN_REBALANCE_USD and settlement_cash >= int(_NKR_LIVE_MIN_REBALANCE_USD * 1_000_000):
-            actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(settlement_cash, int(delta * 1_000_000))))
+        else:
+            # Adaptive floor: never require more than ~40% of session budget to open.
+            min_open = min(_NKR_LIVE_MIN_REBALANCE_USD, max(0.20, float(plan.get("investUsd") or budget_usd or 0) * 0.40))
+            if min_open <= 0:
+                min_open = 0.20
+            if delta >= min_open and settlement_cash >= int(min_open * 1_000_000):
+                actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(settlement_cash, int(delta * 1_000_000))))
     actions.sort(key=lambda x: (x[0], -x[1]))
     execution = None
     for _, delta, action, sym, amount in actions:
