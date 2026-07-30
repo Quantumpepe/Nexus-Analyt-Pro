@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-272-POL-NATIVE-USDC-FULL-PATH-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-273-POL-NATIVE-USDC-ONCHAIN-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -17061,6 +17061,21 @@ def _core_vault_read_onchain(wallet_address: str, chain_key: str = "ETH") -> dic
         ("USDT", str(_USDT_BY_CHAIN.get(cid) or ""), 6, False),
         (str(_NATIVE_SYMBOL_BY_CHAIN.get(cid) or "NATIVE"), NEXUS_NATIVE_TOKEN, int(_NATIVE_DECIMALS_BY_CHAIN.get(cid) or 18), True),
     ]
+    # Polygon has two distinct official USDC contracts. The wallet/deposit UI
+    # matches Vault approval by the exact contract address, so Native Circle
+    # USDC must also be read from tokenConfig and returned in onchain.tokens.
+    # Without this row the backend admission check can allow the token while
+    # the UI still reports "Owner approval required" because no matching
+    # on-chain token state exists.
+    if cid == 137:
+        native_usdc = _norm_addr(
+            os.getenv("USDC_NATIVE_ADDRESS_137") or
+            os.getenv("USDC_NATIVE_ADDRESS_POL") or
+            os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or
+            "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+        )
+        if _looks_like_evm_addr(native_usdc):
+            asset_specs.insert(1, ("USDC_NATIVE", native_usdc, 6, False))
     totals = {"baseCapital": 0.0, "freeBase": 0.0, "securedProfit": 0.0, "allocated": 0.0, "contractAssets": 0.0, "userLiabilities": 0.0, "ownerReserve": 0.0, "liquidityReserve": 0.0}
     tokens = {}
     for symbol, token, fallback_decimals, is_native in asset_specs:
