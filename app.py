@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-290-BUDGET-DECIMALS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-291-POL-QUOTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -29926,9 +29926,11 @@ def _privy_trading_cfg(chain_id=1):
     native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(cid, "ETH")
     vault = _norm_addr(_VAULT_BY_CHAIN.get(cid) or "")
     router = _norm_addr(_ROUTER_V3_BY_CHAIN.get(cid) or _ROUTER_BY_CHAIN.get(cid) or "")
+    # Uniswap V3 QuoterV2 (CREATE2 same on ETH/POL); BSC uses Pancake-compatible quoter.
     quoter_defaults = {
         1: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         56: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
+        137: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon Uniswap V3 QuoterV2
     }
     quoter = _norm_addr(
         os.getenv(f"NEXUS_EXECUTOR_QUOTER_{native_symbol}") or
@@ -35550,7 +35552,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         except Exception as trade_exc:
             err = str(trade_exc)[:240]
             # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
-            if any(x in err.lower() for x in ("quoter_failed", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
+            if any(x in err.lower() for x in ("quoter_failed", "quoter_not_configured", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
                 last_skip = f"{action} {sym} skipped on {chain_key}: {err}"
                 continue
             return {
