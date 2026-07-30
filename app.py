@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-257-NKR-STRATEGIST-AUTONOMY"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-260-NKR-SETTINGS-LIVE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -14228,7 +14228,11 @@ def _db_set_rotation_sessions(wallet_address: str, sessions: list, active_sessio
                     """,
                     vals,
                 )
-                for ev in (sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else [])[:50]:
+                # Persist all events unless an explicit positive limit is configured.
+                # Old hard-cap of 50 made the UI counter look stuck at "50 saved".
+                _ev_list = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
+                _ev_list = _nkr_trim_rotation_events(_ev_list) if "_nkr_trim_rotation_events" in globals() else _ev_list
+                for ev in _ev_list:
                     if not isinstance(ev, dict):
                         continue
                     ev_vals = _rotation_event_to_db_tuple(wa, sid, dict(ev))
@@ -32980,7 +32984,8 @@ NEXUS_NKR_AGGRESSIVE_HARD_CUT_NET_PCT = -0.75
 NEXUS_NKR_AGGRESSIVE_UNDERPERFORM_SCORE_GAP = 5.0
 NEXUS_NKR_AGGRESSIVE_TRANSFER_PCT = 1.00
 NEXUS_NKR_AGGRESSIVE_MIN_SESSION_USD = 0.0
-NEXUS_NKR_EVENT_HISTORY_LIMIT = 0  # 0 = unlimited persisted history; UI display cap is separate
+# 0 = no product cap (keep full history). Optional soft storage bound via ENV only.
+NEXUS_NKR_EVENT_HISTORY_LIMIT = int(os.getenv("NEXUS_NKR_EVENT_HISTORY_LIMIT", "0") or 0)
 NEXUS_NKR_REBALANCE_MODE = "NKR_DYNAMIC_AND_AGGRESSIVE_PROFIT_ROTATION_V1"
 NEXUS_NKR_REBALANCE_POLICY = "DYNAMIC_AND_AGGRESSIVE_REALLOCATE_AGING_WEAK_CAPITAL_TO_CURRENT_LIVE_WINNERS_WITH_MODE_SPECIFIC_THRESHOLDS"
 NEXUS_NKR_LIVE_PRICE_CARD_MODE = "NKR_SESSION_CARDS_USE_TRADER_LIVE_PRICE_SOURCE"
@@ -33604,6 +33609,34 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
         # Do not let an old terminal/local row suppress a confirmed active session.
         st = str(existing.get("status") or existing.get("lifecycleState") or "").upper()
         if st not in ROTATION_TERMINAL_STATUSES and str(existing.get("id") or existing.get("session_id") or "") == local_id:
+            # Backfill Strategist rules from current user UI when older rows lack them.
+            try:
+                state, _ = _db_get_user_app_state(wallet)
+                ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+                capital_mode = _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or existing.get("nkrCapitalMode") or "DYNAMIC")
+                need = not str(existing.get("nkrCapitalMode") or (existing.get("meta") or {}).get("nkr_capital_mode") or "").strip()
+                if need or str(existing.get("nkrCapitalMode") or "").upper() in {"", "UNKNOWN"}:
+                    meta = dict(existing.get("meta") if isinstance(existing.get("meta"), dict) else {})
+                    observation = str(ui.get("nkrObservationWindow") or meta.get("nkr_observation_window") or "1h")
+                    profit_mode = str(ui.get("nkrProfitMode") or meta.get("nkr_profit_mode") or "REINVEST").upper()
+                    days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or existing.get("periodDays") or 10)
+                    meta.update({
+                        "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
+                        "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
+                        "nkr_period_days": days,
+                    })
+                    patched = dict(existing)
+                    patched.update({
+                        "nkrCapitalMode": capital_mode, "capitalMode": capital_mode,
+                        "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
+                        "nkrPeriodDays": days, "periodDays": days, "meta": meta,
+                    })
+                    if not patched.get("budgetUsd") and live_row.get("budget_units"):
+                        pass  # budget already handled on create path
+                    rest = [x for x in sessions if not _same_live_session(x)]
+                    _db_set_rotation_sessions(wallet, rest + [patched], active_session_id=local_id, replace_missing=False)
+            except Exception:
+                pass
             return
         sessions = [x for x in sessions if not _same_live_session(x)]
     nowi = _nkr_now_ms()
@@ -33625,20 +33658,40 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     state, _ = _db_get_user_app_state(wallet)
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or 10)
+    # Stamp the user's chosen Strategist rules onto the session so Info + worker
+    # never show UNKNOWN / empty mode while a live V5 session is running.
+    capital_mode = _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC")
+    observation = str(ui.get("nkrObservationWindow") or ui.get("nkr_observation_window") or "1h")
+    profit_mode = str(ui.get("nkrProfitMode") or ui.get("nkr_profit_mode") or "REINVEST").upper()
+    max_active = int(_safe_float(ui.get("maxActiveAssets") or ui.get("rotationMaxActiveSessions"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT) or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)
+    max_pct = _safe_float(ui.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
     row = {
         "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
         "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "WAITING",
         "active": True, "executionMode": "live", "liveVaultReady": True,
         "budgetUsd": budget, "budgetAmount": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
+        "nkrTotalBudgetUsd": budget, "sessionBudgetUsd": budget,
         "chain": chain_key, "chainId": chain_id, "vault": vault_addr, "vaultAddress": vault_addr,
-        "settlementAsset": asset_symbol, "asset": asset_symbol, "onchainSessionId": sid, "coreVaultSessionId": sid,
+        "settlementAsset": asset_symbol, "baseAsset": asset_symbol if str(asset_symbol).upper() in {"USDC", "USDT"} else "USDC",
+        "payoutAsset": asset_symbol if str(asset_symbol).upper() in {"USDC", "USDT"} else "USDC",
+        "asset": asset_symbol, "onchainSessionId": sid, "coreVaultSessionId": sid,
         "createdAt": nowi, "startedAt": nowi, "campaignStartedAt": nowi,
         "campaignExpiresAt": nowi + days * 86400000, "periodDays": days,
-        "meta": {"nkr_session": True, "wallet_bound": True, "execution_mode": "live",
-                 "live_vault_ready": True, "onchain_session_id": sid, "core_vault_session_id": sid,
-                 "chain": chain_key, "chain_id": chain_id, "vault": vault_addr,
-                 "settlement_asset": asset_symbol, "settlement_token": settlement_token, "decimals": decimals,
-                 "reserved_usd": budget, "lifecycle_state": "ACTIVE", "position_state": "WAITING"},
+        "nkrCapitalMode": capital_mode, "capitalMode": capital_mode,
+        "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
+        "nkrPeriodDays": days, "maxActiveAssets": max_active, "maxCapitalPerAssetPct": max_pct,
+        "meta": {
+            "nkr_session": True, "wallet_bound": True, "execution_mode": "live",
+            "live_vault_ready": True, "onchain_session_id": sid, "core_vault_session_id": sid,
+            "chain": chain_key, "chain_id": chain_id, "vault": vault_addr,
+            "settlement_asset": asset_symbol, "settlement_token": settlement_token, "decimals": decimals,
+            "reserved_usd": budget, "nkr_total_budget_usd": budget,
+            "lifecycle_state": "ACTIVE", "position_state": "WAITING",
+            "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
+            "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
+            "nkr_period_days": days, "max_active_assets": max_active,
+            "max_capital_per_asset_pct": max_pct,
+        },
     }
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
 
@@ -33870,6 +33923,7 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
             }
             history = list(row.get("rotationEvents") or row.get("events") or [])
             history.append(event)
+            history = _nkr_trim_rotation_events(history) if "_nkr_trim_rotation_events" in globals() else history
             row.update({
                 "targetAsset": symbol, "asset": symbol, "symbol": symbol,
                 "positionState": "OPEN", "status": "ACTIVE", "active": True,
@@ -34490,6 +34544,20 @@ def _nkr_strategist_apply_actions(wallet: str, multi_plan: dict, runnable_rows: 
     return results
 
 
+
+def _nkr_trim_rotation_events(events) -> list:
+    """Optionally bound event lists. Limit 0 = unlimited (default for users)."""
+    if not isinstance(events, list):
+        return []
+    try:
+        cap = int(globals().get("NEXUS_NKR_EVENT_HISTORY_LIMIT", 0) or 0)
+    except Exception:
+        cap = 0
+    if cap <= 0 or len(events) <= cap:
+        return events
+    # Newest-first lists: keep the head.
+    return events[:cap]
+
 def _nkr_position_snapshot(vault: str, sid: int, route: dict, cfg: dict) -> dict:
     token = _norm_addr(route.get("token") or "")
     chain_id = int(cfg.get("chainId") or 1)
@@ -35055,14 +35123,15 @@ def _nkr_live_worker_cycle() -> None:
             market_rows = _nkr_live_market_rows(wallet)
             state, _ = _db_get_user_app_state(wallet)
             ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
+            # Prefer explicit UI mode; never silently drop user Aggressive/Tactical/Defensive.
             settings = {
-                "nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"),
-                "nkrProfitMode": ui.get("nkrProfitMode", "REINVEST"),
-                "nkrObservationWindow": ui.get("nkrObservationWindow", "1h"),
-                "nkrPeriodDays": ui.get("nkrPeriodDays", "10"),
+                "nkrCapitalMode": _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
+                "nkrProfitMode": str(ui.get("nkrProfitMode") or "REINVEST").upper(),
+                "nkrObservationWindow": str(ui.get("nkrObservationWindow") or "1h"),
+                "nkrPeriodDays": ui.get("nkrPeriodDays") or 10,
                 "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0),
                 "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)),
-                "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", 80),
+                "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
             }
             # ENGINE-224: the production worker does not call the Shadow/backend
             # simulator. Local rows remain the UI/control projection of on-chain state.
@@ -35384,6 +35453,9 @@ def api_nkr_mode_update():
     A stricter mode may move excess allocated capital back to stable reserve
     proportionally. A more aggressive mode exposes additional available capital,
     which the existing NKR allocator may deploy on the next executor tick.
+
+    Also persists the mode into user app-state UI so the live Strategist worker
+    reads the same rules on the next tick (entry score, reserve, release bands).
     """
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
@@ -35393,11 +35465,32 @@ def api_nkr_mode_update():
     if new_mode not in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
         return err("invalid NKR mode", 400)
 
+    # Always write mode into app-state so the worker Strategist cannot keep an old default.
+    try:
+        state, _ = _db_get_user_app_state(wa)
+        ui = dict(state.get("ui") if isinstance(state.get("ui"), dict) else {})
+        ui["nkrCapitalMode"] = new_mode
+        if body.get("nkrObservationWindow") is not None:
+            ui["nkrObservationWindow"] = str(body.get("nkrObservationWindow"))
+        if body.get("nkrProfitMode") is not None:
+            ui["nkrProfitMode"] = str(body.get("nkrProfitMode")).upper()
+        if body.get("nkrPeriodDays") is not None:
+            ui["nkrPeriodDays"] = body.get("nkrPeriodDays")
+        if body.get("maxActiveAssets") is not None:
+            ui["maxActiveAssets"] = body.get("maxActiveAssets")
+            ui["rotationMaxActiveSessions"] = body.get("maxActiveAssets")
+        state = dict(state or {})
+        state["ui"] = ui
+        _db_set_user_app_state(wa, state)
+    except Exception:
+        pass
+
     sessions, active_id, _ = _db_get_rotation_sessions(wa)
     nkr_sessions = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x)]
     active_sessions = [x for x in nkr_sessions if _nkr_active_session_status_ok(x)]
     if not active_sessions:
-        return err("no active NKR run", 409)
+        # No active run: settings still saved above for the next start.
+        return jsonify({"status": "ok", "mode": new_mode, "sessions": nkr_sessions, "message": f"NKR mode set to {new_mode} (no active session yet)."})
 
     first = active_sessions[0]
     old_mode = _nkr_normalize_performance_mode(first.get("nkrCapitalMode") or (first.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC")
@@ -35447,7 +35540,7 @@ def api_nkr_mode_update():
             "totalNkrBudgetUsd": round(total_budget, 4),
             "nkrCashReserveUsd": round(total_budget * target_reserve_pct / 100.0, 4),
             "lastRotationEvent": event,
-            "rotationEvents": [event] + events,
+            "rotationEvents": _nkr_trim_rotation_events([event] + events),
             "eventCount": int(_safe_float(sess.get("eventCount") or len(events), len(events))) + 1,
             "totalEventCount": int(_safe_float(sess.get("totalEventCount") or len(events), len(events))) + 1,
             "updatedAt": nowi,
@@ -35459,11 +35552,14 @@ def api_nkr_mode_update():
             nxt["openRotation"] = op
         meta.update({
             "nkr_capital_mode": new_mode,
+            "capital_mode": new_mode,
             "cash_reserve_pct": target_reserve_pct,
             "total_nkr_budget_usd": round(total_budget, 4),
             "nkr_last_mode_change_ts": nowi,
             "nkr_previous_mode": old_mode,
         })
+        nxt["capitalMode"] = new_mode
+        nxt["meta"] = meta
         nxt["meta"] = meta
         updated_by_id[sid] = nxt
 
@@ -35559,7 +35655,7 @@ def api_nkr_capital_topup():
             "sessionCapitalUsd": round(new_cap, 4), "reservedUsd": round(new_cap, 4),
             "totalNkrBudgetUsd": round(new_total, 4),
             "nkrCashReserveUsd": round(old_cash + reserve_add, 4),
-            "lastRotationEvent": event, "rotationEvents": [event] + events,
+            "lastRotationEvent": event, "rotationEvents": _nkr_trim_rotation_events([event] + events),
             "eventCount": int(_safe_float(sess.get("eventCount") or len(events), len(events))) + 1,
             "totalEventCount": int(_safe_float(sess.get("totalEventCount") or len(events), len(events))) + 1,
             "updatedAt": nowi,
@@ -36545,7 +36641,7 @@ def _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, d
             "sessionCapitalUsd": round(new_cap, 4),
             "reservedUsd": round(new_cap, 4),
             "lastRotationEvent": move_event,
-            "rotationEvents": [move_event] + events,
+            "rotationEvents": _nkr_trim_rotation_events([move_event] + events),
             "totalEventCount": int(_safe_float(sess.get("totalEventCount") or sess.get("eventCount") or len(events), len(events))) + 1,
             "eventCount": int(_safe_float(sess.get("totalEventCount") or sess.get("eventCount") or len(events), len(events))) + 1,
             "updatedAt": nowi,
