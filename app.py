@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-268-POL-USDC-ADMISSION-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-272-POL-NATIVE-USDC-FULL-PATH-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -224,7 +224,7 @@ NEXUS_WRAPPED_ASSET_POLICY = "INTERNAL_ONLY_VERIFIED_ALLOWLIST"
 NEXUS_DEFAULT_WITHDRAW_POLICY = "USDC_USDT_DEFAULT_ORIGINAL_ASSET_ONLY_ON_USER_REQUEST"
 NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
 NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
-NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 3
+NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 0  # 0 = unlimited (soft allocator only)
 NEXUS_NKR_MAX_ACTIVE_SESSIONS_LIMIT = 0  # 0 = user-defined, no enforced hard cap
 
 # ENGINE-097: Central backend price-cache tiers.
@@ -7520,8 +7520,11 @@ def _vault_approved_token_contracts() -> set[tuple[int, str]]:
             os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
         56: [os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83F1Ad97B32Cd580d",
              os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955"],
-        137: [os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-              os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xC2132D05D31c914a87C6611C10748AEb04B58e8F"],
+        137: [
+              os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+              os.getenv("USDC_NATIVE_ADDRESS_137") or os.getenv("USDC_NATIVE_ADDRESS_POL") or os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+              os.getenv("USDT_ADDRESS_POL") or os.getenv("USDT_ADDRESS_POLYGON") or os.getenv("USDT_ADDRESS_137") or "0xC2132D05D31c914a87C6611C10748AEb04B58e8F"
+        ],
     }
     for cid, addresses in stable_env.items():
         for address in addresses:
@@ -8557,7 +8560,10 @@ _USDC_BY_CHAIN = {
 _USDC_ALT_BY_CHAIN = {
     1: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_ETH") or os.getenv("USDC_ALT_ADDRESSES_1") or "").split(",") if x.strip()],
     56: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_BNB") or os.getenv("USDC_ALT_ADDRESSES_56") or "").split(",") if x.strip()],
-    137: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359").split(",") if x.strip()],
+    137: list(dict.fromkeys([
+        *[x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "").split(",") if x.strip()],
+        (os.getenv("USDC_NATIVE_ADDRESS_137") or os.getenv("USDC_NATIVE_ADDRESS_POL") or os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359").strip(),
+    ])),
 }
 
 _USDT_BY_CHAIN = {
@@ -17291,6 +17297,13 @@ def _vault_asset_spec_for_chain(chain_id: int, symbol: str) -> tuple[str, int, b
         return NEXUS_NATIVE_TOKEN, int(_NATIVE_DECIMALS_BY_CHAIN.get(chain_id) or 18), True
     if sym == "USDC":
         return _norm_addr(_USDC_BY_CHAIN.get(chain_id) or ""), 6, False
+    if sym in {"USDC_NATIVE", "NATIVE_USDC"} and int(chain_id) == 137:
+        return _norm_addr(
+            os.getenv("USDC_NATIVE_ADDRESS_137") or
+            os.getenv("USDC_NATIVE_ADDRESS_POL") or
+            os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or
+            "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+        ), 6, False
     if sym == "USDT":
         return _norm_addr(_USDT_BY_CHAIN.get(chain_id) or ""), 6, False
     raise ValueError("unsupported_vault_asset")
