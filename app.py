@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-249-NKR-RESTART-STATE-FIX-V2"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-250-NKR-STRATEGIST-SIGNALS-TRADER-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -4005,7 +4005,8 @@ def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
                 if "systemScore" in row:
                     row["systemScore"] = round(strategist_score, 4)
         out.append(row)
-    return out
+    # Attach RVOL / relative-strength / on-chain quality signals (0-impact when absent).
+    return _nkr_prepare_strategist_signals(out)
 
 
 @app.get("/api/nexus/binance-public/status")
@@ -34778,16 +34779,151 @@ def _nkr_session_symbol(sess):
     return str(sess.get("targetAsset") or sess.get("sourceSymbol") or sess.get("symbol") or meta.get("source_symbol") or meta.get("selected_symbol") or "ASSET").strip().upper() or "ASSET"
 
 
+def _nkr_prepare_strategist_signals(rows: list) -> list:
+    """Attach conservative, optional quality signals to market rows for the Strategist.
+
+    Design rules (must not make decisions worse than the previous baseline):
+    - Missing fields produce ZERO adjustment (behavior stays identical to before).
+    - Only clear positive confirmation boosts; only clear negative confirmation penalizes.
+    - Relative strength uses the batch median 24h change (watchlist-relative).
+    - RVOL is proxied as log-volume vs. batch median log-volume when true RVOL is absent.
+    - All quality overlays are later hard-capped in _nkr_session_score (±6 total).
+    """
+    if not isinstance(rows, list) or not rows:
+        return rows if isinstance(rows, list) else []
+    changes = []
+    log_vols = []
+    prepared = []
+    for r in rows:
+        if not isinstance(r, dict):
+            prepared.append(r)
+            continue
+        row = dict(r)
+        ch = _nkr_row_change_pct(row)
+        changes.append(ch)
+        vol = _safe_float(
+            row.get("volume24h") or row.get("total_volume") or row.get("volume_24h")
+            or row.get("quoteVolume") or row.get("volume") or 0.0,
+            0.0,
+        )
+        if vol > 0:
+            try:
+                log_vols.append(math.log10(max(1.0, vol)))
+            except Exception:
+                pass
+        row["_strategist_vol"] = vol
+        prepared.append(row)
+    # Median helpers (empty-safe).
+    def _median(vals):
+        vals = sorted(v for v in vals if isinstance(v, (int, float)))
+        if not vals:
+            return None
+        mid = len(vals) // 2
+        return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+    med_change = _median(changes)
+    med_log_vol = _median(log_vols)
+    out = []
+    for row in prepared:
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        ch = _nkr_row_change_pct(row)
+        # Relative strength vs watchlist median (only when batch has enough peers).
+        if med_change is not None and len(changes) >= 3:
+            row["strategist_relative_strength_pct"] = round(ch - float(med_change), 4)
+            row["strategist_batch_median_change_pct"] = round(float(med_change), 4)
+        # RVOL: explicit field wins; else log-volume vs median log-volume.
+        explicit_rvol = None
+        for key in ("rvol", "relativeVolume", "relative_volume", "rVol", "strategist_rvol"):
+            if row.get(key) is not None:
+                explicit_rvol = _safe_float(row.get(key), 0.0)
+                break
+        if explicit_rvol is not None and explicit_rvol > 0:
+            row["strategist_rvol"] = round(explicit_rvol, 4)
+        elif med_log_vol is not None and _safe_float(row.get("_strategist_vol"), 0.0) > 0:
+            try:
+                lv = math.log10(max(1.0, _safe_float(row.get("_strategist_vol"), 1.0)))
+                # 10^(delta_log) ≈ volume multiple vs median peer.
+                row["strategist_rvol"] = round(max(0.05, min(20.0, 10.0 ** (lv - float(med_log_vol)))), 4)
+            except Exception:
+                pass
+        # On-chain / rating delta (optional, already small in UI).
+        for key in (
+            "strategist_onchain_delta", "onchain_delta", "score_delta",
+            "onchainScoreDelta", "scoreDelta",
+        ):
+            if row.get(key) is not None:
+                row["strategist_onchain_delta"] = max(-5.0, min(5.0, _safe_float(row.get(key), 0.0)))
+                break
+        if isinstance(row.get("onchain"), dict) and row.get("strategist_onchain_delta") is None:
+            oc = row.get("onchain") or {}
+            if oc.get("score_delta") is not None:
+                row["strategist_onchain_delta"] = max(-5.0, min(5.0, _safe_float(oc.get("score_delta"), 0.0)))
+        # Prefer an explicit system/rating score when present (does not invent one).
+        for key in ("systemScore", "system_score", "ratingScore", "finalScore", "watchSystemScore"):
+            if row.get(key) is not None and _safe_float(row.get(key), 0.0) > 0:
+                if not row.get("score") or _safe_float(row.get("score"), 0.0) <= 0:
+                    row["score"] = round(_safe_float(row.get(key), 0.0), 4)
+                row["systemScore"] = round(_safe_float(row.get(key), 0.0), 4)
+                break
+        row.pop("_strategist_vol", None)
+        out.append(row)
+    return out
+
+
 def _nkr_session_score(sess, row=None):
+    """NKR/Strategist decision score.
+
+    Baseline behavior is preserved when quality signals are missing.
+    Optional overlays (RVOL, relative strength, on-chain delta) are additive and
+    hard-capped so the Strategist can improve without becoming noisier/worse.
+    """
     row = row if isinstance(row, dict) else {}
-    score = _safe_float((sess or {}).get("score") or (sess or {}).get("confidence") or row.get("score") or row.get("systemScore") or 0, 0.0)
+    score = _safe_float(
+        (sess or {}).get("score") or (sess or {}).get("confidence")
+        or row.get("score") or row.get("systemScore") or row.get("strategistPerformanceScore") or 0,
+        0.0,
+    )
     if score <= 0:
         ch = _nkr_row_change_pct(row)
         score = max(35.0, min(90.0, 55.0 + ch * 3.0))
     # Binance futures intelligence is advisory only. Core NKR logic remains the
     # primary score and this overlay is deliberately capped to avoid overreaction.
-    futures_adj = _safe_float(row.get("futures_score_adjustment") or ((row.get("binanceFutures") or {}).get("futuresScoreAdjustment") if isinstance(row.get("binanceFutures"), dict) else 0), 0.0)
+    futures_adj = _safe_float(
+        row.get("futures_score_adjustment")
+        or ((row.get("binanceFutures") or {}).get("futuresScoreAdjustment") if isinstance(row.get("binanceFutures"), dict) else 0),
+        0.0,
+    )
     score += max(-8.0, min(8.0, futures_adj))
+
+    # --- Conservative quality overlays (0 when signal absent) ---
+    quality_adj = 0.0
+    rs = row.get("strategist_relative_strength_pct")
+    if rs is not None:
+        rs_v = _safe_float(rs, 0.0)
+        # Only reward clear outperformance; only penalize clear underperformance.
+        if rs_v >= 2.0:
+            quality_adj += min(3.0, rs_v * 0.35)
+        elif rs_v <= -3.0:
+            quality_adj -= min(3.0, abs(rs_v) * 0.30)
+
+    rvol = row.get("strategist_rvol")
+    if rvol is not None:
+        rvol_v = _safe_float(rvol, 1.0)
+        ch = _nkr_row_change_pct(row)
+        # Volume confirms upside → mild boost. Upside without volume → mild penalty.
+        if rvol_v >= 1.5 and ch > 0.5:
+            quality_adj += min(2.5, (rvol_v - 1.0) * 1.0)
+        elif rvol_v < 0.55 and ch >= 3.0:
+            quality_adj -= min(2.5, 1.8 + (3.0 - ch) * 0.1)
+
+    oc = row.get("strategist_onchain_delta")
+    if oc is not None:
+        quality_adj += max(-3.0, min(3.0, _safe_float(oc, 0.0)))
+
+    quality_adj = max(-6.0, min(6.0, quality_adj))
+    score += quality_adj
     return max(0.0, min(100.0, score))
 
 
