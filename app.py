@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-250-NKR-STRATEGIST-SIGNALS-TRADER-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-252-NKR-TRADER-USER-STATUS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -14562,6 +14562,9 @@ def api_rotation_sessions():
         "sessions": sessions,
         "activeRotationSessionId": active,
         "summary": summary,
+        # User-facing Strategist status (English). Visible on the NKR panel without System Info.
+        "strategist": _nkr_strategist_user_snapshot(fallback_status=summary.get("runtime") or "IDLE"),
+        "controlState": "RUNNING" if sessions else "WAITING",
         "readOnly": True,
         "source": "backend_corevault",
         "updated_ts": updated_ts or int(time.time() * 1000),
@@ -17449,6 +17452,10 @@ def api_nexus_trading_state():
                 shadow_executor = {"mode": "SHADOW_ONLY", "last_run": None, "ready_for_vault": False, "live_execution_triggered": False}
             conn.commit()
             conn.close()
+    # User-facing Trader/Strategist status (English) for the public Trading panel.
+    hold_status = str(hold_state.get("status") or "").upper()
+    trader_fallback = "RUNNING" if hold_status in {"ACTIVE", "HOLD", "OBSERVE"} else ("IDLE" if not (execution.get("queue_count") or 0) else "RUNNING")
+    trader_status = _trader_strategist_user_snapshot(fallback_status=trader_fallback)
     return jsonify({
         "status": "ok",
         "wallet": wa,
@@ -17461,6 +17468,8 @@ def api_nexus_trading_state():
         "recheck_changes": recheck_changes,
         "execution_mode": execution_mode,
         "vault_ready": vault_ready,
+        "strategist": trader_status,
+        "traderStatus": trader_status,
         "backend_is_state_master": True,
         "states": ["WAIT", "READY", "ACTIVE", "PROTECT", "EXIT_RISK", "HOLD", "OBSERVE", "BLOCKED", "RELEASE_REQUIRED"],
         "ts": now_ts(),
@@ -33093,6 +33102,107 @@ def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[d
     return out,{"startedAt":campaign_start,"expiresAt":campaign_expires,"periodDays":days}
 
 
+def _engine_strategist_user_snapshot(engine: str = "NKR", fallback_status: str = "WAITING") -> dict:
+    """English, user-facing engine/Strategist status for public UI panels (not System Info)."""
+    eng = str(engine or "NKR").upper()
+    if eng == "TRADING":
+        eng = "TRADER"
+    try:
+        with _LIVE_ENGINE_RUNTIME_LOCK:
+            rt = dict(_LIVE_ENGINE_RUNTIME.get(eng) or {})
+        gate = str(rt.get("gate_status") or "").upper()
+        decision = str(rt.get("decision") or "").upper()
+        best = str(rt.get("best_candidate") or rt.get("active_asset") or "").upper()
+        score = _safe_float(rt.get("candidate_score"), 0.0)
+        momentum = _safe_float(rt.get("candidate_momentum_24h"), 0.0)
+        price = _safe_float(rt.get("candidate_price"), 0.0)
+        detail = str(rt.get("decision_detail") or rt.get("reason") or "").strip()
+        position = str(rt.get("position_state") or rt.get("position") or "").upper()
+        status_u = str(rt.get("status") or "").upper() or str(fallback_status or "WAITING").upper()
+
+        if eng == "TRADER":
+            if status_u in {"IDLE", ""} and decision in {"IDLE", "", "WAIT"}:
+                user_summary = "Trader is idle. Approve a budget and start a session to begin execution."
+            elif gate in {"WAITING_ENTRY", ""} and decision in {"WAIT", "STARTED", "HOLD", "IDLE", "SESSION_READY", ""}:
+                user_summary = (
+                    f"Trader session active. Evaluating markets"
+                    f"{f' — best candidate: {best} (score {score:.1f})' if best else ''}. "
+                    f"No on-chain trade yet — waiting for entry conditions."
+                )
+            elif gate in {"POSITION_ACTIVE", "ONCHAIN_CONFIRMED"} or decision in {"OPEN", "ADD", "ACTIVE", "HOLD"}:
+                user_summary = (
+                    f"Trader position active on {best or 'asset'}. "
+                    f"Decision: {decision or 'HOLD'}. Tracking live P/L and risk rules."
+                )
+            elif gate in {"EXIT_PENDING", "ORDERLY_EXIT"} or decision in {"STOPPING", "FINALIZING", "EXIT_SUBMITTING", "PROTECT"}:
+                user_summary = f"Trader exit/protect in progress ({decision or gate}). Waiting for on-chain confirmation."
+            elif decision in {"OPEN", "ADD", "SUBMITTING", "BUY"}:
+                user_summary = f"Submitting on-chain Trader {decision} for {best or 'candidate'}…"
+            else:
+                user_summary = detail or f"Trader status: {decision or status_u} · Gate: {gate or '—'} · Asset: {best or '—'}"
+        else:
+            # NKR (default)
+            if gate in {"WAITING_ENTRY", ""} and decision in {"WAIT", "STARTED", "HOLD", "IDLE", ""}:
+                user_summary = (
+                    f"Scanning watchlist. Best candidate: {best or '—'} "
+                    f"(score {score:.1f}). No on-chain buy yet — waiting for entry conditions."
+                )
+            elif gate in {"POSITION_ACTIVE", "ONCHAIN_CONFIRMED"} or (
+                decision in {"OPEN", "ADD", "HOLD"} and position in {"OPEN", "POSITION_ACTIVE", "ACTIVE"}
+            ):
+                user_summary = (
+                    f"Position active on {best or 'asset'}. "
+                    f"Decision: {decision or 'HOLD'}. Tracking live P/L and exit rules."
+                )
+            elif gate in {"EXIT_PENDING", "ORDERLY_EXIT"} or decision in {"STOPPING", "FINALIZING", "EXIT_SUBMITTING"}:
+                user_summary = f"Exit in progress ({decision or gate}). Waiting for on-chain confirmation."
+            elif decision in {"OPEN", "ADD", "SUBMITTING"}:
+                user_summary = f"Submitting on-chain {decision} for {best or 'candidate'}…"
+            else:
+                user_summary = detail or f"Status: {decision or 'RUNNING'} · Gate: {gate or '—'} · Candidate: {best or '—'}"
+
+        return {
+            "engine": eng,
+            "gate": gate or "—",
+            "decision": decision or "—",
+            "bestCandidate": best or "",
+            "candidateScore": round(score, 2),
+            "candidateMomentum24h": round(momentum, 4),
+            "candidatePrice": round(price, 8) if price > 0 else 0,
+            "position": position or "",
+            "detail": detail,
+            "summary": user_summary,
+            "assetsScanned": int(rt.get("assets_scanned") or 0),
+            "tradableAssets": int(rt.get("tradable_assets") or 0),
+            "lastTickTs": int(rt.get("last_tick_ts") or 0),
+            "tickCount": int(rt.get("tick_count") or 0),
+            "status": status_u,
+            "pendingTx": str(rt.get("pending_tx") or ""),
+            "lastError": str(rt.get("last_error") or "")[:300],
+        }
+    except Exception:
+        return {
+            "engine": eng,
+            "gate": "—",
+            "decision": str(fallback_status or "WAITING").upper(),
+            "bestCandidate": "",
+            "candidateScore": 0,
+            "summary": f"{'Trader' if eng == 'TRADER' else 'Strategist'} status unavailable this tick.",
+            "detail": "",
+            "status": str(fallback_status or "WAITING").upper(),
+        }
+
+
+def _nkr_strategist_user_snapshot(fallback_status: str = "WAITING") -> dict:
+    """Backward-compatible alias for NKR user-facing Strategist status."""
+    return _engine_strategist_user_snapshot("NKR", fallback_status=fallback_status)
+
+
+def _trader_strategist_user_snapshot(fallback_status: str = "IDLE") -> dict:
+    """User-facing Trader status for the Nexus Trading panel (not System Info)."""
+    return _engine_strategist_user_snapshot("TRADER", fallback_status=fallback_status)
+
+
 def _nkr_get_wallet_bundle(wa: str) -> dict:
     state, state_ts = _db_get_user_app_state(wa)
     sessions, active, sess_ts = _db_get_rotation_sessions(wa)
@@ -33115,11 +33225,13 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
         control = "WAITING"
     elif not nkr_sessions:
         control = "WAITING"
+    strategist = _nkr_strategist_user_snapshot(fallback_status=control)
     return {
         "status": "ok",
         "wallet": _norm_addr(wa),
         "mode": NEXUS_NKR_BACKEND_PERSISTENCE_MODE,
         "controlState": control,
+        "strategist": strategist,
         "settings": {
             "nkrBudgetUsd": ui.get("rotationBudgetRelease"),
             "nkrCapitalMode": ui.get("nkrCapitalMode", "DYNAMIC"),
