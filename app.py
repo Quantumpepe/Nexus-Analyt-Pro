@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-285-EXEC-ERROR-SURFACE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-286-MULTI_FEE_QUOTE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -30605,15 +30605,48 @@ def _privy_erc20_balance(token, wallet):
 
 
 def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
+    """Quote Uniswap V3 exact-input. Tries several fee tiers — a single wrong fee
+    causes public RPC 'execution reverted' even when a liquid pool exists (e.g. 3000).
+    Returns amount_out; successful fee is stored on cfg['_last_quote_fee'].
+    """
     if not _looks_like_evm_addr(cfg.get("quoter")):
         raise RuntimeError("quoter_not_configured")
+    if int(amount_in or 0) <= 0:
+        raise RuntimeError("quote_amount_in_zero")
     selector = "0xc6a5026a"
-    data = selector + _addr_to_32(token_in) + _addr_to_32(token_out) + _uint_to_32(amount_in) + _uint_to_32(int(fee if fee is not None else cfg["poolFee"])) + _uint_to_32(0)
-    raw = _eth_call(int(cfg.get("chainId") or 1), cfg["quoter"], data)
-    words = _core_vault_words(raw)
-    if not words or int(words[0]) <= 0:
-        raise RuntimeError("quoter_returned_zero")
-    return int(words[0])
+    chain_id = int(cfg.get("chainId") or 1)
+    fees = []
+    if fee is not None:
+        try:
+            fees.append(int(fee))
+        except Exception:
+            pass
+    # Preferred order: configured default, then common V3 tiers
+    for f in (int(cfg.get("poolFee") or 0), 500, 3000, 10000, 100):
+        if f and f not in fees:
+            fees.append(int(f))
+    last_err = "quoter_no_fee_worked"
+    for f in fees:
+        try:
+            data = (
+                selector + _addr_to_32(token_in) + _addr_to_32(token_out)
+                + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
+            )
+            raw = _eth_call(chain_id, cfg["quoter"], data)
+            words = _core_vault_words(raw)
+            out = int(words[0]) if words else 0
+            if out > 0:
+                try:
+                    if isinstance(cfg, dict):
+                        cfg["_last_quote_fee"] = int(f)
+                except Exception:
+                    pass
+                return int(out)
+            last_err = f"quoter_returned_zero:fee={f}"
+        except Exception as exc:
+            last_err = f"quoter_fee_{f}:{str(exc)[:120]}"
+            continue
+    raise RuntimeError(f"quoter_failed token_in={token_in} token_out={token_out} amount={amount_in} last={last_err}")
 
 
 def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, amount_out_min, fee):
@@ -35186,10 +35219,15 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         raise RuntimeError(f"live_router_not_enabled:{route['symbol']}")
     quote_in = _quote_token_for_router(cfg, token_in)
     quote_out = _quote_token_for_router(cfg, token_out)
-    quote = _privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee)
-    min_out = quote * (10_000 - int(cfg["slippageBps"])) // 10_000
+    if int(amount_in or 0) <= 0:
+        raise RuntimeError("trade_amount_in_zero")
+    quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
+    fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
+    min_out = quote * (10_000 - int(cfg.get("slippageBps") or 100)) // 10_000
+    if min_out <= 0:
+        raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
-    router_data, required_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee)
+    router_data, required_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee_used)
     if not _read_router_selector_allowed(vault, router, required_selector):
         raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}:{required_selector}")
     call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
