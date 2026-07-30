@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-291-POL-QUOTER"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-292-FORCE-NATIVE-ENTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35533,6 +35533,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(settlement_cash, int(delta * 1_000_000))))
     actions.sort(key=lambda x: (x[0], -x[1]))
     execution = None
+    last_skip = ""
     for _, delta, action, sym, amount in actions:
         key = (_norm_addr(wallet), sid, sym); last = _NKR_LIVE_LAST_ASSET_TRADE_TS.get(key, 0)
         if int(time.time()) - last < _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC:
@@ -35574,6 +35575,34 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         return execution | {"plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
     active = [sym for sym, snap in snapshots.items() if snap["amount"] > 0]
     sel = plan.get("selected") or []
+    # ENGINE-292: if we selected assets but never fired OPEN, try chain native once.
+    if not active and not execution and sel and settlement_cash > 0 and budget_usd > 0:
+        native_order = []
+        if chain_key == "BNB":
+            native_order = ["BNB", "WBNB"]
+        elif chain_key == "POL":
+            native_order = ["POL", "MATIC", "WMATIC"]
+        else:
+            native_order = ["ETH", "WETH"]
+        for nsym in native_order:
+            route = routes.get(nsym)
+            if not isinstance(route, dict):
+                continue
+            amt = min(settlement_cash, max(0, int(min(budget_usd, max(plan.get("investUsd") or 0, budget_usd * 0.9)) * 1_000_000)))
+            if amt < int(0.20 * 1_000_000):
+                continue
+            try:
+                result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
+                return {
+                    "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
+                    "asset": nsym,
+                    "detail": f"OPEN {nsym} forced native entry on {chain_key} for ~${amt/1_000_000:.2f}.",
+                    **result,
+                    "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets},
+                }
+            except Exception as native_exc:
+                last_skip = f"native {nsym} on {chain_key}: {str(native_exc)[:160]}"
+                continue
     if active:
         detail = f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve."
         gate = "PORTFOLIO_BALANCED"
@@ -35585,23 +35614,28 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         )
         gate = "WAITING_ENTRY"
         decision = "WAIT"
-    elif settlement_cash < int(_NKR_LIVE_MIN_REBALANCE_USD * 1_000_000):
+    elif settlement_cash < int(0.20 * 1_000_000):
         detail = (
             f"Candidate ready ({sel[0].get('symbol')}) but settlement cash too low "
-            f"({settlement_cash/1_000_000:.2f} USDC). Check vault allocation."
+            f"({settlement_cash/1_000_000:.2f} USDC). Check vault allocation / session budget."
         )
         gate = "SETTLEMENT_LOW"
         decision = "WAIT"
     else:
+        tgt_n = len(targets or {})
         detail = (
-            f"Candidate {sel[0].get('symbol')} selected; waiting next rebalance tick "
-            f"(invest ${plan['investUsd']:.2f}, reserve ${plan['reserveUsd']:.2f})."
+            f"Candidate {sel[0].get('symbol')} selected on {chain_key} "
+            f"(invest ${float(plan.get('investUsd') or 0):.2f}, reserve ${float(plan.get('reserveUsd') or 0):.2f}, "
+            f"targets={tgt_n}, settlement=${settlement_cash/1_000_000:.2f}"
+            + (f", last_skip={last_skip}" if last_skip else "")
+            + ")."
         )
         gate = "WAITING_ENTRY"
         decision = "WAIT"
     return {"executed": False, "decision": decision, "gate": gate,
             "asset": active[0] if active else (sel[0]["symbol"] if sel else ""),
             "detail": detail,
+            "error": last_skip or "",
             "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets, "selected": [x.get("symbol") for x in sel]}}
 
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
