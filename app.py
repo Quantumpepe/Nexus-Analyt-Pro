@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-249-NKR-DIRECT-ONCHAIN-CARD-RECOVERY-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-249-NKR-RESTART-STATE-FIX-V2"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -508,46 +508,9 @@ def _live_active_sessions(wallet, engine):
         except Exception:
             pass
     rows = _read_rows()
-    valid_rows = [r for r in rows if str(r.get("onchain_session_id") or "").isdigit() and int(str(r.get("onchain_session_id") or "0")) > 0]
-    if valid_rows:
-        return valid_rows
-
-    # ENGINE-249: direct on-chain fallback. The session card must not depend on a
-    # successful local registry write or on which Gunicorn worker serves this GET.
-    # When reconciliation could not persist a row, return a transient authoritative
-    # projection directly from every configured V5 CoreVault.
-    transient = []
-    for chain_id in (1, 56, 137, 8453, 42161):
-        vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
-        if not _looks_like_evm_addr(vault):
-            continue
-        try:
-            _vault, _next_id, discovered = _discover_wallet_core_sessions(wa, eng, chain_id, vault)
-        except Exception:
-            continue
-        for sess in discovered or []:
-            try:
-                status_id = int(sess.get("statusId") or 0)
-                sid = int(sess.get("sessionId") or 0)
-            except Exception:
-                continue
-            if status_id not in (1, 2, 3) or sid <= 0:
-                continue
-            transient.append({
-                "wallet_address": wa,
-                "engine": eng,
-                "chain_id": int(chain_id),
-                "vault_address": vault,
-                "privy_wallet_id": "",
-                "onchain_session_id": str(sid),
-                "tx_hash": "",
-                "budget_units": str(int(sess.get("budgetUnits") or 0)),
-                "status": {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING"}.get(status_id, "ACTIVE"),
-                "created_ts": int(sess.get("startsAt") or time.time()),
-                "updated_ts": int(time.time()),
-                "direct_onchain_fallback": True,
-            })
-    return transient
+    # Only rows linked to a real V5 session are presentation/runtime truth.
+    # Invalid legacy rows remain ignored and cannot hide the valid session.
+    return [r for r in rows if str(r.get("onchain_session_id") or "").isdigit() and int(str(r.get("onchain_session_id") or "0")) > 0]
 
 def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
     """Persist the user-visible NKR lifecycle without exposing blockchain details."""
@@ -583,7 +546,12 @@ def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
         updated.append(row)
     if updated:
         _db_set_rotation_sessions(wa, updated, active_session_id=active if state_u == "STOPPING" else "", replace_missing=False)
-    _db_set_user_app_state(wa, {"ui": {"nkrControlState": state_u}})
+    # After FINALIZED/STOPPED the control flag must become WAITING so Start NKR
+    # is not blocked by a stale RUNNING/FINALIZED control state (restart fix).
+    control_ui = "WAITING" if state_u in {"STOPPED", "FINALIZED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED"} else state_u
+    if state_u == "STOPPING":
+        control_ui = "STOPPING"
+    _db_set_user_app_state(wa, {"ui": {"nkrControlState": control_ui}})
 
 
 def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict:
@@ -13822,7 +13790,13 @@ def _rotation_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
-ROTATION_TERMINAL_STATUSES = {"STOPPED", "CLOSED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR", "PROTECTED", "DELETED", "ARCHIVED"}
+# FINALIZED / STOPPING must be terminal. Otherwise a finished on-chain session
+# can still appear active in registry, cards and control state after reload.
+ROTATION_TERMINAL_STATUSES = {
+    "STOPPED", "CLOSED", "COMPLETE", "COMPLETED", "EXPIRED", "ERROR",
+    "PROTECTED", "DELETED", "ARCHIVED", "FINALIZED", "STOPPING", "FINALIZING",
+    "CANCELLED", "RELEASED",
+}
 ROTATION_LOCKED_STATUSES = {"WAITING", "SEARCHING", "ACTIVE", "OPEN", "ENTERING", "EXITING", "PAUSED"}
 ROTATION_ALLOWED_BASE_ASSETS = {"USDC", "USDT"}
 
@@ -33125,14 +33099,21 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     nkr_sessions, campaign_clock = _nkr_apply_campaign_clock(nkr_sessions, ui.get("nkrPeriodDays", "10"))
     control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
-    # Active state wins over historical stopped rows. Otherwise one old STOPPED
-    # session can incorrectly hide a currently paused/running live session.
-    if any(str((x or {}).get("status") or "").upper() in {"ACTIVE", "WAITING", "OPEN", "RUNNING"} for x in nkr_sessions):
+    # Derive control from live session rows. Terminal rows (incl. FINALIZED) must
+    # never keep the UI in RUNNING and must not block a fresh Start NKR.
+    _terminal = {"STOPPED", "FINALIZED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED", "DELETED", "ARCHIVED", "COMPLETE", "COMPLETED"}
+    live_statuses = [str((x or {}).get("status") or "").upper() for x in nkr_sessions]
+    if any(st in {"ACTIVE", "WAITING", "OPEN", "RUNNING", "EXECUTOR", "EXECUTOR_ACTIVE", "READY_DISPATCHED"} for st in live_statuses):
         control = "RUNNING"
-    elif any(str((x or {}).get("status") or "").upper() == "PAUSED" for x in nkr_sessions):
+    elif any(st == "PAUSED" for st in live_statuses):
         control = "PAUSED"
-    elif nkr_sessions and all(str((x or {}).get("status") or "").upper() in {"STOPPED", "FINALIZED", "CLOSED"} for x in nkr_sessions):
-        control = "STOPPED"
+    elif any(st == "STOPPING" or st == "FINALIZING" for st in live_statuses):
+        control = "STOPPING"
+    elif nkr_sessions and all(st in _terminal for st in live_statuses):
+        # All sessions finished → ready for a new run (not stuck on STOPPED/FINALIZED).
+        control = "WAITING"
+    elif not nkr_sessions:
+        control = "WAITING"
     return {
         "status": "ok",
         "wallet": _norm_addr(wa),
@@ -35058,13 +35039,22 @@ def _nkr_mode_reallocation_pass(active, market_by_sym, nowi, dispatch_min, mode=
 
 
 def _nkr_active_session_status_ok(sess):
+    """True only for a still-running NKR session. FINALIZED/STOPPING must never count as active
+    (handover P0: no session may stay locally RUNNING when on-chain is FINALIZED)."""
     status_u = str((sess or {}).get("status") or "").upper()
     pos_u = str((sess or {}).get("positionState") or (sess or {}).get("position_state") or "").upper()
-    if status_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL", "PAUSED", "INACTIVE"}:
+    terminal = {
+        "STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED",
+        "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL",
+        "PAUSED", "INACTIVE", "FINALIZED", "STOPPING", "FINALIZING", "RELEASED",
+        "COMPLETE", "COMPLETED",
+    }
+    if status_u in terminal:
         return False
-    if pos_u in {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WATCH_POOL", "PAUSED", "INACTIVE"}:
+    if pos_u in terminal:
         return False
-    return status_u in {"ACTIVE", "OPEN", "EXECUTOR", "EXECUTOR_ACTIVE", "WAITING", "READY_DISPATCHED"} or bool((sess or {}).get("openRotation"))
+    # Leftover openRotation on a terminal status must not keep the session "active".
+    return status_u in {"ACTIVE", "OPEN", "EXECUTOR", "EXECUTOR_ACTIVE", "WAITING", "READY_DISPATCHED", "RUNNING"}
 
 
 def _nkr_make_promoted_session(nowi, symbol, row, capital_usd, total_budget, score, base="USDT", chain="POL"):
