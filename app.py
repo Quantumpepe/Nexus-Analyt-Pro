@@ -30171,6 +30171,7 @@ def _privy_policy_rule_targets_for_chain(chain_id):
             raise RuntimeError("bnb_v3_router_env_missing: set ROUTER_V3_ADDRESS_56")
 
     policy_usdt = cfg.get("usdt")
+    policy_usdc_native = ""
     if cid == 137:
         policy_usdt = _norm_addr(
             os.getenv("USDT_ADDRESS_POL") or
@@ -30180,12 +30181,24 @@ def _privy_policy_rule_targets_for_chain(chain_id):
         )
         if not _looks_like_evm_addr(policy_usdt) or policy_usdt == NATIVE_TOKEN_ADDRESS:
             raise RuntimeError("pol_usdt_address_missing: set USDT_ADDRESS_137")
+        # Native Circle USDC on Polygon is a separate ERC-20 contract from
+        # legacy bridged USDC.e. Read it independently so the existing policy
+        # can be extended without replacing the legacy USDC target.
+        policy_usdc_native = _norm_addr(
+            os.getenv("USDC_NATIVE_ADDRESS_137") or
+            os.getenv("USDC_NATIVE_ADDRESS_POL") or
+            os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or
+            ""
+        )
+        if policy_usdc_native and (not _looks_like_evm_addr(policy_usdc_native) or policy_usdc_native == NATIVE_TOKEN_ADDRESS):
+            raise RuntimeError("pol_native_usdc_address_invalid: check USDC_NATIVE_ADDRESS_137")
 
     candidates = [
         (f"Allow Nexus V5 Vault {chain_key}", cfg.get("vault"), "CoreVault"),
         (f"Allow {chain_key} V3 Router", policy_router, "Router"),
         (f"Allow {chain_key} Wrapped Native", cfg.get("weth"), "Wrapped native"),
         (f"Allow {chain_key} USDC", cfg.get("usdc"), "USDC"),
+        (f"Allow {chain_key} Native USDC", policy_usdc_native, "USDC_NATIVE"),
         (f"Allow {chain_key} USDT", policy_usdt, "USDT"),
     ]
     rules = []
@@ -30267,6 +30280,7 @@ def _privy_policy_preview(chain_id=56):
         "toAdd": add,
         "confirmationToken": token,
         "expiresInSec": 600,
+        "source": "live_privy_policy_and_runtime_env",
         "ts": now_ts(),
     }
 
@@ -30325,7 +30339,7 @@ def nexus_system_info_privy_policy_apply():
             "status": "ok", "created": created, "createdCount": len(created),
             "alreadyPresentCount": len(final_preview.get("alreadyPresent") or []),
             "remainingCount": len(final_preview.get("toAdd") or []),
-            "policy": final_preview.get("policy"), "ts": now_ts(),
+            "policy": final_preview.get("policy"), "finalPreview": final_preview, "ts": now_ts(),
         })
     except SignatureExpired:
         return jsonify({"status": "error", "error": "confirmation_expired_reload_preview", "ts": now_ts()}), 400
