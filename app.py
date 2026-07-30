@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-262-STOP-EXIT-STABLE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-265-PAUSE-STOP-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -718,9 +718,21 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None):
     rows = _live_active_sessions(wallet, engine)
     target_sid = str(target_session_id or "").strip()
     if target_sid:
-        rows = [x for x in rows if str(x.get("onchain_session_id") or "").strip() == target_sid]
+        matched = []
+        tail = target_sid.split("-")[-1] if "-" in target_sid else target_sid
+        for x in rows:
+            oid = str(x.get("onchain_session_id") or "").strip()
+            if oid == target_sid or oid == tail:
+                matched.append(x)
+        rows = matched
         if not rows:
-            return [{"sessionId": int(target_sid) if target_sid.isdigit() else target_sid, "status": "not_found", "error": "target_onchain_session_not_found"}]
+            # Still mark local STOPPING so UI does not stay on PAUSED/RUNNING.
+            if str(engine).upper() == "NKR":
+                try:
+                    _nkr_set_local_stop_state(wallet, "STOPPING", f"Stop requested for session {target_sid}")
+                except Exception:
+                    pass
+            return [{"sessionId": int(tail) if str(tail).isdigit() else target_sid, "status": "not_found", "error": "target_onchain_session_not_found"}]
     if str(engine).upper() == "NKR":
         _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
     # Keep every paused/open session visible and mark the live registry as closing
@@ -26072,31 +26084,32 @@ def _strategist_is_followup_question(question: str) -> bool:
         return False
     return bool(re.search(
         r"^(und|aber|warum|wieso|wie meinst|was heißt|was heisst|erklär|erklaer|nochmal|weiter|ok|ja|nein|and|but|why|what does|explain|continue|go on|again)\b|"
-        r"\b(das|dieser|diese|diesen|there|that|this|it|same|gleich)\b",
+        r"\b(das|dieser|diese|diesen|there|that|this|it|same|gleich)\b|"
+        r"(welche\s+coin|welche\s+coins|welcher\s+coin|welche\s+assets?|which\s+coin|which\s+coins|best\s+coins?|gute\s+coins?)",
         q,
         re.I,
     ))
 
 
-def _strategist_followup_rule(question: str, intent: str, lang: str) -> str:
-    if not _strategist_is_followup_question(question):
+def _strategist_followup_rule(question: str, intent: str, lang: str, forced: bool = False) -> str:
+    if not forced and not _strategist_is_followup_question(question):
         return ""
     if str(lang or "").lower() == "de":
         return """
-FOLLOW-UP REGEL:
-- Diese Nutzerfrage wirkt wie eine Rückfrage.
-- Behalte den vorherigen Kontext und den zuletzt erkannten Intent bei.
-- Antworte nicht mit einem neuen Vollreport.
-- Erkläre nur den Punkt, nach dem gefragt wurde.
-- Wenn der Nutzer "weiter" sagt, vertiefe die letzte Analyse um eine Ebene: Ursache, Risiko oder nächste Prüfung.
+FOLLOW-UP REGEL (KRITISCH):
+- Der Nutzer hat bereits eine vorherige Antwort erhalten.
+- Wiederhole die vorherige Antwort NICHT und kopiere keine alten Abschnitte.
+- Beantworte die NEUE Frage direkt und konkret.
+- Wenn nach Coins/Assets gefragt wird: nenne konkrete Symbole aus dem Markt-/Watchlist-Kontext, sortiert nach relativer Stärke/Momentum/Volumenqualität. Keine generische Marktlage wiederholen.
+- Vorheriger Kontext nur als Hintergrund, Priorität hat die neue Frage.
 """
     return """
-FOLLOW-UP RULE:
-- This user message looks like a follow-up.
-- Keep the previous context and the last detected intent.
-- Do not create a new full report.
-- Answer only the specific point being asked about.
-- If the user says "continue", deepen the last analysis by one layer: cause, risk, or next check.
+FOLLOW-UP RULE (CRITICAL):
+- The user already received a previous answer.
+- Do NOT repeat or copy the previous answer sections.
+- Answer the NEW question directly and specifically.
+- If the user asks which coins/assets look good: rank concrete symbols from market/watchlist context by relative strength/momentum/volume quality. Do not restate a generic market overview.
+- Prior context is background only; the new question has priority.
 """
 
 def _strategist_intent_from_payload(question: str, extra_context: dict | None = None) -> str:
@@ -26118,6 +26131,8 @@ def _strategist_intent_from_payload(question: str, extra_context: dict | None = 
 
     if re.search(r"(arbitrage|spread|exchange|börse|boerse|preisunterschied|price difference|premium|discount|günstig|guenstig|billig|cheaper|teurer|higher|wo.*kaufen|where.*buy|wo.*verkaufen|where.*sell|sell higher|buy cheaper|wo.*besser|where.*better|wo.*mehr wert|more expensive there|anderer preis|different price|lohnt|worth it)", q, re.I):
         return "rotation_spread"
+    if re.search(r"(welche\s+coin|welche\s+coins|welcher\s+coin|welche\s+assets?|welche\s+token|best\s+coin|best\s+coins|which\s+coin|which\s+coins|which\s+assets?|top\s+coins?|gute\s+coins?|coins?\s+sind\s+(denn\s+)?gut|assets?\s+sind\s+(denn\s+)?gut|was\s+handeln|what\s+to\s+trade|was\s+ist\s+stark)", q, re.I):
+        return "rotation"
     if re.search(r"(rotation|rotieren|relative\s+stärke|relative strength|weakness|strength|kapitalfluss|capital flow|outperform|underperform|welcher.*stärker|welcher.*staerker|which.*stronger|besserer coin|better coin|stärker als|staerker als|stronger than)", q, re.I):
         return "rotation"
     if re.search(r"(grid|range|seitwärts|seitwaerts|sideways|levels|raster)", q, re.I):
@@ -26582,7 +26597,17 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     response_language = _detect_user_language_from_text(str((extra_context or {}).get("raw_user_question") or question), (extra_context or {}).get("user_language") if isinstance(extra_context, dict) else None)
     language_hard_rule = _language_hard_rule(response_language)
     strategist_intent = _strategist_intent_from_payload(question, extra_context if isinstance(extra_context, dict) else {})
-    strategist_followup_rule = _strategist_followup_rule(str((extra_context or {}).get("raw_user_question") or question), strategist_intent, response_language)
+    _forced_followup = bool(
+        (extra_context or {}).get("strategist_followup")
+        if isinstance(extra_context, dict)
+        else False
+    )
+    strategist_followup_rule = _strategist_followup_rule(
+        str((extra_context or {}).get("raw_user_question") or question),
+        strategist_intent,
+        response_language,
+        forced=_forced_followup,
+    )
     strategist_profile = _strategist_response_profile(strategist_intent, response_language)
     strategist_digest = _strategist_context_digest(extra_context if isinstance(extra_context, dict) else {})
     strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
@@ -27269,6 +27294,12 @@ def api_ai_run():
             ai_signal_context["user_intent"] = body.get("user_intent")
         if body.get("raw_user_question"):
             ai_signal_context["raw_user_question"] = body.get("raw_user_question")
+        if body.get("user_intent"):
+            ai_signal_context["user_intent"] = body.get("user_intent")
+        if body.get("strategist_followup") is not None:
+            ai_signal_context["strategist_followup"] = bool(body.get("strategist_followup"))
+        if body.get("previous_response_summary"):
+            ai_signal_context["previous_response_summary"] = str(body.get("previous_response_summary") or "")[:1200]
         if body.get("strategist_intelligence_focus"):
             ai_signal_context["strategist_intelligence_focus"] = body.get("strategist_intelligence_focus")
         if body.get("strategist_phase"):
@@ -27286,13 +27317,18 @@ def api_ai_run():
     if not sym_norm:
         workspace_language = _detect_user_language_from_text(str(body.get("raw_user_question") or question), body.get("user_language"))
         workspace_language_rule = _language_hard_rule(workspace_language)
+        _ws_follow = bool(body.get("strategist_followup") or (isinstance(ai_signal_context, dict) and ai_signal_context.get("strategist_followup")))
+        _ws_raw_q = str(body.get("raw_user_question") or "")
+        _ws_follow_rule = _strategist_followup_rule(_ws_raw_q, str(body.get("user_intent") or "general"), workspace_language, forced=_ws_follow)
         workspace_sys = f"""You are Nexus Analyt AI Analyst, an active research, strategy, Pine Script, backtest, daily report, and trade-review workspace.
 
 {workspace_language_rule}
+{_ws_follow_rule}
 
 Rules:
 - Always answer in the same language as the user's task.
 - The request is task-based; do not require coin symbols.
+- If this is a follow-up, answer the NEW question and do not repeat the previous answer.
 - If strategist_depth_profile is present, use it silently to add WHY / RISK / INVALIDATION / CONFIDENCE.
 - Keep internal complexity hidden; show only clear reasoning.
 - Use probabilistic language and avoid direct trade commands.
@@ -33702,15 +33738,64 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
 
 
-def _nkr_set_onchain_pause(wallet: str, paused: bool) -> list[dict]:
+def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = None) -> list[dict]:
     rows = _live_active_sessions(wallet, "NKR")
+    tid = str(target_id or "").strip()
+    if tid:
+        filtered = []
+        for row in rows:
+            oid = str(row.get("onchain_session_id") or "").strip()
+            if oid == tid or (tid.split("-")[-1] == oid and oid.isdigit()):
+                filtered.append(row)
+            elif tid.upper().startswith("NKR-LIVE-") and oid == tid.split("-")[-1]:
+                filtered.append(row)
+        if filtered:
+            rows = filtered
     results = []
     for row in rows:
         sid = int(str(row.get("onchain_session_id") or "0"))
         wallet_id = str(row.get("privy_wallet_id") or "")
         vault = _norm_addr(row.get("vault_address") or "")
+        chain_id = int(row.get("chain_id") or 1)
         if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
             continue
+        # Skip if already FINALIZED — cannot pause a closed session.
+        try:
+            raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            words = _core_words(raw)
+            status_id = int(words[3]) if len(words) > 3 else -1
+            if status_id == 4:
+                results.append({"sessionId": sid, "status": "already_finalized", "txHash": ""})
+                continue
+            if paused and status_id == 2:
+                # Already paused on-chain
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute(
+                            "UPDATE nexus_live_core_vault_sessions SET status='PAUSED', updated_ts=?, last_error=NULL WHERE id=?",
+                            (int(time.time()), row.get("id")),
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                results.append({"sessionId": sid, "status": "paused", "txHash": ""})
+                continue
+            if (not paused) and status_id == 1:
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute(
+                            "UPDATE nexus_live_core_vault_sessions SET status='ACTIVE', updated_ts=?, last_error=NULL WHERE id=?",
+                            (int(time.time()), row.get("id")),
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                results.append({"sessionId": sid, "status": "active", "txHash": ""})
+                continue
+        except Exception:
+            pass
         data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
         ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{sid}-{int(time.time())}"
         sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref)
@@ -34279,6 +34364,14 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         })
         tips.append("Split capital · " + "/".join(strong))
 
+    # Global leader across live chains (e.g. BNB 65 on BNB while ETH session is idle).
+    global_best_ch, global_best = None, None
+    for ch, b in best_per_chain.items():
+        if not b:
+            continue
+        if global_best is None or (b["score"], b["change"]) > (global_best["score"], global_best["change"]):
+            global_best_ch, global_best = ch, b
+
     # IDLE release tracking per session
     release_candidates = []
     wa = _norm_addr(wallet)
@@ -34294,24 +34387,39 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         open_assets = int(lr.get("open_asset_count") or lr.get("openAssetCount") or 0)
         has_pos = open_assets > 0
         entry_ok = bool(best and best["score"] >= threshold)
-        if has_pos or entry_ok:
+        # Faster release when another live chain clearly leads and this session is flat.
+        other_leads = bool(
+            global_best
+            and global_best_ch
+            and global_best_ch != ch
+            and global_best["score"] >= threshold
+            and (not best or global_best["score"] >= (best["score"] + 4.0))
+        )
+        if has_pos or (entry_ok and not other_leads):
             _NKR_STRATEGIST_IDLE_TICKS[key] = 0
             continue
         _NKR_STRATEGIST_IDLE_TICKS[key] = int(_NKR_STRATEGIST_IDLE_TICKS.get(key) or 0) + 1
         ticks = _NKR_STRATEGIST_IDLE_TICKS[key]
-        if ticks >= _NKR_STRATEGIST_IDLE_RELEASE_TICKS:
+        # Normal idle release OR accelerated release when capital is stuck while BNB/etc leads.
+        need_ticks = 3 if other_leads else _NKR_STRATEGIST_IDLE_RELEASE_TICKS
+        if ticks >= need_ticks:
             actions.append({
                 "type": "RELEASE_IDLE",
                 "chain": ch,
                 "sessionId": sid,
                 "idleTicks": ticks,
+                "priority": 0 if other_leads else 1,
                 "detail": (
-                    f"Session on {ch} has no position and no entry candidate for {ticks} ticks. "
-                    f"Consider Stop & Exit to free capital for stronger chains."
+                    f"Session on {ch} has no position"
+                    + (f" while {global_best_ch}:{global_best['symbol']} leads at {global_best['score']:.1f}" if other_leads else f" and no entry candidate for {ticks} ticks")
+                    + ". Release capital for the stronger chain."
                 ),
             })
-            release_candidates.append({"chain": ch, "sessionId": sid, "idleTicks": ticks})
-            tips.append(f"Release idle {ch} session")
+            release_candidates.append({"chain": ch, "sessionId": sid, "idleTicks": ticks, "otherLeads": other_leads})
+            tips.append(f"Release idle {ch} → fund {global_best_ch or 'leader'}")
+
+    # Prefer RELEASE_IDLE before OPEN_SESSION when capital is locked on a weak/idle chain.
+    actions.sort(key=lambda a: (0 if str(a.get("type")).upper() == "RELEASE_IDLE" else 1, int(a.get("priority") or 1)))
 
     short_tip = tips[0] if tips else ""
     if len(tips) > 1:
@@ -34600,25 +34708,37 @@ def _nkr_observation_minutes(value) -> int:
 
 def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: float, settings: dict) -> dict:
     row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
+    # Route keys are often wraps (WBTC/WETH/WBNB). Market rows use display symbols (BTC/ETH/BNB).
+    _alias_to_display = {
+        "WBTC": "BTC", "CBBTC": "BTC", "BTCB": "BTC",
+        "WETH": "ETH", "WBNB": "BNB", "WMATIC": "POL", "MATIC": "POL",
+    }
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
     max_active = max(1, min(50, int(_safe_float(settings.get("maxActiveAssets"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT))))
     threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    regime, avg_change = _nkr_live_market_regime(market_rows)
+    # Green / risk-on markets: allow a small threshold softener so strong relative
+    # candidates are not blocked just below the hard mode gate (e.g. 59.7 vs 62).
+    soft = 0.0
+    if str(regime or "").upper() in {"GREEN", "RISK_ON", "BULL", "RISKON"} or avg_change >= 0.35:
+        soft = {"AGGRESSIVE": 4.0, "DYNAMIC": 3.0, "TACTICAL": 2.0, "DEFENSIVE": 0.0}.get(mode, 2.0)
+    effective_threshold = max(48.0, threshold - soft)
     ranked = []
     for sym, route in routes.items():
-        row = row_by_symbol.get(sym)
+        display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
+        row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
         if not isinstance(row, dict):
             continue
         price = _nkr_row_price_usd(row); change = _nkr_row_change_pct(row)
         score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
-        if price > 0 and score >= threshold and change > -4.0:
-            ranked.append({"symbol": sym, "score": score, "change": change, "price": price, "route": route})
+        if price > 0 and score >= effective_threshold and change > -4.0:
+            ranked.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
     ranked.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
     if ranked:
-        cut = max(threshold, ranked[0]["score"] - 14.0)
+        cut = max(effective_threshold, ranked[0]["score"] - 14.0)
         selected = [x for x in ranked if x["score"] >= cut][:max_active]
     else:
         selected = []
-    regime, avg_change = _nkr_live_market_regime(market_rows)
     best_score = selected[0]["score"] if selected else 0.0
     release = _nkr_capital_release_decision(
         market_regime=regime, performance=mode,
@@ -34628,6 +34748,10 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         capital_usd=budget_usd,
     )
     invest_usd = min(budget_usd, max(0.0, _safe_float(release.get("releaseUsd"), 0.0)))
+    # If a candidate already cleared the entry gate, deploy available session cash.
+    # Do not leave the whole budget idle just because the release curve is conservative.
+    if selected and invest_usd < max(_NKR_LIVE_MIN_REBALANCE_USD, budget_usd * 0.35):
+        invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.85))
     targets = {}
     if selected and invest_usd >= _NKR_LIVE_MIN_REBALANCE_USD:
         powers = [max(1.0, (x["score"] - threshold + 8.0) ** 2) for x in selected]
@@ -34668,7 +34792,12 @@ def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id
 
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
-    cfg = _privy_trading_cfg(); sid = int(str(live_row.get("onchain_session_id") or "0"))
+    chain_id = int(live_row.get("chain_id") or 1)
+    try:
+        cfg = _privy_trading_cfg(chain_id)
+    except Exception:
+        cfg = _privy_trading_cfg()
+    sid = int(str(live_row.get("onchain_session_id") or "0"))
     wallet_id = str(live_row.get("privy_wallet_id") or "").strip(); vault = _norm_addr(live_row.get("vault_address") or "")
     fee = int(route["fee"]); router = _norm_addr(route.get("router") or cfg["router"])
     router_cfg = _read_router_config(vault, router)
@@ -34789,8 +34918,35 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid)); words = _core_words(raw)
     if len(words) < 13:
         raise RuntimeError("session_decode_failed")
-    if int(words[3]) != 1:
-        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {int(words[3])} on {chain_key}."}
+    status_id = int(words[3])
+    if status_id != 1:
+        # Status 4 = FINALIZED: local/UI must not keep showing RUNNING.
+        if status_id == 4:
+            try:
+                _nkr_set_local_stop_state(wallet, "FINALIZED", f"CoreVault session #{sid} is FINALIZED on {chain_key}")
+            except Exception:
+                pass
+            try:
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute(
+                            "UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', updated_ts=?, last_error=NULL WHERE id=?",
+                            (int(time.time()), live_row.get("id")),
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        return {
+            "executed": False,
+            "decision": "WAIT",
+            "gate": "SESSION_NOT_ACTIVE",
+            "detail": f"CoreVault session status is {status_id} on {chain_key}"
+                      + (" (FINALIZED — capital released; start a new session)." if status_id == 4 else ".")
+                      + (" Resume if PAUSED." if status_id == 2 else ""),
+        }
     settlement_cash = int(words[9]); budget_usd = int(str(live_row.get("budget_units") or words[8] or "0")) / 1_000_000.0
     routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
@@ -35388,6 +35544,37 @@ def _ensure_nkr_live_worker_started() -> None:
         _NKR_LIVE_WORKER_STARTED = True
 
 
+def _nkr_session_matches_control_target(sess: dict, target_id: str) -> bool:
+    """Match UI sessionId against local id OR on-chain id (e.g. NKR-LIVE-ETH-5 vs 5)."""
+    t = str(target_id or "").strip()
+    if not t:
+        return True
+    if not isinstance(sess, dict):
+        return False
+    meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    candidates = [
+        sess.get("id"),
+        sess.get("session_id"),
+        sess.get("sessionId"),
+        sess.get("onchainSessionId"),
+        sess.get("coreVaultSessionId"),
+        sess.get("onchain_session_id"),
+        meta.get("onchain_session_id"),
+        meta.get("core_vault_session_id"),
+    ]
+    raw = {str(c).strip() for c in candidates if c is not None and str(c).strip()}
+    if t in raw:
+        return True
+    # NKR-LIVE-ETH-5 ↔ 5
+    t_tail = t.split("-")[-1] if "-" in t else t
+    for c in raw:
+        if c.split("-")[-1] == t_tail and t_tail.isdigit():
+            return True
+        if t.upper().startswith("NKR-LIVE-") and c == t_tail:
+            return True
+    return False
+
+
 @app.route("/api/nkr/control", methods=["POST"])
 def api_nkr_control():
     wa = _require_auth() or _pick_wallet_from_request()
@@ -35402,7 +35589,9 @@ def api_nkr_control():
     nkr_sessions = [dict(x) for x in sessions if _nkr_is_session(x)]
     target_id = str(body.get("sessionId") or body.get("session_id") or "").strip()
     if target_id:
-        nkr_sessions = [x for x in nkr_sessions if str(x.get("id") or x.get("session_id") or "") == target_id]
+        matched = [x for x in nkr_sessions if _nkr_session_matches_control_target(x, target_id)]
+        # Never drop to empty just because UI sent on-chain id vs local id.
+        nkr_sessions = matched if matched else nkr_sessions
     if action == "DELETE":
         # Delete forever: add tombstone and physically remove session/events.
         conn = _db()
@@ -35438,16 +35627,31 @@ def api_nkr_control():
     elif action in {"PAUSE", "RESUME"}:
         # Pause/resume is not stop. Keep the session visible and keep its Vault
         # allocation reserved while blocking/unblocking new engine actions.
+        # Local status is always updated so the worker stops even if the chain
+        # call fails (e.g. session already FINALIZED or RPC lag).
+        pause_results = []
+        onchain_error = ""
         try:
-            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE")
+            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None)
         except Exception as exc:
-            return jsonify({"status": "error", "error": f"nkr_{action.lower()}_failed:{exc}"}), 502
+            onchain_error = str(exc)[:240]
+        # Always persist local PAUSED/ACTIVE so UI + worker respect the user action.
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         next_control = "PAUSED" if action == "PAUSE" else "RUNNING"
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
+        else:
+            # No local presentation row yet — still stamp control state.
+            pass
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
-        _live_engine_mark("NKR", status="paused" if action == "PAUSE" else "running", decision=next_control, reason="User control confirmed on-chain", pending_tx="", last_error="")
+        _live_engine_mark(
+            "NKR",
+            status="paused" if action == "PAUSE" else "running",
+            decision=next_control,
+            reason=("User control confirmed on-chain" if pause_results and not onchain_error else f"User control stored locally{(': ' + onchain_error) if onchain_error else ''}"),
+            pending_tx="",
+            last_error=onchain_error or "",
+        )
     else:
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         next_control = "RUNNING"
