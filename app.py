@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-281-NO-STARTED-CLOBBER"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-282-TICK-ERROR-VISIBLE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -882,15 +882,16 @@ def _live_engine_health_payload(wallet=""):
                     ),
                     "decision_detail": (
                         f"{asset} position is open and tracked by CoreVault." if has_position else
-                        str(row.get("decision_detail") or row.get("detail") or "CoreVault session is active.")
+                        str(row.get("decision_detail") or row.get("detail") or row.get("last_error") or "CoreVault session is active.")
                     ),
                     # Never wipe a meaningful worker reason with a generic sync label when still scanning.
                     "reason": (
                         "wallet-bound CoreVault state synchronized" if (has_position or paused or exit_pending)
                         else str(row.get("reason") or "wallet-bound CoreVault state synchronized")
                     ),
-                    "pending_tx": "",
-                    "last_error": "",
+                    # ENGINE-282: never wipe worker last_error on status poll (needed for TICK_FAILED debug).
+                    "pending_tx": str(row.get("pending_tx") or ""),
+                    "last_error": str(row.get("last_error") or ""),
                     "active_asset": asset,
                     "position_state": ("EXITING" if exit_pending else ("OPEN" if has_position else (position_state or "WAITING"))),
                     "position_value_usd": position_value,
@@ -35782,11 +35783,23 @@ def _nkr_live_worker_cycle() -> None:
             executions = []
             for live_row in runnable_rows:
                 decision_session = _nkr_processed_session_for_live_row(processed, live_row)
-                with _NKR_LIVE_TRADE_LOCK:
-                    execution = _nkr_live_execute_portfolio(
-                        wallet, live_row, market_rows, settings
-                    )
-                _nkr_confirm_processed_live_exit(processed, live_row, execution)
+                try:
+                    with _NKR_LIVE_TRADE_LOCK:
+                        execution = _nkr_live_execute_portfolio(
+                            wallet, live_row, market_rows, settings
+                        )
+                    _nkr_confirm_processed_live_exit(processed, live_row, execution)
+                except Exception as exec_exc:
+                    # One chain/session failure must not kill the whole wallet tick.
+                    chain_hint = _nkr_chain_key_from_id(live_row.get("chain_id") or 1)
+                    execution = {
+                        "executed": False,
+                        "decision": "WAIT",
+                        "gate": "SESSION_EXEC_ERROR",
+                        "detail": f"{chain_hint} session exec error: {str(exec_exc)[:240]}",
+                        "asset": "",
+                        "error": str(exec_exc)[:500],
+                    }
                 executions.append((live_row, execution))
 
                 # A successful on-chain read/tick proves that a previous local ERROR was
@@ -35873,9 +35886,13 @@ def _nkr_live_worker_cycle() -> None:
                 live_chains=list((diag.get("multi_chain_plan") or {}).get("liveChains") or sorted(_nkr_live_chain_keys())),
             )
         except Exception as exc:
+            err_txt = str(exc)[:1000] or repr(exc)[:1000] or "unknown_worker_exception"
             _live_engine_mark(
                 "NKR", tick=True, status="error", decision="TICK_FAILED",
-                reason="backend worker tick failed", last_error=str(exc)[:1000]
+                gate_status="TICK_FAILED",
+                decision_detail=err_txt[:400],
+                reason="backend worker tick failed",
+                last_error=err_txt,
             )
 
 
