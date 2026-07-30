@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-275-SESSION-LIGHT-READINESS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-277-MULTI-SESSION-OVERVIEW"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2019,12 +2019,38 @@ def api_nexus_core_vault_admin_prepare_action():
 
 
 
+def _v5_usdc_token_candidates(chain_id: int) -> list[str]:
+    """Primary + alternate USDC contracts per chain (POL bridged vs native, BNB peg variants)."""
+    primary = _norm_addr((_USDC_BY_CHAIN or {}).get(int(chain_id)) or "")
+    alts = [_norm_addr(x) for x in ((_USDC_ALT_BY_CHAIN or {}).get(int(chain_id)) or [])]
+    # Always include known good defaults so a bad ENV typo cannot zero out freeBase.
+    defaults = {
+        56: [
+            "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",  # Binance-Peg USDC
+        ],
+        137: [
+            "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # Circle native USDC
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC.e bridged
+        ],
+        1: [
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        ],
+    }.get(int(chain_id), [])
+    out = []
+    for addr in [primary, *alts, *defaults]:
+        a = _norm_addr(addr)
+        if _looks_like_evm_addr(a) and a not in out:
+            out.append(a)
+    return out
+
+
 def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     """Authoritative V5 funding state shared by Grid, NKR and Trader.
 
     Reads tokenConfig and freeBase directly from the selected chain's V5 Vault.
-    No SQLite balance, rounded UI value, USD proxy, or legacy Vault fallback is
-    allowed for an engine funding decision.
+    For USDC, tries primary + alternate contracts and prefers the token that is
+    configured as settlement AND has the highest freeBase (fixes POL native vs
+    bridged and BNB address mismatches).
     """
     chain_key = _normalize_chain_key(chain_value or "ETH") or "ETH"
     chain_id = int((_CHAIN_ID_BY_KEY or {}).get(chain_key, 0) or 0)
@@ -2033,23 +2059,56 @@ def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
     if not _looks_like_evm_addr(vault):
         raise ValueError("core_vault_v5_not_configured")
-    token, fallback_decimals, is_native = _vault_asset_spec_for_chain(chain_id, symbol)
-    if not is_native and not _looks_like_evm_addr(token):
+    sym = str(symbol or "").strip().upper()
+    wa = _norm_addr(wallet)
+
+    candidates = []
+    if sym == "USDC":
+        candidates = [(addr, 6, False) for addr in _v5_usdc_token_candidates(chain_id)]
+    else:
+        token, fallback_decimals, is_native = _vault_asset_spec_for_chain(chain_id, sym)
+        if not is_native and not _looks_like_evm_addr(token):
+            raise ValueError("settlement_asset_not_configured")
+        candidates = [(token, int(fallback_decimals), bool(is_native))]
+
+    best = None
+    probed = []
+    for token, fallback_decimals, is_native in candidates:
+        try:
+            cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token if not is_native else NEXUS_NATIVE_TOKEN))
+            free = _core_vault_words(
+                _core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wa, token if not is_native else NEXUS_NATIVE_TOKEN)
+            )
+            cfg = list(cfg or []) + [0] * (10 - len(cfg or []))
+            row = {
+                "chain": chain_key, "chainId": chain_id, "vault": vault,
+                "symbol": sym, "token": token if not is_native else NEXUS_NATIVE_TOKEN,
+                "native": bool(is_native), "decimals": int(cfg[6] or fallback_decimals),
+                "configured": bool(cfg[0]), "depositEnabled": bool(cfg[1]),
+                "withdrawEnabled": bool(cfg[2]), "executionEnabled": bool(cfg[3]),
+                "paymentEnabled": bool(cfg[4]), "settlementToken": bool(cfg[5]),
+                "maxSessionBudgetUnits": int(cfg[8] or 0),
+                "freeBaseUnits": int((free or [0])[0]),
+            }
+            probed.append({"token": row["token"], "configured": row["configured"], "executionEnabled": row["executionEnabled"], "settlementToken": row["settlementToken"], "freeBaseUnits": row["freeBaseUnits"]})
+            # Prefer: configured + execution + settlement, then highest free
+            score = (
+                1 if row["configured"] else 0,
+                1 if row["executionEnabled"] else 0,
+                1 if row["settlementToken"] else 0,
+                int(row["freeBaseUnits"] or 0),
+            )
+            if best is None or score > best[0]:
+                best = (score, row)
+        except Exception as exc:
+            probed.append({"token": token, "error": str(exc)[:160]})
+            continue
+
+    if not best:
         raise ValueError("settlement_asset_not_configured")
-    cfg = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["tokenConfig"], token))
-    free = _core_vault_words(_core_vault_call(chain_id, vault, _CORE_VAULT_SELECTORS["freeBase"], wallet, token))
-    cfg += [0] * (10 - len(cfg))
-    decimals = int(cfg[6] or fallback_decimals)
-    return {
-        "chain": chain_key, "chainId": chain_id, "vault": vault,
-        "symbol": str(symbol or "").upper(), "token": token,
-        "native": bool(is_native), "decimals": decimals,
-        "configured": bool(cfg[0]), "depositEnabled": bool(cfg[1]),
-        "withdrawEnabled": bool(cfg[2]), "executionEnabled": bool(cfg[3]),
-        "paymentEnabled": bool(cfg[4]), "settlementToken": bool(cfg[5]),
-        "maxSessionBudgetUnits": int(cfg[8] or 0),
-        "freeBaseUnits": int((free or [0])[0]),
-    }
+    result = dict(best[1])
+    result["usdcCandidatesProbed"] = probed if sym == "USDC" else []
+    return result
 
 @app.post("/api/nexus/core-vault/session/create-auto")
 def api_core_vault_create_system_session_auto():
@@ -2154,7 +2213,19 @@ def api_core_vault_create_system_session_auto():
     free_units = int(funding["freeBaseUnits"])
     max_budget_units = int(funding.get("maxSessionBudgetUnits") or 0)
     if max_budget_units and amount_units > max_budget_units:
-        return jsonify({"status":"blocked","error":"session_budget_limit_exceeded","requestedUnits":str(amount_units),"maxUnits":str(max_budget_units),"asset":settlement_symbol}), 409
+        max_amount = round(max_budget_units / float(10 ** max(0, int(decimals or 6))), 8)
+        return jsonify({
+            "status": "blocked",
+            "error": "session_budget_limit_exceeded",
+            "requestedUnits": str(amount_units),
+            "maxUnits": str(max_budget_units),
+            "requestedAmount": round(amount_units / float(10 ** max(0, int(decimals or 6))), 8),
+            "maxAmount": max_amount,
+            "availableAmount": round(free_units / float(10 ** max(0, int(decimals or 6))), 8),
+            "asset": settlement_symbol,
+            "chain": chain_key,
+            "message": f"Vault max session budget on {chain_key} is {max_amount} {settlement_symbol}. Requested {round(amount_units / float(10 ** max(0, int(decimals or 6))), 8)}. Lower the budget and try again.",
+        }), 409
 
     if amount_units > free_units:
         return jsonify({
@@ -7543,7 +7614,7 @@ def _vault_approved_token_contracts() -> set[tuple[int, str]]:
     stable_env = {
         1: [os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
             os.getenv("USDT_ADDRESS_ETH") or os.getenv("USDT_ADDRESS_1") or "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
-        56: [os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83F1Ad97B32Cd580d",
+        56: [os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
              os.getenv("USDT_ADDRESS_BNB") or os.getenv("USDT_ADDRESS_56") or "0x55d398326f99059fF775485246999027B3197955"],
         137: [
               os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
@@ -8579,7 +8650,8 @@ _USDC_BY_CHAIN = {
     1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
     # Polygon native Circle USDC. Old bridged USDC is accepted as alternate below.
-    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+    # Prefer Circle native USDC on Polygon; bridged USDC.e remains in alts / candidate probe.
+    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
 }
 
 _USDC_ALT_BY_CHAIN = {
