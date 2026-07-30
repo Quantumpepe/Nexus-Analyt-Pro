@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-248-NKR-RESTART-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-249-NKR-DIRECT-ONCHAIN-CARD-RECOVERY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -508,9 +508,46 @@ def _live_active_sessions(wallet, engine):
         except Exception:
             pass
     rows = _read_rows()
-    # Only rows linked to a real V5 session are presentation/runtime truth.
-    # Invalid legacy rows remain ignored and cannot hide the valid session.
-    return [r for r in rows if str(r.get("onchain_session_id") or "").isdigit() and int(str(r.get("onchain_session_id") or "0")) > 0]
+    valid_rows = [r for r in rows if str(r.get("onchain_session_id") or "").isdigit() and int(str(r.get("onchain_session_id") or "0")) > 0]
+    if valid_rows:
+        return valid_rows
+
+    # ENGINE-249: direct on-chain fallback. The session card must not depend on a
+    # successful local registry write or on which Gunicorn worker serves this GET.
+    # When reconciliation could not persist a row, return a transient authoritative
+    # projection directly from every configured V5 CoreVault.
+    transient = []
+    for chain_id in (1, 56, 137, 8453, 42161):
+        vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+        if not _looks_like_evm_addr(vault):
+            continue
+        try:
+            _vault, _next_id, discovered = _discover_wallet_core_sessions(wa, eng, chain_id, vault)
+        except Exception:
+            continue
+        for sess in discovered or []:
+            try:
+                status_id = int(sess.get("statusId") or 0)
+                sid = int(sess.get("sessionId") or 0)
+            except Exception:
+                continue
+            if status_id not in (1, 2, 3) or sid <= 0:
+                continue
+            transient.append({
+                "wallet_address": wa,
+                "engine": eng,
+                "chain_id": int(chain_id),
+                "vault_address": vault,
+                "privy_wallet_id": "",
+                "onchain_session_id": str(sid),
+                "tx_hash": "",
+                "budget_units": str(int(sess.get("budgetUnits") or 0)),
+                "status": {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING"}.get(status_id, "ACTIVE"),
+                "created_ts": int(sess.get("startsAt") or time.time()),
+                "updated_ts": int(time.time()),
+                "direct_onchain_fallback": True,
+            })
+    return transient
 
 def _nkr_set_local_stop_state(wallet: str, state: str, message: str = ""):
     """Persist the user-visible NKR lifecycle without exposing blockchain details."""
