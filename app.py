@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-283-AGGRESSIVE-ENTRY"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-284-BUDGET-AND-REASON"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35332,7 +35332,29 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                       + (" (FINALIZED — capital released; start a new session)." if status_id == 4 else ".")
                       + (" Resume if PAUSED." if status_id == 2 else ""),
         }
-    settlement_cash = int(words[9]); budget_usd = int(str(live_row.get("budget_units") or words[8] or "0")) / 1_000_000.0
+    settlement_cash = int(words[9])
+    # Prefer larger of on-chain budget, registry units, and words[8] (USDC 6 decimals).
+    # Prevents invest~$1 while UI shows $20 reserved.
+    _bu_reg = int(str(live_row.get("budget_units") or "0") or 0)
+    _bu_chain = int(words[8] or 0) if len(words) > 8 else 0
+    _bu = max(_bu_reg, _bu_chain)
+    budget_usd = _bu / 1_000_000.0
+    if budget_usd < 1.0:
+        # Fallback: local rotation session capital for this on-chain id
+        try:
+            _sid = str(live_row.get("onchain_session_id") or "")
+            _sessions, _, _ = _db_get_rotation_sessions(wallet)
+            for _s in _sessions or []:
+                if not isinstance(_s, dict):
+                    continue
+                _ms = _s.get("meta") if isinstance(_s.get("meta"), dict) else {}
+                if str(_s.get("onchainSessionId") or _ms.get("onchain_session_id") or "") == _sid:
+                    _local = _safe_float(_s.get("budgetUsd") or _s.get("workingCapitalUsd") or _s.get("reservedUsd") or 0, 0.0)
+                    if _local > budget_usd:
+                        budget_usd = _local
+                    break
+        except Exception:
+            pass
     routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
     plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
