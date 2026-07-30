@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-254-NKR-LIVE-CHAIN-FILTER"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-255-NKR-WRAP-RESOLVE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33410,7 +33410,99 @@ def _nkr_symbol_home_chain(symbol: str) -> str:
         return "ARB"
     if sym in {"BASE"}:
         return "BASE"
+    # Non-EVM display assets: prefer first live chain that has a configured wrap route.
+    try:
+        reg = _nexus_asset_router_registry(include_technical=True)
+        asset = (reg.get("technicalRoutes") or {}).get(sym)
+        routes = (asset or {}).get("routes") if isinstance(asset, dict) else None
+        if isinstance(routes, dict) and routes:
+            live = _nkr_live_chain_keys()
+            for ch in ("ETH", "BNB", "POL"):
+                if ch in routes and ch in live and (routes.get(ch) or {}).get("tokenContract"):
+                    return ch
+            for ch, rt in routes.items():
+                if ch in live and (rt or {}).get("tokenContract"):
+                    return str(ch).upper()
+    except Exception:
+        pass
     return ""
+
+
+def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
+    """Resolve a watchlist/display symbol to the on-chain wrap for a live chain.
+
+    Example: BTC + ETH → WBTC (0x2260…); BTC + BNB → BTCB.
+    User always sees the display symbol; execution uses internalSymbol + tokenContract.
+    """
+    sym = str(symbol or "").strip().upper()
+    chain = _nkr_normalize_watch_chain_key(chain_key) if chain_key else ""
+    live = _nkr_live_chain_keys()
+    out = {
+        "displaySymbol": sym,
+        "chain": chain,
+        "internalSymbol": sym,
+        "tokenContract": "",
+        "decimals": 18,
+        "configured": False,
+        "liveEnabled": False,
+        "tradableOnSession": False,
+        "source": "native_or_unknown",
+    }
+    if not sym:
+        return out
+    # Native gas assets
+    if sym in {"ETH", "WETH"} and (not chain or chain == "ETH"):
+        return {**out, "chain": "ETH", "internalSymbol": "WETH", "configured": True, "tradableOnSession": True, "source": "native"}
+    if sym in {"BNB", "WBNB"} and (not chain or chain == "BNB"):
+        return {**out, "chain": "BNB", "internalSymbol": "WBNB", "configured": True, "tradableOnSession": True, "source": "native"}
+    if sym in {"POL", "MATIC", "WMATIC"} and (not chain or chain == "POL"):
+        return {**out, "chain": "POL", "internalSymbol": "WMATIC", "configured": True, "tradableOnSession": True, "source": "native"}
+    try:
+        reg = _nexus_asset_router_registry(include_technical=True)
+        asset = (reg.get("technicalRoutes") or {}).get(sym)
+        if not isinstance(asset, dict):
+            # Aliases: WBTC → BTC registry entry
+            aliases = {"WBTC": "BTC", "BTCB": "BTC", "CBBTC": "BTC", "WETH": "ETH", "WBNB": "BNB"}
+            alt = aliases.get(sym)
+            if alt:
+                asset = (reg.get("technicalRoutes") or {}).get(alt)
+                if asset:
+                    sym = alt
+                    out["displaySymbol"] = alt
+        routes = (asset or {}).get("routes") if isinstance(asset, dict) else {}
+        if not isinstance(routes, dict) or not routes:
+            return out
+        # Prefer requested chain if it has a route; else first live configured chain.
+        pick_chain = chain if chain in routes else ""
+        if not pick_chain:
+            for ch in ("ETH", "BNB", "POL"):
+                if ch in routes and ch in live and (routes.get(ch) or {}).get("tokenContract"):
+                    pick_chain = ch
+                    break
+        if not pick_chain:
+            pick_chain = next(iter(routes.keys()), "")
+        route = routes.get(pick_chain) or {}
+        token = _norm_addr(route.get("tokenContract") or "")
+        configured = bool(token)
+        live_ready = bool(configured and route.get("routerAddress") and route.get("enabledForLive"))
+        # Tradable for strategist ranking if contract exists on a live vault chain
+        # (liveEnabled still gates actual on-chain submit).
+        tradable = bool(configured and pick_chain in live)
+        return {
+            "displaySymbol": out["displaySymbol"],
+            "chain": str(pick_chain or "").upper(),
+            "internalSymbol": str(route.get("internalSymbol") or sym).upper(),
+            "tokenContract": token,
+            "decimals": int(route.get("decimals") or 18),
+            "configured": configured,
+            "liveEnabled": live_ready,
+            "tradableOnSession": tradable,
+            "source": "asset_router",
+            "routerAddress": _norm_addr(route.get("routerAddress") or ""),
+            "poolFee": route.get("poolFee") or route.get("fee"),
+        }
+    except Exception:
+        return out
 
 
 def _nkr_live_market_rows(wallet: str) -> list[dict]:
@@ -33438,19 +33530,28 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
             sym = ""
         if not sym or sym in {"USDC", "USDT", "USD"}:
             continue
-        home = chain_from_item or _nkr_symbol_home_chain(sym) or ""
+        # Resolve display symbol (BTC/SOL/…) via asset-router wraps on live chains.
+        resolved = _nkr_resolve_display_asset(sym, chain_from_item)
+        home = chain_from_item or resolved.get("chain") or _nkr_symbol_home_chain(sym) or ""
         # Hard skip: known non-live home chain (e.g. Base/ARB watchlist items).
         if home and home not in live_chains:
             skipped_non_live += 1
             continue
-        # Unknown home (generic token): still scannable — session/route filter
-        # decides tradability later. Do not invent BASE/ARB.
+        # Non-EVM display asset with no configured wrap on any live chain → skip.
+        if resolved.get("source") == "asset_router" and not resolved.get("configured"):
+            skipped_non_live += 1
+            continue
         row = {
             "symbol": sym,
             "mode": "market",
             "chain": home,
             "chainKey": home,
             "liveChain": bool(not home or home in live_chains),
+            "displaySymbol": sym,
+            "internalSymbol": str(resolved.get("internalSymbol") or sym).upper(),
+            "wrapToken": str(resolved.get("tokenContract") or ""),
+            "wrapConfigured": bool(resolved.get("configured")),
+            "wrapLiveEnabled": bool(resolved.get("liveEnabled")),
         }
         try:
             ticker24 = _binance_24h_for_symbol(sym)
@@ -33617,16 +33718,42 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
         change = _nkr_row_change_pct(row)
         score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
         home = str(row.get("chain") or row.get("chainKey") or _nkr_symbol_home_chain(sym) or "").upper()
+        resolved = _nkr_resolve_display_asset(sym, session_chain)
+        # Prefer session-chain wrap when the asset-router has one (BTC→WBTC on ETH).
+        if resolved.get("configured") and str(resolved.get("chain") or "").upper() == session_chain:
+            home = session_chain
         # Overall ranking only across live vault chains (ETH/BNB/POL).
         if home and home not in live_chains:
             continue
-        entry = {"symbol": sym, "score": score, "change": change, "price": price, "chain": home or session_chain}
+        internal = str(row.get("internalSymbol") or resolved.get("internalSymbol") or sym).upper()
+        entry = {
+            "symbol": sym,
+            "score": score,
+            "change": change,
+            "price": price,
+            "chain": home or session_chain,
+            "internalSymbol": internal,
+            "wrapConfigured": bool(resolved.get("configured") or row.get("wrapConfigured")),
+        }
         ranked_all.append(entry)
-        # Session-tradable: explicit route set OR same home chain as session.
-        on_session = (sym in tradable) or (home == session_chain) or (not home and sym in tradable)
+        # Session-tradable:
+        # 1) symbol in live route registry for this chain, or
+        # 2) asset-router wrap configured on this session chain (BTC on ETH → WBTC), or
+        # 3) native of this session chain.
+        on_session = False
+        if sym in tradable or internal in tradable:
+            on_session = True
+        if resolved.get("configured") and str(resolved.get("chain") or "").upper() == session_chain:
+            on_session = True
+        if home == session_chain and (sym in tradable or not home):
+            on_session = True
         # Never treat a known foreign native as tradable on this session.
-        if home and home != session_chain and sym not in tradable:
-            on_session = False
+        foreign_native = _nkr_symbol_home_chain(sym)
+        if foreign_native and foreign_native != session_chain and not (
+            resolved.get("configured") and str(resolved.get("chain") or "").upper() == session_chain
+        ):
+            if sym not in tradable and internal not in tradable:
+                on_session = False
         if on_session:
             ranked_session.append(entry)
     ranked_all.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
