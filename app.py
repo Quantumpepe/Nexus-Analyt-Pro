@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-261-NKR-AGGRESSIVE-STICKY"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-262-STOP-EXIT-STABLE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33242,16 +33242,18 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
     control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
     # Derive control from live session rows. Terminal rows (incl. FINALIZED) must
     # never keep the UI in RUNNING and must not block a fresh Start NKR.
+    # Priority: STOPPING/CLOSING beats PAUSED — Pause→Stop must not flicker to PAUSED.
     _terminal = {"STOPPED", "FINALIZED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED", "DELETED", "ARCHIVED", "COMPLETE", "COMPLETED"}
     live_statuses = [str((x or {}).get("status") or "").upper() for x in nkr_sessions]
-    if any(st in {"ACTIVE", "WAITING", "OPEN", "RUNNING", "EXECUTOR", "EXECUTOR_ACTIVE", "READY_DISPATCHED"} for st in live_statuses):
+    if any(st in {"STOPPING", "FINALIZING", "CLOSING", "EXITING", "EXIT_PENDING", "EXIT_REQUESTED"} for st in live_statuses):
+        control = "STOPPING"
+    elif control in {"STOPPING", "FINALIZING", "CLOSING"}:
+        control = "STOPPING"
+    elif any(st in {"ACTIVE", "WAITING", "OPEN", "RUNNING", "EXECUTOR", "EXECUTOR_ACTIVE", "READY_DISPATCHED"} for st in live_statuses):
         control = "RUNNING"
     elif any(st == "PAUSED" for st in live_statuses):
         control = "PAUSED"
-    elif any(st == "STOPPING" or st == "FINALIZING" for st in live_statuses):
-        control = "STOPPING"
     elif nkr_sessions and all(st in _terminal for st in live_statuses):
-        # All sessions finished → ready for a new run (not stuck on STOPPED/FINALIZED).
         control = "WAITING"
     elif not nkr_sessions:
         control = "WAITING"
@@ -33608,6 +33610,10 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     if existing:
         # Do not let an old terminal/local row suppress a confirmed active session.
         st = str(existing.get("status") or existing.get("lifecycleState") or "").upper()
+        # Never rebuild a STOPPING/CLOSING card back to PAUSED/ACTIVE from on-chain
+        # while Stop & Exit is in flight (Pause → Stop must stay on EXITING).
+        if st in {"STOPPING", "FINALIZING", "CLOSING", "EXITING", "EXIT_PENDING", "EXIT_REQUESTED", "STOPPED", "FINALIZED"}:
+            return
         if st not in ROTATION_TERMINAL_STATUSES and str(existing.get("id") or existing.get("session_id") or "") == local_id:
             # Backfill Strategist rules from current user UI when older rows lack them.
             try:
