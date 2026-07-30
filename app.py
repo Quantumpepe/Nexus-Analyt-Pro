@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-278-CHAIN-CANDIDATE-ASSIGN"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-279-LIVE-MARKET-FALLBACK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33724,12 +33724,36 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
     Policy: only scan assets on live vault chains (ETH/BNB/POL).
     Watchlist entries tagged BASE/ARB (or other non-live chains) are skipped
     until that chain has a deployed CoreVault.
+
+    ENGINE-279: if the backend watchlist is empty (UI not synced yet), fall back
+    to a core liquid universe so the live worker never runs with assets_scanned=0
+    while sessions are active. Always force-include ETH/BNB/POL natives.
     """
     items, _ = _db_get_user_watchlist(wallet)
     live_chains = _nkr_live_chain_keys()
+    # Core liquid fallback when wallet watchlist is empty/stale in SQLite
+    default_universe = [
+        "ETH", "BNB", "POL", "BTC", "LINK", "XRP", "TON", "DOGE", "ADA", "SOL",
+        "AVAX", "DOT", "UNI", "AAVE", "PEPE", "WETH", "WBNB",
+    ]
+    if not items:
+        items = [{"symbol": s, "chain": _nkr_symbol_home_chain(s) or ""} for s in default_universe]
+    else:
+        # Always ensure session-chain natives are present even if user removed them
+        have = set()
+        for it in items:
+            if isinstance(it, str):
+                have.add(it.strip().upper())
+            elif isinstance(it, dict):
+                have.add(str(it.get("symbol") or it.get("sym") or "").strip().upper())
+        for native in ("ETH", "BNB", "POL"):
+            if native not in have:
+                items = list(items) + [{"symbol": native, "chain": native}]
+
     rows = []
     skipped_non_live = 0
-    for item in (items or [])[:40]:
+    seen = set()
+    for item in (items or [])[:60]:
         chain_from_item = ""
         if isinstance(item, str):
             sym = item.strip().upper()
@@ -33741,19 +33765,30 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
             )
         else:
             sym = ""
-        if not sym or sym in {"USDC", "USDT", "USD"}:
+        if not sym or sym in {"USDC", "USDT", "USD", "DAI"}:
             continue
+        if sym in seen:
+            continue
+        seen.add(sym)
         # Resolve display symbol (BTC/SOL/…) via asset-router wraps on live chains.
         resolved = _nkr_resolve_display_asset(sym, chain_from_item)
         home = chain_from_item or resolved.get("chain") or _nkr_symbol_home_chain(sym) or ""
-        # Hard skip: known non-live home chain (e.g. Base/ARB watchlist items).
+        # Natives of live chains are always scannable
+        if sym in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC"}:
+            home = home or _nkr_symbol_home_chain(sym) or ""
+        # Hard skip: known non-live home chain (e.g. Base/ARB/SUI-only names without wrap).
         if home and home not in live_chains:
-            skipped_non_live += 1
-            continue
+            # Allow if a wrap exists on any live chain
+            if not (isinstance(resolved, dict) and resolved.get("configured") and str(resolved.get("chain") or "") in live_chains):
+                skipped_non_live += 1
+                continue
+            home = str(resolved.get("chain") or home).upper()
         # Non-EVM display asset with no configured wrap on any live chain → skip.
         if resolved.get("source") == "asset_router" and not resolved.get("configured"):
-            skipped_non_live += 1
-            continue
+            # Still allow pure natives handled above
+            if sym not in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC"}:
+                skipped_non_live += 1
+                continue
         row = {
             "symbol": sym,
             "mode": "market",
@@ -33771,8 +33806,6 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
             px = ticker24 or _price_multi(sym)
             if isinstance(px, dict):
                 row["price"] = px.get("price") or px.get("priceUsd") or 0
-                # Do not use `or` for numeric market fields: a legitimate 0.0 is
-                # different from a missing value and negative percentages are valid.
                 change = px.get("change24h")
                 if change is None:
                     change = px.get("change_24h")
@@ -33785,14 +33818,26 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
                 row["marketDataUpdatedAt"] = int(px.get("updatedAt") or int(time.time() * 1000))
         except Exception:
             pass
+        # Drop only if we truly have no price after all sources
+        if _safe_float(row.get("price"), 0.0) <= 0:
+            try:
+                px2 = _price_multi(sym)
+                if isinstance(px2, dict):
+                    row["price"] = _safe_float(px2.get("price") or px2.get("priceUsd"), 0.0)
+                    if row.get("change24h") is None:
+                        row["change24h"] = _safe_float(px2.get("change24h") or px2.get("change_24h"), 0.0)
+            except Exception:
+                pass
         rows.append(row)
     enriched = _binance_enrich_market_rows(rows)
-    # Attach scan meta for diagnostics (does not affect ranking keys).
     if isinstance(enriched, list) and skipped_non_live > 0:
         for r in enriched:
             if isinstance(r, dict):
                 r.setdefault("skippedNonLiveWatchlist", skipped_non_live)
-    return enriched
+    # Prefer priced rows for ranking; keep zero-price rows only as last resort diagnostics
+    priced = [r for r in (enriched or []) if isinstance(r, dict) and _safe_float(r.get("price"), 0.0) > 0]
+    return priced if priced else (enriched or [])
+
 
 
 def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
@@ -35536,6 +35581,17 @@ def _nkr_live_worker_cycle() -> None:
                 and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}
             ]
             market_rows = _nkr_live_market_rows(wallet)
+            if not market_rows:
+                # Should be rare after ENGINE-279 fallback; still avoid a hard TICK_FAILED.
+                _live_engine_mark(
+                    "NKR", tick=True, status="running",
+                    assets_scanned=0, tradable_assets=0,
+                    best_candidate="", candidate_score=0.0,
+                    decision="WAIT", gate_status="NO_MARKET_DATA",
+                    decision_detail="No priced market rows for Strategist (watchlist empty and price fallback failed).",
+                    reason="waiting_for_market_data", last_error="",
+                )
+                continue
             state, _ = _db_get_user_app_state(wallet)
             ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
             # Prefer mode stamped on live sessions (incl. PAUSED), then app-state UI.
