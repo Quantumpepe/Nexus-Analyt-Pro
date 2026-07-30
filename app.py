@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-280-LIVE-ENTRY-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-281-NO-STARTED-CLOBBER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -402,11 +402,26 @@ def _live_engine_mark(engine: str, **patch):
         pass
 
 def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1):
+    """Upsert live CoreVault session into local registry.
+
+    ENGINE-281: do NOT mark runtime health STARTED on every reconcile upsert.
+    Reconcile runs on every status poll and was wiping worker diagnostics
+    (assets_scanned, candidate scores, WAIT/OPEN gates) back to STARTED/0.
+    Runtime STARTED is only marked when this is a brand-new registry row.
+    """
     _live_engine_tables_init()
     conn = _db()
     nowi = int(time.time())
+    is_new = False
     try:
         with DB_WRITE_LOCK:
+            cur = conn.execute(
+                "SELECT id FROM nexus_live_core_vault_sessions "
+                "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                (int(chain_id), _norm_addr(vault).lower(), str(session_id)),
+            )
+            prev = cur.fetchone()
+            is_new = prev is None
             conn.execute("""
                 INSERT INTO nexus_live_core_vault_sessions
                 (wallet_address,engine,chain_id,vault_address,privy_wallet_id,onchain_session_id,tx_hash,budget_units,status,created_ts,updated_ts)
@@ -420,7 +435,8 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
             conn.commit()
     finally:
         conn.close()
-    _live_engine_mark(engine, status="running", decision="STARTED", reason="CoreVault session created", pending_tx="")
+    if is_new:
+        _live_engine_mark(engine, status="running", decision="STARTED", reason="CoreVault session created", pending_tx="")
 
 def _reconcile_live_registry_from_corevault(wallet, engine):
     """Rebuild the local live-session registry from confirmed V5 CoreVault state.
@@ -35633,7 +35649,31 @@ def _nkr_live_worker_cycle() -> None:
             ]
             market_rows = _nkr_live_market_rows(wallet)
             if not market_rows:
-                # Should be rare after ENGINE-279 fallback; still avoid a hard TICK_FAILED.
+                # ENGINE-281 emergency: build minimal priced natives so the cycle can still rank.
+                emergency = []
+                for sym in ("ETH", "BNB", "POL", "BTC", "LINK"):
+                    try:
+                        px = _price_multi(sym) if "_price_multi" in globals() else None
+                        if not isinstance(px, dict):
+                            px = {}
+                        price = _safe_float(px.get("price") or px.get("priceUsd"), 0.0)
+                        change = _safe_float(px.get("change24h") or px.get("change_24h"), 0.0)
+                        if price <= 0:
+                            continue
+                        emergency.append({
+                            "symbol": sym,
+                            "price": price,
+                            "change24h": change,
+                            "chain": _nkr_symbol_home_chain(sym) if "_nkr_symbol_home_chain" in globals() else "",
+                            "chainKey": _nkr_symbol_home_chain(sym) if "_nkr_symbol_home_chain" in globals() else "",
+                            "score": max(52.0, 55.0 + change * 3.0),
+                            "systemScore": max(52.0, 55.0 + change * 3.0),
+                            "source": "emergency_worker_price_fallback",
+                        })
+                    except Exception:
+                        continue
+                market_rows = emergency
+            if not market_rows:
                 _live_engine_mark(
                     "NKR", tick=True, status="running",
                     assets_scanned=0, tradable_assets=0,
