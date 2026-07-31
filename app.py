@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-295-BSC-DECIMALS-QUOTER"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-296-ALCHEMY-ALL-CHAINS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -5351,12 +5351,28 @@ def _normalize_chain_key(raw: str) -> str:
     }
     return alias.get(s, s)
 
+def _alchemy_url_for_chain(chain_id: int) -> str:
+    """Alchemy JSON-RPC for ETH / BNB / POL when ALCHEMY_KEY is set."""
+    key = str(os.getenv("ALCHEMY_KEY") or os.getenv("ALCHEMY_API_KEY") or "").strip()
+    if not key:
+        return ""
+    hosts = {
+        1: "https://eth-mainnet.g.alchemy.com/v2/",
+        56: "https://bnb-mainnet.g.alchemy.com/v2/",
+        137: "https://polygon-mainnet.g.alchemy.com/v2/",
+    }
+    base = hosts.get(int(chain_id or 0))
+    return f"{base}{key}" if base else ""
+
+
 def _rpc_url_for_chain(chain_id: int) -> str:
     """Return the configured primary JSON-RPC endpoint for a chain.
 
-    Ethereum CoreVault V5 reads use Alchemy when ALCHEMY_KEY is configured.
-    An explicit RPC_URL_ETH/RPC_URL_1 remains supported and takes priority only
-    when intentionally set. No browser key or frontend provider is involved.
+    Priority:
+      1) explicit RPC_URL_* / _RPC_URL_BY_CHAIN
+      2) Alchemy (ALCHEMY_KEY) for ETH + BNB + POL
+      3) other env fallbacks
+    Public nodes are only added later in _rpc_urls_for_chain as secondary.
     """
     cid = int(chain_id or 0)
 
@@ -5373,10 +5389,9 @@ def _rpc_url_for_chain(chain_id: int) -> str:
     if direct:
         return direct
 
-    if cid == 1:
-        alchemy_key = str(os.getenv("ALCHEMY_KEY") or "").strip()
-        if alchemy_key:
-            return f"https://eth-mainnet.g.alchemy.com/v2/{alchemy_key}"
+    alchemy = _accepted(_alchemy_url_for_chain(cid))
+    if alchemy:
+        return alchemy
 
     env_fallbacks = {
         1: [os.getenv("RPC_URL_ETH"), os.getenv("RPC_URL_1")],
@@ -9037,8 +9052,11 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         if url not in urls:
             urls.append(url)
 
-    # The deliberately configured primary RPC remains first.
+    # Primary: explicit env / Alchemy (ETH+BNB+POL) via _rpc_url_for_chain.
     _add(_rpc_url_for_chain(cid))
+    # Ensure Alchemy is always attempted first for quotes when key exists,
+    # even if an explicit public RPC_URL_* was set as primary.
+    _add(_alchemy_url_for_chain(cid))
 
     # Public no-key fallbacks. Keep these limited to standard EVM JSON-RPC.
     fallback = {
