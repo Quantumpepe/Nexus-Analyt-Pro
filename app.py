@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-303-PAUSE-PER-SESSION-FAST"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-304-STICKY-USER-PAUSE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34251,6 +34251,11 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     if existing:
         # Do not let an old terminal/local row suppress a confirmed active session.
         st = str(existing.get("status") or existing.get("lifecycleState") or "").upper()
+        meta_ex = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+        user_ctrl = str(meta_ex.get("nkr_user_control") or existing.get("nkr_user_control") or "").upper()
+        # User pause must stick until explicit RESUME — never force ACTIVE from registry/on-chain.
+        if st == "PAUSED" and user_ctrl in {"PAUSED_BY_USER", "PAUSE", "USER_PAUSED"}:
+            return
         # Never rebuild a STOPPING/CLOSING card back to PAUSED/ACTIVE from on-chain
         # while Stop & Exit is in flight (Pause → Stop must stay on EXITING).
         if st in {"STOPPING", "FINALIZING", "CLOSING", "EXITING", "EXIT_PENDING", "EXIT_REQUESTED", "STOPPED", "FINALIZED"}:
@@ -36238,6 +36243,27 @@ def _nkr_live_worker_cycle() -> None:
             r for r in wallet_rows
             if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
         ]
+        # Extra guard: presentation-layer user pause (even if registry lag)
+        try:
+            _psess, _, _ = _db_get_rotation_sessions(wallet)
+            paused_keys = set()
+            for _sx in (_psess or []):
+                if not isinstance(_sx, dict):
+                    continue
+                _st = str(_sx.get("status") or "").upper()
+                _m = _sx.get("meta") if isinstance(_sx.get("meta"), dict) else {}
+                if _st == "PAUSED" or str(_m.get("nkr_user_control") or "").upper() in {"PAUSED_BY_USER", "USER_PAUSED"}:
+                    _oid = str(_sx.get("onchainSessionId") or _sx.get("onchain_session_id") or _m.get("onchain_session_id") or "")
+                    _cid = int(_sx.get("chainId") or _sx.get("chain_id") or _m.get("chain_id") or 0)
+                    if _oid:
+                        paused_keys.add((int(_cid), str(_oid)))
+            if paused_keys:
+                runnable_rows = [
+                    r for r in runnable_rows
+                    if (int(r.get("chain_id") or 0), str(r.get("onchain_session_id") or "")) not in paused_keys
+                ]
+        except Exception:
+            pass
         if not runnable_rows:
             _live_engine_mark("NKR", status="paused", decision="PAUSED", reason="User paused NKR", pending_tx="")
             continue
@@ -36743,6 +36769,37 @@ def api_nkr_control():
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
+        # Always mirror local control into live registry so the worker skips PAUSED rows
+        # even when the on-chain setSessionPaused tx reverts (privy_rpc_400).
+        try:
+            _live_engine_tables_init()
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    for x in (nkr_sessions or []):
+                        if not isinstance(x, dict):
+                            continue
+                        meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+                        oid = str(
+                            x.get("onchainSessionId")
+                            or x.get("onchain_session_id")
+                            or meta.get("onchain_session_id")
+                            or ""
+                        ).strip()
+                        cid = int(x.get("chainId") or x.get("chain_id") or meta.get("chain_id") or 0)
+                        if not oid or cid <= 0:
+                            continue
+                        reg_status = "PAUSED" if action == "PAUSE" else "ACTIVE"
+                        conn.execute(
+                            "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=? "
+                            "WHERE wallet_address=? AND engine='NKR' AND chain_id=? AND onchain_session_id=?",
+                            (reg_status, int(time.time()), _norm_addr(wa), int(cid), oid),
+                        )
+                    conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
         # Global control state: PAUSED only when EVERY active NKR session is paused.
         try:
             all_sess, _, _ = _db_get_rotation_sessions(wa)
