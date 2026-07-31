@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-308-NKR-WORKER-CHAIN-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-309-ONCHAIN-CONTROL-WORKER-TRUTH-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34405,7 +34405,7 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
             oid = str(row.get("onchain_session_id") or "").strip()
             lid = str(row.get("id") or "").strip()
             cid = int(row.get("chain_id") or 0)
-            r_chain = {1: "ETH", 56: "BNB", 137: "POL"}.get(cid, "")
+            r_chain = _nkr_chain_key_from_id(cid) or str(cid)
             if t_chain and r_chain and t_chain != r_chain:
                 continue
             if lid == tid or (tid.upper().startswith("NKR-LIVE-") and lid.upper() == tid.upper()):
@@ -34461,27 +34461,73 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
         except Exception:
             pass
         data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
-        ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{sid}-{int(time.time())}"
+        ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{chain_id}-{sid}-{int(time.time())}"
         txh = ""
         try:
-            sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref, chain_id=int(chain_id))
+            sent = _privy_send_delegated_transaction(
+                wallet_id,
+                {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"},
+                ref,
+                chain_id=int(chain_id),
+            )
             txh = str(sent.get("hash") or "")
-            # Do not block the control API on long receipt waits (FE aborts ~60s).
-            try:
-                _privy_wait_receipt(txh, timeout_sec=25, chain_id=int(chain_id))
-            except Exception:
-                pass
+            if not txh:
+                raise RuntimeError("Privy returned no transaction hash")
+            # Pause/Resume is authoritative only after the exact session reports the
+            # requested on-chain status. Never flip the registry optimistically.
+            _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
         except Exception as send_exc:
-            results.append({"sessionId": sid, "status": "send_failed", "error": str(send_exc)[:180], "txHash": ""})
+            results.append({
+                "sessionId": sid, "chainId": chain_id,
+                "status": "send_failed", "error": str(send_exc)[:240], "txHash": txh,
+                "confirmed": False,
+            })
             continue
+
+        expected_status_id = 2 if paused else 1
+        confirmed_status_id = -1
+        confirm_error = ""
+        for _attempt in range(8):
+            try:
+                raw_check = _eth_call(
+                    chain_id, vault,
+                    _core_selector("sessionOf(uint256)") + _uint_to_32(sid),
+                )
+                check_words = _core_words(raw_check)
+                confirmed_status_id = int(check_words[3]) if len(check_words) > 3 else -1
+                if confirmed_status_id == expected_status_id:
+                    break
+            except Exception as check_exc:
+                confirm_error = str(check_exc)[:180]
+            time.sleep(1.5)
+
+        if confirmed_status_id != expected_status_id:
+            results.append({
+                "sessionId": sid, "chainId": chain_id,
+                "status": "confirmation_failed",
+                "expectedStatusId": expected_status_id,
+                "actualStatusId": confirmed_status_id,
+                "error": confirm_error or "requested status not confirmed on-chain",
+                "txHash": txh,
+                "confirmed": False,
+            })
+            continue
+
         conn = _db()
         try:
             with DB_WRITE_LOCK:
-                conn.execute("UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL WHERE id=?", ("PAUSED" if paused else "ACTIVE", int(time.time()), row.get("id")))
+                conn.execute(
+                    "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL WHERE id=?",
+                    ("PAUSED" if paused else "ACTIVE", int(time.time()), row.get("id")),
+                )
                 conn.commit()
         finally:
             conn.close()
-        results.append({"sessionId": sid, "status": "paused" if paused else "active", "txHash": txh, "chainId": chain_id})
+        results.append({
+            "sessionId": sid, "status": "paused" if paused else "active",
+            "txHash": txh, "chainId": chain_id,
+            "onchainStatusId": confirmed_status_id, "confirmed": True,
+        })
     return results
 
 
@@ -36291,7 +36337,14 @@ def _nkr_live_worker_cycle() -> None:
     if not live_rows:
         _live_engine_mark(
             "NKR", status="idle", decision="NO_REGISTERED_SESSION",
-            reason="No recoverable NKR CoreVault session was found", last_error=""
+            reason="No recoverable NKR CoreVault session was found", last_error="",
+            assets_scanned=0, tradable_assets=0,
+            best_candidate="", candidate_score=0.0,
+            candidate_momentum_24h=0.0, candidate_price=0.0,
+            gate_status="NO_ACTIVE_SESSION", decision_detail="",
+            active_asset="", position_state="", position_value_usd=0,
+            tx_hash="", pending_tx="", session_chain="",
+            working_chains=[], paused_chains=[], session_states=[],
         )
         return
 
@@ -36328,7 +36381,43 @@ def _nkr_live_worker_cycle() -> None:
         except Exception:
             pass
         if not runnable_rows:
-            _live_engine_mark("NKR", status="paused", decision="PAUSED", reason="User paused NKR", pending_tx="")
+            open_rows = [
+                r for r in (wallet_rows or [])
+                if str((r or {}).get("status") or "").upper()
+                not in {"FINALIZED", "CLOSED", "STOPPED", "COMPLETE", "COMPLETED", "CANCELLED", "ARCHIVED"}
+            ]
+            paused_rows = [r for r in open_rows if str((r or {}).get("status") or "").upper() == "PAUSED"]
+            paused_chain_ids = sorted({int((r or {}).get("chain_id") or 0) for r in paused_rows if int((r or {}).get("chain_id") or 0) > 0})
+            session_states = [
+                {
+                    "chain": _nkr_chain_key_from_id(int((r or {}).get("chain_id") or 0)),
+                    "chainId": int((r or {}).get("chain_id") or 0),
+                    "sessionId": str((r or {}).get("onchain_session_id") or ""),
+                    "status": str((r or {}).get("status") or "UNKNOWN").upper(),
+                }
+                for r in open_rows
+            ]
+            all_paused = bool(open_rows) and len(paused_rows) == len(open_rows)
+            _live_engine_mark(
+                "NKR", tick=True,
+                status="paused" if all_paused else "idle",
+                decision="PAUSED" if all_paused else "NO_RUNNABLE_SESSION",
+                gate_status="ALL_SESSIONS_PAUSED" if all_paused else "NO_RUNNABLE_SESSION",
+                reason="all NKR sessions paused" if all_paused else "no runnable NKR session",
+                decision_detail=(
+                    "Paused sessions: " + ", ".join(
+                        f"{x.get('chain') or x.get('chainId')} #{x.get('sessionId')}" for x in session_states
+                    ) if session_states else "No runnable NKR session."
+                ),
+                assets_scanned=0, tradable_assets=0,
+                best_candidate="", candidate_score=0.0,
+                candidate_momentum_24h=0.0, candidate_price=0.0,
+                active_asset="", position_state="", position_value_usd=0,
+                tx_hash="", pending_tx="", last_error="", session_chain="",
+                working_chains=[],
+                paused_chains=[_nkr_chain_key_from_id(cid) for cid in paused_chain_ids],
+                session_states=session_states,
+            )
             continue
 
         try:
@@ -36894,7 +36983,18 @@ def api_nkr_control():
             pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None, target_chain=target_chain or None)
         except Exception as exc:
             onchain_error = str(exc)[:240]
-        # Always persist local PAUSED/ACTIVE so UI + worker respect the user action.
+        confirmed_results = [r for r in (pause_results or []) if bool((r or {}).get("confirmed")) or str((r or {}).get("status") or "") in {"paused", "active"}]
+        if target_id and not confirmed_results:
+            return jsonify({
+                "status": "error",
+                "error": "onchain_pause_resume_not_confirmed",
+                "action": action,
+                "sessionId": target_id,
+                "chain": target_chain,
+                "results": pause_results,
+                "message": "The requested session state was not confirmed on-chain. The UI and registry were not changed.",
+            }), 409
+        # Persist only after the exact CoreVault session confirmed the requested state.
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
@@ -36927,6 +37027,10 @@ def api_nkr_control():
                     conn.commit()
             finally:
                 conn.close()
+        except Exception:
+            pass
+        try:
+            _reconcile_live_registry_from_corevault(wa, "NKR")
         except Exception:
             pass
         # Global control state: PAUSED only when EVERY active NKR session is paused.
