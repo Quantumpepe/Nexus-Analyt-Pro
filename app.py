@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-292-FORCE-NATIVE-ENTRY"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-293-QUOTER-V2-ABI"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -30630,8 +30630,13 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
     last_err = "quoter_no_fee_worked"
     for f in fees:
         try:
+            # QuoterV2 quoteExactInputSingle takes ONE struct arg → leading offset 0x20.
+            # Flat encoding without offset makes every fee tier "execution reverted"
+            # (even USDC/WETH). Field order: tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96.
             data = (
-                selector + _addr_to_32(token_in) + _addr_to_32(token_out)
+                selector
+                + _uint_to_32(32)
+                + _addr_to_32(token_in) + _addr_to_32(token_out)
                 + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
             )
             raw = _eth_call(chain_id, cfg["quoter"], data)
