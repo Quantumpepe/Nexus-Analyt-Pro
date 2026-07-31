@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-306-SESSION-CONTROL-MODE-QUOTER-CHAIN-SCAN-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-307-ROUTER-MODE-MULTICHAIN-CONTROL-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -429,22 +429,8 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
                 ON CONFLICT(chain_id,vault_address,onchain_session_id) DO UPDATE SET
                     wallet_address=excluded.wallet_address, engine=excluded.engine,
                     privy_wallet_id=excluded.privy_wallet_id, tx_hash=excluded.tx_hash,
-                    budget_units=excluded.budget_units,
-                    status=CASE
-                        WHEN nexus_live_core_vault_sessions.status IN ('PAUSED','STOPPING','CLOSING','FINALIZING','EXITING')
-                            THEN nexus_live_core_vault_sessions.status
-                        ELSE 'ACTIVE'
-                    END,
-                    updated_ts=excluded.updated_ts,
-                    finalized_tx_hash=CASE
-                        WHEN nexus_live_core_vault_sessions.status='FINALIZED' THEN nexus_live_core_vault_sessions.finalized_tx_hash
-                        ELSE NULL
-                    END,
-                    last_error=CASE
-                        WHEN nexus_live_core_vault_sessions.status IN ('PAUSED','STOPPING','CLOSING','FINALIZING','EXITING')
-                            THEN nexus_live_core_vault_sessions.last_error
-                        ELSE NULL
-                    END
+                    budget_units=excluded.budget_units, status='ACTIVE', updated_ts=excluded.updated_ts,
+                    finalized_tx_hash=NULL, last_error=NULL
             """, (_norm_addr(wallet), str(engine).upper(), int(chain_id), _norm_addr(vault), str(wallet_id), str(session_id), str(tx_hash or ""), str(int(budget_units or 0)), "ACTIVE", nowi, nowi))
             conn.commit()
     finally:
@@ -29936,6 +29922,7 @@ NEXUS_PRIVY_BUDGET_AUTHORITY = "COREVAULT_SESSION"
 _PRIVY_APPROVE_SELECTOR = "0x095ea7b3"
 _PRIVY_BALANCE_OF_SELECTOR = "0x70a08231"
 _PRIVY_EXACT_INPUT_SINGLE_SELECTOR = UNISWAP_EXACT_INPUT_SINGLE_SELECTOR
+_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR = "0x414bf389"  # exactInputSingle with deadline (SwapRouter V3)
 # CoreVault V5 Native Final selectors. V5 preserves the dynamic router/token execution model and adds native support.
 _PRIVY_CREATE_SESSION_SELECTOR = "0x" + _keccak256(b"createSession((address,uint8,uint128,uint32,uint16,uint16))")[:4].hex()
 _PRIVY_EXECUTE_TRADE_SELECTOR = "0x" + _keccak256(b"executeTrade((uint256,address,address,address,uint256,uint256,uint256,bytes))")[:4].hex()
@@ -31001,6 +30988,42 @@ def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, am
     return (_PRIVY_EXACT_INPUT_SINGLE_SELECTOR + _addr_to_32(token_in) + _addr_to_32(token_out) +
             _uint_to_32(fee) + _addr_to_32(recipient) + _uint_to_32(amount_in) +
             _uint_to_32(amount_out_min) + _uint_to_32(0))
+
+
+def _privy_exact_input_single_legacy_data(token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline):
+    # Legacy/standard SwapRouter V3 exactInputSingle tuple includes deadline.
+    return (_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR + _addr_to_32(token_in) + _addr_to_32(token_out) +
+            _uint_to_32(fee) + _addr_to_32(recipient) + _uint_to_32(deadline) +
+            _uint_to_32(amount_in) + _uint_to_32(amount_out_min) + _uint_to_32(0))
+
+
+def _router_trade_data_candidates(cfg, token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline):
+    """Return encodings in preference order; the Vault allowlist decides which router ABI is valid.
+
+    ETH commonly uses SwapRouter02 (0x04e45aaf), while existing BNB/POL vault
+    configurations may allow the legacy V3 selector (0x414bf389). We must not
+    assume one selector across all chains.
+    """
+    token_in_n = _norm_addr(token_in)
+    token_out_n = _norm_addr(token_out)
+    native = NATIVE_TOKEN_ADDRESS
+    win = cfg["weth"] if token_in_n.lower() == native.lower() else token_in_n
+    wout = cfg["weth"] if token_out_n.lower() == native.lower() else token_out_n
+    out = [
+        (_privy_exact_input_single_data(win, wout, recipient, amount_in, amount_out_min, fee), _PRIVY_EXACT_INPUT_SINGLE_SELECTOR),
+        (_privy_exact_input_single_legacy_data(win, wout, recipient, amount_in, amount_out_min, fee, deadline), _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR),
+    ]
+    # Native output requires router-side unwrap. Only offer multicall when explicitly allowed.
+    if token_out_n.lower() == native.lower():
+        swap = _privy_exact_input_single_data(win, wout, cfg["router"], amount_in, amount_out_min, fee)
+        unwrap = _privy_unwrap_weth9_data(amount_out_min, recipient)
+        out.insert(0, (_privy_multicall_data([swap, unwrap]), _PRIVY_MULTICALL_SELECTOR))
+    # de-duplicate selectors while preserving order
+    seen=set(); dedup=[]
+    for data, selector in out:
+        if selector.lower() in seen: continue
+        seen.add(selector.lower()); dedup.append((data, selector))
+    return dedup
 
 
 
@@ -34905,16 +34928,6 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
         symbol = str(sym or "").strip().upper()
         if not symbol:
             continue
-        # A chain-native symbol may execute only on its own chain. ETH/WETH on POL,
-        # BNB/WBNB on ETH/POL, or POL/MATIC on ETH/BNB caused misleading candidates
-        # and repeated quoter failures. Cross-chain capital movement is stablecoin-only.
-        foreign_native_groups = {
-            "ETH": {"ETH", "WETH"},
-            "BNB": {"BNB", "WBNB"},
-            "POL": {"POL", "MATIC", "WMATIC", "WPOL"},
-        }
-        if any(symbol in syms and chain_key != owner_chain for owner_chain, syms in foreign_native_groups.items()):
-            continue
         routes[symbol] = {
             "symbol": symbol,
             "token": token,
@@ -35643,13 +35656,29 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     if min_out <= 0:
         raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
-    router_data, required_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee_used)
-    try:
-        sel_ok = _read_router_selector_allowed(vault, router, required_selector, chain_id)
-    except Exception:
-        sel_ok = True  # same soft path as router_config when RPC returns empty
-    if not sel_ok:
-        raise RuntimeError(f"live_router_selector_not_allowed:{route['symbol']}:{required_selector}:chain={chain_id}")
+    router_data = ""
+    required_selector = ""
+    selector_checks = []
+    for candidate_data, candidate_selector in _router_trade_data_candidates(
+        cfg, token_in, token_out, vault, amount_in, min_out, fee_used, deadline
+    ):
+        try:
+            allowed = bool(_read_router_selector_allowed(vault, router, candidate_selector, chain_id))
+        except Exception as sel_exc:
+            # Do not silently choose a selector on a successful explicit false read.
+            # RPC decode failure may still use the chain's primary ABI as a last resort.
+            allowed = False
+            selector_checks.append(f"{candidate_selector}:rpc:{str(sel_exc)[:60]}")
+        else:
+            selector_checks.append(f"{candidate_selector}:{'yes' if allowed else 'no'}")
+        if allowed:
+            router_data, required_selector = candidate_data, candidate_selector
+            break
+    if not router_data:
+        raise RuntimeError(
+            f"live_router_selector_not_allowed:{route['symbol']}:chain={chain_id}:router={router}:"
+            + ",".join(selector_checks)
+        )
     call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
     ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
@@ -38216,7 +38245,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         period_days,
     )
     campaign_expires = int((campaign_clock or {}).get("expiresAt") or 0)
-    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
+    default_mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
     min_score_by_mode = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
     # ENGINE-223: all exit thresholds are percentage- and cost-based so the same
@@ -38225,11 +38254,7 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     trailing_activation_by_mode = {"AGGRESSIVE": 0.80, "DYNAMIC": 0.65, "TACTICAL": 0.50, "DEFENSIVE": 0.40}
     trailing_drawdown_by_mode = {"AGGRESSIVE": 0.55, "DYNAMIC": 0.40, "TACTICAL": 0.30, "DEFENSIVE": 0.22}
     cost_cover_multiple_by_mode = {"AGGRESSIVE": 1.75, "DYNAMIC": 2.00, "TACTICAL": 2.25, "DEFENSIVE": 2.50}
-    dispatch_min = min_score_by_mode.get(mode, 62.0)
-    profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
-    trailing_activation_pct = trailing_activation_by_mode.get(mode, 0.65)
-    trailing_drawdown_pct = trailing_drawdown_by_mode.get(mode, 0.40)
-    cost_cover_multiple = cost_cover_multiple_by_mode.get(mode, 2.0)
+    # Thresholds are selected inside the session loop from that session's immutable start mode.
     total_budget = _safe_float(settings.get("totalNkrBudgetUsd") or settings.get("nkrBudgetUsd") or 0, 0.0)
     active = []
     changed = False
@@ -38267,6 +38292,17 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if chain in {"ETHEREUM", "1"}: chain = "ETH"
         elif chain in {"BSC", "56"}: chain = "BNB"
         elif chain in {"POLYGON", "MATIC", "137"}: chain = "POL"
+        sess_meta_mode = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        mode = _nkr_normalize_performance_mode(
+            sess.get("nkrCapitalMode") or sess.get("performanceMode") or sess.get("mode") or
+            sess_meta_mode.get("nkr_capital_mode") or sess_meta_mode.get("performance_mode") or
+            sess_meta_mode.get("start_mode") or default_mode
+        )
+        dispatch_min = min_score_by_mode.get(mode, 62.0)
+        profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
+        trailing_activation_pct = trailing_activation_by_mode.get(mode, 0.65)
+        trailing_drawdown_pct = trailing_drawdown_by_mode.get(mode, 0.40)
+        cost_cover_multiple = cost_cover_multiple_by_mode.get(mode, 2.0)
         base = str(sess.get("baseAsset") or sess.get("payoutAsset") or "USDC").upper()
         open_rotation_early = sess.get("openRotation") if isinstance(sess.get("openRotation"), dict) else {}
         has_open_trade_early = bool(open_rotation_early and open_rotation_early.get("tradeId"))
