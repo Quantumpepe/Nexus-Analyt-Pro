@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-313-LIVE-MERGED-EVM-ROUTER-CALLDATA-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-314-NKR-SESSION-MODE-SNAPSHOT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2233,6 +2233,13 @@ def api_core_vault_create_system_session_auto():
     if not authenticated_wallet:
         return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
+    nkr_start_config = {
+        "nkrCapitalMode": body.get("nkrCapitalMode") or body.get("nkr_capital_mode"),
+        "nkrObservationWindow": body.get("nkrObservationWindow") or body.get("nkr_observation_window"),
+        "nkrProfitMode": body.get("nkrProfitMode") or body.get("nkr_profit_mode"),
+        "nkrPeriodDays": body.get("nkrPeriodDays") or body.get("nkr_period_days"),
+        "maxActiveAssets": body.get("maxActiveAssets") if body.get("maxActiveAssets") is not None else body.get("max_active_assets"),
+    }
     wallet = _norm_addr(
         body.get("wallet") or body.get("walletAddress") or
         request.headers.get("X-Wallet-Address") or request.headers.get("x-wallet-address") or
@@ -2379,6 +2386,7 @@ def api_core_vault_create_system_session_auto():
                 live_row_now = next((r for r in live_rows_now if str(r.get("onchain_session_id") or "") == str(session_id)), None)
                 if live_row_now:
                     _nkr_ensure_local_live_session(wallet, live_row_now)
+                    _nkr_stamp_exact_session_start_config(wallet, chain_id, session_id, nkr_start_config)
             except Exception as card_exc:
                 _live_engine_mark("NKR", status="running", decision="SESSION_CARD_PENDING", reason="V5 session exists; presentation card will be rebuilt from live session storage", last_error=str(card_exc)[:1000])
         # Start/advertise the matching live engine immediately after the authoritative
@@ -2410,6 +2418,7 @@ def api_core_vault_create_system_session_auto():
             "durationHours": duration_hours,
             "maxSlippageBps": slippage_bps,
             "maxLossBps": max_loss_bps,
+            "nkrCapitalMode": (_nkr_normalize_performance_mode(nkr_start_config.get("nkrCapitalMode") or "DYNAMIC") if system_name == "NKR" else None),
         })
     except Exception as exc:
         error_text = str(exc)
@@ -34483,6 +34492,58 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
 
 
+def _nkr_stamp_exact_session_start_config(wallet: str, chain_id: int, session_id: int, config: dict) -> None:
+    """Persist immutable NKR start settings for one exact on-chain session.
+
+    The setup selector is a draft for the next session and may reset to Dynamic
+    immediately after start.  Therefore the running session must never read its
+    mode from the later global UI state.
+    """
+    if not isinstance(config, dict):
+        return
+    sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    sid = str(session_id or "")
+    cid = int(chain_id or 0)
+    changed = False
+    patched_rows = []
+    for row in (sessions or []):
+        if not isinstance(row, dict):
+            patched_rows.append(row)
+            continue
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_sid = str(row.get("onchainSessionId") or row.get("onchain_session_id") or row.get("coreVaultSessionId") or meta.get("onchain_session_id") or "")
+        row_cid = int(row.get("chainId") or row.get("chain_id") or meta.get("chain_id") or 0)
+        if row_sid != sid or row_cid != cid:
+            patched_rows.append(row)
+            continue
+        mode = _nkr_normalize_performance_mode(config.get("nkrCapitalMode") or config.get("nkr_capital_mode") or "DYNAMIC")
+        observation = str(config.get("nkrObservationWindow") or config.get("nkr_observation_window") or row.get("nkrObservationWindow") or "1h")
+        profit_mode = str(config.get("nkrProfitMode") or config.get("nkr_profit_mode") or row.get("nkrProfitMode") or "REINVEST").upper()
+        days = _nkr_normalize_period_days(config.get("nkrPeriodDays") or config.get("nkr_period_days") or row.get("nkrPeriodDays") or 1)
+        try:
+            max_active = max(0, int(float(config.get("maxActiveAssets") if config.get("maxActiveAssets") is not None else config.get("max_active_assets", row.get("maxActiveAssets", 0)))))
+        except Exception:
+            max_active = int(row.get("maxActiveAssets") or 0)
+        new_meta = dict(meta)
+        new_meta.update({
+            "nkr_capital_mode": mode, "capital_mode": mode, "performance_mode": mode,
+            "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
+            "nkr_period_days": days, "max_active_assets": max_active,
+            "start_mode_locked": True, "start_config_source": "create_auto_request",
+        })
+        new_row = dict(row)
+        new_row.update({
+            "nkrCapitalMode": mode, "capitalMode": mode, "performanceMode": mode,
+            "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
+            "nkrPeriodDays": days, "periodDays": days, "maxActiveAssets": max_active,
+            "meta": new_meta,
+        })
+        patched_rows.append(new_row)
+        changed = True
+    if changed:
+        _db_set_rotation_sessions(wallet, patched_rows, active_session_id=active_id, replace_missing=False)
+
+
 def _nkr_resolve_exact_core_session(wallet: str, target_id: str, target_chain: str) -> dict:
     """Resolve one NKR CoreVault session directly from chain+session id.
 
@@ -36819,7 +36880,12 @@ def _nkr_live_worker_cycle() -> None:
                     with _NKR_LIVE_TRADE_LOCK:
                         sess_settings = dict(settings or {})
                         try:
-                            for _src in (live_row, live_row.get("meta") if isinstance(live_row.get("meta"), dict) else {}):
+                            for _src in (
+                                decision_session,
+                                decision_session.get("meta") if isinstance(decision_session, dict) and isinstance(decision_session.get("meta"), dict) else {},
+                                live_row,
+                                live_row.get("meta") if isinstance(live_row.get("meta"), dict) else {},
+                            ):
                                 if not isinstance(_src, dict):
                                     continue
                                 for _k in ("nkrCapitalMode", "nkr_capital_mode", "mode", "performanceMode", "capitalMode"):
