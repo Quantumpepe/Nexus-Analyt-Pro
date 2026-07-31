@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-304-STICKY-USER-PAUSE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-305-RECEIPT-CHAIN-ID"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -645,7 +645,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
             "data": _core_selector("startClosing(uint256)") + _uint_to_32(sid), "value": "0x0"
         }, ref)
         close_tx = str(sent.get("hash") or sent.get("txHash") or "")
-        _privy_wait_receipt(close_tx, timeout_sec=240)
+        _privy_wait_receipt(close_tx, timeout_sec=90, chain_id=chain_id)
         status_id = 3
 
     exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
@@ -671,7 +671,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         }, ref)
         finalize_tx = str(sent.get("hash") or sent.get("txHash") or "")
         _live_engine_mark(engine, status="closing", decision="FINALIZING", reason="All assets sold; finalizing session", pending_tx=finalize_tx or "submitted")
-        _privy_wait_receipt(finalize_tx, timeout_sec=240)
+        _privy_wait_receipt(finalize_tx, timeout_sec=90, chain_id=chain_id)
 
     after = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
     after_words = _core_words(after)
@@ -1055,14 +1055,14 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
             sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_core_selector("startClosing(uint256)")+_uint_to_32(sid),"value":"0x0"},ref)
             txh=str(sent.get("hash") or "")
             _recovery_job_write(job_id,start_closing_tx_hash=txh,receipt_status="waiting_start_closing_receipt",step_label="START_CLOSING_WAIT")
-            _privy_wait_receipt(txh,timeout_sec=180)
+            _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
             _recovery_job_write(job_id,receipt_status="start_closing_confirmed",step_label="START_CLOSING_CONFIRMED")
         _recovery_job_write(job_id, step=4, step_label="FINALIZE_SUBMIT", receipt_status="submitting_finalize")
         ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-finalize"
         sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),"value":"0x0"},ref)
         txh=str(sent.get("hash") or "")
         _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
-        _privy_wait_receipt(txh,timeout_sec=180)
+        _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
         # A confirmed finalize receipt can be visible before the RPC used for sessionOf
         # has caught up. Poll the authoritative contract state instead of declaring a
         # false failure while the session is still reported as CLOSING.
@@ -30611,17 +30611,27 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     return {"hash": tx_hash, "response": data, "idempotencyKey": reference_id}
 
 
-def _privy_wait_receipt(tx_hash, timeout_sec=180, chain_id=1):
-    end = time.time() + timeout_sec
+def _privy_wait_receipt(tx_hash, timeout_sec=90, chain_id=1):
+    """Poll receipt on the CORRECT chain. Wrong chain_id (always 1) stalls multi-chain workers."""
+    cid = int(chain_id or 1)
+    end = time.time() + max(5, int(timeout_sec or 90))
+    txh = str(tx_hash or "").strip()
+    if not txh or txh == "0x" or len(txh) < 10:
+        raise RuntimeError("transaction_hash_missing")
     while time.time() < end:
-        receipt = _rpc_call(int(chain_id), "eth_getTransactionReceipt", [tx_hash])
+        try:
+            receipt = _rpc_call(cid, "eth_getTransactionReceipt", [txh])
+        except Exception as rpc_exc:
+            # Transient RPC — keep polling until timeout
+            time.sleep(2)
+            continue
         if receipt:
             status = int(str(receipt.get("status") or "0x0"), 16)
             if status != 1:
-                raise RuntimeError(f"transaction_reverted:{tx_hash}")
+                raise RuntimeError(f"transaction_reverted:{txh}:chain={cid}")
             return receipt
         time.sleep(2)
-    raise RuntimeError(f"transaction_receipt_timeout:{tx_hash}")
+    raise RuntimeError(f"transaction_receipt_timeout:{txh}:chain={cid}")
 
 
 def _privy_erc20_balance(token, wallet):
@@ -34417,11 +34427,11 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
         ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{sid}-{int(time.time())}"
         txh = ""
         try:
-            sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref)
+            sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref, chain_id=int(chain_id))
             txh = str(sent.get("hash") or "")
             # Do not block the control API on long receipt waits (FE aborts ~60s).
             try:
-                _privy_wait_receipt(txh, timeout_sec=25)
+                _privy_wait_receipt(txh, timeout_sec=25, chain_id=int(chain_id))
             except Exception:
                 pass
         except Exception as send_exc:
