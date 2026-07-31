@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-316-FULL-NKR-SESSION-CONFIG-AUDIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-317-EVM-ROUTER-PREFLIGHT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -9029,6 +9029,15 @@ def _int_to_32(i: int) -> str:
 
 def _eth_call(chain_id: int, to_addr: str, data: str) -> str:
     return _rpc_call(int(chain_id), "eth_call", [{"to": to_addr, "data": data}, "latest"])
+
+def _eth_call_from(chain_id: int, from_addr: str, to_addr: str, data: str, value: str = "0x0") -> str:
+    """Simulate a state-changing call with the real executor address as msg.sender.
+
+    This is used before Privy broadcast so router ABI/selector mismatches are
+    rejected without sending a reverting transaction. It is EVM-chain generic.
+    """
+    tx = {"from": _norm_addr(from_addr), "to": _norm_addr(to_addr), "data": data, "value": value or "0x0"}
+    return _rpc_call(int(chain_id), "eth_call", [tx, "latest"])
 
 
 def _try_parse_int(v) -> int:
@@ -36030,33 +36039,38 @@ def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id
     return _norm_addr(words[1] if len(words) > 1 else fallback)
 
 
-def _resolve_exact_input_selector(vault, router, chain_id, cfg):
-    """Choose the exactInputSingle ABI actually permitted by this chain's Vault.
+def _exact_input_selector_candidates(vault, router, chain_id, cfg):
+    """Return allowed exactInputSingle selectors in deterministic preference order.
 
-    The optional ENV order works for every configured EVM chain. Both common V3
-    tuple variants remain automatic fallbacks.
+    The Vault allowlist alone cannot prove which ABI the actual router implements;
+    ENGINE-317 therefore returns every allowed candidate and lets a real eth_call
+    preflight choose the executable one.
     """
     env_raw = os.getenv(f"ROUTER_EXACT_INPUT_SINGLE_SELECTORS_{int(chain_id)}", "")
     candidates = [x.strip().lower() for x in env_raw.split(",") if x.strip()]
-    # Pancake V3 commonly uses the tuple with deadline; SwapRouter02 omits it.
-    if int(chain_id) == 56:
-        candidates += [_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_SELECTOR]
-    else:
-        candidates += [_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR]
-    seen = []
+    # Prefer the modern SwapRouter02 ABI first. If the chain uses a legacy/Pancake
+    # router, preflight will reject it and select the deadline tuple instead.
+    candidates += [_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR]
+    seen, allowed = [], []
     for sel in candidates:
         if sel in seen or not re.fullmatch(r"0x[0-9a-f]{8}", sel):
             continue
         seen.append(sel)
         try:
             if _read_router_selector_allowed(vault, router, sel, chain_id):
-                return sel
+                allowed.append(sel)
         except Exception:
             continue
-    raise RuntimeError(
-        f"live_router_exact_selector_not_allowed:chain={chain_id}:router={router}:tested={','.join(seen)}"
-    )
+    if not allowed:
+        raise RuntimeError(
+            f"live_router_exact_selector_not_allowed:chain={chain_id}:router={router}:tested={','.join(seen)}"
+        )
+    return allowed
 
+
+def _resolve_exact_input_selector(vault, router, chain_id, cfg):
+    # Backward-compatible helper for diagnostics and older callers.
+    return _exact_input_selector_candidates(vault, router, chain_id, cfg)[0]
 
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
@@ -36110,24 +36124,44 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     if min_out <= 0:
         raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
-    exact_selector = _resolve_exact_input_selector(vault, router, chain_id, cfg)
-    router_data, required_selector = _native_router_trade_data(
-        cfg, token_in, token_out, vault, amount_in, min_out, fee_used,
-        exact_selector=exact_selector, deadline=deadline,
-    )
-    try:
-        selector_allowed = bool(_read_router_selector_allowed(vault, router, required_selector, chain_id))
-    except Exception as sel_exc:
+    # ENGINE-317: the Vault may allow both common V3 selectors even though the
+    # configured router implements only one. Select by simulating the complete
+    # CoreVault.executeTrade call with the real user wallet as msg.sender.
+    preflight_errors = []
+    exact_selector = ""
+    required_selector = ""
+    router_data = ""
+    call = ""
+    for candidate_selector in _exact_input_selector_candidates(vault, router, chain_id, cfg):
+        try:
+            candidate_data, candidate_required = _native_router_trade_data(
+                cfg, token_in, token_out, vault, amount_in, min_out, fee_used,
+                exact_selector=candidate_selector, deadline=deadline,
+            )
+            try:
+                selector_allowed = bool(_read_router_selector_allowed(vault, router, candidate_required, chain_id))
+            except Exception as sel_exc:
+                raise RuntimeError(f"selector_check:{candidate_required}:{str(sel_exc)[:100]}")
+            if not selector_allowed:
+                raise RuntimeError(f"outer_selector_not_allowed:{candidate_required}")
+            candidate_call = _encode_execute_trade(
+                sid, router, token_in, token_out, amount_in, min_out, deadline, candidate_data
+            )
+            _eth_call_from(chain_id, wallet, vault, candidate_call)
+            exact_selector = candidate_selector
+            required_selector = candidate_required
+            router_data = candidate_data
+            call = candidate_call
+            break
+        except Exception as pf_exc:
+            preflight_errors.append(f"{candidate_selector}:{str(pf_exc)[:180]}")
+            continue
+    if not call:
         raise RuntimeError(
-            f"live_router_selector_check_failed:{route['symbol']}:chain={chain_id}:router={router}:"
-            f"selector={required_selector}:{str(sel_exc)[:120]}"
+            f"live_trade_preflight_failed:{route['symbol']}:chain={chain_id}:router={router}:"
+            f"fee={fee_used}:amountIn={amount_in}:quote={quote}:minOut={min_out}:"
+            f"attempts={' | '.join(preflight_errors)[:700]}"
         )
-    if not selector_allowed:
-        raise RuntimeError(
-            f"live_router_selector_not_allowed:{route['symbol']}:chain={chain_id}:router={router}:"
-            f"selector={required_selector}:exact={exact_selector}"
-        )
-    call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
     ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
