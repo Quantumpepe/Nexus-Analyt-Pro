@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-314-NKR-SESSION-MODE-SNAPSHOT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-316-FULL-NKR-SESSION-CONFIG-AUDIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2239,6 +2239,11 @@ def api_core_vault_create_system_session_auto():
         "nkrProfitMode": body.get("nkrProfitMode") or body.get("nkr_profit_mode"),
         "nkrPeriodDays": body.get("nkrPeriodDays") or body.get("nkr_period_days"),
         "maxActiveAssets": body.get("maxActiveAssets") if body.get("maxActiveAssets") is not None else body.get("max_active_assets"),
+        "maxCapitalPerAssetPct": body.get("maxCapitalPerAssetPct") or body.get("max_capital_per_asset_pct"),
+        "budgetUsd": body.get("amountUsd") or body.get("budgetAmount") or body.get("budgetUsd"),
+        "payoutAsset": body.get("settlementAsset") or body.get("payoutAsset"),
+        "maxSlippageBps": body.get("maxSlippageBps"),
+        "maxLossBps": body.get("maxLossBps"),
     }
     wallet = _norm_addr(
         body.get("wallet") or body.get("walletAddress") or
@@ -2377,6 +2382,10 @@ def api_core_vault_create_system_session_auto():
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
+        if system_name == "NKR":
+            # Persist immutable start settings before any UI reset, registry hydration,
+            # or worker tick can observe this session.
+            _nkr_save_exact_start_config(wallet, chain_id, session_id, nkr_start_config)
         _live_session_register(wallet, system_name, wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
         # Build the user-visible NKR card immediately from the authoritative V5 row.
         # Do not wait for the next polling cycle or for the first opened position.
@@ -33955,7 +33964,21 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
     sessions, active, sess_ts = _db_get_rotation_sessions(wa)
     nkr_sessions = [x for x in (sessions or []) if _nkr_is_session(x)]
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-    nkr_sessions, campaign_clock = _nkr_apply_campaign_clock(nkr_sessions, ui.get("nkrPeriodDays", "10"))
+    # Apply the immutable period independently to every session.  A new setup draft
+    # must not alter the clock of sessions that are already running.
+    _clock_rows = []
+    _clock_values = []
+    for _sess in nkr_sessions:
+        _meta = _sess.get("meta") if isinstance(_sess.get("meta"), dict) else {}
+        _cid = int(_sess.get("chainId") or _sess.get("chain_id") or _meta.get("chain_id") or 0)
+        _sid = str(_sess.get("onchainSessionId") or _sess.get("onchain_session_id") or _meta.get("onchain_session_id") or "")
+        _locked = _nkr_get_exact_start_config(wa, _cid, _sid)
+        _days = _nkr_normalize_period_days(_locked.get("nkrPeriodDays") or _sess.get("nkrPeriodDays") or _sess.get("periodDays") or _meta.get("nkr_period_days") or 1)
+        _one, _clk = _nkr_apply_campaign_clock([_sess], _days)
+        _clock_rows.extend(_one)
+        _clock_values.append(_clk)
+    nkr_sessions = _clock_rows
+    campaign_clock = _clock_values[0] if len(_clock_values) == 1 else {"perSession": _clock_values}
     control = str(ui.get("nkrControlState") or "WAITING").strip().upper()
     # Derive control from live session rows. Terminal rows (incl. FINALIZED) must
     # never keep the UI in RUNNING and must not block a fresh Start NKR.
@@ -34409,13 +34432,14 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
             try:
                 state, _ = _db_get_user_app_state(wallet)
                 ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-                capital_mode = _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or existing.get("nkrCapitalMode") or "DYNAMIC")
+                locked_cfg = _nkr_get_exact_start_config(wallet, chain_id, sid)
+                capital_mode = _nkr_normalize_performance_mode(locked_cfg.get("nkrCapitalMode") or existing.get("nkrCapitalMode") or (existing.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC")
                 need = not str(existing.get("nkrCapitalMode") or (existing.get("meta") or {}).get("nkr_capital_mode") or "").strip()
                 if need or str(existing.get("nkrCapitalMode") or "").upper() in {"", "UNKNOWN"}:
                     meta = dict(existing.get("meta") if isinstance(existing.get("meta"), dict) else {})
-                    observation = str(ui.get("nkrObservationWindow") or meta.get("nkr_observation_window") or "1h")
-                    profit_mode = str(ui.get("nkrProfitMode") or meta.get("nkr_profit_mode") or "REINVEST").upper()
-                    days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or existing.get("periodDays") or 10)
+                    observation = str(locked_cfg.get("nkrObservationWindow") or existing.get("nkrObservationWindow") or meta.get("nkr_observation_window") or "1h")
+                    profit_mode = str(locked_cfg.get("nkrProfitMode") or existing.get("nkrProfitMode") or meta.get("nkr_profit_mode") or "REINVEST").upper()
+                    days = _nkr_normalize_period_days(locked_cfg.get("nkrPeriodDays") or existing.get("nkrPeriodDays") or existing.get("periodDays") or meta.get("nkr_period_days") or 1)
                     meta.update({
                         "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
                         "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
@@ -34453,14 +34477,15 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     asset_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(chain_id, chain_key) if settlement_token == "0x0000000000000000000000000000000000000000" else _symbol_for_chain_token(chain_id, settlement_token)
     state, _ = _db_get_user_app_state(wallet)
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
-    days = _nkr_normalize_period_days(ui.get("nkrPeriodDays") or 10)
-    # Stamp the user's chosen Strategist rules onto the session so Info + worker
-    # never show UNKNOWN / empty mode while a live V5 session is running.
-    capital_mode = _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC")
-    observation = str(ui.get("nkrObservationWindow") or ui.get("nkr_observation_window") or "1h")
-    profit_mode = str(ui.get("nkrProfitMode") or ui.get("nkr_profit_mode") or "REINVEST").upper()
-    max_active = int(_safe_float(ui.get("maxActiveAssets") or ui.get("rotationMaxActiveSessions"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT) or NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)
-    max_pct = _safe_float(ui.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
+    locked_cfg = _nkr_get_exact_start_config(wallet, chain_id, sid)
+    days = _nkr_normalize_period_days(locked_cfg.get("nkrPeriodDays") or 1)
+    # Exact per-session start config is authoritative. The UI value is merely the
+    # draft for the next start and may reset to Dynamic immediately after creation.
+    capital_mode = _nkr_normalize_performance_mode(locked_cfg.get("nkrCapitalMode") or "DYNAMIC")
+    observation = str(locked_cfg.get("nkrObservationWindow") or "1h")
+    profit_mode = str(locked_cfg.get("nkrProfitMode") or "REINVEST").upper()
+    max_active = max(0, int(_safe_float(locked_cfg.get("maxActiveAssets"), 0)))
+    max_pct = _safe_float(locked_cfg.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
     row = {
         "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
         "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "WAITING",
@@ -34490,6 +34515,130 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
         },
     }
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
+
+
+def _nkr_exact_start_cfg_table() -> None:
+    """Create durable per-session NKR start config storage lazily.
+
+    This table is authoritative for immutable settings. UI app-state is only the
+    draft for the next session and must never overwrite a running session.
+    """
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS nkr_session_start_config (
+                    wallet_address TEXT NOT NULL,
+                    chain_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL,
+                    PRIMARY KEY(wallet_address, chain_id, session_id)
+                )"""
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nkr_save_exact_start_config(wallet: str, chain_id: int, session_id: int, config: dict) -> dict:
+    _nkr_exact_start_cfg_table()
+    wa = _norm_addr(wallet)
+    cid = int(chain_id or 0)
+    sid = str(session_id or "")
+    mode = _nkr_normalize_performance_mode((config or {}).get("nkrCapitalMode") or (config or {}).get("nkr_capital_mode") or "DYNAMIC")
+    payload = {
+        "nkrCapitalMode": mode,
+        "nkrObservationWindow": str((config or {}).get("nkrObservationWindow") or (config or {}).get("nkr_observation_window") or "1h"),
+        "nkrProfitMode": str((config or {}).get("nkrProfitMode") or (config or {}).get("nkr_profit_mode") or "REINVEST").upper(),
+        "nkrPeriodDays": _nkr_normalize_period_days((config or {}).get("nkrPeriodDays") or (config or {}).get("nkr_period_days") or 1),
+        "maxActiveAssets": max(0, int(_safe_float((config or {}).get("maxActiveAssets") if (config or {}).get("maxActiveAssets") is not None else (config or {}).get("max_active_assets"), 0))),
+        "maxCapitalPerAssetPct": _safe_float((config or {}).get("maxCapitalPerAssetPct") or (config or {}).get("max_capital_per_asset_pct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
+        "budgetUsd": _safe_float((config or {}).get("budgetUsd") or (config or {}).get("nkrBudgetUsd") or (config or {}).get("amountUsd"), 0.0),
+        "payoutAsset": str((config or {}).get("payoutAsset") or (config or {}).get("settlementAsset") or "USDC").upper(),
+        "maxSlippageBps": int(_safe_float((config or {}).get("maxSlippageBps"), 100)),
+        "maxLossBps": int(_safe_float((config or {}).get("maxLossBps"), 1500)),
+        "start_config_locked": True,
+        "start_mode_locked": True,
+        "source": "core_vault_create_receipt",
+    }
+    now_ms = _nkr_now_ms()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(
+                """INSERT INTO nkr_session_start_config(wallet_address,chain_id,session_id,config_json,created_ts,updated_ts)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(wallet_address,chain_id,session_id) DO UPDATE SET
+                     config_json=excluded.config_json, updated_ts=excluded.updated_ts""",
+                (wa, cid, sid, json.dumps(payload, separators=(",", ":")), now_ms, now_ms),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    return payload
+
+
+def _nkr_get_exact_start_config(wallet: str, chain_id: int, session_id) -> dict:
+    try:
+        _nkr_exact_start_cfg_table()
+        conn = _db()
+        try:
+            row = conn.execute(
+                "SELECT config_json FROM nkr_session_start_config WHERE wallet_address=? AND chain_id=? AND session_id=?",
+                (_norm_addr(wallet), int(chain_id or 0), str(session_id or "")),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return {}
+        data = json.loads(row[0] or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _nkr_settings_for_exact_live_session(wallet: str, live_row: dict, fallback: dict | None = None) -> dict:
+    """Return the immutable rule set for one exact on-chain NKR session.
+
+    Running sessions must never inherit the current setup draft.  Fallback values are
+    accepted only for non-strategy infrastructure fields; all Strategist rule fields
+    are overwritten from the immutable start record or the session row itself.
+    """
+    out = dict(fallback or {})
+    cid = int((live_row or {}).get("chain_id") or 0)
+    sid = str((live_row or {}).get("onchain_session_id") or "")
+    locked = _nkr_get_exact_start_config(wallet, cid, sid)
+    meta = (live_row or {}).get("meta") if isinstance((live_row or {}).get("meta"), dict) else {}
+    # Exact DB snapshot first; local per-session projection is the migration fallback.
+    source = dict(locked or {})
+    if not source:
+        for k, vals in {
+            "nkrCapitalMode": [(live_row or {}).get("nkrCapitalMode"), (live_row or {}).get("capitalMode"), meta.get("nkr_capital_mode"), meta.get("capital_mode")],
+            "nkrObservationWindow": [(live_row or {}).get("nkrObservationWindow"), meta.get("nkr_observation_window")],
+            "nkrProfitMode": [(live_row or {}).get("nkrProfitMode"), meta.get("nkr_profit_mode")],
+            "nkrPeriodDays": [(live_row or {}).get("nkrPeriodDays"), (live_row or {}).get("periodDays"), meta.get("nkr_period_days")],
+            "maxActiveAssets": [(live_row or {}).get("maxActiveAssets"), meta.get("max_active_assets")],
+            "maxCapitalPerAssetPct": [(live_row or {}).get("maxCapitalPerAssetPct"), meta.get("max_capital_per_asset_pct")],
+            "budgetUsd": [(live_row or {}).get("budgetUsd"), (live_row or {}).get("sessionBudgetUsd")],
+            "payoutAsset": [(live_row or {}).get("payoutAsset"), (live_row or {}).get("settlementAsset"), meta.get("settlement_asset")],
+        }.items():
+            for v in vals:
+                if v is not None and str(v).strip() != "":
+                    source[k] = v
+                    break
+    out.update(source)
+    out["nkrCapitalMode"] = _nkr_normalize_performance_mode(source.get("nkrCapitalMode") or "DYNAMIC")
+    out["mode"] = out["nkrCapitalMode"]
+    out["nkrObservationWindow"] = str(source.get("nkrObservationWindow") or "1h")
+    out["nkrProfitMode"] = _nkr_normalize_profit_mode(source.get("nkrProfitMode") or "REINVEST")
+    out["nkrPeriodDays"] = _nkr_normalize_period_days(source.get("nkrPeriodDays") or 1)
+    out["maxActiveAssets"] = max(0, int(_safe_float(source.get("maxActiveAssets"), 0)))
+    out["maxCapitalPerAssetPct"] = _safe_float(source.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
+    out["session_config_locked"] = bool(locked) or bool(source)
+    out["session_config_key"] = f"{cid}:{sid}"
+    return out
 
 
 def _nkr_stamp_exact_session_start_config(wallet: str, chain_id: int, session_id: int, config: dict) -> None:
@@ -36740,14 +36889,23 @@ def _nkr_live_worker_cycle() -> None:
                         break
             except Exception:
                 session_mode = ""
+            exact_primary_cfg = _nkr_get_exact_start_config(
+                wallet,
+                int((runnable_rows[0] if runnable_rows else {}).get("chain_id") or 0),
+                str((runnable_rows[0] if runnable_rows else {}).get("onchain_session_id") or ""),
+            ) if runnable_rows else {}
+            # This object is only the NEXT-SESSION draft for optional Strategist
+            # session creation. Existing session execution below always replaces every
+            # rule field with _nkr_settings_for_exact_live_session().
             settings = {
-                "nkrCapitalMode": _nkr_normalize_performance_mode(session_mode or ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
+                "nkrCapitalMode": _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
                 "nkrProfitMode": str(ui.get("nkrProfitMode") or "REINVEST").upper(),
                 "nkrObservationWindow": str(ui.get("nkrObservationWindow") or "1h"),
-                "nkrPeriodDays": ui.get("nkrPeriodDays") or 10,
+                "nkrPeriodDays": ui.get("nkrPeriodDays") or 1,
                 "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0),
-                "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT)),
+                "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", 0)),
                 "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
+                "settings_scope": "NEXT_SESSION_DRAFT_ONLY",
             }
             # ENGINE-224: the production worker does not call the Shadow/backend
             # simulator. Local rows remain the UI/control projection of on-chain state.
@@ -36896,6 +37054,11 @@ def _nkr_live_worker_cycle() -> None:
                                         break
                         except Exception:
                             pass
+                        # Immutable exact-session settings override every global UI
+                        # draft and every stale local projection.
+                        sess_settings = _nkr_settings_for_exact_live_session(wallet, live_row, sess_settings)
+                        if not sess_settings.get("session_config_locked"):
+                            raise RuntimeError(f"missing immutable NKR session config for {sess_settings.get('session_config_key')}")
                         execution = _nkr_live_execute_portfolio(
                             wallet, live_row, market_rows, sess_settings
                         )
