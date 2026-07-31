@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-299-POOL-USDC-E-DIAG"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-300-WMATIC-ADDRESS-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -8769,7 +8769,7 @@ _ROUTER_V3_BY_CHAIN = {
 _WNATIVE_BY_CHAIN = {
     1: (os.getenv("WNATIVE_ADDRESS_ETH") or os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").strip(),
     56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c").strip(),
-    137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "0x0d500B1d8E8e8F31E21C99d1Db9A6444d3ADf127").strip(),  # WPOL/WMATIC
+    137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270").strip(),  # WPOL/WMATIC
 }
 
 # Owner-managed execution routes for non-EVM display assets such as BTC, SOL and XRP.
