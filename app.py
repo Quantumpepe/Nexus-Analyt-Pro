@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-311-EXACT-SESSION-CONTROL-RUNTIME-TRUTH-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-312-EXACT-CARD-STOP-CHAIN-TX-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -643,7 +643,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         sent = _privy_send_delegated_transaction(wallet_id, {
             "from": _norm_addr(wallet), "to": vault,
             "data": _core_selector("startClosing(uint256)") + _uint_to_32(sid), "value": "0x0"
-        }, ref)
+        }, ref, chain_id=chain_id)
         close_tx = str(sent.get("hash") or sent.get("txHash") or "")
         _privy_wait_receipt(close_tx, timeout_sec=90, chain_id=chain_id)
         status_id = 3
@@ -668,7 +668,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
         sent = _privy_send_delegated_transaction(wallet_id, {
             "from": _norm_addr(wallet), "to": vault,
             "data": _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid), "value": "0x0"
-        }, ref)
+        }, ref, chain_id=chain_id)
         finalize_tx = str(sent.get("hash") or sent.get("txHash") or "")
         _live_engine_mark(engine, status="closing", decision="FINALIZING", reason="All assets sold; finalizing session", pending_tx=finalize_tx or "submitted")
         _privy_wait_receipt(finalize_tx, timeout_sec=90, chain_id=chain_id)
@@ -693,6 +693,56 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
     }
 
 
+
+def _nkr_set_exact_local_session_state(wallet: str, chain_id: int, onchain_session_id: str, state: str, message: str = ""):
+    """Update only one NKR session projection identified by chain + on-chain id.
+
+    Session ids restart on every vault, therefore numeric id alone is never unique.
+    This prevents BNB #1 and POL #1 from changing together.
+    """
+    wa = _norm_addr(wallet)
+    cid = int(chain_id or 0)
+    oid = str(onchain_session_id or "").strip()
+    if cid <= 0 or not oid:
+        return
+    nowi = _nkr_now_ms() if "_nkr_now_ms" in globals() else int(time.time() * 1000)
+    sessions, active, _ = _db_get_rotation_sessions(wa)
+    changed = []
+    state_u = str(state or "STOPPING").upper()
+    for src in sessions or []:
+        if not isinstance(src, dict) or not _nkr_is_session(src):
+            continue
+        meta = dict(src.get("meta") if isinstance(src.get("meta"), dict) else {})
+        scid = int(src.get("chainId") or src.get("chain_id") or meta.get("chain_id") or 0)
+        soid = str(src.get("onchainSessionId") or src.get("onchain_session_id") or src.get("coreVaultSessionId") or meta.get("onchain_session_id") or meta.get("core_vault_session_id") or "").strip()
+        if scid != cid or soid != oid:
+            continue
+        row = dict(src)
+        row["status"] = state_u
+        row["lifecycleState"] = state_u
+        row["positionState"] = "STOPPED" if state_u in {"STOPPED","FINALIZED"} else state_u
+        row["active"] = state_u not in {"STOPPED","FINALIZED"}
+        row["visibleInActiveSessions"] = state_u not in {"STOPPED","FINALIZED"}
+        row["updatedAt"] = nowi
+        if state_u in {"STOPPING","CLOSING","FINALIZING"}:
+            row["stoppingAt"] = nowi
+        if state_u in {"STOPPED","FINALIZED"}:
+            row["stoppedAt"] = nowi
+            row["reservedUsd"] = 0
+        meta.update({
+            "nkr_session": True,
+            "chain_id": cid,
+            "onchain_session_id": oid,
+            "lifecycle_state": state_u,
+            "position_state": row.get("positionState"),
+            "stop_message": str(message or "")[:240],
+        })
+        row["meta"] = meta
+        changed.append(row)
+    if changed:
+        _db_set_rotation_sessions(wa, changed, active_session_id=active, replace_missing=False)
+
+
 def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
     results = []
     try:
@@ -711,8 +761,13 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
                 results.append({"sessionId": row.get("onchain_session_id"), "status": "error", "error": msg})
         if rows and all(x.get("status") == "finalized" for x in results):
             if str(engine).upper() == "NKR":
-                _nkr_set_local_stop_state(wallet, "STOPPED", "NKR safely stopped and capital released")
-            _live_engine_mark(engine, status="stopped", decision="FINALIZED", reason="CoreVault allocation released", pending_tx="", last_error="")
+                for row in rows:
+                    _nkr_set_exact_local_session_state(wallet, int(row.get("chain_id") or 0), str(row.get("onchain_session_id") or ""), "FINALIZED", "NKR safely stopped and capital released")
+            remaining = _live_active_sessions(wallet, engine)
+            if remaining:
+                _live_engine_mark(engine, status="running", decision="SESSION_FINALIZED", reason="Selected CoreVault session finalized; other sessions remain", pending_tx="", last_error="")
+            else:
+                _live_engine_mark(engine, status="stopped", decision="FINALIZED", reason="CoreVault allocation released", pending_tx="", last_error="")
         elif not rows:
             if str(engine).upper() == "NKR":
                 _nkr_set_local_stop_state(wallet, "STOPPED", "NKR stopped")
@@ -747,15 +802,13 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, targe
                 matched.append(x)
         rows = matched
         if not rows:
-            # Still mark local STOPPING so UI does not stay on PAUSED/RUNNING.
-            if str(engine).upper() == "NKR":
-                try:
-                    _nkr_set_local_stop_state(wallet, "STOPPING", f"Stop requested for session {target_sid}")
-                except Exception:
-                    pass
             return [{"sessionId": int(tail) if str(tail).isdigit() else target_sid, "status": "not_found", "error": "target_onchain_session_not_found"}]
     if str(engine).upper() == "NKR":
-        _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
+        if target_sid and rows:
+            for row in rows:
+                _nkr_set_exact_local_session_state(wallet, int(row.get("chain_id") or 0), str(row.get("onchain_session_id") or ""), "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
+        elif not target_sid:
+            _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
     # Keep every paused/open session visible and mark the live registry as closing
     # before the asynchronous worker starts. This prevents the UI from falling
     # back to PAUSED or hiding the session while an exit is pending.
