@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-298-POOL-QUOTE-FALLBACK"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-299-POOL-USDC-E-DIAG"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -30684,7 +30684,8 @@ def _nkr_pool_slot0_quote(chain_id: int, token_in: str, token_out: str, amount_i
     """Approximate amountOut from V3 pool slot0 when Quoter contract is unusable.
 
     Uses factory.getPool + pool.slot0 sqrtPriceX96. Conservative 0.5% haircut.
-    Returns {} on failure.
+    On Polygon also tries USDC.e if native USDC has no pool.
+    Returns {} on failure; sets last_detail on cfg-less path via returned error key.
     """
     factory = _nkr_v3_factory(chain_id)
     if not factory or int(amount_in or 0) <= 0:
@@ -30693,54 +30694,95 @@ def _nkr_pool_slot0_quote(chain_id: int, token_in: str, token_out: str, amount_i
     tout = _norm_addr(token_out)
     if not tin or not tout or tin == tout:
         return {}
-    # getPool(address,address,uint24) → 0x1698ee82
     get_pool_sel = "0x1698ee82"
-    # slot0() → 0x3850c7bd
     slot0_sel = "0x3850c7bd"
-    # token0() → 0x0dfe1681
     token0_sel = "0x0dfe1681"
     fee_list = [int(f) for f in (fees or []) if int(f or 0) > 0]
     if not fee_list:
         fee_list = [500, 2500, 3000, 10000, 100]
-    for fee in fee_list:
-        try:
-            data = get_pool_sel + _addr_to_32(tin) + _addr_to_32(tout) + _uint_to_32(int(fee))
-            raw = _eth_call(int(chain_id), factory, data)
-            words = _abi_hex_words(raw) or []
-            if not words:
+    # Token-in candidates: requested + POL USDC.e fallback for liquidity
+    in_candidates = [tin]
+    if int(chain_id) == 137:
+        usdc_e = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        if tin.lower() != usdc_e.lower():
+            in_candidates.append(_norm_addr(usdc_e))
+    if int(chain_id) == 56:
+        # common BSC USDCs
+        for alt in ("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", "0x55d398326f99059fF775485246999027B3197955"):
+            if tin.lower() != alt.lower():
+                in_candidates.append(_norm_addr(alt))
+    last_detail = "no_pool"
+    for tin_try in in_candidates:
+        for fee in fee_list:
+            try:
+                data = get_pool_sel + _addr_to_32(tin_try) + _addr_to_32(tout) + _uint_to_32(int(fee))
+                raw = _eth_call(int(chain_id), factory, data)
+                words = _abi_hex_words(raw) or []
+                if not words:
+                    # try core_vault_words
+                    try:
+                        cw = _core_vault_words(raw)
+                        if cw:
+                            pool = _norm_addr(hex(cw[0]))
+                        else:
+                            last_detail = f"empty_getPool:fee={fee}"
+                            continue
+                    except Exception:
+                        last_detail = f"empty_getPool:fee={fee}"
+                        continue
+                else:
+                    pool = _word_address(words[0])
+                if not pool or int(pool, 16) == 0:
+                    last_detail = f"zero_pool:fee={fee}:in={tin_try[:10]}"
+                    continue
+                sraw = _eth_call(int(chain_id), pool, slot0_sel)
+                sw = _abi_hex_words(sraw) or []
+                if not sw:
+                    try:
+                        cw = _core_vault_words(sraw)
+                        sqrt_p = int(cw[0]) if cw else 0
+                    except Exception:
+                        last_detail = f"slot0_empty:pool={pool[:10]}"
+                        continue
+                else:
+                    sqrt_p = int(sw[0], 16)
+                if sqrt_p <= 0:
+                    last_detail = f"slot0_zero:pool={pool[:10]}"
+                    continue
+                t0raw = _eth_call(int(chain_id), pool, token0_sel)
+                t0w = _abi_hex_words(t0raw) or []
+                if t0w:
+                    token0 = _word_address(t0w[0])
+                else:
+                    try:
+                        token0 = _norm_addr(hex(_core_vault_words(t0raw)[0]))
+                    except Exception:
+                        token0 = ""
+                Q96 = float(2 ** 96)
+                ratio = (float(sqrt_p) / Q96) ** 2
+                if ratio <= 0:
+                    continue
+                zero_for_one = _norm_addr(token0) == _norm_addr(tin_try)
+                amt = int(amount_in)
+                # If we switched to USDC.e for pool discovery but amount is for native USDC (same 6 dec), keep amt
+                if zero_for_one:
+                    out = int(amt * ratio)
+                else:
+                    out = int(amt / ratio)
+                out = int(out * 995 // 1000)
+                if out > 0:
+                    return {
+                        "amountOut": out,
+                        "fee": int(fee),
+                        "pool": pool,
+                        "tokenInUsed": tin_try,
+                        "detail": f"pool_slot0:fee={fee}:pool={pool[:12]}",
+                    }
+                last_detail = f"out_zero:fee={fee}:ratio={ratio:.6e}"
+            except Exception as exc:
+                last_detail = f"exc:fee={fee}:{str(exc)[:80]}"
                 continue
-            pool = _word_address(words[0])
-            if not pool or int(pool, 16) == 0:
-                continue
-            sraw = _eth_call(int(chain_id), pool, slot0_sel)
-            sw = _abi_hex_words(sraw) or []
-            if not sw:
-                continue
-            sqrt_p = int(sw[0], 16)
-            if sqrt_p <= 0:
-                continue
-            t0raw = _eth_call(int(chain_id), pool, token0_sel)
-            t0w = _abi_hex_words(t0raw) or []
-            token0 = _word_address(t0w[0]) if t0w else ""
-            # price token1/token0 = (sqrtP / 2^96)^2
-            # amountOut depends on zero_for_one = token_in == token0
-            Q96 = 2 ** 96
-            # Use float carefully for mid-size amounts
-            ratio = (sqrt_p / Q96) ** 2
-            zero_for_one = _norm_addr(token0) == tin
-            if zero_for_one:
-                # token0 -> token1: out = in * ratio
-                out = int(amount_in * ratio)
-            else:
-                # token1 -> token0: out = in / ratio
-                out = int(amount_in / ratio) if ratio > 0 else 0
-            # 0.5% safety haircut for approx quote
-            out = int(out * 995 // 1000)
-            if out > 0:
-                return {"amountOut": out, "fee": int(fee), "pool": pool}
-        except Exception:
-            continue
-    return {}
+    return {"amountOut": 0, "detail": last_detail}
 
 
 def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
@@ -30902,11 +30944,11 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                     last_err = f"alt:{alt_n[:10]}:{sname}:fee={f}:{str(exc)[:80]}"
                     continue
     # ENGINE-298: pool slot0 fallback when all quoter contracts fail (Alchemy or not).
-    pool_out = _nkr_pool_slot0_quote(chain_id, tin, tout, int(amount_in), fees)
-    if pool_out and int(pool_out.get("amountOut") or 0) > 0:
+    pool_out = _nkr_pool_slot0_quote(chain_id, tin, tout, int(amount_in), fees) or {}
+    if int(pool_out.get("amountOut") or 0) > 0:
         try:
             if isinstance(cfg, dict):
-                cfg["_last_quote_fee"] = int(pool_out.get("fee") or fees[0] if fees else 500)
+                cfg["_last_quote_fee"] = int(pool_out.get("fee") or (fees[0] if fees else 500))
                 cfg["_last_quote_strategy"] = "pool_slot0"
         except Exception:
             pass
@@ -30918,9 +30960,10 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
         except Exception:
             pass
         return int(pool_out["amountOut"])
+    pool_detail = str(pool_out.get("detail") or "pool_none")
     raise RuntimeError(
         f"quoter_failed chain={chain_id} token_in={tin} token_out={tout} "
-        f"amount={amount_in} last={last_err}"
+        f"amount={amount_in} last={last_err}|pool={pool_detail}"
     )
 
 
