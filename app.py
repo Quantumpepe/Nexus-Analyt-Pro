@@ -31428,6 +31428,174 @@ def _privy_delegated_readiness(wallet_address, chain_id=1):
 def _live_vault_execution_readiness(wallet_address): return _privy_delegated_readiness(wallet_address)
 
 
+
+# ENGINE-318: Read-only, chain-generic EVM execution diagnostics.
+# This endpoint never sends a transaction and never mutates vault state.
+_ERC20_ALLOWANCE_SELECTOR = "0xdd62ed3e"
+_ERC20_BALANCE_OF_SELECTOR = "0x70a08231"
+
+
+def _diag_bool(ok, ok_label="READY", bad_label="FAILED", detail=None):
+    return {
+        "ok": bool(ok),
+        "status": ok_label if ok else bad_label,
+        "detail": detail,
+    }
+
+
+def _diag_uint_call(chain_id: int, contract: str, selector: str, *words: str) -> int:
+    data = str(selector) + "".join(words)
+    raw = _eth_call(int(chain_id), _norm_addr(contract), data)
+    decoded = _abi_hex_words(raw)
+    return int(decoded[0], 16) if decoded else 0
+
+
+def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", session_id=None) -> dict:
+    cid = int(chain_id)
+    cfg = _privy_trading_cfg(cid)
+    vault = _norm_addr(cfg.get("vault") or _VAULT_BY_CHAIN.get(cid) or "")
+    router = _norm_addr(cfg.get("router") or "")
+    quoter = _norm_addr(cfg.get("quoter") or "")
+    token_in = _norm_addr(cfg.get("usdc") or "")
+    token_out = _norm_addr(cfg.get("weth") or "")
+    chain_name = str(cfg.get("chainKey") or cfg.get("chain") or (_EVM_CHAIN_KEY_BY_ID.get(cid) if "_EVM_CHAIN_KEY_BY_ID" in globals() else None) or cid).upper()
+    report = {
+        "chainId": cid,
+        "chain": chain_name,
+        "engine": str(engine or "NKR").upper(),
+        "wallet": _norm_addr(wallet),
+        "vault": vault,
+        "router": router,
+        "quoter": quoter,
+        "tokenIn": token_in,
+        "tokenOut": token_out,
+        "sessionId": int(session_id) if str(session_id or "").isdigit() else None,
+        "checks": {},
+        "selectors": [],
+        "blockers": [],
+    }
+    c = report["checks"]
+    try:
+        c["vaultConfigured"] = _diag_bool(_looks_like_evm_addr(vault), detail=vault or "missing")
+        c["vaultHasCode"] = _diag_bool(bool(vault and _contract_has_code(vault, cid)), detail=vault)
+        c["routerConfigured"] = _diag_bool(_looks_like_evm_addr(router), detail=router or "missing")
+        c["routerHasCode"] = _diag_bool(bool(router and _contract_has_code(router, cid)), detail=router)
+        c["quoterConfigured"] = _diag_bool(_looks_like_evm_addr(quoter), detail=quoter or "missing")
+        c["quoterHasCode"] = _diag_bool(bool(quoter and _contract_has_code(quoter, cid)), detail=quoter)
+
+        if vault and router:
+            router_cfg = _read_router_config(vault, router, cid)
+            c["routerEnabled"] = _diag_bool(bool(router_cfg.get("enabled")), detail=router_cfg)
+        else:
+            c["routerEnabled"] = _diag_bool(False, detail="vault_or_router_missing")
+
+        for selector in (_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR):
+            allowed = bool(vault and router and _read_router_selector_allowed(vault, router, selector, cid))
+            report["selectors"].append({"selector": selector, "allowed": allowed})
+        c["anySelectorAllowed"] = _diag_bool(any(x["allowed"] for x in report["selectors"]), detail=report["selectors"])
+
+        if token_in:
+            tin = _read_token_config(vault, token_in, cid) if vault else {}
+            c["settlementTokenConfigured"] = _diag_bool(bool(tin.get("configured")), detail=tin)
+            c["settlementExecutionEnabled"] = _diag_bool(bool(tin.get("executionEnabled")), detail=tin)
+            vault_token_balance = _diag_uint_call(cid, token_in, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(vault)) if vault else 0
+            allowance = _diag_uint_call(cid, token_in, _ERC20_ALLOWANCE_SELECTOR, _addr_to_32(vault), _addr_to_32(router)) if vault and router else 0
+            c["vaultTokenBalance"] = _diag_bool(vault_token_balance > 0, detail={"raw": vault_token_balance, "decimals": tin.get("decimals")})
+            # A zero allowance is diagnostic, not automatically fatal: some routers are called
+            # through permit/approval helpers, while CoreVault implementations may approve in-call.
+            c["routerAllowance"] = _diag_bool(allowance > 0, ok_label="NON_ZERO", bad_label="ZERO", detail={"raw": allowance, "vault": vault, "spender": router})
+        else:
+            c["settlementTokenConfigured"] = _diag_bool(False, detail="token_in_missing")
+            c["settlementExecutionEnabled"] = _diag_bool(False, detail="token_in_missing")
+            c["vaultTokenBalance"] = _diag_bool(False, detail="token_in_missing")
+            c["routerAllowance"] = _diag_bool(False, bad_label="UNKNOWN", detail="token_in_or_router_missing")
+
+        if token_out:
+            tout = _read_token_config(vault, token_out, cid) if vault else {}
+            c["targetTokenConfigured"] = _diag_bool(bool(tout.get("configured")), detail=tout)
+            c["targetExecutionEnabled"] = _diag_bool(bool(tout.get("executionEnabled")), detail=tout)
+        else:
+            c["targetTokenConfigured"] = _diag_bool(False, detail="token_out_missing")
+            c["targetExecutionEnabled"] = _diag_bool(False, detail="token_out_missing")
+
+        if report["sessionId"] is not None and vault:
+            words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["sessionOf"], int(report["sessionId"])))
+            if len(words) >= 13:
+                owner = _norm_addr("0x" + words[0][-40:])
+                settlement = _norm_addr("0x" + words[1][-40:])
+                status = int(words[3], 16)
+                budget = int(words[8], 16)
+                cash = int(words[9], 16)
+                open_assets = int(words[12], 16)
+                session_detail = {"owner": owner, "settlementToken": settlement, "system": int(words[2],16), "status": status, "budget": budget, "settlementCash": cash, "openAssetCount": open_assets}
+                c["sessionFound"] = _diag_bool(owner != ZERO_ADDRESS, detail=session_detail)
+                c["sessionOwnerMatches"] = _diag_bool(owner.lower() == _norm_addr(wallet).lower(), detail=session_detail)
+                c["sessionActive"] = _diag_bool(status == 1, detail=session_detail)
+                c["sessionSettlementMatches"] = _diag_bool(settlement.lower() == token_in.lower(), detail=session_detail)
+                c["sessionHasCash"] = _diag_bool(cash > 0, detail=session_detail)
+            else:
+                c["sessionFound"] = _diag_bool(False, detail="session_decode_failed")
+
+        # Small quote probe only; no transaction and no state mutation.
+        if quoter and token_in and token_out and c.get("quoterHasCode", {}).get("ok"):
+            try:
+                probe_in = 1_000_000
+                probe_out = int(_privy_quote(cfg, token_in, token_out, probe_in))
+                c["quoteProbe"] = _diag_bool(probe_out > 0, detail={"amountIn": probe_in, "amountOut": probe_out, "fee": cfg.get("fee")})
+            except Exception as exc:
+                c["quoteProbe"] = _diag_bool(False, detail=str(exc))
+        else:
+            c["quoteProbe"] = _diag_bool(False, detail="quoter_or_token_missing")
+    except Exception as exc:
+        report["diagnosticError"] = str(exc)
+
+    fatal_keys = [
+        "vaultConfigured", "vaultHasCode", "routerConfigured", "routerHasCode",
+        "routerEnabled", "anySelectorAllowed", "settlementTokenConfigured",
+        "settlementExecutionEnabled", "targetTokenConfigured", "targetExecutionEnabled",
+        "quoterHasCode", "quoteProbe",
+    ]
+    if report["sessionId"] is not None:
+        fatal_keys += ["sessionFound", "sessionOwnerMatches", "sessionActive", "sessionSettlementMatches", "sessionHasCash"]
+    for key in fatal_keys:
+        if not bool((c.get(key) or {}).get("ok")):
+            report["blockers"].append(key)
+    # Keep allowance visible but do not declare it fatal without knowing the router's approval model.
+    report["status"] = "READY" if not report["blockers"] else "CHECK_REQUIRED"
+    return report
+
+
+@app.get("/api/nexus/system-info/evm-diagnostics")
+def api_nexus_system_info_evm_diagnostics():
+    owner, err = _require_owner_system_info()
+    if err:
+        return err
+    engine = str(request.args.get("engine") or "ALL").upper()
+    raw_chain = request.args.get("chain_id") or request.args.get("chainId")
+    raw_session = request.args.get("session_id") or request.args.get("sessionId")
+    chain_ids = []
+    if str(raw_chain or "").isdigit():
+        chain_ids = [int(raw_chain)]
+    else:
+        candidates = set(int(x) for x in (_VAULT_BY_CHAIN or {}).keys())
+        for cid in (1, 56, 137, 8453, 42161, 10, 43114):
+            try:
+                cfg = _privy_trading_cfg(cid)
+                if _looks_like_evm_addr(cfg.get("vault") or ""):
+                    candidates.add(cid)
+            except Exception:
+                pass
+        chain_ids = sorted(candidates)
+    reports = []
+    for cid in chain_ids:
+        try:
+            reports.append(_evm_execution_diagnostic(cid, owner, engine=engine, session_id=raw_session if len(chain_ids) == 1 else None))
+        except Exception as exc:
+            reports.append({"chainId": cid, "chain": str(cid), "engine": engine, "status": "ERROR", "checks": {}, "blockers": ["diagnostic_exception"], "diagnosticError": str(exc)})
+    overall = "READY" if reports and all(r.get("status") == "READY" for r in reports) else "CHECK_REQUIRED"
+    return jsonify({"status": "ok", "overall": overall, "engine": engine, "reports": reports, "readOnly": True, "ts": now_ts()})
+
+
 @app.get("/api/nexus/privy-trading/diagnostics")
 def api_privy_trading_diagnostics():
     owner, denied = _require_owner_system_info()
