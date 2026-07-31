@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-305-RECEIPT-CHAIN-ID"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-306-SESSION-CONTROL-MODE-QUOTER-CHAIN-SCAN-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -429,8 +429,22 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
                 ON CONFLICT(chain_id,vault_address,onchain_session_id) DO UPDATE SET
                     wallet_address=excluded.wallet_address, engine=excluded.engine,
                     privy_wallet_id=excluded.privy_wallet_id, tx_hash=excluded.tx_hash,
-                    budget_units=excluded.budget_units, status='ACTIVE', updated_ts=excluded.updated_ts,
-                    finalized_tx_hash=NULL, last_error=NULL
+                    budget_units=excluded.budget_units,
+                    status=CASE
+                        WHEN nexus_live_core_vault_sessions.status IN ('PAUSED','STOPPING','CLOSING','FINALIZING','EXITING')
+                            THEN nexus_live_core_vault_sessions.status
+                        ELSE 'ACTIVE'
+                    END,
+                    updated_ts=excluded.updated_ts,
+                    finalized_tx_hash=CASE
+                        WHEN nexus_live_core_vault_sessions.status='FINALIZED' THEN nexus_live_core_vault_sessions.finalized_tx_hash
+                        ELSE NULL
+                    END,
+                    last_error=CASE
+                        WHEN nexus_live_core_vault_sessions.status IN ('PAUSED','STOPPING','CLOSING','FINALIZING','EXITING')
+                            THEN nexus_live_core_vault_sessions.last_error
+                        ELSE NULL
+                    END
             """, (_norm_addr(wallet), str(engine).upper(), int(chain_id), _norm_addr(vault), str(wallet_id), str(session_id), str(tx_hash or ""), str(int(budget_units or 0)), "ACTIVE", nowi, nowi))
             conn.commit()
     finally:
@@ -34890,6 +34904,16 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
             continue
         symbol = str(sym or "").strip().upper()
         if not symbol:
+            continue
+        # A chain-native symbol may execute only on its own chain. ETH/WETH on POL,
+        # BNB/WBNB on ETH/POL, or POL/MATIC on ETH/BNB caused misleading candidates
+        # and repeated quoter failures. Cross-chain capital movement is stablecoin-only.
+        foreign_native_groups = {
+            "ETH": {"ETH", "WETH"},
+            "BNB": {"BNB", "WBNB"},
+            "POL": {"POL", "MATIC", "WMATIC", "WPOL"},
+        }
+        if any(symbol in syms and chain_key != owner_chain for owner_chain, syms in foreign_native_groups.items()):
             continue
         routes[symbol] = {
             "symbol": symbol,
