@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-310-SESSION-CARD-CONTROL-DIRECT-ONCHAIN-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-311-EXACT-SESSION-CONTROL-RUNTIME-TRUTH-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -825,7 +825,13 @@ def _live_engine_health_payload(wallet=""):
         if wallet and eng == "NKR" and live:
             try:
                 sessions, _, _ = _db_get_rotation_sessions(wallet)
-                active_local = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or x.get("lifecycleState") or "").upper() not in {"STOPPED","FINALIZED","CLOSED","EXPIRED","CANCELLED","RELEASED","ARCHIVED"}]
+                live_keys = {(int(x.get("chain_id") or 0), str(x.get("onchain_session_id") or "")) for x in live}
+                def _local_live_key(x):
+                    xm = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+                    cid = int(x.get("chainId") or x.get("chain_id") or xm.get("chain_id") or 0)
+                    oid = str(x.get("onchainSessionId") or x.get("onchain_session_id") or x.get("coreVaultSessionId") or xm.get("onchain_session_id") or "")
+                    return (cid, oid)
+                active_local = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x) and _local_live_key(x) in live_keys and str(x.get("status") or x.get("lifecycleState") or "").upper() not in {"STOPPED","FINALIZED","CLOSED","EXPIRED","CANCELLED","RELEASED","ARCHIVED"}]
                 # Prefer the row that actually carries the live on-chain position. Older
                 # placeholder/stop rows can survive in local persistence after a deploy and
                 # must never overwrite the authoritative CoreVault position state.
@@ -857,6 +863,16 @@ def _live_engine_health_payload(wallet=""):
                     position_state = "OPEN"
                 live_statuses = {str(x.get("status") or "").upper() for x in live}
                 paused = bool(live_statuses and live_statuses <= {"PAUSED"})
+                if paused:
+                    # A paused portfolio has no active worker candidate. Never resurrect a
+                    # finalized ETH position from stale local/app-state rows.
+                    asset = ""
+                    position_state = ""
+                    onchain_state = ""
+                    position_qty = 0.0
+                    tx_hash_hint = ""
+                    has_position = False
+                    exit_pending = False
                 latest_ms = max([int(float(x.get("updatedAt") or x.get("updated_at") or x.get("createdAt") or 0)) for x in active_local] or [0])
                 latest_sec = latest_ms // 1000 if latest_ms > 10_000_000_000 else latest_ms
                 tx_hash = tx_hash_hint
@@ -871,8 +887,8 @@ def _live_engine_health_payload(wallet=""):
                     "tick_count": max(int(row.get("tick_count") or 0), int(current.get("eventCount") or current.get("totalEventCount") or 0), 1),
                     # Preserve worker tick diagnostics (assets_scanned, scores, WAIT/OPEN gates).
                     # Only override decision/gate when there is a real on-chain position or pause.
-                    "best_candidate": asset or str(row.get("best_candidate") or ""),
-                    "candidate_price": price or float(row.get("candidate_price") or 0),
+                    "best_candidate": "" if paused else (asset or str(row.get("best_candidate") or "")),
+                    "candidate_price": 0.0 if paused else (price or float(row.get("candidate_price") or 0)),
                     "decision": (
                         "PAUSED" if paused else
                         ("EXITING" if exit_pending else
@@ -886,8 +902,9 @@ def _live_engine_health_payload(wallet=""):
                           str(row.get("gate_status") or row.get("gate") or "SESSION_ACTIVE")))
                     ),
                     "decision_detail": (
-                        f"{asset} position is open and tracked by CoreVault." if has_position else
-                        str(row.get("decision_detail") or row.get("detail") or row.get("last_error") or "CoreVault session is active.")
+                        "All NKR sessions are paused on-chain." if paused else
+                        (f"{asset} position is open and tracked by CoreVault." if has_position else
+                         str(row.get("decision_detail") or row.get("detail") or row.get("last_error") or "CoreVault session is active."))
                     ),
                     # Never wipe a meaningful worker reason with a generic sync label when still scanning.
                     "reason": (
@@ -34400,6 +34417,88 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
 
 
+def _nkr_resolve_exact_core_session(wallet: str, target_id: str, target_chain: str) -> dict:
+    """Resolve one NKR CoreVault session directly from chain+session id.
+
+    This intentionally does not depend on rotation_sessions or the live registry cache.
+    Session card controls must remain usable after deploy/reload when only on-chain state exists.
+    """
+    wa = _norm_addr(wallet)
+    sid_txt = str(target_id or "").strip().split("-")[-1]
+    chain_id = int(_nkr_chain_id_from_key(target_chain) or 0)
+    if not sid_txt.isdigit() or int(sid_txt) <= 0 or chain_id <= 0:
+        raise RuntimeError("exact chain and numeric on-chain session id required")
+    sid = int(sid_txt)
+    vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+    if not _looks_like_evm_addr(vault):
+        raise RuntimeError(f"vault not configured for chain {chain_id}")
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    if len(words) < 4:
+        raise RuntimeError("sessionOf returned incomplete data")
+    owner = "0x" + words[0].to_bytes(32, "big")[-20:].hex()
+    system_id = int(words[2])
+    status_id = int(words[3])
+    if _norm_addr(owner) != wa:
+        raise RuntimeError("session owner does not match connected wallet")
+    if system_id != int(_CORE_SYSTEM_ID.get("NKR", 0)):
+        raise RuntimeError("session is not an NKR session")
+    wallet_id = str(_privy_wallet_id_for_user(wa) or "")
+    if not wallet_id:
+        raise RuntimeError("Privy wallet id not found")
+    return {
+        "wallet_address": wa, "engine": "NKR", "chain_id": chain_id,
+        "vault_address": vault, "privy_wallet_id": wallet_id,
+        "onchain_session_id": str(sid), "status_id": status_id,
+        "status": {1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(status_id,"UNKNOWN"),
+    }
+
+def _nkr_control_exact_core_session(wallet: str, target_id: str, target_chain: str, paused: bool) -> list[dict]:
+    row = _nkr_resolve_exact_core_session(wallet, target_id, target_chain)
+    sid = int(row["onchain_session_id"]); chain_id = int(row["chain_id"])
+    vault = row["vault_address"]; wallet_id = row["privy_wallet_id"]
+    expected = 2 if paused else 1
+    if int(row.get("status_id") or -1) == expected:
+        confirmed = True; txh = ""
+    else:
+        if int(row.get("status_id") or -1) == 4:
+            raise RuntimeError("session already finalized")
+        data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
+        sent = _privy_send_delegated_transaction(
+            wallet_id,
+            {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"},
+            f"nexus-nkr-exact-{'pause' if paused else 'resume'}-{chain_id}-{sid}-{int(time.time())}",
+            chain_id=chain_id,
+        )
+        txh = str(sent.get("hash") or "")
+        if not txh:
+            raise RuntimeError("Privy returned no transaction hash")
+        _privy_wait_receipt(txh, timeout_sec=120, chain_id=chain_id)
+        confirmed = False
+        for _ in range(12):
+            chk = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            ww = _core_words(chk)
+            actual = int(ww[3]) if len(ww) > 3 else -1
+            if actual == expected:
+                confirmed = True; break
+            time.sleep(1.5)
+        if not confirmed:
+            raise RuntimeError(f"on-chain status not confirmed; expected {expected}")
+    # Recreate/update the optional registry only after chain confirmation.
+    _live_session_register(_norm_addr(wallet), "NKR", wallet_id, vault, sid, txh, 0, chain_id)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(
+                "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL "
+                "WHERE wallet_address=? AND engine='NKR' AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                ("PAUSED" if paused else "ACTIVE", int(time.time()), _norm_addr(wallet), chain_id, vault.lower(), str(sid)),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    return [{"sessionId":sid,"chainId":chain_id,"status":"paused" if paused else "active","txHash":txh,"confirmed":True}]
+
 def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = None, target_chain: str | None = None) -> list[dict]:
     rows = _live_active_sessions(wallet, "NKR")
     tid = str(target_id or "").strip()
@@ -36992,6 +37091,20 @@ def api_nkr_control():
         return out
     finalize_results = []
     if action in {"STOP", "STOP_EXIT", "RETRY_EXIT", "PANIC_STOP"}:
+        # Ensure an on-chain-only card has an exact registry projection before finalization.
+        if target_id and target_chain:
+            try:
+                _exact = _nkr_resolve_exact_core_session(wa, target_id, target_chain)
+                _live_session_register(wa, "NKR", _exact["privy_wallet_id"], _exact["vault_address"], int(_exact["onchain_session_id"]), "", 0, int(_exact["chain_id"]))
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute("UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=? WHERE wallet_address=? AND engine='NKR' AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=?", (_exact["status"], int(time.time()), _norm_addr(wa), int(_exact["chain_id"]), _exact["vault_address"].lower(), str(_exact["onchain_session_id"])))
+                        conn.commit()
+                finally:
+                    conn.close()
+            except Exception as exact_exc:
+                return jsonify({"status":"error","error":"exact_session_resolution_failed","message":str(exact_exc),"sessionId":target_id,"chain":target_chain}), 409
         # Safe live stop is asynchronous and is bound to the exact on-chain session
         # selected by the user. Never finalize or mutate unrelated historical rows.
         finalize_results = _live_finalize_engine_sessions(wa, "NKR", target_id or None, target_chain or None)
@@ -37005,9 +37118,12 @@ def api_nkr_control():
         pause_results = []
         onchain_error = ""
         try:
-            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None, target_chain=target_chain or None)
+            if target_id and target_chain:
+                pause_results = _nkr_control_exact_core_session(wa, target_id, target_chain, action == "PAUSE")
+            else:
+                pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None, target_chain=target_chain or None)
         except Exception as exc:
-            onchain_error = str(exc)[:240]
+            onchain_error = str(exc)[:500]
         confirmed_results = [r for r in (pause_results or []) if bool((r or {}).get("confirmed")) or str((r or {}).get("status") or "") in {"paused", "active"}]
         if target_id and not confirmed_results:
             return jsonify({
