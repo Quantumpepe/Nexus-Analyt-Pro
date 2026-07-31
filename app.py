@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-296-ALCHEMY-ALL-CHAINS"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-298-POOL-QUOTE-FALLBACK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -30626,6 +30626,123 @@ def _privy_erc20_balance(token, wallet):
     return int(words[0]) if words else 0
 
 
+
+# Short-lived quoter cache — cuts Alchemy CU and avoids repeat reverts under multi-user load.
+_NKR_QUOTE_CACHE: dict = {}
+_NKR_QUOTE_CACHE_LOCK = threading.RLock()
+_NKR_QUOTE_CACHE_TTL_SEC = max(3, min(60, int(os.getenv("NEXUS_QUOTE_CACHE_TTL_SEC", "12"))))
+_NKR_QUOTE_CACHE_MAX = 512
+
+
+def _nkr_quote_cache_key(chain_id, token_in, token_out, amount_in, fee) -> str:
+    # Bucket amounts so nearby sizes share a quote (saves CU under many sessions).
+    try:
+        amt = int(amount_in or 0)
+        if amt >= 1_000_000:
+            amt = (amt // 100_000) * 100_000
+        elif amt >= 1_000:
+            amt = (amt // 100) * 100
+    except Exception:
+        amt = amount_in
+    return f"{int(chain_id)}:{str(token_in).lower()}:{str(token_out).lower()}:{amt}:{fee}"
+
+
+def _nkr_quote_cache_get(key: str):
+    now = time.time()
+    with _NKR_QUOTE_CACHE_LOCK:
+        row = _NKR_QUOTE_CACHE.get(key)
+        if not row:
+            return None
+        ts, val = row
+        if now - ts > _NKR_QUOTE_CACHE_TTL_SEC:
+            _NKR_QUOTE_CACHE.pop(key, None)
+            return None
+        return val
+
+
+def _nkr_quote_cache_put(key: str, value):
+    with _NKR_QUOTE_CACHE_LOCK:
+        if len(_NKR_QUOTE_CACHE) >= _NKR_QUOTE_CACHE_MAX:
+            # Drop oldest ~25%
+            items = sorted(_NKR_QUOTE_CACHE.items(), key=lambda kv: kv[1][0])
+            for k, _ in items[: max(1, _NKR_QUOTE_CACHE_MAX // 4)]:
+                _NKR_QUOTE_CACHE.pop(k, None)
+        _NKR_QUOTE_CACHE[key] = (time.time(), value)
+
+
+
+def _nkr_v3_factory(chain_id: int) -> str:
+    """Uniswap V3 / Pancake V3 factory per chain."""
+    return {
+        1: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        56: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",  # Pancake V3
+        137: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+    }.get(int(chain_id or 0), "")
+
+
+def _nkr_pool_slot0_quote(chain_id: int, token_in: str, token_out: str, amount_in: int, fees: list) -> dict:
+    """Approximate amountOut from V3 pool slot0 when Quoter contract is unusable.
+
+    Uses factory.getPool + pool.slot0 sqrtPriceX96. Conservative 0.5% haircut.
+    Returns {} on failure.
+    """
+    factory = _nkr_v3_factory(chain_id)
+    if not factory or int(amount_in or 0) <= 0:
+        return {}
+    tin = _norm_addr(token_in)
+    tout = _norm_addr(token_out)
+    if not tin or not tout or tin == tout:
+        return {}
+    # getPool(address,address,uint24) → 0x1698ee82
+    get_pool_sel = "0x1698ee82"
+    # slot0() → 0x3850c7bd
+    slot0_sel = "0x3850c7bd"
+    # token0() → 0x0dfe1681
+    token0_sel = "0x0dfe1681"
+    fee_list = [int(f) for f in (fees or []) if int(f or 0) > 0]
+    if not fee_list:
+        fee_list = [500, 2500, 3000, 10000, 100]
+    for fee in fee_list:
+        try:
+            data = get_pool_sel + _addr_to_32(tin) + _addr_to_32(tout) + _uint_to_32(int(fee))
+            raw = _eth_call(int(chain_id), factory, data)
+            words = _abi_hex_words(raw) or []
+            if not words:
+                continue
+            pool = _word_address(words[0])
+            if not pool or int(pool, 16) == 0:
+                continue
+            sraw = _eth_call(int(chain_id), pool, slot0_sel)
+            sw = _abi_hex_words(sraw) or []
+            if not sw:
+                continue
+            sqrt_p = int(sw[0], 16)
+            if sqrt_p <= 0:
+                continue
+            t0raw = _eth_call(int(chain_id), pool, token0_sel)
+            t0w = _abi_hex_words(t0raw) or []
+            token0 = _word_address(t0w[0]) if t0w else ""
+            # price token1/token0 = (sqrtP / 2^96)^2
+            # amountOut depends on zero_for_one = token_in == token0
+            Q96 = 2 ** 96
+            # Use float carefully for mid-size amounts
+            ratio = (sqrt_p / Q96) ** 2
+            zero_for_one = _norm_addr(token0) == tin
+            if zero_for_one:
+                # token0 -> token1: out = in * ratio
+                out = int(amount_in * ratio)
+            else:
+                # token1 -> token0: out = in / ratio
+                out = int(amount_in / ratio) if ratio > 0 else 0
+            # 0.5% safety haircut for approx quote
+            out = int(out * 995 // 1000)
+            if out > 0:
+                return {"amountOut": out, "fee": int(fee), "pool": pool}
+        except Exception:
+            continue
+    return {}
+
+
 def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
     """Quote Uniswap/Pancake V3 exact-input across fee tiers and ABI variants.
 
@@ -30639,6 +30756,35 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
     chain_id = int(cfg.get("chainId") or 1)
     tin = _norm_addr(token_in)
     tout = _norm_addr(token_out)
+    amount_in = int(amount_in)
+    # If amount looks like 18-dec for ~$10-100 but chain USDC is 6-dec style (1e6-1e9 range expected),
+    # also try a down-scaled candidate later via amounts list.
+    amounts_to_try = [amount_in]
+    if amount_in >= 10 ** 15:  # clearly 18-dec scale
+        scaled6 = amount_in // 10 ** 12  # 18-dec units → 6-dec units
+        if scaled6 > 0 and scaled6 not in amounts_to_try:
+            amounts_to_try.append(int(scaled6))
+    elif 10 ** 4 <= amount_in <= 10 ** 10:  # 6-dec style
+        scaled18 = amount_in * 10 ** 12
+        if scaled18 not in amounts_to_try:
+            amounts_to_try.append(int(scaled18))
+    # Cache hit (same pair / fee / amount bucket) — no RPC
+    _fee_hint = None
+    try:
+        _fee_hint = int(fee) if fee is not None else int(cfg.get("poolFee") or 0) or None
+    except Exception:
+        _fee_hint = None
+    if _fee_hint:
+        _ck = _nkr_quote_cache_key(chain_id, tin, tout, amount_in, _fee_hint)
+        _hit = _nkr_quote_cache_get(_ck)
+        if _hit is not None:
+            try:
+                if isinstance(cfg, dict):
+                    cfg["_last_quote_fee"] = int(_fee_hint)
+                    cfg["_last_quote_strategy"] = "cache"
+            except Exception:
+                pass
+            return int(_hit)
     fees = []
     if fee is not None:
         try:
@@ -30702,6 +30848,10 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                             cfg["_last_quote_strategy"] = sname
                     except Exception:
                         pass
+                    try:
+                        _nkr_quote_cache_put(_nkr_quote_cache_key(chain_id, tin, tout, amount_in, f), int(out))
+                    except Exception:
+                        pass
                     return int(out)
                 last_err = f"zero:{sname}:fee={f}"
             except Exception as exc:
@@ -30743,10 +30893,31 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                                 cfg["quoter"] = alt_n
                         except Exception:
                             pass
+                        try:
+                            _nkr_quote_cache_put(_nkr_quote_cache_key(chain_id, tin, tout, amount_in, f), int(out))
+                        except Exception:
+                            pass
                         return int(out)
                 except Exception as exc:
                     last_err = f"alt:{alt_n[:10]}:{sname}:fee={f}:{str(exc)[:80]}"
                     continue
+    # ENGINE-298: pool slot0 fallback when all quoter contracts fail (Alchemy or not).
+    pool_out = _nkr_pool_slot0_quote(chain_id, tin, tout, int(amount_in), fees)
+    if pool_out and int(pool_out.get("amountOut") or 0) > 0:
+        try:
+            if isinstance(cfg, dict):
+                cfg["_last_quote_fee"] = int(pool_out.get("fee") or fees[0] if fees else 500)
+                cfg["_last_quote_strategy"] = "pool_slot0"
+        except Exception:
+            pass
+        try:
+            _nkr_quote_cache_put(
+                _nkr_quote_cache_key(chain_id, tin, tout, amount_in, pool_out.get("fee")),
+                int(pool_out["amountOut"]),
+            )
+        except Exception:
+            pass
+        return int(pool_out["amountOut"])
     raise RuntimeError(
         f"quoter_failed chain={chain_id} token_in={tin} token_out={tout} "
         f"amount={amount_in} last={last_err}"
@@ -35340,6 +35511,28 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     quote_out = _quote_token_for_router(cfg, token_out)
     if int(amount_in or 0) <= 0:
         raise RuntimeError("trade_amount_in_zero")
+    # Normalize amount_in to settlement token decimals (BSC USDC often 18, ETH/POL USDC 6)
+    try:
+        _st = _norm_addr(token_in)
+        _td = 6
+        try:
+            _td = int((_read_token_config(vault, _st, chain_id) or {}).get("decimals") or 6)
+        except Exception:
+            # Binance-Peg USDC
+            if chain_id == 56 and _st.lower() == "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d":
+                _td = 18
+            else:
+                _td = int(cfg.get("usdcDecimals") or 6) if False else 6
+        # Heuristic: amount that encodes ~$1-$1000
+        ai = int(amount_in)
+        if _td >= 18 and 10 ** 4 <= ai <= 10 ** 10:
+            # was built as 6-dec, scale up
+            amount_in = ai * (10 ** (_td - 6))
+        elif _td <= 6 and ai >= 10 ** 14:
+            # was built as 18-dec, scale down
+            amount_in = ai // (10 ** (18 - _td))
+    except Exception:
+        pass
     quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
     fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
     # Slightly wider slippage on live NKR opens (public mempool + multi-hop delay).
