@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-294-MULTI-QUOTER"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-295-BSC-DECIMALS-QUOTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -29926,12 +29926,14 @@ def _privy_trading_cfg(chain_id=1):
     native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(cid, "ETH")
     vault = _norm_addr(_VAULT_BY_CHAIN.get(cid) or "")
     router = _norm_addr(_ROUTER_V3_BY_CHAIN.get(cid) or _ROUTER_BY_CHAIN.get(cid) or "")
-    # Uniswap V3 QuoterV2 (CREATE2 same on ETH/POL); BSC uses Pancake-compatible quoter.
+    # Uniswap V3 QuoterV2 (ETH/POL); Pancake V3 QuoterV2 on BSC.
     quoter_defaults = {
         1: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
-        56: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",
-        137: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",  # Polygon Uniswap V3 QuoterV2
+        56: "0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997",  # PancakeSwap V3 QuoterV2
+        137: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
     }
+    # Secondary quoters tried by _privy_quote if primary fails all strategies
+    
     quoter = _norm_addr(
         os.getenv(f"NEXUS_EXECUTOR_QUOTER_{native_symbol}") or
         os.getenv(f"QUOTER_V3_ADDRESS_{cid}") or quoter_defaults.get(cid, "")
@@ -30625,7 +30627,11 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
             fees.append(int(fee))
         except Exception:
             pass
-    for f in (int(cfg.get("poolFee") or 0), 500, 3000, 10000, 100, 2500):
+    # Pancake V3 on BSC uses 100/500/2500/10000 (not Uniswap's 3000).
+    preferred = (int(cfg.get("poolFee") or 0), 500, 2500, 10000, 100, 3000) if int(cfg.get("chainId") or 1) == 56 else (
+        int(cfg.get("poolFee") or 0), 500, 3000, 10000, 100, 2500
+    )
+    for f in preferred:
         if f and f not in fees:
             fees.append(int(f))
     # (name, selector, builder(fee) -> calldata)
@@ -30683,6 +30689,46 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
             except Exception as exc:
                 last_err = f"{sname}:fee={f}:{str(exc)[:100]}"
                 continue
+    # Try alternate quoter contracts on this chain (Pancake has multiple helper contracts)
+    alt_quoters = {
+        56: [
+            "0x78D78E420Da98ad378D7799bE8f4AF69033EB077",
+            "0x5eF0CDb676332c7EB77e09D9495C70b5E55a0Fb6",
+        ],
+        137: [
+            "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+        ],
+    }.get(chain_id, [])
+    primary = _norm_addr(cfg.get("quoter") or "")
+    for alt in alt_quoters:
+        alt_n = _norm_addr(alt)
+        if not alt_n or alt_n == primary:
+            continue
+        for f in fees:
+            for sname, builder in strategies:
+                try:
+                    raw = _eth_call(chain_id, alt_n, builder(f))
+                    words = []
+                    try:
+                        words = _core_vault_words(raw)
+                    except Exception:
+                        try:
+                            words = [int(x, 16) for x in (_abi_hex_words(raw) or [])]
+                        except Exception:
+                            words = []
+                    out = int(words[0]) if words else 0
+                    if out > 0:
+                        try:
+                            if isinstance(cfg, dict):
+                                cfg["_last_quote_fee"] = int(f)
+                                cfg["_last_quote_strategy"] = f"{sname}@{alt_n[:10]}"
+                                cfg["quoter"] = alt_n
+                        except Exception:
+                            pass
+                        return int(out)
+                except Exception as exc:
+                    last_err = f"alt:{alt_n[:10]}:{sname}:fee={f}:{str(exc)[:80]}"
+                    continue
     raise RuntimeError(
         f"quoter_failed chain={chain_id} token_in={tin} token_out={tout} "
         f"amount={amount_in} last={last_err}"
@@ -35498,15 +35544,8 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         budget_usd = spendable_usd
     elif budget_usd <= 0 and 0 < spendable_usd <= 1_000_000.0:
         budget_usd = spendable_usd
-    # Keep settlement_cash in RAW token units for trade amount caps (must match token decimals)
-    if _dec != 6 and settlement_cash > 0:
-        # OPEN path multiplies USD by 1e6 assuming USDC-6; normalize raw to 6-dec units for that path
-        # when settlement is USDC-like. If truly 18-dec stable, convert to 6-dec equivalent.
-        try:
-            _settlement_usd = settlement_cash / _div
-            settlement_cash = int(max(0, round(_settlement_usd * 1_000_000)))
-        except Exception:
-            pass
+    # Keep settlement_cash in RAW token units matching _dec (do NOT force 6-dec — breaks BSC USDC-18).
+    # OPEN amounts use _dec scale below.
     routes = _nkr_live_route_registry(cfg)
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
     plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
@@ -35568,7 +35607,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             if min_open <= 0:
                 min_open = 0.20
             if delta >= min_open and settlement_cash >= int(min_open * 1_000_000):
-                actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(settlement_cash, int(delta * 1_000_000))))
+                _scale = 10 ** int(_dec if "_dec" in dir() else 6)
+                try:
+                    _scale = 10 ** max(0, min(18, int(_dec)))
+                except Exception:
+                    _scale = 1_000_000
+                _amt_units = max(1, int(round(float(delta) * _scale)))
+                actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(int(settlement_cash), _amt_units)))
     actions.sort(key=lambda x: (x[0], -x[1]))
     execution = None
     last_skip = ""
@@ -35626,8 +35671,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             route = routes.get(nsym)
             if not isinstance(route, dict):
                 continue
-            amt = min(settlement_cash, max(0, int(min(budget_usd, max(plan.get("investUsd") or 0, budget_usd * 0.9)) * 1_000_000)))
-            if amt < int(0.20 * 1_000_000):
+            try:
+                _scale = 10 ** max(0, min(18, int(_dec)))
+            except Exception:
+                _scale = 1_000_000
+            _usd = float(min(budget_usd, max(float(plan.get("investUsd") or 0), budget_usd * 0.9)))
+            amt = min(int(settlement_cash), max(0, int(round(_usd * _scale))))
+            if amt < int(round(0.20 * _scale)):
                 continue
             try:
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
@@ -35652,10 +35702,14 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         )
         gate = "WAITING_ENTRY"
         decision = "WAIT"
-    elif settlement_cash < int(0.20 * 1_000_000):
+    elif settlement_cash < int(round(0.20 * (10 ** max(0, min(18, int(_dec if "_dec" in dir() else 6)))))):
+        try:
+            _sdiv = float(10 ** max(0, min(18, int(_dec))))
+        except Exception:
+            _sdiv = 1_000_000.0
         detail = (
             f"Candidate ready ({sel[0].get('symbol')}) but settlement cash too low "
-            f"({settlement_cash/1_000_000:.2f} USDC). Check vault allocation / session budget."
+            f"({settlement_cash/_sdiv:.2f} USDC). Check vault allocation / session budget."
         )
         gate = "SETTLEMENT_LOW"
         decision = "WAIT"
@@ -35664,7 +35718,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         detail = (
             f"Candidate {sel[0].get('symbol')} selected on {chain_key} "
             f"(invest ${float(plan.get('investUsd') or 0):.2f}, reserve ${float(plan.get('reserveUsd') or 0):.2f}, "
-            f"targets={tgt_n}, settlement=${settlement_cash/1_000_000:.2f}"
+            f"targets={tgt_n}, settlement=${settlement_cash / float(10 ** max(0, min(18, int(_dec) if _dec else 6))):.2f}"
             + (f", last_skip={last_skip}" if last_skip else "")
             + ")."
         )
