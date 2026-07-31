@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-307-ROUTER-MODE-MULTICHAIN-CONTROL-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-308-NKR-WORKER-CHAIN-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36430,16 +36430,74 @@ def _nkr_live_worker_cycle() -> None:
                     ]
                 except Exception:
                     pass
-            primary_chain_id = int((runnable_rows[0] or {}).get("chain_id") or 1) if runnable_rows else 1
-            try:
-                tradable_syms = list((_nkr_live_route_registry(_privy_trading_cfg(primary_chain_id)) or {}).keys())
-            except Exception:
-                tradable_syms = []
+            # ENGINE-308: never fall back to Ethereum when no runnable session exists.
+            # The worker is session/chain scoped.  PAUSED sessions remain visible in
+            # diagnostics but are never used as an execution target.
+            def _worker_chain_id(row):
+                try:
+                    return int((row or {}).get("chain_id") or 0)
+                except Exception:
+                    return 0
+
+            open_rows = [
+                r for r in (wallet_rows or [])
+                if str((r or {}).get("status") or "").upper()
+                not in {"FINALIZED", "CLOSED", "STOPPED", "COMPLETE", "COMPLETED", "CANCELLED", "ARCHIVED"}
+            ]
+            paused_rows = [r for r in open_rows if str((r or {}).get("status") or "").upper() == "PAUSED"]
+            working_rows = [
+                r for r in (runnable_rows or [])
+                if str((r or {}).get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+            ]
+            working_chain_ids = sorted({cid for cid in (_worker_chain_id(r) for r in working_rows) if cid > 0})
+            paused_chain_ids = sorted({cid for cid in (_worker_chain_id(r) for r in paused_rows) if cid > 0})
+            primary_chain_id = working_chain_ids[0] if working_chain_ids else 0
+
+            tradable_syms = []
+            if primary_chain_id > 0:
+                try:
+                    tradable_syms = list((_nkr_live_route_registry(_privy_trading_cfg(primary_chain_id)) or {}).keys())
+                except Exception:
+                    tradable_syms = []
+
             diag = _nkr_runtime_decision_diagnostics(
                 processed, market_rows, settings, summary,
-                session_chain_id=primary_chain_id,
+                session_chain_id=primary_chain_id or None,
                 tradable_symbols=tradable_syms,
             )
+            diag["working_chains"] = [_nkr_chain_key_from_id(cid) for cid in working_chain_ids]
+            diag["paused_chains"] = [_nkr_chain_key_from_id(cid) for cid in paused_chain_ids]
+            diag["session_states"] = [
+                {
+                    "chain": _nkr_chain_key_from_id(_worker_chain_id(r)),
+                    "chainId": _worker_chain_id(r),
+                    "sessionId": str((r or {}).get("onchain_session_id") or ""),
+                    "status": str((r or {}).get("status") or "UNKNOWN").upper(),
+                }
+                for r in open_rows
+            ]
+            if not working_rows:
+                # All live sessions are paused (or none exist). Clear stale ETH/position
+                # fields instead of carrying the previous completed session forward.
+                diag.update({
+                    "best_candidate": "",
+                    "candidate_score": 0.0,
+                    "candidate_momentum_24h": 0.0,
+                    "candidate_price": 0.0,
+                    "active_asset": "",
+                    "position_state": "",
+                    "position_value_usd": 0.0,
+                    "tx_hash": "",
+                    "pending_tx": "",
+                    "session_chain": "",
+                    "decision": "PAUSED" if paused_rows else "IDLE",
+                    "gate_status": "ALL_SESSIONS_PAUSED" if paused_rows else "NO_ACTIVE_SESSION",
+                    "decision_detail": (
+                        "All NKR sessions are paused: "
+                        + ", ".join(f"{x['chain']} #{x['sessionId']}" for x in diag["session_states"] if x["status"] == "PAUSED")
+                        if paused_rows else "No active NKR session is available for execution."
+                    ),
+                })
             # Merge orchestration tip into diagnostics (compact UI uses recommendation/tip).
             if multi_plan.get("tip"):
                 existing_rec = str(diag.get("recommendation") or "")
@@ -36600,25 +36658,33 @@ def _nkr_live_worker_cycle() -> None:
                     bits.append(f"{ch}:{g}" + (f"/{a}" if a else ""))
                 if bits:
                     detail = (detail + " | " + ", ".join(bits)).strip(" |")[:400]
+            runtime_status = "running" if working_rows else ("paused" if paused_rows else "idle")
             _live_engine_mark(
-                "NKR", tick=True, status="running",
+                "NKR", tick=True, status=runtime_status,
                 assets_scanned=len(market_rows),
                 tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0),
-                best_candidate=exec_asset or diag.get("best_candidate") or "",
+                best_candidate=(exec_asset or diag.get("best_candidate") or "") if working_rows else "",
                 candidate_score=execution.get("score", diag.get("candidate_score", 0.0)),
                 candidate_momentum_24h=execution.get("change", diag.get("candidate_momentum_24h", 0.0)),
                 candidate_price=execution.get("price", diag.get("candidate_price", 0.0)),
-                decision=execution.get("decision") or diag.get("decision") or "WAIT",
-                gate_status=execution.get("gate") or diag.get("gate_status") or "",
-                decision_detail=detail[:400],
-                reason="CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed",
-                pending_tx=execution.get("txHash", ""),
-                last_error=err_keep,
+                decision=(execution.get("decision") or diag.get("decision") or "WAIT") if working_rows else diag.get("decision", "IDLE"),
+                gate_status=(execution.get("gate") or diag.get("gate_status") or "") if working_rows else diag.get("gate_status", "NO_ACTIVE_SESSION"),
+                decision_detail=(detail[:400] if working_rows else str(diag.get("decision_detail") or "")[:400]),
+                reason=("CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed") if working_rows else ("all NKR sessions paused" if paused_rows else "no active NKR session"),
+                pending_tx=execution.get("txHash", "") if working_rows else "",
+                last_error=err_keep if working_rows else "",
                 # Multi-EVM Strategist fields (user panel + System Info)
                 best_overall=diag.get("best_overall") or "",
                 best_overall_score=diag.get("best_overall_score") or 0,
                 best_overall_chain=diag.get("best_overall_chain") or "",
-                session_chain=diag.get("session_chain") or _nkr_chain_key_from_id(primary_chain_id),
+                session_chain=(diag.get("session_chain") or (_nkr_chain_key_from_id(primary_chain_id) if primary_chain_id else "")),
+                working_chains=diag.get("working_chains") or [],
+                paused_chains=diag.get("paused_chains") or [],
+                session_states=diag.get("session_states") or [],
+                active_asset=(execution.get("asset") or diag.get("active_asset") or "") if working_rows else "",
+                position_state=(execution.get("positionState") or diag.get("position_state") or "") if working_rows else "",
+                position_value_usd=(execution.get("positionValueUsd") or diag.get("position_value_usd") or 0) if working_rows else 0,
+                tx_hash=(execution.get("txHash") or diag.get("tx_hash") or "") if working_rows else "",
                 recommendation=diag.get("recommendation") or "",
                 multi_chain_tip=(diag.get("multi_chain_plan") or {}).get("tip") or "",
                 multi_chain_actions=(diag.get("multi_chain_plan") or {}).get("actions") or [],
