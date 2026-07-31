@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-300-WMATIC-ADDRESS-FIX"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-302-AGGRESSIVE-AUDIT-SCOPE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -8257,8 +8257,10 @@ def api_nexus_nkr_aggressive_ack():
         return err("Nexus NKR Aggressive acknowledgement must be accepted", 400)
 
     scope = str(body.get("scope") or ("session" if body.get("session_id") or body.get("sessionId") else "draft")).strip().lower()
+    if scope in ("session_start", "active_or_draft", "draft_consent"):
+        scope = "session" if "session" in scope else "draft"
     if scope not in ("draft", "session"):
-        scope = "draft"
+        scope = "session" if (body.get("session_id") or body.get("sessionId")) else "draft"
     sid = str(body.get("session_id") or body.get("sessionId") or body.get("nkr_session_id") or "").strip()
     warning_version = str(body.get("warning_version") or body.get("warningVersion") or "AGGRESSIVE_WARNING_V1").strip()[:80]
     frontend_build = str(body.get("frontend_build") or body.get("frontendBuild") or "").strip()[:80]
@@ -8266,6 +8268,7 @@ def api_nexus_nkr_aggressive_ack():
         budget_usd = float(str(body.get("budget_usd") or body.get("budgetUsd") or 0).replace(",", "."))
     except Exception:
         budget_usd = 0.0
+    chain = str(body.get("chain") or body.get("chainKey") or "").strip().upper()[:12]
 
     ts = now_ts()
     acceptance_id = f"NKR-AGR-{ts}-{uuid.uuid4().hex[:18]}"
@@ -8280,6 +8283,7 @@ def api_nexus_nkr_aggressive_ack():
         "scope": scope,
         "session_id": sid,
         "wallet": wa,
+        "chain": chain,
     }
 
     conn = _db()
@@ -34346,12 +34350,17 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
         filtered = []
         for row in rows:
             oid = str(row.get("onchain_session_id") or "").strip()
-            if oid == tid or (tid.split("-")[-1] == oid and oid.isdigit()):
+            lid = str(row.get("id") or "").strip()
+            if oid == tid or lid == tid:
+                filtered.append(row)
+            elif tid.split("-")[-1] == oid and oid.isdigit():
                 filtered.append(row)
             elif tid.upper().startswith("NKR-LIVE-") and oid == tid.split("-")[-1]:
                 filtered.append(row)
-        if filtered:
-            rows = filtered
+            elif tid.upper() in lid.upper() and oid:
+                filtered.append(row)
+        # Never pause/resume every chain when a target was requested but not matched.
+        rows = filtered
     results = []
     for row in rows:
         sid = int(str(row.get("onchain_session_id") or "0"))
@@ -36369,8 +36378,21 @@ def _nkr_live_worker_cycle() -> None:
                 decision_session = _nkr_processed_session_for_live_row(processed, live_row)
                 try:
                     with _NKR_LIVE_TRADE_LOCK:
+                        sess_settings = dict(settings or {})
+                        try:
+                            for _src in (live_row, live_row.get("meta") if isinstance(live_row.get("meta"), dict) else {}):
+                                if not isinstance(_src, dict):
+                                    continue
+                                for _k in ("nkrCapitalMode", "nkr_capital_mode", "mode", "performanceMode", "capitalMode"):
+                                    _v = _src.get(_k)
+                                    if _v:
+                                        sess_settings["nkrCapitalMode"] = _v
+                                        sess_settings["mode"] = _v
+                                        break
+                        except Exception:
+                            pass
                         execution = _nkr_live_execute_portfolio(
-                            wallet, live_row, market_rows, settings
+                            wallet, live_row, market_rows, sess_settings
                         )
                     _nkr_confirm_processed_live_exit(processed, live_row, execution)
                 except Exception as exec_exc:
@@ -36446,6 +36468,22 @@ def _nkr_live_worker_cycle() -> None:
                     (e for _, e in executions if e.get("error") or str(e.get("gate") or "").endswith("ERROR")),
                     executions[-1][1] if executions else {},
                 )
+            # Multi-session inventory for System Info (one line per live chain/session)
+            try:
+                inv = []
+                for lr in (wallet_rows or []):
+                    ch = _nkr_chain_key_from_id((lr or {}).get("chain_id") or 1)
+                    st = str((lr or {}).get("status") or "?")
+                    oid = str((lr or {}).get("onchain_session_id") or "")
+                    inv.append(f"{ch}:{st}:#{oid}")
+                if inv:
+                    execution = dict(execution or {})
+                    prev = str(execution.get("detail") or "")
+                    tag = "sessions=[" + ", ".join(inv) + "]"
+                    if tag not in prev:
+                        execution["detail"] = (prev + " | " + tag).strip(" |")[:400]
+            except Exception:
+                pass
             exec_asset = str(execution.get("asset") or diag.get("best_candidate") or "")
             detail = str(execution.get("detail") or diag.get("decision_detail") or "")
             err_keep = str(execution.get("error") or "")
@@ -36608,8 +36646,15 @@ def api_nkr_control():
     target_id = str(body.get("sessionId") or body.get("session_id") or "").strip()
     if target_id:
         matched = [x for x in nkr_sessions if _nkr_session_matches_control_target(x, target_id)]
-        # Never drop to empty just because UI sent on-chain id vs local id.
-        nkr_sessions = matched if matched else nkr_sessions
+        # ENGINE-301: NEVER fall back to all sessions — that paused BNB+POL together.
+        if not matched:
+            return jsonify({
+                "status": "error",
+                "error": "target_session_not_found",
+                "sessionId": target_id,
+                "message": "Pause/Stop target session was not found. No other sessions were changed.",
+            }), 404
+        nkr_sessions = matched
     if action == "DELETE":
         # Delete forever: add tombstone and physically remove session/events.
         conn = _db()
@@ -36655,18 +36700,35 @@ def api_nkr_control():
             onchain_error = str(exc)[:240]
         # Always persist local PAUSED/ACTIVE so UI + worker respect the user action.
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
-        next_control = "PAUSED" if action == "PAUSE" else "RUNNING"
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
-        else:
-            # No local presentation row yet — still stamp control state.
-            pass
+        # Global control state: PAUSED only when EVERY active NKR session is paused.
+        try:
+            all_sess, _, _ = _db_get_rotation_sessions(wa)
+            nkr_all = [x for x in (all_sess or []) if _nkr_is_session(x)]
+            openish = []
+            for x in nkr_all:
+                st = str(x.get("status") or x.get("lifecycleState") or "").upper()
+                if st in {"STOPPED", "CLOSED", "FINALIZED", "EXPIRED", "DELETED"}:
+                    continue
+                openish.append(st)
+            if not openish:
+                next_control = "WAITING"
+            elif all(st == "PAUSED" for st in openish):
+                next_control = "PAUSED"
+            else:
+                next_control = "RUNNING"
+        except Exception:
+            next_control = "PAUSED" if action == "PAUSE" else "RUNNING"
         _db_set_user_app_state(wa, {"ui": {"nkrControlState": next_control}})
         _live_engine_mark(
             "NKR",
-            status="paused" if action == "PAUSE" else "running",
+            status="paused" if next_control == "PAUSED" else "running",
             decision=next_control,
-            reason=("User control confirmed on-chain" if pause_results and not onchain_error else f"User control stored locally{(': ' + onchain_error) if onchain_error else ''}"),
+            reason=(
+                f"User {action} on session {target_id or 'all'}; "
+                + ("on-chain ok" if pause_results and not onchain_error else f"local{(': ' + onchain_error) if onchain_error else ''}")
+            ),
             pending_tx="",
             last_error=onchain_error or "",
         )
