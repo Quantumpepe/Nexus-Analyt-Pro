@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-312-EXACT-CARD-STOP-CHAIN-TX-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-313-LIVE-MERGED-EVM-ROUTER-CALLDATA-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31066,10 +31066,17 @@ def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, am
 
 
 def _privy_exact_input_single_legacy_data(token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline):
-    # Legacy/standard SwapRouter V3 exactInputSingle tuple includes deadline.
+    # Legacy/Pancake V3 exactInputSingle tuple includes deadline.
     return (_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR + _addr_to_32(token_in) + _addr_to_32(token_out) +
             _uint_to_32(fee) + _addr_to_32(recipient) + _uint_to_32(deadline) +
             _uint_to_32(amount_in) + _uint_to_32(amount_out_min) + _uint_to_32(0))
+
+
+def _router_exact_input_single_data(selector, token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline):
+    sel = str(selector or "").lower()
+    if sel == _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR:
+        return _privy_exact_input_single_legacy_data(token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline)
+    return _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, amount_out_min, fee)
 
 
 def _router_trade_data_candidates(cfg, token_in, token_out, recipient, amount_in, amount_out_min, fee, deadline):
@@ -31127,19 +31134,25 @@ def _privy_unwrap_weth9_data(amount_min, recipient):
     return _PRIVY_UNWRAP_WETH9_SELECTOR + _uint_to_32(amount_min) + _addr_to_32(recipient)
 
 
-def _native_router_trade_data(cfg, token_in, token_out, recipient, amount_in, amount_out_min, fee):
+def _native_router_trade_data(cfg, token_in, token_out, recipient, amount_in, amount_out_min, fee, *, exact_selector=None, deadline=None):
     token_in_n = _norm_addr(token_in)
     token_out_n = _norm_addr(token_out)
     native = NATIVE_TOKEN_ADDRESS
+    exact_selector = str(exact_selector or _PRIVY_EXACT_INPUT_SINGLE_SELECTOR).lower()
+    deadline = int(deadline or (now_ts() + 300))
+    wrapped = _norm_addr(cfg.get("weth") or cfg.get("wrappedNative") or "")
+    if not _looks_like_evm_addr(wrapped):
+        raise RuntimeError("wrapped_native_not_configured")
     if token_in_n.lower() == native.lower():
-        # SwapRouter02 accepts msg.value and internally pays the WETH input.
-        return _privy_exact_input_single_data(cfg["weth"], token_out_n, recipient, amount_in, amount_out_min, fee), _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+        data = _router_exact_input_single_data(exact_selector, wrapped, token_out_n, recipient, amount_in, amount_out_min, fee, deadline)
+        return data, exact_selector
     if token_out_n.lower() == native.lower():
-        # Swap to WETH inside the router, then unwrap and return native ETH to the Vault.
-        swap = _privy_exact_input_single_data(token_in_n, cfg["weth"], cfg["router"], amount_in, amount_out_min, fee)
+        # Swap to wrapped native, then unwrap in one router multicall so CoreVault receives native value.
+        swap = _router_exact_input_single_data(exact_selector, token_in_n, wrapped, cfg["router"], amount_in, amount_out_min, fee, deadline)
         unwrap = _privy_unwrap_weth9_data(amount_out_min, recipient)
         return _privy_multicall_data([swap, unwrap]), _PRIVY_MULTICALL_SELECTOR
-    return _privy_exact_input_single_data(token_in_n, token_out_n, recipient, amount_in, amount_out_min, fee), _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+    data = _router_exact_input_single_data(exact_selector, token_in_n, token_out_n, recipient, amount_in, amount_out_min, fee, deadline)
+    return data, exact_selector
 
 
 def _quote_token_for_router(cfg, token):
@@ -35807,6 +35820,34 @@ def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id
     return _norm_addr(words[1] if len(words) > 1 else fallback)
 
 
+def _resolve_exact_input_selector(vault, router, chain_id, cfg):
+    """Choose the exactInputSingle ABI actually permitted by this chain's Vault.
+
+    The optional ENV order works for every configured EVM chain. Both common V3
+    tuple variants remain automatic fallbacks.
+    """
+    env_raw = os.getenv(f"ROUTER_EXACT_INPUT_SINGLE_SELECTORS_{int(chain_id)}", "")
+    candidates = [x.strip().lower() for x in env_raw.split(",") if x.strip()]
+    # Pancake V3 commonly uses the tuple with deadline; SwapRouter02 omits it.
+    if int(chain_id) == 56:
+        candidates += [_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_SELECTOR]
+    else:
+        candidates += [_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR]
+    seen = []
+    for sel in candidates:
+        if sel in seen or not re.fullmatch(r"0x[0-9a-f]{8}", sel):
+            continue
+        seen.append(sel)
+        try:
+            if _read_router_selector_allowed(vault, router, sel, chain_id):
+                return sel
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"live_router_exact_selector_not_allowed:chain={chain_id}:router={router}:tested={','.join(seen)}"
+    )
+
+
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
     chain_id = int(live_row.get("chain_id") or 1)
@@ -35859,34 +35900,28 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     if min_out <= 0:
         raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
-    router_data = ""
-    required_selector = ""
-    selector_checks = []
-    for candidate_data, candidate_selector in _router_trade_data_candidates(
-        cfg, token_in, token_out, vault, amount_in, min_out, fee_used, deadline
-    ):
-        try:
-            allowed = bool(_read_router_selector_allowed(vault, router, candidate_selector, chain_id))
-        except Exception as sel_exc:
-            # Do not silently choose a selector on a successful explicit false read.
-            # RPC decode failure may still use the chain's primary ABI as a last resort.
-            allowed = False
-            selector_checks.append(f"{candidate_selector}:rpc:{str(sel_exc)[:60]}")
-        else:
-            selector_checks.append(f"{candidate_selector}:{'yes' if allowed else 'no'}")
-        if allowed:
-            router_data, required_selector = candidate_data, candidate_selector
-            break
-    if not router_data:
+    exact_selector = _resolve_exact_input_selector(vault, router, chain_id, cfg)
+    router_data, required_selector = _native_router_trade_data(
+        cfg, token_in, token_out, vault, amount_in, min_out, fee_used,
+        exact_selector=exact_selector, deadline=deadline,
+    )
+    try:
+        selector_allowed = bool(_read_router_selector_allowed(vault, router, required_selector, chain_id))
+    except Exception as sel_exc:
+        raise RuntimeError(
+            f"live_router_selector_check_failed:{route['symbol']}:chain={chain_id}:router={router}:"
+            f"selector={required_selector}:{str(sel_exc)[:120]}"
+        )
+    if not selector_allowed:
         raise RuntimeError(
             f"live_router_selector_not_allowed:{route['symbol']}:chain={chain_id}:router={router}:"
-            + ",".join(selector_checks)
+            f"selector={required_selector}:exact={exact_selector}"
         )
     call = _encode_execute_trade(sid, router, token_in, token_out, amount_in, min_out, deadline, router_data)
     ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
-    return {"txHash": txh, "quoteOut": quote, "minOut": min_out}
+    return {"txHash": txh, "quoteOut": quote, "minOut": min_out, "router": router, "exactSelector": exact_selector, "outerSelector": required_selector, "fee": fee_used, "chainId": chain_id}
 
 
 def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapshots: dict, market_rows: list[dict], plan: dict) -> None:
