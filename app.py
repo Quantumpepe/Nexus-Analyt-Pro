@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-293-QUOTER-V2-ABI"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-294-MULTI-QUOTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -30607,53 +30607,86 @@ def _privy_erc20_balance(token, wallet):
 
 
 def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
-    """Quote Uniswap V3 exact-input. Tries several fee tiers — a single wrong fee
-    causes public RPC 'execution reverted' even when a liquid pool exists (e.g. 3000).
-    Returns amount_out; successful fee is stored on cfg['_last_quote_fee'].
+    """Quote Uniswap/Pancake V3 exact-input across fee tiers and ABI variants.
+
+    Tries QuoterV2 struct encoding (offset+fields) and QuoterV1 flat encoding
+    (fee before amountIn). Stores successful fee on cfg['_last_quote_fee'].
     """
     if not _looks_like_evm_addr(cfg.get("quoter")):
         raise RuntimeError("quoter_not_configured")
     if int(amount_in or 0) <= 0:
         raise RuntimeError("quote_amount_in_zero")
-    selector = "0xc6a5026a"
     chain_id = int(cfg.get("chainId") or 1)
+    tin = _norm_addr(token_in)
+    tout = _norm_addr(token_out)
     fees = []
     if fee is not None:
         try:
             fees.append(int(fee))
         except Exception:
             pass
-    # Preferred order: configured default, then common V3 tiers
-    for f in (int(cfg.get("poolFee") or 0), 500, 3000, 10000, 100):
+    for f in (int(cfg.get("poolFee") or 0), 500, 3000, 10000, 100, 2500):
         if f and f not in fees:
             fees.append(int(f))
-    last_err = "quoter_no_fee_worked"
+    # (name, selector, builder(fee) -> calldata)
+    # V2: quoteExactInputSingle((address,address,uint256,uint24,uint160))
+    sel_v2 = "0xc6a5026a"
+    # V1: quoteExactInputSingle(address,address,uint24,uint256,uint160)
+    sel_v1 = "0xf7729d43"
+    def _build_v2(f):
+        return (
+            sel_v2
+            + _uint_to_32(32)
+            + _addr_to_32(tin) + _addr_to_32(tout)
+            + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
+        )
+    def _build_v1(f):
+        return (
+            sel_v1
+            + _addr_to_32(tin) + _addr_to_32(tout)
+            + _uint_to_32(int(f)) + _uint_to_32(amount_in) + _uint_to_32(0)
+        )
+    def _build_v2_flat(f):
+        # Some forks accept flat V2 field order without offset
+        return (
+            sel_v2
+            + _addr_to_32(tin) + _addr_to_32(tout)
+            + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
+        )
+    strategies = (("v2", _build_v2), ("v1", _build_v1), ("v2flat", _build_v2_flat))
+    last_err = "quoter_no_strategy_worked"
     for f in fees:
-        try:
-            # QuoterV2 quoteExactInputSingle takes ONE struct arg → leading offset 0x20.
-            # Flat encoding without offset makes every fee tier "execution reverted"
-            # (even USDC/WETH). Field order: tokenIn, tokenOut, amountIn, fee, sqrtPriceLimitX96.
-            data = (
-                selector
-                + _uint_to_32(32)
-                + _addr_to_32(token_in) + _addr_to_32(token_out)
-                + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
-            )
-            raw = _eth_call(chain_id, cfg["quoter"], data)
-            words = _core_vault_words(raw)
-            out = int(words[0]) if words else 0
-            if out > 0:
+        for sname, builder in strategies:
+            try:
+                raw = _eth_call(chain_id, cfg["quoter"], builder(f))
+                words = []
                 try:
-                    if isinstance(cfg, dict):
-                        cfg["_last_quote_fee"] = int(f)
+                    words = _core_vault_words(raw)
                 except Exception:
-                    pass
-                return int(out)
-            last_err = f"quoter_returned_zero:fee={f}"
-        except Exception as exc:
-            last_err = f"quoter_fee_{f}:{str(exc)[:120]}"
-            continue
-    raise RuntimeError(f"quoter_failed token_in={token_in} token_out={token_out} amount={amount_in} last={last_err}")
+                    words = []
+                if not words:
+                    try:
+                        hw = _abi_hex_words(raw)
+                        words = [int(x, 16) for x in hw] if hw else []
+                    except Exception:
+                        words = []
+                out = int(words[0]) if words else 0
+                if out > 0:
+                    try:
+                        if isinstance(cfg, dict):
+                            cfg["_last_quote_fee"] = int(f)
+                            cfg["_last_quote_strategy"] = sname
+                    except Exception:
+                        pass
+                    return int(out)
+                last_err = f"zero:{sname}:fee={f}"
+            except Exception as exc:
+                last_err = f"{sname}:fee={f}:{str(exc)[:100]}"
+                continue
+    raise RuntimeError(
+        f"quoter_failed chain={chain_id} token_in={tin} token_out={tout} "
+        f"amount={amount_in} last={last_err}"
+    )
 
 
 def _privy_exact_input_single_data(token_in, token_out, recipient, amount_in, amount_out_min, fee):
