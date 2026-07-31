@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-309-ONCHAIN-CONTROL-WORKER-TRUTH-FIX"
+BACKEND_BUILD_ID = "B-2026.07.31-ENGINE-310-SESSION-CARD-CONTROL-DIRECT-ONCHAIN-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -724,7 +724,7 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
         _live_engine_mark(engine, status="error", decision="STOP_FAILED", reason="Safe stop requires owner review", pending_tx="", last_error=str(exc)[:1000])
 
 
-def _live_finalize_engine_sessions(wallet, engine, target_session_id=None):
+def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, target_chain=None):
     """Queue a browser-independent safe stop for one exact CoreVault session.
 
     When target_session_id is supplied, only that on-chain session is processed.
@@ -733,11 +733,16 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None):
     """
     rows = _live_active_sessions(wallet, engine)
     target_sid = str(target_session_id or "").strip()
+    target_chain_key = str(target_chain or "").strip().upper()
+    target_chain_id = int(_nkr_chain_id_from_key(target_chain_key) or 0) if target_chain_key else 0
     if target_sid:
         matched = []
         tail = target_sid.split("-")[-1] if "-" in target_sid else target_sid
         for x in rows:
             oid = str(x.get("onchain_session_id") or "").strip()
+            cid = int(x.get("chain_id") or 0)
+            if target_chain_id and cid != target_chain_id:
+                continue
             if oid == target_sid or oid == tail:
                 matched.append(x)
         rows = matched
@@ -36928,16 +36933,36 @@ def api_nkr_control():
     target_chain = str(body.get("chain") or body.get("chainKey") or body.get("chain_key") or "").strip().upper()
     if target_id:
         matched = [x for x in nkr_sessions if _nkr_session_matches_control_target(x, target_id, target_chain)]
-        # ENGINE-303: NEVER fall back to all sessions — that paused BNB+POL together.
+        # The CoreVault registry is authoritative. A card reconstructed directly
+        # from on-chain state may not yet have a matching local rotation row.
+        # Never make its buttons depend on that optional cache row.
         if not matched:
-            return jsonify({
-                "status": "error",
-                "error": "target_session_not_found",
-                "sessionId": target_id,
-                "chain": target_chain,
-                "message": "Pause/Stop target session was not found. No other sessions were changed.",
-            }), 404
-        nkr_sessions = matched
+            tail = target_id.split("-")[-1] if "-" in target_id else target_id
+            wanted_chain_id = int(_nkr_chain_id_from_key(target_chain) or 0) if target_chain else 0
+            live_matches = []
+            try:
+                for live_row in _live_active_sessions(wa, "NKR"):
+                    oid = str(live_row.get("onchain_session_id") or "").strip()
+                    cid = int(live_row.get("chain_id") or 0)
+                    if wanted_chain_id and cid != wanted_chain_id:
+                        continue
+                    if oid == target_id or oid == tail:
+                        live_matches.append(dict(live_row))
+            except Exception:
+                live_matches = []
+            if not live_matches:
+                return jsonify({
+                    "status": "error",
+                    "error": "target_session_not_found",
+                    "sessionId": target_id,
+                    "chain": target_chain,
+                    "message": "The exact on-chain session was not found. No other sessions were changed.",
+                }), 404
+            # Keep local updates optional; pause/resume/stop below operate directly
+            # on the exact live registry row using chain + on-chain session id.
+            nkr_sessions = []
+        else:
+            nkr_sessions = matched
     elif body.get("requireSessionId"):
         return jsonify({"status": "error", "error": "session_id_required", "message": "sessionId required for per-card control"}), 400
     if action == "DELETE":
@@ -36969,7 +36994,7 @@ def api_nkr_control():
     if action in {"STOP", "STOP_EXIT", "RETRY_EXIT", "PANIC_STOP"}:
         # Safe live stop is asynchronous and is bound to the exact on-chain session
         # selected by the user. Never finalize or mutate unrelated historical rows.
-        finalize_results = _live_finalize_engine_sessions(wa, "NKR", target_id or None)
+        finalize_results = _live_finalize_engine_sessions(wa, "NKR", target_id or None, target_chain or None)
         if target_id and finalize_results and finalize_results[0].get("status") == "not_found":
             return jsonify({"status":"error","error":"target_onchain_session_not_found","sessionId":target_id,"coreVaultFinalize":finalize_results}), 404
     elif action in {"PAUSE", "RESUME"}:
@@ -36998,6 +37023,12 @@ def api_nkr_control():
         updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
+        else:
+            # On-chain-only card: rebuild the local projection after confirmed control.
+            try:
+                _reconcile_live_registry_from_corevault(wa, "NKR")
+            except Exception:
+                pass
         # Always mirror local control into live registry so the worker skips PAUSED rows
         # even when the on-chain setSessionPaused tx reverts (privy_rpc_400).
         try:
