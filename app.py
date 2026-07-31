@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-302-AGGRESSIVE-AUDIT-SCOPE"
+BACKEND_BUILD_ID = "B-2026.07.30-ENGINE-303-PAUSE-PER-SESSION-FAST"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34343,23 +34343,25 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     _db_set_rotation_sessions(wallet, [row], active_session_id=local_id, replace_missing=False)
 
 
-def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = None) -> list[dict]:
+def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = None, target_chain: str | None = None) -> list[dict]:
     rows = _live_active_sessions(wallet, "NKR")
     tid = str(target_id or "").strip()
+    t_chain = str(target_chain or "").strip().upper()
     if tid:
         filtered = []
         for row in rows:
             oid = str(row.get("onchain_session_id") or "").strip()
             lid = str(row.get("id") or "").strip()
-            if oid == tid or lid == tid:
+            cid = int(row.get("chain_id") or 0)
+            r_chain = {1: "ETH", 56: "BNB", 137: "POL"}.get(cid, "")
+            if t_chain and r_chain and t_chain != r_chain:
+                continue
+            if lid == tid or (tid.upper().startswith("NKR-LIVE-") and lid.upper() == tid.upper()):
                 filtered.append(row)
-            elif tid.split("-")[-1] == oid and oid.isdigit():
+            elif oid == tid and (not t_chain or t_chain == r_chain):
                 filtered.append(row)
-            elif tid.upper().startswith("NKR-LIVE-") and oid == tid.split("-")[-1]:
+            elif tid.upper().startswith("NKR-LIVE-") and oid == tid.split("-")[-1] and (not t_chain or t_chain == r_chain):
                 filtered.append(row)
-            elif tid.upper() in lid.upper() and oid:
-                filtered.append(row)
-        # Never pause/resume every chain when a target was requested but not matched.
         rows = filtered
     results = []
     for row in rows:
@@ -34408,9 +34410,18 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
             pass
         data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
         ref = f"nexus-nkr-{'pause' if paused else 'resume'}-{sid}-{int(time.time())}"
-        sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref)
-        txh = str(sent.get("hash") or "")
-        _privy_wait_receipt(txh, timeout_sec=240)
+        txh = ""
+        try:
+            sent = _privy_send_delegated_transaction(wallet_id, {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"}, ref)
+            txh = str(sent.get("hash") or "")
+            # Do not block the control API on long receipt waits (FE aborts ~60s).
+            try:
+                _privy_wait_receipt(txh, timeout_sec=25)
+            except Exception:
+                pass
+        except Exception as send_exc:
+            results.append({"sessionId": sid, "status": "send_failed", "error": str(send_exc)[:180], "txHash": ""})
+            continue
         conn = _db()
         try:
             with DB_WRITE_LOCK:
@@ -34418,7 +34429,7 @@ def _nkr_set_onchain_pause(wallet: str, paused: bool, target_id: str | None = No
                 conn.commit()
         finally:
             conn.close()
-        results.append({"sessionId": sid, "status": "paused" if paused else "active", "txHash": txh})
+        results.append({"sessionId": sid, "status": "paused" if paused else "active", "txHash": txh, "chainId": chain_id})
     return results
 
 
@@ -36600,14 +36611,30 @@ def _ensure_nkr_live_worker_started() -> None:
         _NKR_LIVE_WORKER_STARTED = True
 
 
-def _nkr_session_matches_control_target(sess: dict, target_id: str) -> bool:
-    """Match UI sessionId against local id OR on-chain id (e.g. NKR-LIVE-ETH-5 vs 5)."""
+def _nkr_session_matches_control_target(sess: dict, target_id: str, target_chain: str = "") -> bool:
+    """Match UI sessionId against local id OR on-chain id, preferably with chain.
+
+    Numeric-only ids (e.g. "5") MUST also match chain when provided, otherwise
+    ETH#5 and POL#5 would both pause.
+    """
     t = str(target_id or "").strip()
     if not t:
-        return True
+        return False  # never match-all; caller must pass an id
     if not isinstance(sess, dict):
         return False
     meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+    sess_chain = str(
+        sess.get("chain") or sess.get("chainKey") or meta.get("chain") or meta.get("chain_key") or ""
+    ).strip().upper()
+    chain_id = int(sess.get("chainId") or sess.get("chain_id") or meta.get("chain_id") or 0)
+    if not sess_chain and chain_id:
+        sess_chain = {1: "ETH", 56: "BNB", 137: "POL"}.get(chain_id, "")
+    t_chain = str(target_chain or "").strip().upper()
+    # If target encodes chain: NKR-LIVE-BNB-3
+    if t.upper().startswith("NKR-LIVE-"):
+        parts = t.split("-")
+        if len(parts) >= 4:
+            t_chain = t_chain or parts[2].upper()
     candidates = [
         sess.get("id"),
         sess.get("session_id"),
@@ -36620,13 +36647,23 @@ def _nkr_session_matches_control_target(sess: dict, target_id: str) -> bool:
     ]
     raw = {str(c).strip() for c in candidates if c is not None and str(c).strip()}
     if t in raw:
+        if t_chain and sess_chain and t_chain != sess_chain:
+            return False
         return True
-    # NKR-LIVE-ETH-5 ↔ 5
     t_tail = t.split("-")[-1] if "-" in t else t
     for c in raw:
-        if c.split("-")[-1] == t_tail and t_tail.isdigit():
+        c_tail = c.split("-")[-1] if "-" in str(c) else str(c)
+        if t_tail.isdigit() and c_tail == t_tail:
+            if t_chain and sess_chain and t_chain != sess_chain:
+                continue
+            # Without chain, only exact full-id match above is safe for multi-chain.
+            if not t_chain:
+                # Prefer full local ids like NKR-LIVE-BNB-3
+                if str(c).upper().startswith("NKR-LIVE-") and t.upper().startswith("NKR-LIVE-"):
+                    return str(c).upper() == t.upper()
+                continue
             return True
-        if t.upper().startswith("NKR-LIVE-") and c == t_tail:
+        if t.upper().startswith("NKR-LIVE-") and c == t_tail and (not t_chain or t_chain == sess_chain):
             return True
     return False
 
@@ -36644,17 +36681,21 @@ def api_nkr_control():
     sessions, active, _ = _db_get_rotation_sessions(wa)
     nkr_sessions = [dict(x) for x in sessions if _nkr_is_session(x)]
     target_id = str(body.get("sessionId") or body.get("session_id") or "").strip()
+    target_chain = str(body.get("chain") or body.get("chainKey") or body.get("chain_key") or "").strip().upper()
     if target_id:
-        matched = [x for x in nkr_sessions if _nkr_session_matches_control_target(x, target_id)]
-        # ENGINE-301: NEVER fall back to all sessions — that paused BNB+POL together.
+        matched = [x for x in nkr_sessions if _nkr_session_matches_control_target(x, target_id, target_chain)]
+        # ENGINE-303: NEVER fall back to all sessions — that paused BNB+POL together.
         if not matched:
             return jsonify({
                 "status": "error",
                 "error": "target_session_not_found",
                 "sessionId": target_id,
+                "chain": target_chain,
                 "message": "Pause/Stop target session was not found. No other sessions were changed.",
             }), 404
         nkr_sessions = matched
+    elif body.get("requireSessionId"):
+        return jsonify({"status": "error", "error": "session_id_required", "message": "sessionId required for per-card control"}), 400
     if action == "DELETE":
         # Delete forever: add tombstone and physically remove session/events.
         conn = _db()
@@ -36695,7 +36736,7 @@ def api_nkr_control():
         pause_results = []
         onchain_error = ""
         try:
-            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None)
+            pause_results = _nkr_set_onchain_pause(wa, action == "PAUSE", target_id=target_id or None, target_chain=target_chain or None)
         except Exception as exc:
             onchain_error = str(exc)[:240]
         # Always persist local PAUSED/ACTIVE so UI + worker respect the user action.
