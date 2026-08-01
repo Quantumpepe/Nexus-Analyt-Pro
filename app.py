@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-346-BNB-V2-ROUTE-READONLY-PREFLIGHT"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-347-BNB-V2-LIVE-CLOSING-EXECUTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36507,6 +36507,96 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
     _db_set_rotation_sessions(wallet, kept, active_session_id=active_id or master_id, replace_missing=True)
 
 
+
+# ENGINE-347: live PancakeSwap V2 recovery execution for BNB CLOSING sessions.
+# Build 346 only proved the route read-only. The normal closing worker still used
+# the V3 exactInputSingle path, so pressing Stop & Exit could never use the route
+# that had just passed the Vault preflight. This helper executes exactly the same
+# allow-listed V2 calldata that Build 346 simulated successfully.
+def _nkr_live_bnb_v2_closing_exit(wallet: str, row: dict, session_id: int,
+                                  token_in: str, settlement: str, amount_in: int) -> dict:
+    chain_id = 56
+    vault = _norm_addr(row.get("vault_address") or "")
+    wallet_id = str(row.get("privy_wallet_id") or "").strip()
+    if not wallet_id:
+        wallet_id = str(_privy_wallet_id_for_user(_norm_addr(wallet)) or "").strip()
+    token_in = _norm_addr(token_in)
+    settlement = _norm_addr(settlement)
+    router = _norm_addr("0x10ED43C718714eb63d5aA57B78B54704E256024E")
+    selector = _core_selector("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)")
+    if not wallet_id or not _looks_like_evm_addr(vault):
+        raise RuntimeError("bnb_v2_closing_incomplete_session_mapping")
+    if not _looks_like_evm_addr(token_in) or not _looks_like_evm_addr(settlement):
+        raise RuntimeError("bnb_v2_closing_invalid_token")
+    if int(amount_in or 0) <= 0:
+        raise RuntimeError("bnb_v2_closing_amount_zero")
+
+    rcfg = _read_router_config(vault, router, chain_id)
+    if not bool(rcfg.get("enabled")):
+        raise RuntimeError("bnb_v2_router_not_enabled_in_vault")
+    if not bool(_read_router_selector_allowed(vault, router, selector, chain_id)):
+        raise RuntimeError("bnb_v2_selector_not_allowed_in_vault")
+
+    cfg = _privy_trading_cfg(chain_id)
+    wbnb = _norm_addr(cfg.get("weth") or "")
+    candidates = [("DIRECT", [token_in, settlement])]
+    if _looks_like_evm_addr(wbnb) and wbnb.lower() not in {token_in.lower(), settlement.lower()}:
+        candidates.append(("VIA_WBNB", [token_in, wbnb, settlement]))
+
+    best = None
+    quote_errors = []
+    for label, path in candidates:
+        try:
+            raw = _eth_call(chain_id, router, _v2_get_amounts_out_data(amount_in, path))
+            amounts = _decode_uint_array(raw)
+            if len(amounts) != len(path) or int(amounts[-1]) <= 0:
+                raise RuntimeError("invalid_v2_quote")
+            candidate = {"label": label, "path": path, "amounts": amounts, "amountOut": int(amounts[-1])}
+            if best is None or candidate["amountOut"] > best["amountOut"]:
+                best = candidate
+        except Exception as exc:
+            quote_errors.append(f"{label}:{str(exc)[:260]}")
+    if not best:
+        raise RuntimeError("bnb_v2_no_recovery_route:" + " | ".join(quote_errors)[:1000])
+
+    slippage_bps = max(200, min(3000, int(cfg.get("slippageBps") or 500)))
+    min_out = int(best["amountOut"]) * (10000 - slippage_bps) // 10000
+    deadline = now_ts() + 300
+    router_data = _v2_swap_exact_tokens_data(
+        int(amount_in), int(min_out), best["path"], vault, deadline
+    )
+    call = _encode_execute_trade(
+        int(session_id), router, token_in, settlement,
+        int(amount_in), int(min_out), int(deadline), router_data
+    )
+
+    guardian = _read_vault_guardian(vault, chain_id)
+    if _looks_like_evm_addr(guardian):
+        # Fail before signing if the exact live call no longer passes.
+        _eth_call_from(chain_id, guardian, vault, call)
+
+    _live_engine_mark(
+        "NKR", status="closing", decision="EXIT_SUBMITTING",
+        gate_status="BNB_V2_RECOVERY", active_asset="XRP",
+        reason=f"Submitting PancakeSwap V2 {best['label']} closing exit for session #{session_id}",
+        position_state="EXITING", pending_tx="submitting", last_error="",
+    )
+    reference = f"nexus-nkr-bnb-v2-closing-{session_id}-{int(time.time())}"
+    sent = _send_vault_tx(wallet_id, wallet, vault, call, reference, chain_id=chain_id)
+    receipt = sent.get("receipt") if isinstance(sent.get("receipt"), dict) else {}
+    tx_hash = str(sent.get("hash") or sent.get("txHash") or receipt.get("transactionHash") or "")
+    remaining = _position_amount(vault, int(session_id), token_in, chain_id=chain_id)
+    if remaining != 0:
+        raise RuntimeError(f"bnb_v2_position_not_zero_after_exit:{remaining}")
+    return {
+        "executed": True, "txHash": tx_hash, "router": router,
+        "selector": selector, "routeMode": "PANCAKESWAP_V2_RECOVERY",
+        "pathMode": best["label"], "path": best["path"],
+        "quoteOut": int(best["amountOut"]), "minAmountOut": int(min_out),
+        "amountIn": int(amount_in),
+    }
+
+
 def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dict:
     """Force-close every mapped position for one CLOSING NKR session.
 
@@ -36831,6 +36921,17 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
                     route_errors.append(
                         f"two_hop_first_leg_failed:{' | '.join(first_errors)[:900]}"
                     )
+        if not result and int(chain_id) == 56:
+            # ENGINE-347: Build 346 proved this exact V2 route through the Vault,
+            # but the worker still attempted only V3 routes. Use V2 only as a
+            # CLOSING recovery fallback after the normal routes fail.
+            try:
+                result = _nkr_live_bnb_v2_closing_exit(
+                    wallet, row, session_id, token, settlement, amount
+                )
+                route_errors.append("v3_failed_then_pancake_v2_recovery_succeeded")
+            except Exception as v2_exc:
+                route_errors.append(f"pancake_v2_recovery_failed:{str(v2_exc)[:900]}")
         if not result:
             raise RuntimeError(
                 f"closing_exit_all_routes_failed:chain={chain_id}:session={session_id}:asset={sym}:token={token}:"
