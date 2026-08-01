@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-326-DIAGNOSTIC-ENDPOINT-COMPAT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-327-LIVE-SESSION-SETTLEMENT-ADDRESS-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36034,9 +36034,27 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
 
 
 def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id: int = 1) -> str:
-    raw = _eth_call(int(chain_id or 1), vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    """Read the settlement-token address from the live on-chain session.
+
+    `_core_words()` returns ABI words as integers. Passing that integer directly
+    through `_norm_addr()` produced a decimal string (for example
+    `7922878...`) and the subsequent `tokenConfig(address)` call reverted.
+    Convert the uint256 ABI word back to its lower 160-bit EVM address first.
+    """
+    raw = _eth_call(int(chain_id or 1), vault, _core_selector("sessionOf(uint256)") + _uint_to_32(int(sid)))
     words = _core_words(raw)
-    return _norm_addr(words[1] if len(words) > 1 else fallback)
+    if len(words) > 1:
+        try:
+            value = int(words[1]) & ((1 << 160) - 1)
+            address = _norm_addr("0x" + format(value, "040x"))
+            if value != 0 and _looks_like_evm_addr(address):
+                return address
+        except Exception:
+            pass
+    fallback_address = _norm_addr(fallback)
+    if _looks_like_evm_addr(fallback_address):
+        return fallback_address
+    raise RuntimeError(f"session_settlement_token_invalid:chain={int(chain_id or 1)}:session={int(sid)}")
 
 
 def _exact_input_selector_candidates(vault, router, chain_id, cfg):
