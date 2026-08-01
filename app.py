@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-323-BNB-LIVE-AMOUNT-DECIMALS-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-325-DYNAMIC-TARGET-TOKEN-EXECUTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36094,61 +36094,79 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     quote_out = _quote_token_for_router(cfg, token_out)
     if int(amount_in or 0) <= 0:
         raise RuntimeError("trade_amount_in_zero")
-    # ENGINE-323: normalize the live amount with the *on-chain settlement token decimals*.
-    # The old heuristic could leave BSC Binance-Peg USDC at 6-decimal units
-    # (e.g. 18_400_000) although the token and CoreVault session use 18 decimals.
-    # That produced a quote around 31_000 wei instead of ~3.1e16 wei and caused
-    # CoreVault.executeTrade to revert. This block is deliberately isolated from
-    # session control, strategist, Grid and Trader logic.
+    # ENGINE-325: exact integer-only live amount normalization; dynamic targets require no manual Vault tokenConfig.
+    # Never use float arithmetic for ERC-20 base units. The live amount is kept
+    # as an integer and aligned to the settlement token's decimal scale.
     _st = _norm_addr(token_in)
-    _td = None
-    try:
-        token_cfg = _read_token_config(vault, _st, chain_id) or {}
-        raw_decimals = token_cfg.get("decimals")
-        if raw_decimals is not None:
-            parsed_decimals = int(raw_decimals)
-            if 0 < parsed_decimals <= 36:
-                _td = parsed_decimals
-    except Exception:
-        _td = None
+    _tt = _norm_addr(token_out)
 
-    # Canonical chain fallbacks are used only when the view call is unavailable.
-    if _td is None:
-        if chain_id == 56 and _st.lower() == "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d":
-            _td = 18  # Binance-Peg USDC on BNB Chain
-        elif _st.lower() in {
-            str(cfg.get("usdc") or "").lower(),
-            str(cfg.get("usdt") or "").lower(),
-        }:
-            _td = 6
-        else:
-            _td = 18
+    try:
+        settlement_cfg = _read_token_config(vault, _st, chain_id) or {}
+    except Exception as exc:
+        raise RuntimeError(f"settlement_token_config_read_failed:chain={chain_id}:token={_st}:{exc}")
+    if not settlement_cfg.get("configured") or not settlement_cfg.get("executionEnabled"):
+        raise RuntimeError(
+            f"settlement_token_not_executable:chain={chain_id}:token={_st}:"
+            f"configured={bool(settlement_cfg.get('configured'))}:"
+            f"executionEnabled={bool(settlement_cfg.get('executionEnabled'))}"
+        )
+
+    # ENGINE-325: ordinary trade targets are dynamic assets. They must NOT be
+    # manually configured in CoreVault tokenConfig before every trade. The
+    # settlement token remains strictly configured, while target eligibility is
+    # determined by the existing chain mapping / watchlist security gate, an
+    # approved router+selector, a real token contract, and a successful quote +
+    # full CoreVault preflight. tokenConfig(target) is read only as optional
+    # metadata and is never a hard blocker for a normal trade target.
+    try:
+        target_cfg = _read_token_config(vault, _tt, chain_id) or {}
+    except Exception:
+        target_cfg = {}
+    try:
+        target_code = str(_rpc_call(chain_id, "eth_getCode", [_tt, "latest"]) or "0x")
+    except Exception as exc:
+        raise RuntimeError(f"target_token_code_read_failed:{route.get('symbol')}:chain={chain_id}:token={_tt}:{exc}")
+    if target_code in ("0x", "0x0", ""):
+        raise RuntimeError(f"target_token_has_no_contract:{route.get('symbol')}:chain={chain_id}:token={_tt}")
+
+    settlement_decimals = int(settlement_cfg.get("decimals") or 0)
+    if settlement_decimals <= 0 or settlement_decimals > 36:
+        raise RuntimeError(
+            f"invalid_settlement_decimals:chain={chain_id}:token={_st}:decimals={settlement_decimals}"
+        )
 
     ai = int(amount_in or 0)
-    # NKR budgets are historically prepared in 6-decimal stablecoin units.
-    # Convert exactly once when the actual settlement token has more decimals.
-    if _td > 6 and 10 ** 4 <= ai < 10 ** 15:
-        ai *= 10 ** (_td - 6)
-    elif _td <= 6 and ai >= 10 ** 15:
-        ai //= 10 ** (18 - _td)
+    # Historical NKR allocation amounts were prepared in 6-decimal stablecoin
+    # units. Convert once, using integer multiplication only.
+    if settlement_decimals > 6 and 10 ** 4 <= ai < 10 ** 15:
+        ai *= 10 ** (settlement_decimals - 6)
+    elif settlement_decimals < 18 and ai >= 10 ** 15:
+        ai //= 10 ** (18 - settlement_decimals)
 
-    # Never submit more than the session's on-chain settlement cash.
+    # Remove binary-float dust that may already have entered upstream. For an
+    # 18-decimal stablecoin, NKR budgets are intentionally limited to 6 decimal
+    # places, so 18_400_000_000_000_002_048 becomes exactly
+    # 18_400_000_000_000_000_000.
+    if settlement_decimals > 6:
+        quantum = 10 ** (settlement_decimals - 6)
+        ai = (ai // quantum) * quantum
+
+    # The on-chain session is authoritative. Never submit more than its current
+    # settlement cash.
+    settlement_cash = 0
     try:
         session_raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
         session_words = _core_words(session_raw)
         settlement_cash = int(session_words[9]) if len(session_words) > 9 else 0
-        if settlement_cash > 0:
-            ai = min(ai, settlement_cash)
-    except Exception:
-        settlement_cash = 0
+    except Exception as exc:
+        raise RuntimeError(f"session_cash_read_failed:chain={chain_id}:session={sid}:{exc}")
+    if settlement_cash <= 0:
+        raise RuntimeError(f"session_has_no_settlement_cash:chain={chain_id}:session={sid}")
+    ai = min(ai, settlement_cash)
 
     if ai <= 0:
         raise RuntimeError("trade_amount_in_zero_after_decimal_normalization")
-    if _td >= 18 and ai < 10 ** 15:
-        raise RuntimeError(
-            f"live_amount_decimal_mismatch:chain={chain_id}:token={_st}:decimals={_td}:amountIn={ai}"
-        )
-    amount_in = ai
+    amount_in = int(ai)
     quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
     fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
     # Slightly wider slippage on live NKR opens (public mempool + multi-hop delay).
