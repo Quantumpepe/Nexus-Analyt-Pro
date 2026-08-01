@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-334-BNB-CLOSING-FAST-EXIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-335-BNB-XRP-TWO-HOP-CLOSING-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35466,6 +35466,13 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
         symbol = str(sym or "").strip().upper()
         if not symbol:
             continue
+        # ENGINE-335: a technical mapping is not automatically a live trading route.
+        # Dynamic assets such as XRP/SOL/BTC may exist in the central registry for
+        # display/recovery, but NKR must never open a new position unless that exact
+        # chain route was explicitly enabled. Existing positions are still recovered
+        # during CLOSING from the session cards and TradeExecuted events below.
+        if not bool(route.get("enabledForLive")):
+            continue
         routes[symbol] = {
             "symbol": symbol,
             "token": token,
@@ -36558,9 +36565,84 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
             except Exception as route_exc:
                 route_errors.append(f"fee={exit_fee}:{str(route_exc)[:260]}")
         if not result:
+            # ENGINE-335: BNB dynamic assets often have no direct V3 pool against
+            # the session settlement token. The original worker could therefore
+            # open XRP through the wrapped-native market, but CLOSING attempted only
+            # XRP -> settlement and remained stuck forever. Recover with the same
+            # chain-native bridge in two deterministic on-chain trades:
+            #   target token -> wrapped native -> session settlement.
+            intermediate = _norm_addr(cfg.get("weth") or "")
+            if (
+                _looks_like_evm_addr(intermediate)
+                and intermediate.lower() not in {token.lower(), settlement.lower()}
+            ):
+                first_leg = None
+                first_errors = []
+                for bridge_fee in fee_candidates:
+                    try:
+                        bridge_route = dict(route or {})
+                        bridge_route["fee"] = int(bridge_fee)
+                        first_leg = _nkr_live_trade_route(
+                            wallet, row, bridge_route, token, intermediate, amount, action="EXIT"
+                        )
+                        break
+                    except Exception as bridge_exc:
+                        first_errors.append(f"fee={bridge_fee}:{str(bridge_exc)[:260]}")
+                if first_leg:
+                    bridge_amount = _position_amount(vault, session_id, intermediate, chain_id=chain_id)
+                    if bridge_amount <= 0:
+                        raise RuntimeError(
+                            f"closing_two_hop_intermediate_empty:chain={chain_id}:session={session_id}:"
+                            f"asset={sym}:token={token}:intermediate={intermediate}"
+                        )
+                    native_symbol = str(cfg.get("nativeSymbol") or _nkr_chain_key_from_id(chain_id) or "NATIVE").upper()
+                    native_route = {
+                        "symbol": native_symbol,
+                        "token": intermediate,
+                        "decimals": 18,
+                        "router": _norm_addr(cfg.get("router") or (route or {}).get("router") or ""),
+                        "fee": int(cfg.get("poolFee") or 500),
+                        "feeCandidates": [100, 500, 2500, 3000, 10000],
+                        "live": True,
+                        "source": "closing_two_hop_native_bridge",
+                        "chain": _nkr_chain_key_from_id(chain_id),
+                    }
+                    second_leg = None
+                    second_errors = []
+                    native_fees = list(dict.fromkeys([
+                        int(native_route.get("fee") or 0), 100, 500, 2500, 3000, 10000
+                    ]))
+                    for native_fee in [x for x in native_fees if x > 0]:
+                        try:
+                            nr = dict(native_route)
+                            nr["fee"] = int(native_fee)
+                            second_leg = _nkr_live_trade_route(
+                                wallet, row, nr, intermediate, settlement, bridge_amount, action="EXIT"
+                            )
+                            break
+                        except Exception as native_exc:
+                            second_errors.append(f"fee={native_fee}:{str(native_exc)[:260]}")
+                    if not second_leg:
+                        raise RuntimeError(
+                            f"closing_two_hop_second_leg_failed:chain={chain_id}:session={session_id}:"
+                            f"asset={sym}:intermediate={intermediate}:attempts={' | '.join(second_errors)[:900]}"
+                        )
+                    result = {
+                        **second_leg,
+                        "twoHop": True,
+                        "firstLegTxHash": str(first_leg.get("txHash") or ""),
+                        "secondLegTxHash": str(second_leg.get("txHash") or ""),
+                        "bridgeToken": intermediate,
+                    }
+                    route_errors.append("direct_failed_then_two_hop_succeeded")
+                else:
+                    route_errors.append(
+                        f"two_hop_first_leg_failed:{' | '.join(first_errors)[:900]}"
+                    )
+        if not result:
             raise RuntimeError(
                 f"closing_exit_all_routes_failed:chain={chain_id}:session={session_id}:asset={sym}:token={token}:"
-                f"attempts={' | '.join(route_errors)[:1200]}"
+                f"attempts={' | '.join(route_errors)[:1800]}"
             )
         remaining = _position_amount(vault, session_id, token, chain_id=chain_id)
         if remaining != 0:
