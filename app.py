@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-348-STRATEGIST-SESSION-SIGNAL-AUDIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-349-OWNER-AUTH-SESSION-AUDIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34305,12 +34305,19 @@ def api_nkr_bridge_plan():
 
 @app.get("/api/nexus/system-info/nkr-session-audit")
 def api_nexus_nkr_session_audit():
-    """Read-only proof that every live NKR session keeps its own rules and signals."""
-    authenticated_wallet = _require_auth()
-    if not authenticated_wallet:
-        return err("unauthorized", 401)
-    wallet = _norm_addr(request.args.get("wallet") or authenticated_wallet)
-    if wallet.lower() != _norm_addr(authenticated_wallet).lower():
+    """Owner-only read-only proof that every live NKR session keeps its own rules and signals.
+
+    This endpoint is part of System Info and therefore uses the same wallet-bound
+    owner authorization as /api/nexus/system-info-owner-panel. The normal app
+    session currently does not always expose a backend bearer token to JavaScript;
+    requiring _require_auth() here made the button return 401 even while the owner
+    System Info panel itself was authorized and open.
+    """
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    wallet = _norm_addr(request.args.get("wallet") or request.args.get("wallet_address") or owner)
+    if not wallet or wallet.lower() != _norm_addr(owner).lower():
         return jsonify({"status": "error", "error": "wallet_mismatch"}), 403
     rows = _live_active_sessions(wallet, "NKR")
     market_rows = _nkr_live_market_rows(wallet)
