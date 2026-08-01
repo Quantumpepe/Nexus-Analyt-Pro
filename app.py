@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-338-RPC-STORM-AND-TIMEOUT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-339-TARGETED-CLOSING-EVENT-SCAN-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31328,37 +31328,74 @@ def _nkr_addr_from_abi_word(value) -> str:
         return ""
 
 def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> list[dict]:
-    """Reliably enumerate TradeExecuted logs for one session.
+    """Enumerate TradeExecuted logs for one session without a chain-wide scan.
 
-    Public EVM RPCs often reject broad eth_getLogs ranges. Older builds silently
-    swallowed those errors, returned an empty history, and therefore could not
-    discover the token behind openAssetCount > 0. This scanner uses small chunks,
-    recursively splits rejected ranges, retries transient failures, and raises a
-    concrete error when every request fails instead of pretending there are no logs.
+    ENGINE-339: The previous recovery path defaulted to a 500,000-block search.
+    For a dynamic BNB asset this could keep the CLOSING thread busy for many
+    minutes while System Info only showed EXITING and no pending transaction.
+
+    The registry already stores the createSession transaction hash. Resolve its
+    receipt first and scan only from that creation block. If the receipt is not
+    available, use a tightly bounded recent fallback window. This keeps recovery
+    deterministic and prevents public RPC saturation.
     """
     cid = int(chain_id or 0)
     va = _norm_addr(vault)
     sid = int(session_id or 0)
     if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(va):
         return []
+
     try:
         latest_raw = _rpc_call(cid, "eth_blockNumber", [])
         latest = int(str(latest_raw), 16)
     except Exception as exc:
         raise RuntimeError(f"closing_log_head_failed:chain={cid}:{exc}")
 
-    lookback = max(50000, int(os.getenv("NEXUS_NKR_TRADE_LOG_LOOKBACK_BLOCKS", "500000")))
-    base_chunk = max(100, min(2000, int(os.getenv("NEXUS_NKR_TRADE_LOG_CHUNK_BLOCKS", "1000"))))
-    start_block = max(0, latest - lookback)
+    # Prefer the exact block in which createSession was confirmed.
+    create_block = None
+    try:
+        con = _db()
+        try:
+            db_row = con.execute(
+                "SELECT tx_hash FROM nexus_live_core_vault_sessions "
+                "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=? "
+                "ORDER BY updated_ts DESC LIMIT 1",
+                (cid, va.lower(), str(sid)),
+            ).fetchone()
+        finally:
+            con.close()
+        tx_hash = str((db_row[0] if db_row else "") or "").strip()
+        if tx_hash:
+            receipt = _rpc_call(cid, "eth_getTransactionReceipt", [tx_hash]) or {}
+            block_hex = str((receipt or {}).get("blockNumber") or "")
+            if block_hex:
+                create_block = int(block_hex, 16)
+    except Exception:
+        create_block = None
+
+    fallback_lookback = max(2000, min(50000, int(os.getenv("NEXUS_NKR_TRADE_LOG_LOOKBACK_BLOCKS", "30000"))))
+    start_block = max(0, int(create_block) - 8) if create_block is not None else max(0, latest - fallback_lookback)
+    # Hard safety bound: recovery may never scan more than 50k blocks.
+    if latest - start_block > 50000:
+        start_block = max(0, latest - 50000)
+
+    base_chunk = max(250, min(2500, int(os.getenv("NEXUS_NKR_TRADE_LOG_CHUNK_BLOCKS", "2000"))))
     sid_topic = "0x" + format(sid, "064x")
     out, seen = [], set()
     request_errors = []
     successful_ranges = 0
 
+    _live_engine_mark(
+        "NKR", status="closing", decision="DISCOVERING_OPEN_ASSET",
+        gate_status="EXIT_PENDING",
+        reason=f"Reading TradeExecuted events for session {sid} from block {start_block} to {latest}",
+        pending_tx="", last_error="",
+    )
+
     def fetch_range(lo: int, hi: int, depth: int = 0):
         nonlocal successful_ranges
         last_exc = None
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 rows = _rpc_call(cid, "eth_getLogs", [{
                     "address": va,
@@ -31370,8 +31407,8 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
                 return rows if isinstance(rows, list) else []
             except Exception as exc:
                 last_exc = exc
-                time.sleep(0.15 * (attempt + 1))
-        if lo < hi and depth < 8:
+                time.sleep(0.10 * (attempt + 1))
+        if lo < hi and depth < 4:
             mid = (lo + hi) // 2
             return fetch_range(lo, mid, depth + 1) + fetch_range(mid + 1, hi, depth + 1)
         request_errors.append(f"{lo}-{hi}:{str(last_exc)[:180]}")
@@ -31406,7 +31443,7 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
     if successful_ranges == 0:
         raise RuntimeError(
             f"closing_trade_event_scan_failed:chain={cid}:session={sid}:"
-            f"errors={' | '.join(request_errors)[:900]}"
+            f"range={start_block}-{latest}:errors={' | '.join(request_errors)[:900]}"
         )
     out.sort(key=lambda x: int(x.get("blockNumber") or 0))
     return out
