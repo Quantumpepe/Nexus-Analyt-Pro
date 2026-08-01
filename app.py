@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-343-CLOSING-TOKEN-RESOLUTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-344-BNB-DIRECT-POSITION-RECOVERY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31453,7 +31453,7 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
     while cursor <= latest:
         if time.time() - scan_started > scan_deadline_sec:
             raise RuntimeError(
-                f"closing_trade_event_scan_timeout:chain={cid}:session={sid}:"
+                f"closing_trade_event_scan_timeout_after_direct_position_checks:chain={cid}:session={sid}:"
                 f"cursor={cursor}:range={start_block}-{latest}:deadline={scan_deadline_sec}s"
             )
         hi = min(latest, cursor + base_chunk - 1)
@@ -36557,6 +36557,36 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
             })
     except Exception as exc:
         _live_engine_mark("NKR", last_error=f"closing technical route inventory warning: {str(exc)[:220]}")
+
+    # ENGINE-344: deterministic BNB recovery inventory.
+    # The affected legacy session was opened with a Binance-peg asset before the
+    # technical-route registry became authoritative. Public RPC log scans can time
+    # out before the old TradeExecuted event is found, even though positionOf is a
+    # cheap and exact read. Probe the canonical BNB contracts directly first.
+    # These entries are CLOSING-only and can never be selected for a new trade.
+    if int(chain_id) == 56:
+        bnb_recovery_tokens = {
+            "WBNB": ("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),
+            "XRP": ("0x1D2F0dA169ceB9fC7B3144628dB156F3F6c60dBE", 18),
+            "BTCB": ("0x7130d2A12B9BCbFae4f2634d864A1Ee1Ce3Ead9c", 18),
+            "ETH": ("0x2170Ed0880ac9A755fd29B2688956BD959F933F8", 18),
+        }
+        for recovery_symbol, (recovery_token, recovery_decimals) in bnb_recovery_tokens.items():
+            token = _norm_addr(recovery_token)
+            if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+                continue
+            routes.setdefault(recovery_symbol, {
+                "symbol": recovery_symbol,
+                "token": token,
+                "decimals": recovery_decimals,
+                "router": _norm_addr(cfg.get("router") or ""),
+                "fee": int(cfg.get("poolFee") or 500),
+                "feeCandidates": [100, 500, 2500, 3000, 10000],
+                "live": True,
+                "source": "bnb_direct_position_recovery",
+                "chain": "BNB",
+                "closingRecoveryOnly": True,
+            })
 
     # Include all addresses previously seen by the automatic EVM token registry.
     # This catches dynamic assets whose central router mapping was edited after the
