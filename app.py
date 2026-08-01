@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-336-CLOSING-BRIDGE-DIRECTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-337-NO-ALCHEMY-PUBLIC-RPC-FAILOVER-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -5447,27 +5447,25 @@ def _normalize_chain_key(raw: str) -> str:
     return alias.get(s, s)
 
 def _alchemy_url_for_chain(chain_id: int) -> str:
-    """Alchemy JSON-RPC for ETH / BNB / POL when ALCHEMY_KEY is set."""
-    key = str(os.getenv("ALCHEMY_KEY") or os.getenv("ALCHEMY_API_KEY") or "").strip()
-    if not key:
-        return ""
-    hosts = {
-        1: "https://eth-mainnet.g.alchemy.com/v2/",
-        56: "https://bnb-mainnet.g.alchemy.com/v2/",
-        137: "https://polygon-mainnet.g.alchemy.com/v2/",
-    }
-    base = hosts.get(int(chain_id or 0))
-    return f"{base}{key}" if base else ""
+    """Alchemy is intentionally disabled for Nexus.
+
+    Kept only as a compatibility stub because older call sites may still import
+    this helper. Returning an empty string guarantees that no Alchemy endpoint
+    can enter the server-side RPC candidate list, even when legacy environment
+    variables are still present on Render.
+    """
+    return ""
 
 
 def _rpc_url_for_chain(chain_id: int) -> str:
-    """Return the configured primary JSON-RPC endpoint for a chain.
+    """Return the configured primary provider-neutral JSON-RPC endpoint.
 
     Priority:
       1) explicit RPC_URL_* / _RPC_URL_BY_CHAIN
-      2) Alchemy (ALCHEMY_KEY) for ETH + BNB + POL
-      3) other env fallbacks
-    Public nodes are only added later in _rpc_urls_for_chain as secondary.
+      2) other explicit environment fallbacks
+
+    Alchemy is never selected. Public no-key nodes are added by
+    _rpc_urls_for_chain() as failover candidates.
     """
     cid = int(chain_id or 0)
 
@@ -5483,10 +5481,6 @@ def _rpc_url_for_chain(chain_id: int) -> str:
     direct = _accepted(_RPC_URL_BY_CHAIN.get(cid) or "")
     if direct:
         return direct
-
-    alchemy = _accepted(_alchemy_url_for_chain(cid))
-    if alchemy:
-        return alchemy
 
     env_fallbacks = {
         1: [os.getenv("RPC_URL_ETH"), os.getenv("RPC_URL_1")],
@@ -9135,11 +9129,12 @@ def _nft_activation_put(wallet_address: str, tier: str, contract: str, chain_id:
     conn.close()
 
 def _rpc_urls_for_chain(chain_id: int) -> list[str]:
-    """Return the single central RPC candidate list for an enabled EVM chain.
+    """Return the central provider-neutral RPC candidate list.
 
-    All normal on-chain reads in Nexus go through _rpc_call(), which uses this
-    function. Ethereum uses the server-side Alchemy endpoint first when configured.
-    Public endpoints are fallback-only and never replace a healthy primary provider.
+    All normal on-chain reads in Nexus go through _rpc_call(). Explicit RPC_URL_*
+    values are preferred; otherwise Nexus rotates across public no-key endpoints.
+    Alchemy is excluded unconditionally so an exhausted Alchemy account can never
+    block session resolution, closing, exits, quotes, receipts or vault reads.
     """
     cid = int(chain_id or 0)
     urls: list[str] = []
@@ -9152,6 +9147,8 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         blocked = (
             "rpc.ankr.com",
             "flashbots.net",
+            "alchemy.com",
+            "alchemyapi.io",
         )
         if any(marker in lowered for marker in blocked):
             return
@@ -9160,11 +9157,8 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         if url not in urls:
             urls.append(url)
 
-    # Primary: explicit env / Alchemy (ETH+BNB+POL) via _rpc_url_for_chain.
+    # Primary: explicit provider-neutral RPC_URL_* configuration.
     _add(_rpc_url_for_chain(cid))
-    # Ensure Alchemy is always attempted first for quotes when key exists,
-    # even if an explicit public RPC_URL_* was set as primary.
-    _add(_alchemy_url_for_chain(cid))
 
     # Public no-key fallbacks. Keep these limited to standard EVM JSON-RPC.
     fallback = {
@@ -9178,6 +9172,12 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
             "https://bsc-dataseed.binance.org",
             "https://bsc-dataseed1.binance.org",
             "https://bsc-dataseed2.binance.org",
+            "https://bsc-dataseed3.binance.org",
+            "https://bsc-dataseed4.binance.org",
+            "https://bsc-dataseed1.defibit.io",
+            "https://bsc-dataseed2.defibit.io",
+            "https://bsc-dataseed1.ninicoin.io",
+            "https://bsc-dataseed2.ninicoin.io",
         ],
         137: [
             "https://polygon-bor-rpc.publicnode.com",
