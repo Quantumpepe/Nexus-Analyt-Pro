@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-352-MULTICHAIN-ENTRY-DEDUP-LIVE-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-355-ENTRY-SINGLE-FILL-TARGETED-PAUSE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1197,6 +1197,37 @@ def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
     first_id = max(1, next_id - 500)
     wanted_system = int(_CORE_SYSTEM_ID.get(str(engine).upper(), 0))
     found = []
+    token_decimals_cache = {}
+
+    def _session_token_decimals(token_addr: str) -> int:
+        key = _norm_addr(token_addr).lower()
+        if key in token_decimals_cache:
+            return token_decimals_cache[key]
+        decimals = 18
+        try:
+            raw_cfg = _eth_call(int(chain_id), vault_addr, _core_selector("tokenConfig(address)") + _addr_to_32(token_addr))
+            cfg_words = _core_words(raw_cfg)
+            if len(cfg_words) >= 7:
+                decimals = int(cfg_words[6])
+        except Exception:
+            # Chain-safe fallback for the currently deployed settlement contracts.
+            decimals = 6 if int(chain_id) in (1, 137) else 18
+        decimals = max(0, min(36, int(decimals)))
+        token_decimals_cache[key] = decimals
+        return decimals
+
+    def _format_units(raw_value: int, decimals: int) -> str:
+        raw_value = int(raw_value or 0)
+        decimals = int(decimals or 0)
+        if decimals <= 0:
+            return str(raw_value)
+        base = 10 ** decimals
+        whole, frac = divmod(raw_value, base)
+        if frac == 0:
+            return str(whole)
+        frac_text = str(frac).rjust(decimals, "0").rstrip("0")
+        return f"{whole}.{frac_text}"
+
     for sid in range(first_id, max(first_id, next_id)):
         try:
             raw = _eth_call(int(chain_id), vault_addr, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
@@ -1210,12 +1241,24 @@ def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
             open_asset_count = int(words[12])
             if owner.lower() != wa.lower() or system_id != wanted_system:
                 continue
+            settlement_decimals = _session_token_decimals(token)
+            budget_units = int(words[8])
+            settlement_cash_units = int(words[9])
+            realized_profit_units = int(words[10])
+            realized_loss_units = int(words[11])
             found.append({
                 "sessionId": sid, "owner": owner, "settlementToken": token,
                 "systemId": system_id, "statusId": status_id,
                 "startsAt": int(words[4]), "endsAt": int(words[5]),
-                "budgetUnits": str(int(words[8])), "settlementCashUnits": str(int(words[9])),
-                "realizedProfitUnits": str(int(words[10])), "realizedLossUnits": str(int(words[11])),
+                "settlementDecimals": settlement_decimals,
+                "budgetUnits": str(budget_units),
+                "settlementCashUnits": str(settlement_cash_units),
+                "realizedProfitUnits": str(realized_profit_units),
+                "realizedLossUnits": str(realized_loss_units),
+                "budget": _format_units(budget_units, settlement_decimals),
+                "settlementCash": _format_units(settlement_cash_units, settlement_decimals),
+                "realizedProfit": _format_units(realized_profit_units, settlement_decimals),
+                "realizedLoss": _format_units(realized_loss_units, settlement_decimals),
                 "openAssetCount": open_asset_count,
             })
         except Exception:
@@ -1240,11 +1283,26 @@ def api_nexus_live_reservation_recover():
     vault=str(body.get("vault") or request.args.get("vault") or "")
     vault_addr,next_id,sessions=_discover_wallet_core_sessions(wa,engine,chain_id,vault)
     status_labels={0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}
+    nowi = int(time.time())
     for s in sessions:
-        sid=int(s.get("statusId") or 0)
-        s["statusLabel"]=status_labels.get(sid,f"UNKNOWN_{sid}")
-        s["rawStatusId"]=sid
-        s["recoverable"]=bool(sid in (1,2,3) and int(s.get("openAssetCount") or 0)==0)
+        status_id=int(s.get("statusId") or 0)
+        open_assets=int(s.get("openAssetCount") or 0)
+        ends_at=int(s.get("endsAt") or 0)
+        expired_empty = bool(status_id in (1, 2) and open_assets == 0 and ends_at > 0 and ends_at <= nowi)
+        closing_empty = bool(status_id == 3 and open_assets == 0)
+        s["statusLabel"]=status_labels.get(status_id,f"UNKNOWN_{status_id}")
+        s["rawStatusId"]=status_id
+        s["recoverable"]=bool(closing_empty or expired_empty)
+        if closing_empty:
+            s["recoveryReason"]="CLOSING_EMPTY"
+        elif expired_empty:
+            s["recoveryReason"]="EXPIRED_EMPTY"
+        elif open_assets > 0:
+            s["recoveryReason"]="OPEN_POSITION_BLOCKS_FINALIZE"
+        elif status_id in (1, 2):
+            s["recoveryReason"]="LIVE_SESSION_NOT_STALE"
+        else:
+            s["recoveryReason"]="NOT_REQUIRED"
     candidates=[s for s in sessions if s.get("recoverable")]
     blocked=[s for s in sessions if int(s.get("statusId") or 0) in (1,2,3) and int(s.get("openAssetCount") or 0)>0]
     preview=request.method=="GET" or not bool(body.get("execute"))
@@ -31528,7 +31586,7 @@ def _privy_delegated_readiness(wallet_address, chain_id=1):
         "walletDelegated": True,
         "userApprovalRequired": False,
         "budgetAuthority": "COREVAULT_SESSION",
-        "vaultConnected": False, "vaultPaused": None, "solvent": False,
+        "vaultConnected": False, "vaultPaused": None, "solvent": None, "solvencyReadOk": False, "solvency": {},
         "usdcConfigured": False, "usdcExecutionEnabled": False, "usdcSettlementToken": False, "usdcDecimalsCorrect": False,
         "usdtConfigured": False, "usdtExecutionEnabled": False, "usdtSettlementToken": False, "usdtDecimalsCorrect": False,
         "nativeConfigured": False, "nativeExecutionEnabled": False, "nativeSettlementToken": False, "nativeDecimalsCorrect": False,
@@ -31557,8 +31615,49 @@ def _privy_delegated_readiness(wallet_address, chain_id=1):
                 "nativeConfigured": native_cfg["configured"], "nativeExecutionEnabled": native_cfg["executionEnabled"],
                 "nativeSettlementToken": native_cfg["settlementToken"], "nativeDecimalsCorrect": native_cfg["decimals"] == 18,
             })
-            solv = _core_vault_words(_core_vault_call(int(cfg["chainId"]), cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], cfg["usdc"])) + [0, 0, 0]
-            checks["solvent"] = bool(solv[2])
+            # ENGINE-353: Solvency must be an explicit, inspectable on-chain read.
+            # The old panel reduced a missing/failed decode to False and displayed NOT READY
+            # without assets or obligations. Read every configured settlement asset separately
+            # and preserve read failures as UNKNOWN instead of claiming insolvency.
+            settlement_specs = [
+                ("USDC", cfg["usdc"], usdc_cfg),
+                ("USDT", cfg["usdt"], usdt_cfg),
+                (str(cfg.get("nativeSymbol") or "NATIVE"), NATIVE_TOKEN_ADDRESS, native_cfg),
+            ]
+            solvency_rows = {}
+            for solv_symbol, solv_token, token_cfg in settlement_specs:
+                if not (bool(token_cfg.get("configured")) and bool(token_cfg.get("settlementToken"))):
+                    continue
+                decimals = int(token_cfg.get("decimals") or (18 if solv_token == NATIVE_TOKEN_ADDRESS else 6))
+                try:
+                    raw_solvency = _core_vault_call(
+                        int(cfg["chainId"]), cfg["vault"], _CORE_VAULT_SELECTORS["solvency"], solv_token
+                    )
+                    solv_words = _core_vault_words(raw_solvency)
+                    if len(solv_words) < 3:
+                        raise RuntimeError(f"solvency_decode_words:{len(solv_words)}")
+                    assets_units, obligations_units, solvent_flag = int(solv_words[0]), int(solv_words[1]), bool(solv_words[2])
+                    scale = float(10 ** decimals)
+                    solvency_rows[solv_symbol] = {
+                        "token": solv_token, "decimals": decimals, "readOk": True,
+                        "assetsUnits": str(assets_units), "obligationsUnits": str(obligations_units),
+                        "assets": assets_units / scale, "obligations": obligations_units / scale,
+                        "surplus": (assets_units - obligations_units) / scale, "solvent": solvent_flag,
+                    }
+                except Exception as solv_exc:
+                    solvency_rows[solv_symbol] = {
+                        "token": solv_token, "decimals": decimals, "readOk": False,
+                        "assetsUnits": None, "obligationsUnits": None, "assets": None,
+                        "obligations": None, "surplus": None, "solvent": None,
+                        "error": str(solv_exc)[:500],
+                    }
+            checked_solvency = list(solvency_rows.values())
+            checks["solvency"] = solvency_rows
+            checks["solvencyReadOk"] = bool(checked_solvency) and all(bool(x.get("readOk")) for x in checked_solvency)
+            checks["solvent"] = (
+                all(bool(x.get("solvent")) for x in checked_solvency)
+                if checks["solvencyReadOk"] else None
+            )
             checks["routerHasCode"] = _contract_has_code(cfg["router"], cfg["chainId"])
             checks["quoterHasCode"] = _contract_has_code(cfg["quoter"], cfg["chainId"])
             router_cfg = _read_router_config(cfg["vault"], cfg["router"], cfg["chainId"])
@@ -31578,7 +31677,7 @@ def _privy_delegated_readiness(wallet_address, chain_id=1):
     required = [
         ("privyAppConfigured","privy_app_credentials_missing"),("tradingSignerConfigured","privy_trading_signer_missing"),
         ("tradingPolicyConfigured","privy_trading_policy_missing"),("walletProvisioned","privy_wallet_mapping_pending"),
-        ("vaultConnected","vault_not_connected"),("solvent","vault_not_solvent"),
+        ("vaultConnected","vault_not_connected"),("solvencyReadOk","vault_solvency_read_failed"),("solvent","vault_not_solvent"),
         ("usdcConfigured","usdc_not_configured"),("usdcExecutionEnabled","usdc_execution_disabled"),
         ("usdcSettlementToken","usdc_not_settlement_token"),("usdcDecimalsCorrect","usdc_decimals_invalid"),
         ("usdtConfigured","usdt_not_configured"),("usdtExecutionEnabled","usdt_execution_disabled"),
@@ -37445,11 +37544,28 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "asset": sym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
                     }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
-                if open_assets_now > 0 and action == "OPEN":
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=45, state="POSITION_ALREADY_OPEN")
+                same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
+                max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
+                # A confirmed position must never be filled again on every worker tick.
+                # OPEN is only valid for a genuinely new slot; ADD is reserved for an
+                # explicit future top-up/rebalance command and is not an automatic tick action.
+                if same_asset_amount > 0 and action in {"OPEN", "ADD"}:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="SAME_ASSET_ALREADY_FUNDED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
-                        "asset": sym, "detail": f"{chain_key} session #{sid} already has {open_assets_now} open asset(s); duplicate OPEN blocked.",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already holds {sym}; repeated {action} blocked.",
+                    }
+                if action == "OPEN" and open_assets_now >= max_assets_now:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="MAX_ASSETS_REACHED")
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "MAX_ASSETS_REACHED",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already has {open_assets_now}/{max_assets_now} open asset(s); duplicate OPEN blocked.",
+                    }
+                if action == "ADD":
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="AUTOMATIC_ADD_BLOCKED")
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "AUTOMATIC_ADD_BLOCKED",
+                        "asset": sym, "detail": f"Automatic repeated ADD for {sym} is disabled; only an explicit capital top-up may increase an existing position.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
                 _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
@@ -37513,11 +37629,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "asset": nsym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
                     }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
-                if open_assets_now > 0:
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=45, state="POSITION_ALREADY_OPEN")
+                same_asset_amount = int((_nkr_position_snapshot(vault, sid, route, cfg) or {}).get("amount") or 0)
+                max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
+                if same_asset_amount > 0 or open_assets_now >= max_assets_now:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="POSITION_ALREADY_OPEN")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
-                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has {open_assets_now} open asset(s); forced duplicate OPEN blocked.",
+                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has a funded position ({open_assets_now}/{max_assets_now}); forced duplicate OPEN blocked.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
                 _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
@@ -38720,8 +38838,27 @@ def api_nkr_control():
                 "results": pause_results,
                 "message": "The requested session state was not confirmed on-chain. The UI and registry were not changed.",
             }), 409
-        # Persist only after the exact CoreVault session confirmed the requested state.
-        updated = [_nkr_session_update_for_control(x, action, nowi) for x in nkr_sessions]
+        # Persist only the exact requested session. Previous builds applied PAUSE/RESUME
+        # to every local NKR row, which is why pausing ETH also made POL appear paused.
+        def _control_target_matches(x):
+            if not isinstance(x, dict):
+                return False
+            meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+            oid = str(x.get("onchainSessionId") or x.get("onchain_session_id") or x.get("coreVaultSessionId") or meta.get("onchain_session_id") or meta.get("core_vault_session_id") or "").strip()
+            raw_chain = x.get("chain") or x.get("chainKey") or meta.get("chain") or meta.get("chain_key") or x.get("chainId") or x.get("chain_id") or meta.get("chain_id") or ""
+            try:
+                row_chain = _nkr_chain_key_from_id(int(raw_chain)) if str(raw_chain).isdigit() else str(raw_chain).upper()
+            except Exception:
+                row_chain = str(raw_chain).upper()
+            aliases = {"BSC":"BNB", "BNB CHAIN":"BNB", "ETHEREUM":"ETH", "POLYGON":"POL", "MATIC":"POL"}
+            row_chain = aliases.get(row_chain, row_chain)
+            wanted_chain = aliases.get(str(target_chain or "").upper(), str(target_chain or "").upper())
+            return (not target_id or oid == str(target_id)) and (not wanted_chain or row_chain == wanted_chain)
+
+        updated = [
+            _nkr_session_update_for_control(x, action, nowi) if _control_target_matches(x) else x
+            for x in nkr_sessions
+        ]
         if updated:
             _db_set_rotation_sessions(wa, updated, active_session_id=active, replace_missing=False)
         else:
@@ -38738,7 +38875,7 @@ def api_nkr_control():
             try:
                 with DB_WRITE_LOCK:
                     for x in (nkr_sessions or []):
-                        if not isinstance(x, dict):
+                        if not isinstance(x, dict) or not _control_target_matches(x):
                             continue
                         meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
                         oid = str(
@@ -38756,6 +38893,18 @@ def api_nkr_control():
                             "WHERE wallet_address=? AND engine='NKR' AND chain_id=? AND onchain_session_id=?",
                             (reg_status, int(time.time()), _norm_addr(wa), int(cid), oid),
                         )
+                    if target_id and target_chain:
+                        try:
+                            target_cid = {"ETH":1,"ETHEREUM":1,"BNB":56,"BSC":56,"BNB CHAIN":56,"POL":137,"POLYGON":137,"MATIC":137}.get(str(target_chain).upper(), int(target_chain) if str(target_chain).isdigit() else 0)
+                        except Exception:
+                            target_cid = 0
+                        if target_cid:
+                            reg_status = "PAUSED" if action == "PAUSE" else "ACTIVE"
+                            conn.execute(
+                                "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL "
+                                "WHERE wallet_address=? AND engine='NKR' AND chain_id=? AND onchain_session_id=?",
+                                (reg_status, int(time.time()), _norm_addr(wa), int(target_cid), str(target_id)),
+                            )
                     conn.commit()
             finally:
                 conn.close()
