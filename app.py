@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-332-COMPLETE-CLOSING-QUOTE-ROUTE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-333-CLOSING-PIPELINE-FULL-AUDIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -623,7 +623,9 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
 
 def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
     sid = int(str(row.get("onchain_session_id") or "0"))
-    wallet_id = str(row.get("privy_wallet_id") or "")
+    wallet_id = str(row.get("privy_wallet_id") or "").strip()
+    if not wallet_id:
+        wallet_id = str(_privy_wallet_id_for_user(_norm_addr(wallet)) or "").strip()
     vault = _norm_addr(row.get("vault_address") or "")
     chain_id = int(row.get("chain_id") or 1)
     if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
@@ -31319,11 +31321,13 @@ def _nkr_addr_from_abi_word(value) -> str:
         return ""
 
 def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> list[dict]:
-    """Read TradeExecuted logs for one session and recover every token/router used.
+    """Reliably enumerate TradeExecuted logs for one session.
 
-    This is required for dynamic targets: positionOf() is keyed by token address, while
-    sessionOf() exposes only openAssetCount.  The TradeExecuted event is therefore the
-    authoritative enumerable history from which an exit worker can recover the token.
+    Public EVM RPCs often reject broad eth_getLogs ranges. Older builds silently
+    swallowed those errors, returned an empty history, and therefore could not
+    discover the token behind openAssetCount > 0. This scanner uses small chunks,
+    recursively splits rejected ranges, retries transient failures, and raises a
+    concrete error when every request fails instead of pretending there are no logs.
     """
     cid = int(chain_id or 0)
     va = _norm_addr(vault)
@@ -31333,43 +31337,70 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
     try:
         latest_raw = _rpc_call(cid, "eth_blockNumber", [])
         latest = int(str(latest_raw), 16)
-    except Exception:
-        return []
-    lookback = max(20000, int(os.getenv("NEXUS_NKR_TRADE_LOG_LOOKBACK_BLOCKS", "180000")))
-    chunk = max(1000, min(20000, int(os.getenv("NEXUS_NKR_TRADE_LOG_CHUNK_BLOCKS", "10000"))))
-    start = max(0, latest - lookback)
+    except Exception as exc:
+        raise RuntimeError(f"closing_log_head_failed:chain={cid}:{exc}")
+
+    lookback = max(50000, int(os.getenv("NEXUS_NKR_TRADE_LOG_LOOKBACK_BLOCKS", "500000")))
+    base_chunk = max(100, min(2000, int(os.getenv("NEXUS_NKR_TRADE_LOG_CHUNK_BLOCKS", "1000"))))
+    start_block = max(0, latest - lookback)
     sid_topic = "0x" + format(sid, "064x")
     out, seen = [], set()
-    cursor = start
+    request_errors = []
+    successful_ranges = 0
+
+    def fetch_range(lo: int, hi: int, depth: int = 0):
+        nonlocal successful_ranges
+        last_exc = None
+        for attempt in range(3):
+            try:
+                rows = _rpc_call(cid, "eth_getLogs", [{
+                    "address": va,
+                    "fromBlock": hex(lo),
+                    "toBlock": hex(hi),
+                    "topics": [_NKR_TRADE_EXECUTED_TOPIC, sid_topic],
+                }]) or []
+                successful_ranges += 1
+                return rows if isinstance(rows, list) else []
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.15 * (attempt + 1))
+        if lo < hi and depth < 8:
+            mid = (lo + hi) // 2
+            return fetch_range(lo, mid, depth + 1) + fetch_range(mid + 1, hi, depth + 1)
+        request_errors.append(f"{lo}-{hi}:{str(last_exc)[:180]}")
+        return []
+
+    cursor = start_block
     while cursor <= latest:
-        end = min(latest, cursor + chunk - 1)
-        try:
-            logs = _rpc_call(cid, "eth_getLogs", [{
-                "address": va,
-                "fromBlock": hex(cursor),
-                "toBlock": hex(end),
-                "topics": [_NKR_TRADE_EXECUTED_TOPIC, sid_topic],
-            }]) or []
-        except Exception:
-            cursor = end + 1
-            continue
-        for log in logs if isinstance(logs, list) else []:
+        hi = min(latest, cursor + base_chunk - 1)
+        logs = fetch_range(cursor, hi)
+        for log in logs:
             topics = list((log or {}).get("topics") or [])
             data = str((log or {}).get("data") or "0x").removeprefix("0x")
-            if len(topics) < 4 or len(data) < 64:
+            if len(topics) < 4 or len(data) < 192:
                 continue
             router = _nkr_addr_from_abi_word(topics[2])
             token_in = _nkr_addr_from_abi_word(topics[3])
             token_out = _nkr_addr_from_abi_word("0x" + data[:64])
+            amount_in = int(data[64:128], 16)
+            amount_out = int(data[128:192], 16)
             item = {
                 "router": router, "tokenIn": token_in, "tokenOut": token_out,
+                "amountIn": amount_in, "amountOut": amount_out,
                 "blockNumber": int(str((log or {}).get("blockNumber") or "0x0"), 16),
                 "transactionHash": str((log or {}).get("transactionHash") or ""),
             }
             key = (item["transactionHash"].lower(), token_in.lower(), token_out.lower())
             if key not in seen:
-                seen.add(key); out.append(item)
-        cursor = end + 1
+                seen.add(key)
+                out.append(item)
+        cursor = hi + 1
+
+    if successful_ranges == 0:
+        raise RuntimeError(
+            f"closing_trade_event_scan_failed:chain={cid}:session={sid}:"
+            f"errors={' | '.join(request_errors)[:900]}"
+        )
     out.sort(key=lambda x: int(x.get("blockNumber") or 0))
     return out
 
@@ -36177,6 +36208,10 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         cfg = _privy_trading_cfg()
     sid = int(str(live_row.get("onchain_session_id") or "0"))
     wallet_id = str(live_row.get("privy_wallet_id") or "").strip()
+    if not wallet_id:
+        wallet_id = str(_privy_wallet_id_for_user(_norm_addr(wallet)) or "").strip()
+    if not wallet_id:
+        raise RuntimeError(f"closing_wallet_mapping_missing:chain={chain_id}:session={sid}:wallet={_norm_addr(wallet)}")
     vault = _norm_addr(live_row.get("vault_address") or "")
     mode = str(action or "ENTRY").strip().upper()
     if mode not in {"ENTRY", "BUY", "OPEN", "EXIT", "SELL", "CLOSE", "REDUCE"}:
@@ -36419,6 +36454,21 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     except Exception:
         pass
 
+    # Also recover the last runtime asset/token recorded by the live worker. This is
+    # a secondary source only; on-chain positionOf remains authoritative.
+    try:
+        rt = _live_engine_snapshot("NKR") or {}
+        rt_sym = str(rt.get("active_asset") or rt.get("best_candidate") or "").upper()
+        if rt_sym and rt_sym in routes:
+            pass
+        elif rt_sym:
+            for rsym, rr in list(routes.items()):
+                if str(rsym).upper() == rt_sym:
+                    routes[rt_sym] = rr
+                    break
+    except Exception:
+        pass
+
     # Recover every dynamically traded token from authoritative TradeExecuted logs.
     # This closes assets even when the watchlist changed, the UI card vanished, or
     # the target never had a static route entry.
@@ -36439,6 +36489,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
             routes[symbol] = {
                 "symbol": symbol, "token": token, "decimals": 18,
                 "router": event_router, "fee": int(cfg.get("poolFee") or 500),
+                "feeCandidates": [100, 500, 2500, 3000, 10000],
                 "live": True, "source": "onchain_trade_event_recovery",
                 "chain": _nkr_chain_key_from_id(chain_id),
             }
@@ -36464,9 +36515,27 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
             reason=f"CLOSING session #{session_id}: selling {sym} back to settlement",
             active_asset=sym, position_state="EXITING", pending_tx="submitting", last_error="",
         )
-        result = _nkr_live_trade_route(
-            wallet, row, route, token, settlement, amount, action="EXIT"
-        )
+        result = None
+        route_errors = []
+        fee_candidates = list((route or {}).get("feeCandidates") or [])
+        if int((route or {}).get("fee") or 0) > 0:
+            fee_candidates.insert(0, int((route or {}).get("fee")))
+        fee_candidates = list(dict.fromkeys([int(x) for x in fee_candidates if int(x or 0) > 0])) or [500, 2500, 3000, 10000, 100]
+        for exit_fee in fee_candidates:
+            try:
+                exit_route = dict(route or {})
+                exit_route["fee"] = int(exit_fee)
+                result = _nkr_live_trade_route(
+                    wallet, row, exit_route, token, settlement, amount, action="EXIT"
+                )
+                break
+            except Exception as route_exc:
+                route_errors.append(f"fee={exit_fee}:{str(route_exc)[:260]}")
+        if not result:
+            raise RuntimeError(
+                f"closing_exit_all_routes_failed:chain={chain_id}:session={session_id}:asset={sym}:token={token}:"
+                f"attempts={' | '.join(route_errors)[:1200]}"
+            )
         remaining = _position_amount(vault, session_id, token, chain_id=chain_id)
         if remaining != 0:
             raise RuntimeError(
@@ -37050,7 +37119,7 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
                 reason=f"CoreVault session {key[2]} is CLOSING; closing all open positions first",
                 pending_tx="submitting", last_error="",
             )
-            # ENGINE331: CLOSING with openAssetCount > 0 must execute exits before
+            # ENGINE333: CLOSING with openAssetCount > 0 must execute exits before
             # finalizeSession. ENGINE330 defined the chain-aware exit helper but did
             # not invoke it here, so the worker repeatedly attempted finalization
             # while the contract correctly remained CLOSING.
