@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-337-NO-ALCHEMY-PUBLIC-RPC-FAILOVER-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-338-RPC-STORM-AND-TIMEOUT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -9199,8 +9199,9 @@ _RPC_HTTP_SESSION.headers.update({
 _RPC_UNHEALTHY_UNTIL: dict[tuple[int, str], float] = {}
 _RPC_LAST_GOOD: dict[int, str] = {}
 _RPC_FAILURE_COOLDOWN_SEC = 45
-_RPC_CONNECT_TIMEOUT_SEC = 4
-_RPC_READ_TIMEOUT_SEC = 8
+_RPC_CONNECT_TIMEOUT_SEC = 2
+_RPC_READ_TIMEOUT_SEC = 4
+_RPC_MAX_ENDPOINTS_PER_CALL = 3
 
 
 def _rpc_call(chain_id: int, method: str, params: list):
@@ -9228,6 +9229,12 @@ def _rpc_call(chain_id: int, method: str, params: list):
     now = time.time()
     available = [u for u in urls if _RPC_UNHEALTHY_UNTIL.get((cid, u), 0) <= now]
     candidates = available or urls
+    # Never walk every public endpoint in one web request. Ten endpoints with
+    # connect/read timeouts could block Flask workers for roughly two minutes,
+    # causing pending OPTIONS/GET requests and making the whole UI appear dead.
+    # Try the last-known-good endpoint plus at most two fallbacks; the next call
+    # automatically rotates past endpoints placed in cooldown.
+    candidates = candidates[:_RPC_MAX_ENDPOINTS_PER_CALL]
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": str(method), "params": list(params or [])}
     failures: list[str] = []
