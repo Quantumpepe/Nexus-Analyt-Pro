@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-350-FAST-LOCAL-STRATEGIST-AUDIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-351-ETH-POL-READONLY-READINESS-AUDIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -41083,3 +41083,167 @@ def api_nexus_system_info_evm_diagnostics():
 def _boot_nkr_live_worker_once():
     _ensure_nkr_live_worker_started()
     return None
+
+# ENGINE-351: isolated ETH/POL readiness audit with a BNB regression snapshot.
+# This endpoint is additive and read-only. It does not alter the NKR worker,
+# route registry, session settings, BNB V2 recovery path, database rows, or Vault.
+@app.get("/api/nexus/system-info/eth-pol-readiness-audit")
+def api_nexus_eth_pol_readiness_audit():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+
+    wallet = _norm_addr(request.args.get("wallet") or owner)
+    if not _looks_like_evm_addr(wallet) or wallet.lower() != _norm_addr(owner).lower():
+        return jsonify({"status":"error","error":"wallet_mismatch"}), 403
+
+    chain_names = {1:"ETH", 56:"BNB", 137:"POL"}
+    requested = str(request.args.get("chains") or "ETH,POL").upper()
+    wanted = []
+    for part in requested.split(","):
+        key = part.strip()
+        cid = {"ETH":1,"ETHEREUM":1,"BNB":56,"BSC":56,"POL":137,"POLYGON":137,"MATIC":137}.get(key)
+        if cid and cid not in wanted:
+            wanted.append(cid)
+    # BNB is always included as a regression snapshot, never as a mutation target.
+    audit_ids = list(wanted)
+    if 56 not in audit_ids:
+        audit_ids.append(56)
+
+    reports = []
+    for cid in audit_ids:
+        chain = chain_names[cid]
+        checks = []
+        blockers = []
+        warnings = []
+        vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(cid) or "")
+
+        def add(name, ok, detail=None, severity="blocker"):
+            row = {"name":name,"ok":bool(ok),"detail":detail}
+            checks.append(row)
+            if not ok:
+                (blockers if severity == "blocker" else warnings).append(name)
+
+        add("vaultConfigured", _looks_like_evm_addr(vault), {"vault":vault or None})
+        try:
+            block_raw = _rpc_call(cid, "eth_blockNumber", [])
+            add("rpcReachable", True, {"blockNumber":int(str(block_raw),16)})
+        except Exception as exc:
+            add("rpcReachable", False, {"error":str(exc)[:300]})
+
+        if _looks_like_evm_addr(vault):
+            try:
+                code = str(_rpc_call(cid, "eth_getCode", [vault,"latest"]) or "0x")
+                add("vaultContractCode", code not in {"0x","0x0","0x00",""}, {"codeBytes":max(0,(len(code)-2)//2)})
+            except Exception as exc:
+                add("vaultContractCode", False, {"error":str(exc)[:300]})
+
+            try:
+                guardian = _read_vault_guardian(vault, cid)
+                add("guardianConfigured", _looks_like_evm_addr(guardian), {"guardian":guardian})
+            except Exception as exc:
+                guardian = ""
+                add("guardianConfigured", False, {"error":str(exc)[:300]})
+        else:
+            guardian = ""
+
+        try:
+            cfg = _privy_trading_cfg(cid)
+        except Exception as exc:
+            cfg = {}
+            add("chainTradingConfig", False, {"error":str(exc)[:300]})
+        else:
+            add("chainTradingConfig", True, {
+                "router":_norm_addr(cfg.get("router") or ""),
+                "quoter":_norm_addr(cfg.get("quoter") or ""),
+                "settlement":_norm_addr(cfg.get("usdc") or ""),
+                "wrappedNative":_norm_addr(cfg.get("weth") or ""),
+                "poolFee":cfg.get("poolFee"),
+            })
+
+        router = _norm_addr(cfg.get("router") or "") if cfg else ""
+        settlement = _norm_addr(cfg.get("usdc") or "") if cfg else ""
+        wrapped = _norm_addr(cfg.get("weth") or "") if cfg else ""
+        if _looks_like_evm_addr(vault) and _looks_like_evm_addr(router):
+            try:
+                rcfg = _read_router_config(vault, router, cid)
+                add("primaryRouterEnabled", bool(rcfg.get("enabled")), {"router":router,"config":rcfg})
+            except Exception as exc:
+                add("primaryRouterEnabled", False, {"router":router,"error":str(exc)[:300]})
+            try:
+                allowed = _exact_input_selector_candidates(vault, router, cid, cfg)
+                add("primaryRouterSelector", bool(allowed), {"router":router,"allowedSelectors":allowed})
+            except Exception as exc:
+                add("primaryRouterSelector", False, {"router":router,"error":str(exc)[:300]})
+        else:
+            add("primaryRouterAddress", False, {"router":router or None})
+
+        if _looks_like_evm_addr(vault) and _looks_like_evm_addr(settlement):
+            try:
+                tcfg = _read_token_config(vault, settlement, cid) or {}
+                add("settlementExecutable", bool(tcfg.get("configured") and tcfg.get("executionEnabled")), {"token":settlement,"config":tcfg})
+                try:
+                    free_units = int(_eth_call(cid, vault, _core_selector("freeBase(address,address)") + _address_to_32(wallet) + _address_to_32(settlement)),16)
+                except Exception:
+                    free_units = None
+                checks.append({"name":"walletFreeBase","ok":free_units is not None,"detail":{"units":str(free_units) if free_units is not None else None},"informational":True})
+            except Exception as exc:
+                add("settlementExecutable", False, {"token":settlement,"error":str(exc)[:300]})
+
+        if _looks_like_evm_addr(wrapped):
+            try:
+                code = str(_rpc_call(cid, "eth_getCode", [wrapped,"latest"]) or "0x")
+                add("wrappedNativeContract", code not in {"0x","0x0","0x00",""}, {"token":wrapped}, severity="warning")
+            except Exception as exc:
+                add("wrappedNativeContract", False, {"token":wrapped,"error":str(exc)[:300]}, severity="warning")
+
+        local_sessions = []
+        try:
+            _live_engine_tables_init()
+            con = _db()
+            try:
+                rows = con.execute(
+                    "SELECT onchain_session_id,status,budget_units,updated_ts FROM nexus_live_core_vault_sessions "
+                    "WHERE wallet_address=? AND engine='NKR' AND chain_id=? "
+                    "AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') ORDER BY updated_ts DESC",
+                    (wallet,cid),
+                ).fetchall()
+                local_sessions = [dict(r) for r in rows]
+            finally:
+                con.close()
+        except Exception as exc:
+            warnings.append("localSessionRegistry")
+            checks.append({"name":"localSessionRegistry","ok":False,"detail":{"error":str(exc)[:300]}})
+
+        role = "REGRESSION_GUARD" if cid == 56 else "READINESS_TARGET"
+        status = "BLOCKED" if blockers else ("WARNING" if warnings else "READY")
+        reports.append({
+            "chain":chain,"chainId":cid,"role":role,"status":status,
+            "vault":vault or None,"guardian":guardian or None,"router":router or None,
+            "settlement":settlement or None,"wrappedNative":wrapped or None,
+            "checks":checks,"blockers":blockers,"warnings":warnings,
+            "activeLocalNkrSessions":local_sessions,
+        })
+
+    targets = [r for r in reports if r["role"] == "READINESS_TARGET"]
+    bnb = next((r for r in reports if r["chainId"] == 56), None)
+    overall = "READY" if targets and all(r["status"] == "READY" for r in targets) else "BLOCKED"
+    return jsonify({
+        "status":overall,
+        "build":BACKEND_BUILD_ID,
+        "readonly":True,
+        "transactionsSent":0,
+        "mutations":0,
+        "workerChanges":0,
+        "bnbExecutionCodeChanged":False,
+        "scope":"ETH_AND_POL_READINESS_WITH_BNB_REGRESSION_GUARD",
+        "wallet":wallet,
+        "reports":reports,
+        "bnbRegression":{
+            "status":(bnb or {}).get("status"),
+            "activeSessions":(bnb or {}).get("activeLocalNkrSessions",[]),
+            "note":"BNB is read only. ENGINE-347 PancakeSwap V2 closing execution and ENGINE-350 Strategist audit are untouched.",
+        },
+        "nextStep":"Configure or repair only the chain reported as blocked. Do not change shared BNB execution code.",
+        "ts":now_ts(),
+    })
