@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-325-DYNAMIC-TARGET-TOKEN-EXECUTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-326-DIAGNOSTIC-ENDPOINT-COMPAT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -39503,6 +39503,71 @@ def api_nexus_engine_history_sync():
         finally:
             conn.close()
     return jsonify({"status":"ok","engine":engine,"written":written,"ts":now_i})
+
+
+@app.get("/api/nexus/system-info/evm-diagnostics")
+def api_nexus_system_info_evm_diagnostics_compat():
+    """Compatibility endpoint for BUILD368.
+
+    This endpoint is deliberately read-only and isolated from the live worker and
+    execution path.  ENGINE325 is based on the stable ENGINE317 branch, which did
+    not include the later developer-diagnostics endpoint.  Returning a compatible
+    payload prevents the frontend from showing a 404 without changing any trading,
+    session, strategist, Grid, Trader, or Vault behavior.
+    """
+    engine = str(request.args.get("engine") or "ALL").strip().upper() or "ALL"
+    try:
+        chain_id = int(request.args.get("chain_id") or 0)
+    except Exception:
+        chain_id = 0
+    session_raw = request.args.get("session_id")
+    try:
+        session_id = int(session_raw) if session_raw not in (None, "") else None
+    except Exception:
+        session_id = None
+
+    chain_names = {
+        1: "ETH", 56: "BNB", 137: "POL", 8453: "BASE",
+        42161: "ARB", 10: "OP", 43114: "AVAX",
+    }
+    report = {
+        "chainId": chain_id or None,
+        "chain": chain_names.get(chain_id, str(chain_id) if chain_id else "—"),
+        "engine": engine,
+        "sessionId": session_id,
+        "status": "INFO",
+        "summary": {"blockerCount": 0, "warningCount": 1, "targetSymbol": "—"},
+        "checks": {
+            "diagnosticsEndpoint": {
+                "ok": True,
+                "status": "READY",
+                "detail": "Compatibility endpoint active; live execution is unaffected.",
+            },
+            "diagnosticsMode": {
+                "ok": False,
+                "status": "INFO",
+                "detail": "Full developer diagnostics are not loaded in this stable ENGINE317-derived runtime.",
+            },
+        },
+        "blockers": [],
+        "diagnosticError": None,
+        "rootCause": {
+            "status": "READY",
+            "stage": "DIAGNOSTICS_ENDPOINT",
+            "title": "Endpoint available; no 404",
+            "contract": None,
+            "function": "/api/nexus/system-info/evm-diagnostics",
+            "error": None,
+            "remediation": None,
+        },
+    }
+    return jsonify({
+        "status": "ok",
+        "overall": "INFO",
+        "engine": engine,
+        "reports": [report],
+        "ts": now_ts(),
+    })
 
 # ENGINE-194 boot hook: safe under Flask reload/multiple requests; guarded once per process.
 @app.before_request
