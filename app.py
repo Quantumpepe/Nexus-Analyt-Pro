@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-345-BNB-SMART-ROUTER-READONLY-PREFLIGHT"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-346-BNB-V2-ROUTE-READONLY-PREFLIGHT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40254,11 +40254,18 @@ def api_nexus_engine_history_sync():
 
 
 
-# ENGINE-345: BNB Smart Router read-only route and Vault preflight.
-# This endpoint NEVER signs or sends a transaction. It is intentionally separate
-# from the live closing worker so the owner can verify the exact selector and path
-# before allowing a new router selector on-chain.
+# ENGINE-346: BNB read-only route discovery and CoreVault preflight.
+#
+# Build 345 proved that the BSC Smart Router at 0x13f4... does not expose the
+# classic V2 getAmountsOut/swapExactTokensForTokens ABI. Build 346 therefore
+# tests the official PancakeSwap V2 router directly. This is the simplest
+# compatible recovery path for the existing CoreVault because the Vault already
+# supports arbitrary allow-listed routers and selectors.
+#
+# This endpoint NEVER signs or sends a transaction.
 _BNB_PANCAKE_SMART_ROUTER = "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4"
+_BNB_PANCAKE_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+_BNB_MIXED_ROUTE_QUOTER_V1 = "0x678Aa4bF4E210cf2166753e054d5b7c31cc7fa86"
 _BNB_XRP_TOKEN = "0x1D2F0dA169ceB9Fc7B3144628dB156f3F6c60dBE"
 _V2_GET_AMOUNTS_OUT_SELECTOR = _core_selector("getAmountsOut(uint256,address[])")
 _V2_SWAP_EXACT_TOKENS_SELECTOR = _core_selector("swapExactTokensForTokens(uint256,uint256,address[],address,uint256)")
@@ -40281,8 +40288,6 @@ def _v2_get_amounts_out_data(amount_in, path):
 
 
 def _v2_swap_exact_tokens_data(amount_in, min_out, path, recipient, deadline):
-    # swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
-    # Dynamic path begins after five 32-byte head words.
     return (
         _V2_SWAP_EXACT_TOKENS_SELECTOR
         + _uint_to_32(int(amount_in))
@@ -40308,23 +40313,35 @@ def _decode_uint_array(raw):
     return [int(words[start + i], 16) for i in range(count)]
 
 
+def _read_vault_guardian(vault, chain_id):
+    raw = _eth_call(chain_id, vault, _core_selector("guardian()"))
+    words = _core_words(raw)
+    if not words:
+        return ""
+    return _nkr_addr_from_abi_word(words[0])
+
+
 @app.get("/api/nexus/system-info/bnb-smart-router-preflight")
 def nexus_bnb_smart_router_preflight():
-    """Read-only XRP -> WBNB -> settlement preflight for BNB CLOSING sessions.
+    """Read-only XRP recovery route test for BNB CLOSING sessions.
 
-    It checks the already enabled Pancake Smart Router, quotes the V2-compatible
-    path with getAmountsOut, derives the exact swap selector, and (only when that
-    selector is already allowed) simulates CoreVault.executeTrade via eth_call.
-    No Privy request, signature or transaction is created.
+    The public URL is kept for compatibility with Build 345, but Build 346 now
+    uses the official PancakeSwap V2 router because the Smart Router does not
+    expose the classic V2 ABI. It tests both XRP->settlement and
+    XRP->WBNB->settlement and returns the exact router/selector configuration.
     """
     wallet = _norm_addr(request.args.get("wallet") or request.headers.get("X-Wallet-Address") or "")
     session_id = int(request.args.get("sessionId") or request.args.get("session_id") or 8)
     chain_id = 56
-    smart_router = _norm_addr(request.args.get("router") or _BNB_PANCAKE_SMART_ROUTER)
+    v2_router = _norm_addr(request.args.get("router") or _BNB_PANCAKE_V2_ROUTER)
     result = {
         "status": "checking", "readOnly": True, "transactionsSent": 0,
         "chain": "BNB", "chainId": chain_id, "sessionId": session_id,
-        "router": smart_router, "selector": _V2_SWAP_EXACT_TOKENS_SELECTOR,
+        "routeMode": "PANCAKESWAP_V2_RECOVERY",
+        "router": v2_router,
+        "smartRouterAlreadyEnabledButUnused": _BNB_PANCAKE_SMART_ROUTER,
+        "mixedRouteQuoterReference": _BNB_MIXED_ROUTE_QUOTER_V1,
+        "selector": _V2_SWAP_EXACT_TOKENS_SELECTOR,
         "selectorSignature": "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
         "checks": [], "recommendation": None,
     }
@@ -40334,12 +40351,12 @@ def nexus_bnb_smart_router_preflight():
         if detail is not None:
             row["detail"] = detail
         if error:
-            row["error"] = str(error)[:1200]
+            row["error"] = str(error)[:1600]
         result["checks"].append(row)
         return bool(ok)
 
     if not _looks_like_evm_addr(wallet):
-        result.update(status="blocked", blocker="wallet_missing", recommendation="Open System Info while the owner wallet is connected.")
+        result.update(status="blocked", blocker="wallet_missing", recommendation="Open the URL with the connected wallet address.")
         return jsonify(result), 400
 
     try:
@@ -40350,17 +40367,10 @@ def nexus_bnb_smart_router_preflight():
         result["vault"] = vault
         result["wallet"] = wallet
 
-        code_ok = _contract_has_code(smart_router, chain_id)
-        check("smartRouterContractCode", code_ok, {"router": smart_router})
+        code_ok = _contract_has_code(v2_router, chain_id)
+        check("pancakeV2RouterContractCode", code_ok, {"router": v2_router})
         if not code_ok:
-            raise RuntimeError("smart_router_has_no_contract_code")
-
-        router_cfg = _read_router_config(vault, smart_router, chain_id)
-        result["routerConfig"] = router_cfg
-        check("smartRouterEnabledInVault", bool(router_cfg.get("enabled")), router_cfg)
-        if not router_cfg.get("enabled"):
-            result.update(status="blocked", blocker="smart_router_disabled", recommendation="Enable the Smart Router with configureRouter before any selector is allowed.")
-            return jsonify(result)
+            raise RuntimeError("pancake_v2_router_has_no_contract_code")
 
         raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(session_id))
         words = _core_words(raw)
@@ -40370,7 +40380,8 @@ def nexus_bnb_smart_router_preflight():
         session_status = int(words[3])
         open_assets = int(words[12])
         result["session"] = {
-            "settlementToken": settlement, "statusId": session_status,
+            "settlementToken": settlement,
+            "statusId": session_status,
             "status": {1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(session_status, str(session_status)),
             "openAssetCount": open_assets,
         }
@@ -40388,70 +40399,119 @@ def nexus_bnb_smart_router_preflight():
         if amount_in <= 0:
             raise RuntimeError("xrp_position_empty")
 
-        path = [xrp, wbnb, settlement]
-        result["path"] = path
-        quote_raw = _eth_call(chain_id, smart_router, _v2_get_amounts_out_data(amount_in, path))
-        amounts = _decode_uint_array(quote_raw)
-        if len(amounts) != len(path) or int(amounts[-1]) <= 0:
-            raise RuntimeError(f"smart_router_quote_invalid:{amounts}")
-        quote_out = int(amounts[-1])
+        candidate_paths = [
+            ("DIRECT", [xrp, settlement]),
+            ("VIA_WBNB", [xrp, wbnb, settlement]),
+        ]
+        quotes = []
+        best = None
+        for label, path in candidate_paths:
+            try:
+                quote_raw = _eth_call(chain_id, v2_router, _v2_get_amounts_out_data(amount_in, path))
+                amounts = _decode_uint_array(quote_raw)
+                row = {
+                    "label": label, "ok": bool(len(amounts) == len(path) and int(amounts[-1]) > 0),
+                    "path": path, "amounts": [str(x) for x in amounts],
+                    "amountOut": str(amounts[-1]) if amounts else "0",
+                }
+                quotes.append(row)
+                if row["ok"] and (best is None or int(amounts[-1]) > int(best["amountOut"])):
+                    best = row
+            except Exception as exc:
+                quotes.append({"label": label, "ok": False, "path": path, "error": str(exc)[:1200]})
+        result["routeQuotes"] = quotes
+        check("pancakeV2RouteQuote", best is not None, {"quotes": quotes})
+        if best is None:
+            result.update(
+                status="blocked", blocker="no_v2_route",
+                recommendation="No executable PancakeSwap V2 route was found. Do not configure a new selector; inspect another liquidity source.",
+            )
+            return jsonify(result)
+
+        quote_out = int(best["amountOut"])
         slippage_bps = max(200, int(cfg.get("slippageBps") or 500))
         min_out = quote_out * (10000 - slippage_bps) // 10000
-        result["quote"] = {
-            "amounts": [str(x) for x in amounts], "amountIn": str(amount_in),
-            "amountOut": str(quote_out), "minAmountOut": str(min_out),
-            "slippageBps": slippage_bps, "source": "SmartRouter.getAmountsOut",
+        result["selectedRoute"] = {
+            **best, "amountIn": str(amount_in), "minAmountOut": str(min_out),
+            "slippageBps": slippage_bps, "source": "PancakeRouterV2.getAmountsOut",
         }
-        check("smartRouterV2PathQuote", True, result["quote"])
 
-        selector_allowed = bool(_read_router_selector_allowed(vault, smart_router, _V2_SWAP_EXACT_TOKENS_SELECTOR, chain_id))
+        router_cfg = _read_router_config(vault, v2_router, chain_id)
+        selector_allowed = bool(_read_router_selector_allowed(vault, v2_router, _V2_SWAP_EXACT_TOKENS_SELECTOR, chain_id))
+        result["routerConfig"] = router_cfg
         result["selectorAllowed"] = selector_allowed
+        check("pancakeV2RouterEnabledInVault", bool(router_cfg.get("enabled")), router_cfg)
         check("vaultSelectorAllowed", selector_allowed, {
-            "router": smart_router, "selector": _V2_SWAP_EXACT_TOKENS_SELECTOR,
+            "router": v2_router, "selector": _V2_SWAP_EXACT_TOKENS_SELECTOR,
             "signature": result["selectorSignature"],
         })
 
-        deadline = now_ts() + 300
-        router_data = _v2_swap_exact_tokens_data(amount_in, min_out, path, vault, deadline)
-        result["routerCalldataSelector"] = router_data[:10]
-        result["routerCalldataBytes"] = (len(router_data) - 2) // 2
-        result["vaultPreflightAttempted"] = False
-        result["vaultPreflightPassed"] = False
+        result["requiredOnchainConfiguration"] = {
+            "configureRouter": {
+                "router": v2_router,
+                "enabled": True,
+                "oracle": ZERO_ADDRESS,
+            },
+            "configureRouterSelector": {
+                "router": v2_router,
+                "selector": _V2_SWAP_EXACT_TOKENS_SELECTOR,
+                "allowed": True,
+            },
+        }
+
+        if not router_cfg.get("enabled"):
+            result.update(
+                status="router_configuration_required", blocker="v2_router_not_enabled",
+                recommendation=(
+                    "The read-only V2 quote succeeded. Configure the official PancakeSwap V2 router in the BNB CoreVault: "
+                    f"router={v2_router}, enabled=true, oracle={ZERO_ADDRESS}. Simulate before Write. "
+                    "Do not press Stop & Exit yet."
+                ),
+            )
+            return jsonify(result)
 
         if not selector_allowed:
             result.update(
                 status="selector_required", blocker="selector_not_allowed",
                 recommendation=(
-                    "Read-only quote succeeded. In CoreVault.configureRouterSelector use router "
-                    f"{smart_router}, selector {_V2_SWAP_EXACT_TOKENS_SELECTOR}, allowed=true. "
-                    "Simulate first. Do not run Stop & Exit until this endpoint then reports vaultPreflightPassed=true."
+                    "The V2 router is enabled and the route quote succeeded. Configure only this selector: "
+                    f"router={v2_router}, selector={_V2_SWAP_EXACT_TOKENS_SELECTOR}, allowed=true. "
+                    "Simulate before Write, then reload this endpoint."
                 ),
             )
             return jsonify(result)
 
-        call = _encode_execute_trade(
-            session_id, smart_router, xrp, settlement, amount_in, min_out, deadline, router_data
-        )
+        deadline = now_ts() + 300
+        router_data = _v2_swap_exact_tokens_data(amount_in, min_out, best["path"], vault, deadline)
+        result["routerCalldataSelector"] = router_data[:10]
+        result["routerCalldataBytes"] = (len(router_data) - 2) // 2
+        call = _encode_execute_trade(session_id, v2_router, xrp, settlement, amount_in, min_out, deadline, router_data)
         result["vaultPreflightAttempted"] = True
+        result["vaultPreflightPassed"] = False
+
+        guardian = _read_vault_guardian(vault, chain_id)
+        result["vaultGuardian"] = guardian
+        preflight_from = guardian if _looks_like_evm_addr(guardian) else wallet
+        result["preflightFrom"] = preflight_from
         try:
-            preflight_raw = _eth_call_from(chain_id, wallet, vault, call)
+            preflight_raw = _eth_call_from(chain_id, preflight_from, vault, call)
             result["vaultPreflightPassed"] = True
             result["vaultPreflightResult"] = preflight_raw
-            check("coreVaultExecuteTradeEthCall", True, {"result": preflight_raw})
+            check("coreVaultExecuteTradeEthCall", True, {"result": preflight_raw, "from": preflight_from})
             result.update(
                 status="ready", blocker=None,
-                recommendation="Vault eth_call passed. The selector and XRP -> WBNB -> settlement path are executable; live execution is still not triggered by this endpoint.",
+                recommendation="Read-only Vault preflight passed. The live worker may now use this exact V2 route; this endpoint still sent zero transactions.",
             )
         except Exception as exc:
             result["vaultPreflightError"] = str(exc)
-            check("coreVaultExecuteTradeEthCall", False, error=exc)
+            check("coreVaultExecuteTradeEthCall", False, {"from": preflight_from}, error=exc)
             result.update(
                 status="blocked", blocker="vault_preflight_failed",
-                recommendation="Do not execute live. Review the returned Vault preflight error; router approval/allowance or route compatibility is still missing.",
+                recommendation="Do not execute live. The route exists, but the complete CoreVault eth_call still reverts. Review the returned error before any worker change.",
             )
         return jsonify(result)
     except Exception as exc:
-        result.update(status="blocked", blocker="preflight_setup_failed", error=str(exc), recommendation="Do not allow another selector until the read-only quote succeeds.")
+        result.update(status="blocked", blocker="preflight_setup_failed", error=str(exc), recommendation="Do not configure another selector until a read-only route quote succeeds.")
         check("preflightSetup", False, error=exc)
         return jsonify(result), 200
 
