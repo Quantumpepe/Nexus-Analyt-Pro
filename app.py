@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-327-LIVE-SESSION-SETTLEMENT-ADDRESS-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-329-CLOSING-AUTO-FINALIZE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36819,6 +36819,97 @@ def _nkr_confirm_processed_live_exit(processed: list[dict], live_row: dict, exec
         sess["rotationEvents"] = events
 
 
+
+_NKR_CLOSING_FINALIZE_LOCK = threading.RLock()
+_NKR_CLOSING_FINALIZE_INFLIGHT = set()
+
+
+def _nkr_closing_finalize_key(row: dict) -> tuple:
+    return (
+        int((row or {}).get("chain_id") or 0),
+        _norm_addr((row or {}).get("vault_address") or ""),
+        str((row or {}).get("onchain_session_id") or "").strip(),
+    )
+
+
+def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
+    """Finalize one authoritative on-chain CLOSING NKR session exactly once.
+
+    Stop & Exit already submitted startClosing.  The live worker must not rank or
+    trade that row again.  When openAssetCount is zero this helper submits the
+    missing finalizeSession transaction, waits for confirmation, and verifies
+    FINALIZED directly from sessionOf().
+    """
+    key = _nkr_closing_finalize_key(row)
+    if key[0] <= 0 or not key[1] or not key[2]:
+        return False
+    with _NKR_CLOSING_FINALIZE_LOCK:
+        if key in _NKR_CLOSING_FINALIZE_INFLIGHT:
+            return True
+        _NKR_CLOSING_FINALIZE_INFLIGHT.add(key)
+
+    def _runner():
+        try:
+            _nkr_set_exact_local_session_state(
+                wallet, key[0], key[2], "CLOSING",
+                "CoreVault closing confirmed; finalizing session"
+            )
+            _live_engine_mark(
+                "NKR", status="closing", decision="FINALIZING",
+                gate_status="EXIT_PENDING",
+                reason=f"CoreVault session {key[2]} is CLOSING; submitting finalizeSession",
+                pending_tx="submitting", last_error="",
+            )
+            result = _finalize_one_live_session(wallet, "NKR", dict(row))
+            _nkr_set_exact_local_session_state(
+                wallet, key[0], key[2], "FINALIZED",
+                "CoreVault session finalized and capital released"
+            )
+            remaining = _live_active_sessions(wallet, "NKR")
+            if remaining:
+                _live_engine_mark(
+                    "NKR", status="running", decision="SESSION_FINALIZED",
+                    gate_status="", reason=f"Session {key[2]} finalized; other sessions remain",
+                    pending_tx="", last_error="",
+                )
+            else:
+                _live_engine_mark(
+                    "NKR", status="stopped", decision="FINALIZED",
+                    gate_status="", reason=f"CoreVault session {key[2]} finalized",
+                    pending_tx="", last_error="",
+                )
+        except Exception as exc:
+            msg = str(exc)[:1200]
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    conn.execute(
+                        "UPDATE nexus_live_core_vault_sessions "
+                        "SET status='CLOSING', updated_ts=?, last_error=? "
+                        "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                        (int(time.time()), msg, key[0], key[1].lower(), key[2]),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            _live_engine_mark(
+                "NKR", status="closing", decision="FINALIZE_FAILED",
+                gate_status="EXIT_PENDING",
+                reason=f"Session {key[2]} remains CLOSING; finalizeSession failed",
+                pending_tx="", last_error=msg,
+            )
+        finally:
+            with _NKR_CLOSING_FINALIZE_LOCK:
+                _NKR_CLOSING_FINALIZE_INFLIGHT.discard(key)
+
+    threading.Thread(
+        target=_runner,
+        name=f"nkr-finalize-{key[0]}-{key[2]}",
+        daemon=True,
+    ).start()
+    return True
+
+
 def _nkr_live_worker_cycle() -> None:
     """Process every recoverable NKR registry row.
 
@@ -36860,9 +36951,49 @@ def _nkr_live_worker_cycle() -> None:
             by_wallet.setdefault(wallet, []).append(row)
 
     for wallet, wallet_rows in by_wallet.items():
+        # CLOSING is terminal orchestration, never a tradable worker row.  Re-read
+        # sessionOf() so a stale local ACTIVE/PAUSED projection cannot hide an
+        # already confirmed on-chain startClosing transaction.
+        closing_rows = []
+        for _row in (wallet_rows or []):
+            try:
+                _cid = int((_row or {}).get("chain_id") or 0)
+                _vault = _norm_addr((_row or {}).get("vault_address") or "")
+                _sid = int(str((_row or {}).get("onchain_session_id") or "0"))
+                if _cid <= 0 or _sid <= 0 or not _looks_like_evm_addr(_vault):
+                    continue
+                _raw = _eth_call(_cid, _vault, _core_selector("sessionOf(uint256)") + _uint_to_32(_sid))
+                _words = _core_words(_raw)
+                _onchain_status = int(_words[3]) if len(_words) >= 4 else -1
+                if _onchain_status == 3:
+                    _row = dict(_row)
+                    _row["status"] = "CLOSING"
+                    closing_rows.append(_row)
+                elif _onchain_status == 4:
+                    conn = _db()
+                    try:
+                        with DB_WRITE_LOCK:
+                            conn.execute(
+                                "UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', updated_ts=?, last_error=NULL "
+                                "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                                (int(time.time()), _cid, _vault.lower(), str(_sid)),
+                            )
+                            conn.commit()
+                    finally:
+                        conn.close()
+                    _nkr_set_exact_local_session_state(wallet, _cid, str(_sid), "FINALIZED", "On-chain session finalized")
+            except Exception:
+                if str((_row or {}).get("status") or "").upper() == "CLOSING":
+                    closing_rows.append(dict(_row))
+
+        closing_keys = {_nkr_closing_finalize_key(r) for r in closing_rows}
+        for _closing in closing_rows:
+            _nkr_finalize_closing_session_async(wallet, _closing)
+
         runnable_rows = [
             r for r in wallet_rows
-            if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+            if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR"}
+            and _nkr_closing_finalize_key(r) not in closing_keys
         ]
         # Extra guard: presentation-layer user pause (even if registry lag)
         try:
