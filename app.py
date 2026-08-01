@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-335-BNB-XRP-TWO-HOP-CLOSING-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-336-CLOSING-BRIDGE-DIRECTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36252,8 +36252,16 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     if not _looks_like_evm_addr(session_settlement):
         raise RuntimeError(f"session_settlement_invalid:chain={chain_id}:session={sid}")
     if is_exit:
+        # ENGINE-336: A CLOSING recovery may require a deterministic bridge leg
+        # target -> wrapped native -> settlement.  The first leg is still an
+        # exit of the original position, but its tokenOut is intentionally not
+        # the session settlement token.  Permit this only when explicitly
+        # marked by the closing pipeline and only while the on-chain session is
+        # already CLOSING. Normal exits remain settlement-only.
+        closing_bridge_leg = bool((route or {}).get("closingBridgeLeg"))
         if token_out.lower() != session_settlement.lower():
-            raise RuntimeError(f"exit_direction_invalid:chain={chain_id}:session={sid}:expectedOut={session_settlement}:actualOut={token_out}")
+            if not (closing_bridge_leg and session_status == 3):
+                raise RuntimeError(f"exit_direction_invalid:chain={chain_id}:session={sid}:expectedOut={session_settlement}:actualOut={token_out}")
         if session_status not in {1, 2, 3}:
             raise RuntimeError(f"exit_session_status_invalid:chain={chain_id}:session={sid}:status={session_status}")
     else:
@@ -36582,6 +36590,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
                     try:
                         bridge_route = dict(route or {})
                         bridge_route["fee"] = int(bridge_fee)
+                        bridge_route["closingBridgeLeg"] = True
                         first_leg = _nkr_live_trade_route(
                             wallet, row, bridge_route, token, intermediate, amount, action="EXIT"
                         )
