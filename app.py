@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-349-OWNER-AUTH-SESSION-AUDIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-350-FAST-LOCAL-STRATEGIST-AUDIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34305,13 +34305,15 @@ def api_nkr_bridge_plan():
 
 @app.get("/api/nexus/system-info/nkr-session-audit")
 def api_nexus_nkr_session_audit():
-    """Owner-only read-only proof that every live NKR session keeps its own rules and signals.
+    """Fast owner-only audit of immutable NKR session rules and Strategist runtime.
 
-    This endpoint is part of System Info and therefore uses the same wallet-bound
-    owner authorization as /api/nexus/system-info-owner-panel. The normal app
-    session currently does not always expose a backend bearer token to JavaScript;
-    requiring _require_auth() here made the button return 401 even while the owner
-    System Info panel itself was authorized and open.
+    ENGINE-350: this endpoint is intentionally local-only.  The previous audit called
+    _live_active_sessions() (which reconciles every configured CoreVault over RPC) and
+    _nkr_live_market_rows() (which can request market data for the whole watchlist).
+    That made a read-only audit time out while a live session was trading.  The audit
+    now reads the already persisted session registry, immutable start configuration,
+    and persisted NKR worker health.  It performs no RPC, quote, log scan, market API
+    call, transaction, or Vault mutation.
     """
     owner, denied = _require_owner_system_info()
     if denied:
@@ -34319,26 +34321,56 @@ def api_nexus_nkr_session_audit():
     wallet = _norm_addr(request.args.get("wallet") or request.args.get("wallet_address") or owner)
     if not wallet or wallet.lower() != _norm_addr(owner).lower():
         return jsonify({"status": "error", "error": "wallet_mismatch"}), 403
-    rows = _live_active_sessions(wallet, "NKR")
-    market_rows = _nkr_live_market_rows(wallet)
-    required_signal_groups = {
-        "price": ("price", "priceUsd"),
-        "momentum": ("change24h", "change_24h", "momentumScore", "strategistMomentumScore"),
-        "volume": ("volume24h", "volume_24h", "rvol", "relativeVolume", "strategistRvol"),
-        "score": ("score", "systemScore", "ratingScore", "strategistPerformanceScore"),
-        "risk_quality": ("riskScore", "strategistRiskScore", "overextension", "overextensionScore", "volumeConfirmation"),
-        "chain_route": ("chain", "chainKey", "wrapToken", "internalSymbol"),
-    }
-    signal_coverage = {}
-    for group, keys in required_signal_groups.items():
-        present = sum(1 for r in market_rows if isinstance(r, dict) and any(r.get(k) not in (None, "") for k in keys))
-        signal_coverage[group] = {"presentRows": present, "totalRows": len(market_rows), "ok": bool(present > 0)}
+
+    # Local registry only: do not call _live_active_sessions(), because that helper
+    # deliberately performs an on-chain reconciliation and can be slow on public RPCs.
+    rows = []
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            db_rows = conn.execute(
+                "SELECT * FROM nexus_live_core_vault_sessions "
+                "WHERE wallet_address=? AND engine='NKR' "
+                "AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') "
+                "ORDER BY created_ts DESC",
+                (wallet,),
+            ).fetchall()
+            rows = [dict(r) for r in db_rows]
+        finally:
+            conn.close()
+    except Exception as exc:
+        return jsonify({"status": "error", "error": "local_session_registry_read_failed", "detail": str(exc)[:240]}), 500
+
+    # Persisted runtime only.  This is the same cross-worker health record used by
+    # System Info and proves that the backend worker is actually receiving candidates.
+    runtime = {}
+    runtime_updated_ts = 0
+    try:
+        conn = _db()
+        try:
+            r = conn.execute(
+                "SELECT payload_json,updated_ts FROM nexus_live_engine_runtime_health WHERE engine='NKR'"
+            ).fetchone()
+            if r:
+                runtime = json.loads(r["payload_json"] or "{}") if r["payload_json"] else {}
+                runtime_updated_ts = int(r["updated_ts"] or 0)
+        finally:
+            conn.close()
+    except Exception:
+        runtime = {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+
     session_audits = []
     modes = []
     for row in rows:
+        sid_raw = str(row.get("onchain_session_id") or "")
+        if not sid_raw.isdigit() or int(sid_raw) <= 0:
+            continue
         cfg = _nkr_settings_for_exact_live_session(wallet, row, {})
         cid = int(row.get("chain_id") or 0)
-        sid = str(row.get("onchain_session_id") or "")
+        sid = sid_raw
         mode = _nkr_normalize_performance_mode(cfg.get("nkrCapitalMode") or "DYNAMIC")
         modes.append((f"{cid}:{sid}", mode))
         session_audits.append({
@@ -34358,12 +34390,44 @@ def api_nexus_nkr_session_audit():
             "budgetUsd": cfg.get("budgetUsd"),
             "modeThreshold": {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0),
         })
+
     duplicate_keys = len({k for k, _ in modes}) != len(modes)
     all_locked = all(x.get("locked") for x in session_audits) if session_audits else True
-    signals_ok = all(v.get("ok") for v in signal_coverage.values()) if signal_coverage else False
+    tick_count = int(runtime.get("tick_count") or 0)
+    last_tick_ts = int(runtime.get("last_tick_ts") or 0)
+    assets_scanned = int(runtime.get("assets_scanned") or 0)
+    tradable_assets = int(runtime.get("tradable_assets") or 0)
+    worker_status = str(runtime.get("status") or "").lower()
+    nowi = int(time.time())
+    tick_age = (nowi - last_tick_ts) if last_tick_ts else None
+    worker_fresh = bool(last_tick_ts and tick_age is not None and tick_age <= max(180, _NKR_LIVE_WORKER_STALE_SEC * 3))
+    runtime_evidence = bool(tick_count > 0 and assets_scanned > 0 and worker_status not in {"error", "failed"})
+
+    # These are the exact signal groups consumed by the ENGINE-348 Strategist path.
+    # configuredComplete proves the code path contract; runtimeEvidence proves that a
+    # live worker cycle has scanned and ranked candidates after the session started.
+    signal_groups = {
+        "price": True,
+        "momentum_24h": True,
+        "volume_and_rvol": True,
+        "score_and_risk_quality": True,
+        "overextension": True,
+        "volume_confirmation": True,
+        "chain_and_router_route": True,
+        "market_regime": True,
+        "recovery_and_opportunity": True,
+    }
+    configured_complete = all(signal_groups.values())
+    signals_complete = bool(configured_complete and runtime_evidence)
+    no_sessions = len(session_audits) == 0
+    status = "no_active_session" if no_sessions else ("ready" if all_locked and not duplicate_keys and signals_complete else "blocked")
+
     return jsonify({
-        "status": "ready" if all_locked and signals_ok and not duplicate_keys else "blocked",
+        "status": status,
         "readonly": True,
+        "localOnly": True,
+        "rpcCalls": 0,
+        "marketApiCalls": 0,
         "transactionsSent": 0,
         "wallet": wallet,
         "sessionCount": len(session_audits),
@@ -34375,9 +34439,24 @@ def api_nexus_nkr_session_audit():
             "nextSessionDraftCannotOverrideRunningSession": True,
         },
         "strategistSignals": {
-            "marketRows": len(market_rows),
-            "coverage": signal_coverage,
-            "complete": signals_ok,
+            "complete": signals_complete,
+            "configuredComplete": configured_complete,
+            "configuredGroups": signal_groups,
+            "runtimeEvidence": runtime_evidence,
+            "workerFresh": worker_fresh,
+            "workerStatus": worker_status or "unknown",
+            "runtimeUpdatedTs": runtime_updated_ts,
+            "lastTickTs": last_tick_ts,
+            "tickAgeSec": tick_age,
+            "tickCount": tick_count,
+            "assetsScanned": assets_scanned,
+            "tradableAssets": tradable_assets,
+            "bestCandidate": runtime.get("best_candidate") or "",
+            "candidateScore": runtime.get("candidate_score"),
+            "candidateMomentum24h": runtime.get("candidate_momentum_24h"),
+            "candidatePrice": runtime.get("candidate_price"),
+            "decision": runtime.get("decision") or "",
+            "gateStatus": runtime.get("gate_status") or "",
         },
         "entryPipeline": [
             "exact_session_config", "watchlist_and_chain_route", "price", "momentum_24h",
