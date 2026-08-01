@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-330-CLOSING-FORCE-EXIT-ALL-EVM-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-331-CLOSING-EXIT-THEN-FINALIZE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36942,9 +36942,20 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
                 "CoreVault closing confirmed; finalizing session"
             )
             _live_engine_mark(
+                "NKR", status="closing", decision="EXITING",
+                gate_status="EXIT_PENDING",
+                reason=f"CoreVault session {key[2]} is CLOSING; closing all open positions first",
+                pending_tx="submitting", last_error="",
+            )
+            # ENGINE331: CLOSING with openAssetCount > 0 must execute exits before
+            # finalizeSession. ENGINE330 defined the chain-aware exit helper but did
+            # not invoke it here, so the worker repeatedly attempted finalization
+            # while the contract correctly remained CLOSING.
+            exit_result = _nkr_exit_all_open_positions(wallet, dict(row), int(key[2]))
+            _live_engine_mark(
                 "NKR", status="closing", decision="FINALIZING",
                 gate_status="EXIT_PENDING",
-                reason=f"CoreVault session {key[2]} is CLOSING; submitting finalizeSession",
+                reason=f"CoreVault session {key[2]} positions closed; submitting finalizeSession",
                 pending_tx="submitting", last_error="",
             )
             result = _finalize_one_live_session(wallet, "NKR", dict(row))
