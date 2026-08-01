@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-331-CLOSING-EXIT-THEN-FINALIZE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-332-COMPLETE-CLOSING-QUOTE-ROUTE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31301,6 +31301,78 @@ def _send_vault_tx(wallet_id, wallet, vault, data, reference, chain_id=1):
     receipt = _privy_wait_receipt(sent["hash"], chain_id=int(chain_id))
     return {"hash": sent["hash"], "receipt": receipt}
 
+
+# Authoritative on-chain discovery for dynamically traded session assets.
+_NKR_TRADE_EXECUTED_TOPIC = "0x" + _keccak256(
+    b"TradeExecuted(uint256,address,address,address,uint256,uint256)"
+).hex()
+
+def _nkr_addr_from_abi_word(value) -> str:
+    try:
+        if isinstance(value, int):
+            number = value
+        else:
+            text = str(value or "").strip().lower()
+            number = int(text, 16) if text.startswith("0x") else int(text or "0")
+        return _norm_addr("0x" + format(number & ((1 << 160) - 1), "040x"))
+    except Exception:
+        return ""
+
+def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> list[dict]:
+    """Read TradeExecuted logs for one session and recover every token/router used.
+
+    This is required for dynamic targets: positionOf() is keyed by token address, while
+    sessionOf() exposes only openAssetCount.  The TradeExecuted event is therefore the
+    authoritative enumerable history from which an exit worker can recover the token.
+    """
+    cid = int(chain_id or 0)
+    va = _norm_addr(vault)
+    sid = int(session_id or 0)
+    if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(va):
+        return []
+    try:
+        latest_raw = _rpc_call(cid, "eth_blockNumber", [])
+        latest = int(str(latest_raw), 16)
+    except Exception:
+        return []
+    lookback = max(20000, int(os.getenv("NEXUS_NKR_TRADE_LOG_LOOKBACK_BLOCKS", "180000")))
+    chunk = max(1000, min(20000, int(os.getenv("NEXUS_NKR_TRADE_LOG_CHUNK_BLOCKS", "10000"))))
+    start = max(0, latest - lookback)
+    sid_topic = "0x" + format(sid, "064x")
+    out, seen = [], set()
+    cursor = start
+    while cursor <= latest:
+        end = min(latest, cursor + chunk - 1)
+        try:
+            logs = _rpc_call(cid, "eth_getLogs", [{
+                "address": va,
+                "fromBlock": hex(cursor),
+                "toBlock": hex(end),
+                "topics": [_NKR_TRADE_EXECUTED_TOPIC, sid_topic],
+            }]) or []
+        except Exception:
+            cursor = end + 1
+            continue
+        for log in logs if isinstance(logs, list) else []:
+            topics = list((log or {}).get("topics") or [])
+            data = str((log or {}).get("data") or "0x").removeprefix("0x")
+            if len(topics) < 4 or len(data) < 64:
+                continue
+            router = _nkr_addr_from_abi_word(topics[2])
+            token_in = _nkr_addr_from_abi_word(topics[3])
+            token_out = _nkr_addr_from_abi_word("0x" + data[:64])
+            item = {
+                "router": router, "tokenIn": token_in, "tokenOut": token_out,
+                "blockNumber": int(str((log or {}).get("blockNumber") or "0x0"), 16),
+                "transactionHash": str((log or {}).get("transactionHash") or ""),
+            }
+            key = (item["transactionHash"].lower(), token_in.lower(), token_out.lower())
+            if key not in seen:
+                seen.add(key); out.append(item)
+        cursor = end + 1
+    out.sort(key=lambda x: int(x.get("blockNumber") or 0))
+    return out
+
 def _privy_job_write(job_id, wallet, wallet_id, system, amount, status, stage, error="", txs=None):
     _privy_trading_db_init(); now = now_ts()
     with DB_WRITE_LOCK:
@@ -36092,149 +36164,155 @@ def _resolve_exact_input_selector(vault, router, chain_id, cfg):
 
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
+    """Execute one live NKR entry or exit with direction-correct unit handling.
+
+    ENTRY spends the session settlement cash. EXIT spends the exact raw position
+    amount and must never be capped by settlementCash or require the target token
+    to be configured as a settlement token.
+    """
     chain_id = int(live_row.get("chain_id") or 1)
     try:
         cfg = _privy_trading_cfg(chain_id)
     except Exception:
         cfg = _privy_trading_cfg()
     sid = int(str(live_row.get("onchain_session_id") or "0"))
-    wallet_id = str(live_row.get("privy_wallet_id") or "").strip(); vault = _norm_addr(live_row.get("vault_address") or "")
-    fee = int(route["fee"]); router = _norm_addr(route.get("router") or cfg["router"])
-    # ENGINE-287: always pass chain_id — BNB/POL were hitting ETH defaults and reverting.
+    wallet_id = str(live_row.get("privy_wallet_id") or "").strip()
+    vault = _norm_addr(live_row.get("vault_address") or "")
+    mode = str(action or "ENTRY").strip().upper()
+    if mode not in {"ENTRY", "BUY", "OPEN", "EXIT", "SELL", "CLOSE", "REDUCE"}:
+        raise RuntimeError(f"unsupported_live_trade_action:{mode}")
+    is_exit = mode in {"EXIT", "SELL", "CLOSE", "REDUCE"}
+    fee = int((route or {}).get("fee") or cfg.get("poolFee") or 500)
+    router = _norm_addr((route or {}).get("router") or cfg.get("router") or "")
+    token_in = _norm_addr(token_in); token_out = _norm_addr(token_out)
+    if not all((_looks_like_evm_addr(vault), _looks_like_evm_addr(router),
+                _looks_like_evm_addr(token_in), _looks_like_evm_addr(token_out))):
+        raise RuntimeError(f"invalid_live_trade_addresses:chain={chain_id}:vault={vault}:router={router}:in={token_in}:out={token_out}")
+
     try:
         router_cfg = _read_router_config(vault, router, chain_id)
     except Exception as rc_exc:
-        # BNB/POL occasionally return empty ABI data on public RPC; vault routers are pre-verified.
         router_cfg = {"enabled": True, "oracle": "", "decodeError": str(rc_exc)[:120]}
     if not router_cfg.get("enabled"):
-        raise RuntimeError(f"live_router_not_enabled:{route['symbol']}:chain={chain_id}")
-    quote_in = _quote_token_for_router(cfg, token_in)
-    quote_out = _quote_token_for_router(cfg, token_out)
-    if int(amount_in or 0) <= 0:
-        raise RuntimeError("trade_amount_in_zero")
-    # ENGINE-325: exact integer-only live amount normalization; dynamic targets require no manual Vault tokenConfig.
-    # Never use float arithmetic for ERC-20 base units. The live amount is kept
-    # as an integer and aligned to the settlement token's decimal scale.
-    _st = _norm_addr(token_in)
-    _tt = _norm_addr(token_out)
+        raise RuntimeError(f"live_router_not_enabled:{(route or {}).get('symbol','')}:chain={chain_id}")
 
-    try:
-        settlement_cfg = _read_token_config(vault, _st, chain_id) or {}
-    except Exception as exc:
-        raise RuntimeError(f"settlement_token_config_read_failed:chain={chain_id}:token={_st}:{exc}")
-    if not settlement_cfg.get("configured") or not settlement_cfg.get("executionEnabled"):
-        raise RuntimeError(
-            f"settlement_token_not_executable:chain={chain_id}:token={_st}:"
-            f"configured={bool(settlement_cfg.get('configured'))}:"
-            f"executionEnabled={bool(settlement_cfg.get('executionEnabled'))}"
-        )
-
-    # ENGINE-325: ordinary trade targets are dynamic assets. They must NOT be
-    # manually configured in CoreVault tokenConfig before every trade. The
-    # settlement token remains strictly configured, while target eligibility is
-    # determined by the existing chain mapping / watchlist security gate, an
-    # approved router+selector, a real token contract, and a successful quote +
-    # full CoreVault preflight. tokenConfig(target) is read only as optional
-    # metadata and is never a hard blocker for a normal trade target.
-    try:
-        target_cfg = _read_token_config(vault, _tt, chain_id) or {}
-    except Exception:
-        target_cfg = {}
-    try:
-        target_code = str(_rpc_call(chain_id, "eth_getCode", [_tt, "latest"]) or "0x")
-    except Exception as exc:
-        raise RuntimeError(f"target_token_code_read_failed:{route.get('symbol')}:chain={chain_id}:token={_tt}:{exc}")
-    if target_code in ("0x", "0x0", ""):
-        raise RuntimeError(f"target_token_has_no_contract:{route.get('symbol')}:chain={chain_id}:token={_tt}")
-
-    settlement_decimals = int(settlement_cfg.get("decimals") or 0)
-    if settlement_decimals <= 0 or settlement_decimals > 36:
-        raise RuntimeError(
-            f"invalid_settlement_decimals:chain={chain_id}:token={_st}:decimals={settlement_decimals}"
-        )
-
-    ai = int(amount_in or 0)
-    # Historical NKR allocation amounts were prepared in 6-decimal stablecoin
-    # units. Convert once, using integer multiplication only.
-    if settlement_decimals > 6 and 10 ** 4 <= ai < 10 ** 15:
-        ai *= 10 ** (settlement_decimals - 6)
-    elif settlement_decimals < 18 and ai >= 10 ** 15:
-        ai //= 10 ** (18 - settlement_decimals)
-
-    # Remove binary-float dust that may already have entered upstream. For an
-    # 18-decimal stablecoin, NKR budgets are intentionally limited to 6 decimal
-    # places, so 18_400_000_000_000_002_048 becomes exactly
-    # 18_400_000_000_000_000_000.
-    if settlement_decimals > 6:
-        quantum = 10 ** (settlement_decimals - 6)
-        ai = (ai // quantum) * quantum
-
-    # The on-chain session is authoritative. Never submit more than its current
-    # settlement cash.
-    settlement_cash = 0
+    # Session is authoritative for direction, state and settlement currency.
     try:
         session_raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
         session_words = _core_words(session_raw)
-        settlement_cash = int(session_words[9]) if len(session_words) > 9 else 0
     except Exception as exc:
-        raise RuntimeError(f"session_cash_read_failed:chain={chain_id}:session={sid}:{exc}")
-    if settlement_cash <= 0:
-        raise RuntimeError(f"session_has_no_settlement_cash:chain={chain_id}:session={sid}")
-    ai = min(ai, settlement_cash)
+        raise RuntimeError(f"session_read_failed:chain={chain_id}:session={sid}:{exc}")
+    if len(session_words) < 13:
+        raise RuntimeError(f"session_decode_failed:chain={chain_id}:session={sid}:words={len(session_words)}")
+    session_settlement = _nkr_addr_from_abi_word(session_words[1])
+    session_status = int(session_words[3])
+    settlement_cash = int(session_words[9])
+    if not _looks_like_evm_addr(session_settlement):
+        raise RuntimeError(f"session_settlement_invalid:chain={chain_id}:session={sid}")
+    if is_exit:
+        if token_out.lower() != session_settlement.lower():
+            raise RuntimeError(f"exit_direction_invalid:chain={chain_id}:session={sid}:expectedOut={session_settlement}:actualOut={token_out}")
+        if session_status not in {1, 2, 3}:
+            raise RuntimeError(f"exit_session_status_invalid:chain={chain_id}:session={sid}:status={session_status}")
+    else:
+        if token_in.lower() != session_settlement.lower():
+            raise RuntimeError(f"entry_direction_invalid:chain={chain_id}:session={sid}:expectedIn={session_settlement}:actualIn={token_in}")
+        if session_status != 1:
+            raise RuntimeError(f"entry_session_not_active:chain={chain_id}:session={sid}:status={session_status}")
 
+    # Only the actual settlement token is a mandatory configured execution token.
+    try:
+        settlement_cfg = _read_token_config(vault, session_settlement, chain_id) or {}
+    except Exception as exc:
+        raise RuntimeError(f"settlement_token_config_read_failed:chain={chain_id}:token={session_settlement}:{exc}")
+    if not settlement_cfg.get("configured") or not settlement_cfg.get("executionEnabled"):
+        raise RuntimeError(
+            f"settlement_token_not_executable:chain={chain_id}:token={session_settlement}:"
+            f"configured={bool(settlement_cfg.get('configured'))}:executionEnabled={bool(settlement_cfg.get('executionEnabled'))}"
+        )
+
+    # The non-settlement side is dynamic. It needs contract code and a real route,
+    # not a manual tokenConfig entry for every tradable asset.
+    dynamic_token = token_in if is_exit else token_out
+    try:
+        dynamic_code = str(_rpc_call(chain_id, "eth_getCode", [dynamic_token, "latest"]) or "0x")
+    except Exception as exc:
+        raise RuntimeError(f"target_token_code_read_failed:{(route or {}).get('symbol','')}:chain={chain_id}:token={dynamic_token}:{exc}")
+    if dynamic_code in ("0x", "0x0", ""):
+        raise RuntimeError(f"target_token_has_no_contract:{(route or {}).get('symbol','')}:chain={chain_id}:token={dynamic_token}")
+
+    ai = int(amount_in or 0)
     if ai <= 0:
-        raise RuntimeError("trade_amount_in_zero_after_decimal_normalization")
+        raise RuntimeError("trade_amount_in_zero")
+    if is_exit:
+        # positionOf() already returns exact target-token base units. Never rescale.
+        onchain_position = _position_amount(vault, sid, token_in, chain_id=chain_id)
+        if onchain_position <= 0:
+            raise RuntimeError(f"exit_position_empty:chain={chain_id}:session={sid}:token={token_in}")
+        ai = min(ai, onchain_position)
+    else:
+        settlement_decimals = int(settlement_cfg.get("decimals") or 0)
+        if settlement_decimals <= 0 or settlement_decimals > 36:
+            raise RuntimeError(f"invalid_settlement_decimals:chain={chain_id}:token={session_settlement}:decimals={settlement_decimals}")
+        # Legacy UI allocations arrive in six-decimal stable units. Normalize only ENTRY.
+        if settlement_decimals > 6 and 10 ** 4 <= ai < 10 ** 15:
+            ai *= 10 ** (settlement_decimals - 6)
+        elif settlement_decimals < 18 and ai >= 10 ** 15:
+            ai //= 10 ** (18 - settlement_decimals)
+        if settlement_decimals > 6:
+            quantum = 10 ** (settlement_decimals - 6)
+            ai = (ai // quantum) * quantum
+        if settlement_cash <= 0:
+            raise RuntimeError(f"session_has_no_settlement_cash:chain={chain_id}:session={sid}")
+        ai = min(ai, settlement_cash)
+    if ai <= 0:
+        raise RuntimeError("trade_amount_in_zero_after_normalization")
     amount_in = int(ai)
+
+    quote_in = _quote_token_for_router(cfg, token_in)
+    quote_out = _quote_token_for_router(cfg, token_out)
     quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
     fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
-    # Slightly wider slippage on live NKR opens (public mempool + multi-hop delay).
-    slip = max(int(cfg.get("slippageBps") or 100), 150)
+    slip = max(int(cfg.get("slippageBps") or 100), 200 if is_exit else 150)
     min_out = quote * (10_000 - slip) // 10_000
     if min_out <= 0:
-        raise RuntimeError(f"quote_min_out_zero:quote={quote}:fee={fee_used}")
+        raise RuntimeError(f"quote_min_out_zero:action={mode}:quote={quote}:fee={fee_used}")
     deadline = now_ts() + 300
-    # ENGINE-317: the Vault may allow both common V3 selectors even though the
-    # configured router implements only one. Select by simulating the complete
-    # CoreVault.executeTrade call with the real user wallet as msg.sender.
+
     preflight_errors = []
-    exact_selector = ""
-    required_selector = ""
-    router_data = ""
-    call = ""
+    exact_selector = required_selector = router_data = call = ""
     for candidate_selector in _exact_input_selector_candidates(vault, router, chain_id, cfg):
         try:
             candidate_data, candidate_required = _native_router_trade_data(
                 cfg, token_in, token_out, vault, amount_in, min_out, fee_used,
                 exact_selector=candidate_selector, deadline=deadline,
             )
-            try:
-                selector_allowed = bool(_read_router_selector_allowed(vault, router, candidate_required, chain_id))
-            except Exception as sel_exc:
-                raise RuntimeError(f"selector_check:{candidate_required}:{str(sel_exc)[:100]}")
-            if not selector_allowed:
+            if not bool(_read_router_selector_allowed(vault, router, candidate_required, chain_id)):
                 raise RuntimeError(f"outer_selector_not_allowed:{candidate_required}")
             candidate_call = _encode_execute_trade(
                 sid, router, token_in, token_out, amount_in, min_out, deadline, candidate_data
             )
             _eth_call_from(chain_id, wallet, vault, candidate_call)
-            exact_selector = candidate_selector
-            required_selector = candidate_required
-            router_data = candidate_data
-            call = candidate_call
+            exact_selector, required_selector = candidate_selector, candidate_required
+            router_data, call = candidate_data, candidate_call
             break
         except Exception as pf_exc:
-            preflight_errors.append(f"{candidate_selector}:{str(pf_exc)[:180]}")
-            continue
+            preflight_errors.append(f"{candidate_selector}:{str(pf_exc)[:220]}")
     if not call:
         raise RuntimeError(
-            f"live_trade_preflight_failed:{route['symbol']}:chain={chain_id}:router={router}:"
-            f"fee={fee_used}:amountIn={amount_in}:quote={quote}:minOut={min_out}:"
-            f"attempts={' | '.join(preflight_errors)[:700]}"
+            f"live_trade_preflight_failed:{mode}:{(route or {}).get('symbol','')}:chain={chain_id}:router={router}:"
+            f"tokenIn={token_in}:tokenOut={token_out}:fee={fee_used}:amountIn={amount_in}:quote={quote}:minOut={min_out}:"
+            f"attempts={' | '.join(preflight_errors)[:900]}"
         )
-    ref = f"nexus-nkr-{action.lower()}-{sid}-{route['symbol']}-{int(time.time())}"
+    ref = f"nexus-nkr-{mode.lower()}-{sid}-{(route or {}).get('symbol','TOKEN')}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
-    return {"txHash": txh, "quoteOut": quote, "minOut": min_out, "router": router, "exactSelector": exact_selector, "outerSelector": required_selector, "fee": fee_used, "chainId": chain_id}
+    return {
+        "txHash": txh, "quoteOut": quote, "minOut": min_out, "router": router,
+        "exactSelector": exact_selector, "outerSelector": required_selector,
+        "fee": fee_used, "chainId": chain_id, "action": mode,
+        "tokenIn": token_in, "tokenOut": token_out, "amountIn": amount_in,
+    }
 
 
 def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapshots: dict, market_rows: list[dict], plan: dict) -> None:
@@ -36341,6 +36419,31 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     except Exception:
         pass
 
+    # Recover every dynamically traded token from authoritative TradeExecuted logs.
+    # This closes assets even when the watchlist changed, the UI card vanished, or
+    # the target never had a static route entry.
+    event_history = _nkr_session_trade_events(chain_id, vault, int(session_id))
+    route_by_token = {
+        _norm_addr((r or {}).get("token") or "").lower(): (sym, r)
+        for sym, r in routes.items()
+        if _looks_like_evm_addr(_norm_addr((r or {}).get("token") or ""))
+    }
+    for ev in event_history:
+        for token in (_norm_addr(ev.get("tokenIn") or ""), _norm_addr(ev.get("tokenOut") or "")):
+            if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+                continue
+            if token.lower() in route_by_token:
+                continue
+            symbol = f"TOKEN_{token[-6:].upper()}"
+            event_router = _norm_addr(ev.get("router") or cfg.get("router") or "")
+            routes[symbol] = {
+                "symbol": symbol, "token": token, "decimals": 18,
+                "router": event_router, "fee": int(cfg.get("poolFee") or 500),
+                "live": True, "source": "onchain_trade_event_recovery",
+                "chain": _nkr_chain_key_from_id(chain_id),
+            }
+            route_by_token[token.lower()] = (symbol, routes[symbol])
+
     executed = []
     discovered = []
     for sym, route in routes.items():
@@ -36384,7 +36487,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
         mapped = ",".join(f"{x['asset']}:{x['token']}:{x['amount']}" for x in discovered) or "none"
         raise RuntimeError(
             f"closing_open_assets_unmapped:chain={chain_id}:session={session_id}:"
-            f"openAssetCount={open_assets}:mappedPositions={mapped}"
+            f"openAssetCount={open_assets}:mappedPositions={mapped}:tradeEvents={len(event_history)}"
         )
 
     return {
