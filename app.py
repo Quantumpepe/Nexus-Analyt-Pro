@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-340-REAL-EVM-DIAGNOSTICS-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-343-CLOSING-TOKEN-RESOLUTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -428,7 +428,9 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(chain_id,vault_address,onchain_session_id) DO UPDATE SET
                     wallet_address=excluded.wallet_address, engine=excluded.engine,
-                    privy_wallet_id=excluded.privy_wallet_id, tx_hash=excluded.tx_hash,
+                    privy_wallet_id=excluded.privy_wallet_id,
+                    tx_hash=CASE WHEN excluded.tx_hash IS NOT NULL AND trim(excluded.tx_hash)<>''
+                                 THEN excluded.tx_hash ELSE nexus_live_core_vault_sessions.tx_hash END,
                     budget_units=excluded.budget_units, status='ACTIVE', updated_ts=excluded.updated_ts,
                     finalized_tx_hash=NULL, last_error=NULL
             """, (_norm_addr(wallet), str(engine).upper(), int(chain_id), _norm_addr(vault), str(wallet_id), str(session_id), str(tx_hash or ""), str(int(budget_units or 0)), "ACTIVE", nowi, nowi))
@@ -31385,12 +31387,27 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
     request_errors = []
     successful_ranges = 0
 
+    stage_text = f"DISCOVERING_OPEN_ASSET range={start_block}-{latest}"
     _live_engine_mark(
         "NKR", status="closing", decision="DISCOVERING_OPEN_ASSET",
         gate_status="EXIT_PENDING",
         reason=f"Reading TradeExecuted events for session {sid} from block {start_block} to {latest}",
         pending_tx="", last_error="",
     )
+    try:
+        con = _db()
+        try:
+            with DB_WRITE_LOCK:
+                con.execute(
+                    "UPDATE nexus_live_core_vault_sessions SET status='CLOSING', updated_ts=?, last_error=? "
+                    "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                    (int(time.time()), stage_text, cid, va.lower(), str(sid)),
+                )
+                con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
 
     def fetch_range(lo: int, hi: int, depth: int = 0):
         nonlocal successful_ranges
@@ -31403,6 +31420,22 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
                     "toBlock": hex(hi),
                     "topics": [_NKR_TRADE_EXECUTED_TOPIC, sid_topic],
                 }]) or []
+                # Some public BNB RPCs inconsistently return an empty result when
+                # multiple indexed topics are supplied. Retry topic0-only for the
+                # same bounded range and filter sessionId locally.
+                if not rows:
+                    broad = _rpc_call(cid, "eth_getLogs", [{
+                        "address": va,
+                        "fromBlock": hex(lo),
+                        "toBlock": hex(hi),
+                        "topics": [_NKR_TRADE_EXECUTED_TOPIC],
+                    }]) or []
+                    if isinstance(broad, list):
+                        rows = [
+                            log for log in broad
+                            if len(list((log or {}).get("topics") or [])) >= 2
+                            and str(((log or {}).get("topics") or ["", ""])[1]).lower() == sid_topic.lower()
+                        ]
                 successful_ranges += 1
                 return rows if isinstance(rows, list) else []
             except Exception as exc:
@@ -31415,8 +31448,21 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
         return []
 
     cursor = start_block
+    scan_started = time.time()
+    scan_deadline_sec = max(20, min(90, int(os.getenv("NEXUS_NKR_CLOSING_SCAN_DEADLINE_SEC", "45"))))
     while cursor <= latest:
+        if time.time() - scan_started > scan_deadline_sec:
+            raise RuntimeError(
+                f"closing_trade_event_scan_timeout:chain={cid}:session={sid}:"
+                f"cursor={cursor}:range={start_block}-{latest}:deadline={scan_deadline_sec}s"
+            )
         hi = min(latest, cursor + base_chunk - 1)
+        _live_engine_mark(
+            "NKR", status="closing", decision="DISCOVERING_OPEN_ASSET",
+            gate_status="EXIT_PENDING",
+            reason=f"Scanning TradeExecuted blocks {cursor}-{hi} for session {sid}",
+            pending_tx="",
+        )
         logs = fetch_range(cursor, hi)
         for log in logs:
             topics = list((log or {}).get("topics") or [])
@@ -36480,6 +36526,69 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     )
     routes = _nkr_live_route_registry(cfg)
 
+    # ENGINE-343: CLOSING recovery must inspect every technically known token on
+    # the session chain, not only routes currently enabled for NEW live entries.
+    # Build 335 intentionally removed disabled XRP/BTC/SOL routes from the normal
+    # trading registry. That was correct for entry safety, but it also made an
+    # already-open position invisible during CLOSING whenever TradeExecuted log
+    # recovery was unavailable. positionOf(sessionId, token) is authoritative and
+    # returns zero for unrelated candidates, so adding technical tokens here is
+    # deterministic and cannot invent a position or open a new trade.
+    try:
+        technical = (_nexus_asset_router_registry(include_technical=True).get("technicalRoutes") or {})
+        chain_key = _nkr_chain_key_from_id(chain_id)
+        for display_symbol, asset in technical.items():
+            rr = ((asset or {}).get("routes") or {}).get(chain_key) or {}
+            token = _norm_addr(rr.get("tokenContract") or rr.get("tokenAddress") or "")
+            if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+                continue
+            symbol = str(display_symbol or rr.get("internalSymbol") or f"TOKEN_{token[-6:]}").upper()
+            routes.setdefault(symbol, {
+                "symbol": symbol,
+                "token": token,
+                "decimals": max(0, min(36, int(rr.get("decimals") or 18))),
+                "router": _norm_addr(rr.get("routerAddress") or cfg.get("router") or ""),
+                "fee": int(rr.get("poolFee") or rr.get("fee") or cfg.get("poolFee") or 500),
+                "feeCandidates": [100, 500, 2500, 3000, 10000],
+                "live": True,
+                "source": "closing_technical_route_recovery",
+                "chain": chain_key,
+                "closingRecoveryOnly": True,
+            })
+    except Exception as exc:
+        _live_engine_mark("NKR", last_error=f"closing technical route inventory warning: {str(exc)[:220]}")
+
+    # Include all addresses previously seen by the automatic EVM token registry.
+    # This catches dynamic assets whose central router mapping was edited after the
+    # entry. Again, only a positive on-chain positionOf result can become executable.
+    try:
+        con = _db()
+        try:
+            rows = con.execute(
+                "SELECT token_address, symbol FROM nexus_evm_token_registry WHERE chain_id=?",
+                (int(chain_id),),
+            ).fetchall()
+        finally:
+            con.close()
+        for db_row in rows or []:
+            token = _norm_addr(db_row[0] if not isinstance(db_row, dict) else db_row.get("token_address"))
+            symbol_raw = db_row[1] if not isinstance(db_row, dict) else db_row.get("symbol")
+            if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+                continue
+            symbol = str(symbol_raw or f"TOKEN_{token[-6:]}").upper()
+            if symbol in routes and _norm_addr((routes.get(symbol) or {}).get("token") or "").lower() != token.lower():
+                symbol = f"{symbol}_{token[-6:].upper()}"
+            routes.setdefault(symbol, {
+                "symbol": symbol, "token": token, "decimals": 18,
+                "router": _norm_addr(cfg.get("router") or ""),
+                "fee": int(cfg.get("poolFee") or 500),
+                "feeCandidates": [100, 500, 2500, 3000, 10000],
+                "live": True, "source": "closing_token_registry_recovery",
+                "chain": _nkr_chain_key_from_id(chain_id), "closingRecoveryOnly": True,
+            })
+    except Exception:
+        pass
+
     # Include token addresses already stamped on live asset cards.  This makes
     # closing resilient when a position was opened from a dynamic route that is
     # no longer present in the current watchlist/registry snapshot.
@@ -37448,6 +37557,35 @@ def _nkr_live_worker_cycle() -> None:
         except Exception:
             pass
         if not runnable_rows:
+            # Do not overwrite the active CLOSING/EXITING diagnostics immediately
+            # after the recovery thread was started. Earlier builds replaced
+            # DISCOVERING_OPEN_ASSET / EXITING with NO_RUNNABLE_SESSION on every
+            # worker tick, hiding the real stage and any failure from System Info.
+            with _NKR_CLOSING_FINALIZE_LOCK:
+                wallet_inflight = any(
+                    key in _NKR_CLOSING_FINALIZE_INFLIGHT
+                    for key in closing_keys
+                )
+            if closing_rows or wallet_inflight:
+                _live_engine_mark(
+                    "NKR", tick=True, status="closing",
+                    decision="EXITING", gate_status="EXIT_PENDING",
+                    reason="CLOSING session recovery is running",
+                    decision_detail=", ".join(
+                        f"{_nkr_chain_key_from_id(int((r or {}).get('chain_id') or 0))} #{str((r or {}).get('onchain_session_id') or '')}"
+                        for r in closing_rows
+                    )[:400],
+                    session_states=[
+                        {
+                            "chain": _nkr_chain_key_from_id(int((r or {}).get("chain_id") or 0)),
+                            "chainId": int((r or {}).get("chain_id") or 0),
+                            "sessionId": str((r or {}).get("onchain_session_id") or ""),
+                            "status": "CLOSING",
+                        }
+                        for r in closing_rows
+                    ],
+                )
+                continue
             open_rows = [
                 r for r in (wallet_rows or [])
                 if str((r or {}).get("status") or "").upper()
