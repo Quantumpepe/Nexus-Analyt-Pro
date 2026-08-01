@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-321-COREVAULT-ABI-READ-LIVE-TRADE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-322-DIAGNOSTIC-TYPE-GUARD-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31449,6 +31449,52 @@ _ERC20_ALLOWANCE_SELECTOR = "0xdd62ed3e"
 _ERC20_BALANCE_OF_SELECTOR = "0x70a08231"
 
 
+
+
+def _diag_as_dict(value, *, field="value") -> dict:
+    """Normalize diagnostic inputs without ever throwing on unexpected response types.
+
+    Some runtime/config values may arrive as JSON strings after ENV/SQLite hydration.
+    Diagnostics must not crash the live worker because a dict-like field is a string.
+    """
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {}
+    return {}
+
+
+def _diag_as_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _diag_check_ok(checks: dict, key: str) -> bool:
+    item = checks.get(key) if isinstance(checks, dict) else None
+    return bool(item.get("ok")) if isinstance(item, dict) else False
+
+
+def _diag_check_detail(checks: dict, key: str):
+    item = checks.get(key) if isinstance(checks, dict) else None
+    return item.get("detail") if isinstance(item, dict) else None
+
 def _diag_bool(ok, ok_label="READY", bad_label="FAILED", detail=None):
     return {
         "ok": bool(ok),
@@ -31637,7 +31683,7 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
         "wallet": _norm_addr(wallet), "vault": vault, "router": router,
         "quoter": quoter, "tokenIn": token_in, "tokenOut": token_out,
         "sessionId": resolved_sid, "sessionSource": "request" if str(session_id or "").isdigit() else ("registry" if resolved_sid else "none"),
-        "registryRow": {k: registry_row.get(k) for k in ("status","chain_id","vault_address","onchain_session_id","budget_units","updated_ts") if registry_row and k in registry_row},
+        "registryRow": {k: _diag_as_dict(registry_row, field="registryRow").get(k) for k in ("status","chain_id","vault_address","onchain_session_id","budget_units","updated_ts") if k in _diag_as_dict(registry_row, field="registryRow")},
         "checks": {}, "selectors": [], "feeTiers": [], "blockers": [], "warnings": [], "actionPlan": [],
         "session": None, "tradePlan": None, "executionTrace": [], "rootCause": None,
         "contractMap": {"vault": vault, "router": router, "quoter": quoter, "settlementToken": token_in, "targetToken": token_out},
@@ -31654,8 +31700,9 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
         c["quoterConfigured"] = _diag_bool(_looks_like_evm_addr(quoter), detail=quoter or "missing")
         c["quoterHasCode"] = _diag_bool(bool(quoter and _contract_has_code(quoter, cid)), detail=quoter)
 
-        router_cfg = _read_router_config(vault, router, cid) if vault and router else {}
-        c["routerEnabled"] = _diag_bool(bool(router_cfg.get("enabled")), detail=router_cfg or "vault_or_router_missing")
+        router_cfg_raw = _read_router_config(vault, router, cid) if vault and router else {}
+        router_cfg = _diag_as_dict(router_cfg_raw, field="routerConfig")
+        c["routerEnabled"] = _diag_bool(bool(router_cfg.get("enabled")), detail=router_cfg or {"raw": str(router_cfg_raw)[:500], "reason": "vault_or_router_missing_or_invalid_response"})
         for selector in (_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR):
             try:
                 allowed = bool(vault and router and _read_router_selector_allowed(vault, router, selector, cid))
@@ -31687,7 +31734,9 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
                 report["session"] = session_detail
                 c["sessionFound"] = _diag_bool(owner != ZERO_ADDRESS, detail=session_detail)
                 c["sessionOwnerMatches"] = _diag_bool(owner.lower() == _norm_addr(wallet).lower(), detail=session_detail)
-                c["sessionSystemMatches"] = _diag_bool(int(session_detail["system"]) == int((cfg.get("systemIds") or {}).get(engine_u, -1)), detail={"actual": session_detail["system"], "expected": (cfg.get("systemIds") or {}).get(engine_u)})
+                system_ids = _diag_as_dict(cfg.get("systemIds"), field="systemIds")
+                expected_system = system_ids.get(engine_u, system_ids.get(engine_u.lower(), -1))
+                c["sessionSystemMatches"] = _diag_bool(int(session_detail["system"]) == int(expected_system if expected_system is not None else -1), detail={"actual": session_detail["system"], "expected": expected_system, "rawSystemIds": cfg.get("systemIds")})
                 c["sessionActive"] = _diag_bool(int(session_detail["status"]) == 1, detail=session_detail)
                 c["sessionSettlementMatches"] = _diag_bool(settlement.lower() == token_in.lower(), detail=session_detail)
                 c["sessionHasCash"] = _diag_bool(int(session_detail["settlementCash"]) > 0, detail=session_detail)
@@ -31762,6 +31811,9 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
             c["executeTradePreflight"] = _diag_bool(False, bad_label="BLOCKED", detail=reasons)
     except Exception as exc:
         report["diagnosticError"] = str(exc)
+        report["diagnosticErrorType"] = type(exc).__name__
+        report.setdefault("warnings", []).append("diagnostic_partial_failure")
+        c.setdefault("executeTradePreflight", _diag_bool(False, bad_label="BLOCKED", detail={"stage":"DIAGNOSTIC_RUNTIME","error":str(exc),"type":type(exc).__name__}))
 
     fatal_keys = [
         "vaultConfigured", "vaultHasCode", "routerConfigured", "routerHasCode", "routerEnabled",
@@ -31772,11 +31824,11 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
     if resolved_sid is not None:
         fatal_keys += ["sessionFound", "sessionOwnerMatches", "sessionSystemMatches", "sessionActive", "sessionHasCash", "sessionNotExpired"]
     for key in fatal_keys:
-        if not bool((c.get(key) or {}).get("ok")):
+        if not _diag_check_ok(c, key):
             report["blockers"].append(key)
-    if not bool((c.get("routerAllowance") or {}).get("ok")):
+    if not _diag_check_ok(c, "routerAllowance"):
         report["warnings"].append("routerAllowance")
-    if resolved_sid is not None and not bool((c.get("executeTradePreflight") or {}).get("ok")):
+    if resolved_sid is not None and not _diag_check_ok(c, "executeTradePreflight"):
         report["blockers"].append("executeTradePreflight")
 
     # Human-readable, complete action plan. No automatic mutation is performed.
@@ -31787,17 +31839,17 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
     if not bool((c.get("configuredFeeHasQuote") or {}).get("ok")):
         working = [x.get("fee") for x in report.get("feeTiers", []) if x.get("ok")]
         report["actionPlan"].append({"priority": 2, "code": "SET_WORKING_POOL_FEE", "title": "Pool-Fee der Chain korrigieren", "detail": {"configured": cfg.get("poolFee"), "working": working}})
-    if not bool((c.get("routerAllowance") or {}).get("ok")):
+    if not _diag_check_ok(c, "routerAllowance"):
         report["actionPlan"].append({"priority": 3, "code": "CHECK_ROUTER_APPROVAL_MODEL", "title": "Router-Allowance/Approval-Modell prüfen", "detail": {"allowanceRaw": settlement_snapshot.get("routerAllowanceRaw"), "token": token_in, "vault": vault, "router": router, "note": "ZERO ist nur dann ein Blocker, wenn executeTrade nicht selbst forceApprove ausführt."}})
     if resolved_sid is None:
         report["actionPlan"].append({"priority": 2, "code": "RESOLVE_SESSION", "title": "Aktive Session für Diagnose auswählen", "detail": {"chain": chain_name, "engine": engine_u}})
-    if resolved_sid is not None and not bool((c.get("executeTradePreflight") or {}).get("ok")):
+    if resolved_sid is not None and not _diag_check_ok(c, "executeTradePreflight"):
         report["actionPlan"].append({"priority": 1, "code": "FIX_EXECUTE_TRADE_PREFLIGHT", "title": "executeTrade-Preflight beheben", "detail": (c.get("executeTradePreflight") or {}).get("detail")})
 
     # One complete ordered execution trace. The first failed step is the root cause shown in the UI.
     _trace = report["executionTrace"]
-    def _ck(key): return bool((c.get(key) or {}).get("ok"))
-    def _cd(key): return (c.get(key) or {}).get("detail")
+    def _ck(key): return _diag_check_ok(c, key)
+    def _cd(key): return _diag_check_detail(c, key)
     _trace.extend([
         _diag_step("Vault-Vertrag vorhanden", _ck("vaultHasCode"), "INFRASTRUCTURE", vault, "eth_getCode", _cd("vaultHasCode"), remediation="Vault-Adresse/RPC der Chain prüfen"),
         _diag_step("Router-Vertrag vorhanden und aktiviert", _ck("routerHasCode") and _ck("routerEnabled"), "ROUTER_CONFIG", router, "routerConfig", {"code":_cd("routerHasCode"),"config":_cd("routerEnabled")}, remediation="configureRouter(router, enabled=true)"),
@@ -31809,7 +31861,7 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
         _diag_step("Mindestens ein Pool/Fee-Tier liefert Quote", _ck("quoteProbe"), "QUOTE", quoter, "quoteExactInputSingle", report.get("feeTiers"), remediation="Token-Paar, Quoter und Pool-Fee/Liquidität prüfen"),
         _diag_step("Konfigurierte Pool-Fee liefert Quote", _ck("configuredFeeHasQuote"), "POOL_FEE", quoter, "quoteExactInputSingle", _cd("configuredFeeHasQuote"), remediation="Pool-Fee auf ein funktionierendes Fee-Tier setzen"),
     ])
-    _pre = c.get("executeTradePreflight") or {}
+    _pre = _diag_as_dict(c.get("executeTradePreflight"), field="executeTradePreflight")
     _pre_error = None
     if not _pre.get("ok"):
         details = _pre.get("detail")
@@ -31859,7 +31911,7 @@ def api_nexus_system_info_evm_diagnostics():
         try:
             reports.append(_evm_execution_diagnostic(cid, owner, engine=engine, session_id=raw_session if len(chain_ids) == 1 else None))
         except Exception as exc:
-            reports.append({"chainId": cid, "chain": str(cid), "engine": engine, "status": "ERROR", "checks": {}, "blockers": ["diagnostic_exception"], "diagnosticError": str(exc)})
+            reports.append({"chainId": cid, "chain": str(cid), "engine": engine, "status": "ERROR", "checks": {}, "blockers": ["diagnostic_exception"], "warnings": [], "diagnosticError": str(exc), "diagnosticErrorType": type(exc).__name__, "rootCause": {"status": "BLOCKED", "stage": "DIAGNOSTIC_RUNTIME", "title": "Diagnose-Lesefehler", "detail": str(exc)}, "readOnly": True})
     overall = "READY" if reports and all(r.get("status") == "READY" for r in reports) else "CHECK_REQUIRED"
     return jsonify({"status": "ok", "overall": overall, "engine": engine, "reports": reports, "readOnly": True, "diagnosticVersion": "COMPLETE_DEVELOPER_CENTER_V1", "ts": now_ts()})
 
