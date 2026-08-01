@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-320-COMPLETE-DEVELOPER-DIAGNOSTIC-CENTER"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-321-COREVAULT-ABI-READ-LIVE-TRADE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -17235,6 +17235,7 @@ _CORE_VAULT_SELECTORS = {
     "withdrawNative": "0xb8ca8dd8",
     "paySubscriptionNative": "0xbf07d24a",
     "subscriptionPrice": "0x59bcb422",
+    "sessionOf": _core_selector("sessionOf(uint256)"),
     "withdrawBase": "0xad151a50",
     "withdrawProfit": "0x1cd9ca8d",
 }
@@ -17267,8 +17268,21 @@ def _core_vault_call(chain_id: int, vault: str, selector: str, *address_args: st
     data = selector + "".join(_addr_to_32(a) for a in address_args)
     return _eth_call(chain_id, vault, data)
 
-def _core_vault_call_words(chain_id: int, vault: str, selector: str, *encoded_words: str) -> str:
-    data = str(selector) + "".join(str(w).lower().removeprefix("0x").rjust(64, "0") for w in encoded_words)
+def _core_vault_call_words(chain_id: int, vault: str, selector: str, *encoded_words) -> str:
+    # ABI words are hexadecimal 32-byte values. Converting an integer through
+    # str() is wrong for values >= 10 (e.g. session 10 became hex 0x10 = 16).
+    parts = []
+    for value in encoded_words:
+        if isinstance(value, bool):
+            parts.append(_uint_to_32(1 if value else 0))
+        elif isinstance(value, int):
+            parts.append(_uint_to_32(value))
+        else:
+            raw = str(value or "").lower().removeprefix("0x")
+            if not re.fullmatch(r"[0-9a-f]{1,64}", raw):
+                raise ValueError("invalid ABI word")
+            parts.append(raw.rjust(64, "0"))
+    data = str(selector) + "".join(parts)
     return _eth_call(chain_id, vault, data)
 
 def _bytes32_word(value: str) -> str:
@@ -30963,9 +30977,9 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
     # V1: quoteExactInputSingle(address,address,uint24,uint256,uint160)
     sel_v1 = "0xf7729d43"
     def _build_v2(f):
+        # A single all-static tuple is encoded inline; there is no dynamic offset.
         return (
             sel_v2
-            + _uint_to_32(32)
             + _addr_to_32(tin) + _addr_to_32(tout)
             + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
         )
@@ -30982,7 +30996,7 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
             + _addr_to_32(tin) + _addr_to_32(tout)
             + _uint_to_32(amount_in) + _uint_to_32(int(f)) + _uint_to_32(0)
         )
-    strategies = (("v2", _build_v2), ("v1", _build_v1), ("v2flat", _build_v2_flat))
+    strategies = (("v2", _build_v2), ("v1", _build_v1))
     last_err = "quoter_no_strategy_worked"
     for f in fees:
         for sname, builder in strategies:
@@ -31492,8 +31506,13 @@ def _diag_token_snapshot(chain_id: int, vault: str, token: str, owner: str, rout
     token = _norm_addr(token)
     if not _looks_like_evm_addr(token):
         return {"address": token, "configured": False, "error": "token_missing"}
-    cfg = _read_token_config(vault, token, chain_id) if vault else {}
-    decimals = int(cfg.get("decimals") or 18)
+    cfg_error = ""
+    try:
+        cfg = _read_token_config(vault, token, chain_id) if vault else {}
+    except Exception as exc:
+        cfg = {}
+        cfg_error = str(exc)
+    decimals = int(cfg.get("decimals") if cfg.get("decimals") is not None else 18)
     vault_balance = _diag_uint_call(chain_id, token, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(vault)) if vault else 0
     owner_balance = _diag_uint_call(chain_id, token, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(owner)) if owner else 0
     allowance = _diag_uint_call(chain_id, token, _ERC20_ALLOWANCE_SELECTOR, _addr_to_32(vault), _addr_to_32(router)) if vault and router else 0
@@ -31516,6 +31535,7 @@ def _diag_token_snapshot(chain_id: int, vault: str, token: str, owner: str, rout
         "ownerBalance": float(owner_balance) / float(10 ** decimals) if decimals >= 0 else 0.0,
         "routerAllowanceRaw": int(allowance),
         "routerAllowance": float(allowance) / float(10 ** decimals) if decimals >= 0 else 0.0,
+        "tokenConfigReadError": cfg_error or None,
     }
 
 
@@ -31648,17 +31668,19 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
 
         # Read the actual on-chain session before deciding which settlement token to inspect.
         if resolved_sid is not None and vault:
-            words = _core_vault_words(_core_vault_call_words(cid, vault, _CORE_VAULT_SELECTORS["sessionOf"], int(resolved_sid)))
+            raw_session = _core_vault_call_words(cid, vault, _CORE_VAULT_SELECTORS["sessionOf"], int(resolved_sid))
+            words = _core_vault_words(raw_session)
             if len(words) >= 13:
-                owner = _norm_addr("0x" + words[0][-40:])
-                settlement = _norm_addr("0x" + words[1][-40:])
+                owner = _norm_addr("0x" + f"{int(words[0]):064x}"[-40:])
+                settlement = _norm_addr("0x" + f"{int(words[1]):064x}"[-40:])
                 session_detail = {
-                    "owner": owner, "settlementToken": settlement, "system": int(words[2],16),
-                    "status": int(words[3],16), "startsAt": int(words[4],16), "endsAt": int(words[5],16),
-                    "maxSlippageBps": int(words[6],16), "maxLossBps": int(words[7],16),
-                    "budget": int(words[8],16), "settlementCash": int(words[9],16),
-                    "realizedProfit": int(words[10],16), "realizedLoss": int(words[11],16),
-                    "openAssetCount": int(words[12],16),
+                    "owner": owner, "settlementToken": settlement, "system": int(words[2]),
+                    "status": int(words[3]), "startsAt": int(words[4]), "endsAt": int(words[5]),
+                    "maxSlippageBps": int(words[6]), "maxLossBps": int(words[7]),
+                    "budget": int(words[8]), "settlementCash": int(words[9]),
+                    "realizedProfit": int(words[10]), "realizedLoss": int(words[11]),
+                    "openAssetCount": int(words[12]),
+                    "rawWordCount": len(words),
                 }
                 token_in = settlement if _looks_like_evm_addr(settlement) else token_in
                 report["tokenIn"] = token_in
