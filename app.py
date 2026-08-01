@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-339-TARGETED-CLOSING-EVENT-SCAN-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-340-REAL-EVM-DIAGNOSTICS-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40086,68 +40086,247 @@ def api_nexus_engine_history_sync():
 
 
 @app.get("/api/nexus/system-info/evm-diagnostics")
-def api_nexus_system_info_evm_diagnostics_compat():
-    """Compatibility endpoint for BUILD368.
+def api_nexus_system_info_evm_diagnostics():
+    """Read-only, session-specific EVM diagnostics.
 
-    This endpoint is deliberately read-only and isolated from the live worker and
-    execution path.  ENGINE325 is based on the stable ENGINE317 branch, which did
-    not include the later developer-diagnostics endpoint.  Returning a compatible
-    payload prevents the frontend from showing a 404 without changing any trading,
-    session, strategist, Grid, Trader, or Vault behavior.
+    BUILD340 replaces the former compatibility placeholder. It reads the real
+    CoreVault, selected session, router, selector, settlement token, runtime row
+    and known open positions. It never sends a transaction and never mutates the
+    Vault or the worker state.
     """
-    engine = str(request.args.get("engine") or "ALL").strip().upper() or "ALL"
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+
+    engine = str(request.args.get("engine") or "NKR").strip().upper() or "NKR"
+    if engine == "TRADING":
+        engine = "TRADER"
+    if engine not in _CORE_SYSTEM_ID:
+        return jsonify({"status":"error","error":"engine must be NKR, GRID or TRADER"}), 400
+
+    chain_names = {1:"ETH",56:"BNB",137:"POL",8453:"BASE",42161:"ARB",10:"OP",43114:"AVAX"}
     try:
         chain_id = int(request.args.get("chain_id") or 0)
     except Exception:
         chain_id = 0
-    session_raw = request.args.get("session_id")
     try:
-        session_id = int(session_raw) if session_raw not in (None, "") else None
+        session_id = int(request.args.get("session_id")) if request.args.get("session_id") not in (None, "") else 0
     except Exception:
-        session_id = None
+        session_id = 0
 
-    chain_names = {
-        1: "ETH", 56: "BNB", 137: "POL", 8453: "BASE",
-        42161: "ARB", 10: "OP", 43114: "AVAX",
-    }
+    wallet = _norm_addr(request.args.get("wallet") or owner)
+    if not _looks_like_evm_addr(wallet):
+        wallet = _norm_addr(owner)
+
+    # Resolve omitted chain/session from the persistent live registry only. This
+    # avoids scanning hundreds of session ids merely to open the diagnostics UI.
+    registry_row = None
+    try:
+        _live_engine_tables_init()
+        con = _db()
+        try:
+            clauses = ["wallet_address=?", "engine=?"]
+            vals = [wallet, engine]
+            if chain_id > 0:
+                clauses.append("chain_id=?"); vals.append(chain_id)
+            if session_id > 0:
+                clauses.append("onchain_session_id=?"); vals.append(str(session_id))
+            registry_row = con.execute(
+                "SELECT * FROM nexus_live_core_vault_sessions WHERE " + " AND ".join(clauses) +
+                " ORDER BY CASE status WHEN 'CLOSING' THEN 0 WHEN 'STOPPING' THEN 1 WHEN 'ACTIVE' THEN 2 ELSE 3 END, updated_ts DESC LIMIT 1",
+                tuple(vals),
+            ).fetchone()
+            registry_row = dict(registry_row) if registry_row else None
+        finally:
+            con.close()
+    except Exception:
+        registry_row = None
+
+    if registry_row:
+        if chain_id <= 0: chain_id = int(registry_row.get("chain_id") or 0)
+        if session_id <= 0: session_id = int(str(registry_row.get("onchain_session_id") or "0"))
+
+    vault = _norm_addr((registry_row or {}).get("vault_address") or (_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+    chain = chain_names.get(chain_id, str(chain_id) if chain_id else "—")
+    checks = {}
+    blockers = []
+    warnings = []
+    execution_trace = []
+    diagnostic_error = None
+    session = None
+    target_token = None
+    settlement_detail = None
+    router_detail = None
+    selectors = []
+    fee_tiers = []
+    root_cause = None
+
+    def add_check(name, ok, status, detail=None, blocker=None, warning=None):
+        checks[name] = {"ok": bool(ok), "status": str(status), "detail": detail}
+        if blocker and not ok: blockers.append(blocker)
+        if warning and not ok: warnings.append(warning)
+
+    def trace(stage, name, ok, contract=None, function=None, detail=None, error=None, remediation=None):
+        execution_trace.append({
+            "stage":stage, "name":name, "ok":bool(ok), "contract":contract,
+            "function":function, "detail":detail, "error":error,
+            "remediation":remediation,
+        })
+
+    add_check("requestContext", chain_id > 0 and session_id > 0, "READY" if chain_id > 0 and session_id > 0 else "MISSING", {
+        "wallet":wallet, "engine":engine, "chainId":chain_id or None,
+        "sessionId":session_id or None, "registryRowFound":bool(registry_row),
+    }, blocker="session_context_missing")
+    add_check("vaultConfigured", _looks_like_evm_addr(vault), "READY" if _looks_like_evm_addr(vault) else "MISSING", {"vault":vault or None}, blocker="vault_not_configured")
+
+    if chain_id > 0 and _looks_like_evm_addr(vault):
+        try:
+            block_raw = _rpc_call(chain_id, "eth_blockNumber", [])
+            block_no = int(str(block_raw), 16)
+            add_check("rpcReachable", True, "READY", {"blockNumber":block_no, "candidateCount":len(_rpc_urls_for_chain(chain_id))})
+            trace("RPC", "Chain head read", True, function="eth_blockNumber", detail={"blockNumber":block_no})
+        except Exception as exc:
+            msg = str(exc)
+            add_check("rpcReachable", False, "FAILED", {"error":msg}, blocker="rpc_unreachable")
+            trace("RPC", "Chain head read", False, function="eth_blockNumber", error=msg, remediation="Configure a working provider-neutral RPC_URL for this chain.")
+            diagnostic_error = msg
+
+        try:
+            code = _rpc_call(chain_id, "eth_getCode", [vault, "latest"])
+            has_code = bool(str(code or "0x") not in ("0x", "0x0", "0x00"))
+            add_check("vaultContractCode", has_code, "READY" if has_code else "FAILED", {"vault":vault,"codeBytes":max(0,(len(str(code))-2)//2)}, blocker="vault_contract_missing")
+            trace("VAULT", "CoreVault contract code", has_code, contract=vault, function="eth_getCode", detail={"codeBytes":max(0,(len(str(code))-2)//2)})
+        except Exception as exc:
+            add_check("vaultContractCode", False, "FAILED", {"error":str(exc)}, blocker="vault_contract_read_failed")
+
+    if chain_id > 0 and session_id > 0 and _looks_like_evm_addr(vault) and not blockers[:1] == ["rpc_unreachable"]:
+        try:
+            raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(session_id))
+            words = _core_words(raw)
+            if len(words) < 13:
+                raise RuntimeError(f"session_decode_failed:words={len(words)}")
+            status_id = int(words[3])
+            status_label = {0:"UNINITIALIZED",1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(status_id,f"UNKNOWN_{status_id}")
+            session = {
+                "sessionId":session_id, "owner":_norm_addr(_word_addr(words[0])),
+                "settlementToken":_norm_addr(_word_addr(words[1])), "systemId":int(words[2]),
+                "statusId":status_id, "status":status_label, "startsAt":int(words[4]),
+                "endsAt":int(words[5]), "maxSlippageBps":int(words[6]), "maxLossBps":int(words[7]),
+                "budgetUnits":str(int(words[8])), "settlementCashUnits":str(int(words[9])),
+                "realizedProfitUnits":str(int(words[10])), "realizedLossUnits":str(int(words[11])),
+                "openAssetCount":int(words[12]),
+            }
+            owner_ok = session["owner"].lower() == wallet.lower()
+            system_ok = session["systemId"] == int(_CORE_SYSTEM_ID[engine])
+            add_check("sessionRead", True, status_label, session)
+            add_check("sessionOwner", owner_ok, "READY" if owner_ok else "MISMATCH", {"expected":wallet,"actual":session["owner"]}, blocker="session_owner_mismatch")
+            add_check("sessionSystem", system_ok, "READY" if system_ok else "MISMATCH", {"expected":_CORE_SYSTEM_ID[engine],"actual":session["systemId"]}, blocker="session_system_mismatch")
+            trace("SESSION", "CoreVault sessionOf", True, contract=vault, function="sessionOf(uint256)", detail=session)
+        except Exception as exc:
+            msg=str(exc)
+            add_check("sessionRead", False, "FAILED", {"error":msg}, blocker="session_read_failed")
+            trace("SESSION", "CoreVault sessionOf", False, contract=vault, function="sessionOf(uint256)", error=msg)
+            diagnostic_error = diagnostic_error or msg
+
+    cfg = None
+    if chain_id in (1,56,137):
+        try:
+            cfg = _privy_trading_cfg(chain_id)
+            router = _norm_addr(cfg.get("router") or "")
+            quoter = _norm_addr(cfg.get("quoter") or "")
+            settlement = _norm_addr((session or {}).get("settlementToken") or cfg.get("usdc") or "")
+            settlement_detail = {"address":settlement,"configuredAddress":cfg.get("usdc"),"symbol":"USDC" if settlement.lower()==_norm_addr(cfg.get("usdc")).lower() else "SESSION_SETTLEMENT"}
+            add_check("routerConfigured", _looks_like_evm_addr(router), "READY" if _looks_like_evm_addr(router) else "MISSING", {"router":router}, blocker="router_not_configured")
+            add_check("quoterConfigured", _looks_like_evm_addr(quoter), "READY" if _looks_like_evm_addr(quoter) else "MISSING", {"quoter":quoter}, warning="quoter_not_configured")
+            if _looks_like_evm_addr(router):
+                rcfg = _read_router_config(vault, router, chain_id)
+                selector_ok = _read_router_selector_allowed(vault, router, _PRIVY_EXACT_INPUT_SINGLE_SELECTOR, chain_id)
+                router_detail = {"address":router, "enabled":bool(rcfg.get("enabled")), "oracle":rcfg.get("oracle"), "selector":_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, "selectorAllowed":bool(selector_ok)}
+                add_check("routerEnabled", bool(rcfg.get("enabled")), "READY" if rcfg.get("enabled") else "DISABLED", router_detail, blocker="router_disabled")
+                add_check("routerSelectorAllowed", bool(selector_ok), "READY" if selector_ok else "BLOCKED", router_detail, blocker="router_selector_blocked")
+                selectors.append(router_detail)
+                trace("ROUTER", "Router and selector", bool(rcfg.get("enabled") and selector_ok), contract=vault, function="routerConfig/routerSelectorAllowed", detail=router_detail)
+        except Exception as exc:
+            msg=str(exc)
+            add_check("executionConfig", False, "FAILED", {"error":msg}, blocker="execution_config_failed")
+            diagnostic_error = diagnostic_error or msg
+
+    # Discover the actual non-zero position. Known wrapped-native positions are
+    # checked first. Event history is only scanned on an explicit diagnostics click.
+    if session and int(session.get("openAssetCount") or 0) > 0 and cfg:
+        discovered = []
+        candidates = []
+        for symbol,key in ((cfg.get("nativeSymbol") or "WNATIVE","weth"),("USDC","usdc"),("USDT","usdt")):
+            addr=_norm_addr(cfg.get(key) or "")
+            if _looks_like_evm_addr(addr) and all(addr.lower()!=x[1].lower() for x in candidates):
+                candidates.append((symbol,addr))
+        try:
+            for symbol, token in candidates:
+                amount = _position_amount(vault, session_id, token, chain_id)
+                if amount > 0:
+                    discovered.append({"symbol":symbol,"address":token,"amountUnits":str(amount),"source":"positionOf_known_token"})
+            if len(discovered) < int(session.get("openAssetCount") or 0):
+                events = _nkr_session_trade_events(chain_id, vault, session_id)
+                seen=set(x["address"].lower() for x in discovered)
+                for ev in reversed(events):
+                    token=_norm_addr(ev.get("tokenOut") or "")
+                    if not _looks_like_evm_addr(token) or token.lower() in seen or token.lower()==_norm_addr(session["settlementToken"]).lower():
+                        continue
+                    amount=_position_amount(vault, session_id, token, chain_id)
+                    if amount>0:
+                        discovered.append({"symbol":ev.get("symbol") or "DYNAMIC","address":token,"amountUnits":str(amount),"source":"TradeExecuted+positionOf"})
+                        seen.add(token.lower())
+            target_token = discovered[0] if discovered else None
+            found_ok = len(discovered) >= int(session.get("openAssetCount") or 0)
+            add_check("openPositionResolution", found_ok, "READY" if found_ok else "UNRESOLVED", {"expectedCount":session.get("openAssetCount"),"positions":discovered}, blocker="open_position_unresolved")
+            trace("POSITION", "Resolve open on-chain positions", found_ok, contract=vault, function="positionOf/TradeExecuted", detail={"positions":discovered})
+        except Exception as exc:
+            msg=str(exc)
+            add_check("openPositionResolution", False, "FAILED", {"error":msg}, blocker="open_position_resolution_failed")
+            trace("POSITION", "Resolve open on-chain positions", False, contract=vault, function="positionOf/TradeExecuted", error=msg)
+            diagnostic_error = diagnostic_error or msg
+    elif session:
+        add_check("openPositionResolution", True, "ZERO", {"expectedCount":0,"positions":[]})
+
+    runtime = None
+    try:
+        runtime = _live_engine_health_payload(wallet).get(engine) or {}
+        add_check("workerRuntime", True, str(runtime.get("decision") or runtime.get("status") or "UNKNOWN").upper(), runtime)
+    except Exception as exc:
+        add_check("workerRuntime", False, "UNKNOWN", {"error":str(exc)}, warning="runtime_unavailable")
+
+    if blockers:
+        first=blockers[0]
+        mapping={
+            "rpc_unreachable":("RPC","Chain RPC unavailable","Configure a working provider-neutral RPC_URL for the chain."),
+            "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
+            "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
+            "open_position_resolution_failed":("POSITION","Position discovery failed","Check RPC eth_getLogs support and the session creation block."),
+            "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
+            "router_selector_blocked":("ROUTER","Router selector blocked","Allow exactInputSingle selector on-chain."),
+        }
+        stage,title,rem=mapping.get(first,("READ_CHECK",first.replace("_"," ").title(),"Inspect the failed check below."))
+        root_cause={"status":"BLOCKED","stage":stage,"title":title,"contract":vault or None,"function":None,"error":diagnostic_error,"remediation":rem}
+    elif warnings:
+        root_cause={"status":"WARNING","stage":"READ_CHECK","title":"Read checks completed with warnings","contract":vault or None,"function":None,"error":None,"remediation":"Review warning checks."}
+    else:
+        root_cause={"status":"READY","stage":"READ_CHECK","title":"All selected read checks passed","contract":vault or None,"function":None,"error":None,"remediation":None}
+
+    overall = "BLOCKED" if blockers else ("WARNING" if warnings else "READY")
     report = {
-        "chainId": chain_id or None,
-        "chain": chain_names.get(chain_id, str(chain_id) if chain_id else "—"),
-        "engine": engine,
-        "sessionId": session_id,
-        "status": "INFO",
-        "summary": {"blockerCount": 0, "warningCount": 1, "targetSymbol": "—"},
-        "checks": {
-            "diagnosticsEndpoint": {
-                "ok": True,
-                "status": "READY",
-                "detail": "Compatibility endpoint active; live execution is unaffected.",
-            },
-            "diagnosticsMode": {
-                "ok": False,
-                "status": "INFO",
-                "detail": "Full developer diagnostics are not loaded in this stable ENGINE317-derived runtime.",
-            },
-        },
-        "blockers": [],
-        "diagnosticError": None,
-        "rootCause": {
-            "status": "READY",
-            "stage": "DIAGNOSTICS_ENDPOINT",
-            "title": "Endpoint available; no 404",
-            "contract": None,
-            "function": "/api/nexus/system-info/evm-diagnostics",
-            "error": None,
-            "remediation": None,
-        },
+        "chainId":chain_id or None,"chain":chain,"engine":engine,"sessionId":session_id or None,
+        "status":overall,"summary":{"blockerCount":len(set(blockers)),"warningCount":len(set(warnings)),"targetSymbol":(target_token or {}).get("symbol") or "—"},
+        "vault":vault or None,"router":(router_detail or {}).get("address") if router_detail else None,
+        "quoter":(cfg or {}).get("quoter") if cfg else None,"settlement":(session or {}).get("settlementToken") if session else None,
+        "target":(target_token or {}).get("address") if target_token else None,
+        "sessionSource":"ONCHAIN_SESSION_OF","checks":checks,"blockers":list(dict.fromkeys(blockers)),
+        "warnings":list(dict.fromkeys(warnings)),"diagnosticError":diagnostic_error,"rootCause":root_cause,
+        "executionTrace":execution_trace,"session":session,"settlementToken":settlement_detail,
+        "targetToken":target_token,"selectors":selectors,"feeTiers":fee_tiers,
+        "contractMap":{"vault":vault or None,"router":(router_detail or {}).get("address") if router_detail else None,"quoter":(cfg or {}).get("quoter") if cfg else None},
+        "runtime":runtime,"readOnly":True,"transactionsSent":0,
     }
-    return jsonify({
-        "status": "ok",
-        "overall": "INFO",
-        "engine": engine,
-        "reports": [report],
-        "ts": now_ts(),
-    })
+    return jsonify({"status":"ok","overall":overall,"engine":engine,"reports":[report],"ts":now_ts()})
 
 # ENGINE-194 boot hook: safe under Flask reload/multiple requests; guarded once per process.
 @app.before_request
