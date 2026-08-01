@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-329-CLOSING-AUTO-FINALIZE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-330-CLOSING-FORCE-EXIT-ALL-EVM-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36290,23 +36290,110 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
 
 
 def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dict:
-    cfg = _privy_trading_cfg(); routes = _nkr_live_eth_route_registry(cfg)
-    executed = []; vault = _norm_addr(row.get("vault_address") or "")
+    """Force-close every mapped position for one CLOSING NKR session.
+
+    This path is chain-aware and bypasses Strategist entry/score logic entirely.
+    It is used only after startClosing is confirmed on-chain.  Every positive
+    position is sold back to the session's own settlement token, then the caller
+    may finalize only after sessionOf().openAssetCount is zero.
+    """
+    chain_id = int((row or {}).get("chain_id") or 1)
+    cfg = _privy_trading_cfg(chain_id)
+    vault = _norm_addr((row or {}).get("vault_address") or cfg.get("vault") or "")
+    if not _looks_like_evm_addr(vault):
+        raise RuntimeError(f"closing_exit_vault_missing:chain={chain_id}")
+
+    settlement = _live_session_settlement_token(
+        vault, int(session_id), _norm_addr(cfg.get("usdc") or ""), chain_id=chain_id
+    )
+    routes = _nkr_live_route_registry(cfg)
+
+    # Include token addresses already stamped on live asset cards.  This makes
+    # closing resilient when a position was opened from a dynamic route that is
+    # no longer present in the current watchlist/registry snapshot.
+    try:
+        sessions, _, _ = _db_get_rotation_sessions(wallet)
+        for card in sessions or []:
+            if not isinstance(card, dict):
+                continue
+            meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+            card_sid = str(
+                card.get("onchainSessionId") or card.get("onchain_session_id")
+                or meta.get("onchain_session_id") or ""
+            )
+            if card_sid != str(session_id):
+                continue
+            token = _norm_addr(meta.get("token_address") or card.get("tokenAddress") or "")
+            symbol = str(card.get("symbol") or card.get("targetAsset") or meta.get("nkr_active_asset") or "").upper()
+            if not symbol:
+                symbol = f"TOKEN_{token[-6:]}" if token else "UNKNOWN"
+            if _looks_like_evm_addr(token) and token.lower() != settlement.lower():
+                routes.setdefault(symbol, {
+                    "symbol": symbol,
+                    "token": token,
+                    "decimals": int(meta.get("token_decimals") or 18),
+                    "router": _norm_addr(meta.get("router_address") or cfg.get("router") or ""),
+                    "fee": int(meta.get("pool_fee") or cfg.get("poolFee") or 500),
+                    "live": True,
+                    "source": "live_session_card_recovery",
+                    "chain": _nkr_chain_key_from_id(chain_id),
+                })
+    except Exception:
+        pass
+
+    executed = []
+    discovered = []
     for sym, route in routes.items():
-        amount = _position_amount(vault, session_id, route["token"])
+        token = _norm_addr((route or {}).get("token") or "")
+        if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+            continue
+        try:
+            amount = _position_amount(vault, session_id, token, chain_id=chain_id)
+        except Exception as pos_exc:
+            continue
         if amount <= 0:
             continue
-        settlement = _live_session_settlement_token(_norm_addr(row.get("vault_address") or cfg["vault"]), int(str(row.get("onchain_session_id") or "0")), cfg["usdc"])
-        result = _nkr_live_trade_route(wallet, row, route, route["token"], settlement, amount, action="EXIT")
-        if _position_amount(vault, session_id, route["token"]) != 0:
-            raise RuntimeError(f"position_not_zero_after_exit:{sym}")
-        executed.append({"asset": sym, **result, "amountIn": amount})
-    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(session_id)); words = _core_words(raw)
-    open_assets = int(words[12]) if len(words) >= 13 else -1
+        discovered.append({"asset": sym, "token": token, "amount": amount})
+
+        _live_engine_mark(
+            "NKR", status="closing", decision="EXIT_SUBMITTING",
+            gate_status="ORDERLY_EXIT",
+            reason=f"CLOSING session #{session_id}: selling {sym} back to settlement",
+            active_asset=sym, position_state="EXITING", pending_tx="submitting", last_error="",
+        )
+        result = _nkr_live_trade_route(
+            wallet, row, route, token, settlement, amount, action="EXIT"
+        )
+        remaining = _position_amount(vault, session_id, token, chain_id=chain_id)
+        if remaining != 0:
+            raise RuntimeError(
+                f"position_not_zero_after_closing_exit:chain={chain_id}:session={session_id}:"
+                f"asset={sym}:token={token}:remaining={remaining}"
+            )
+        executed.append({"asset": sym, "token": token, **result, "amountIn": amount})
+
+    raw = _eth_call(
+        chain_id, vault,
+        _core_selector("sessionOf(uint256)") + _uint_to_32(session_id)
+    )
+    words = _core_words(raw)
+    if len(words) < 13:
+        raise RuntimeError(f"closing_session_decode_failed:chain={chain_id}:session={session_id}")
+    open_assets = int(words[12])
     if open_assets != 0:
-        raise RuntimeError(f"unmapped_open_assets_after_orderly_exit:{open_assets}")
-    return {"executed": bool(executed), "trades": executed,
-            "txHash": str(executed[-1].get("txHash") if executed else ""), "amountIn": sum(int(x.get("amountIn") or 0) for x in executed), "amountOut": 0}
+        mapped = ",".join(f"{x['asset']}:{x['token']}:{x['amount']}" for x in discovered) or "none"
+        raise RuntimeError(
+            f"closing_open_assets_unmapped:chain={chain_id}:session={session_id}:"
+            f"openAssetCount={open_assets}:mappedPositions={mapped}"
+        )
+
+    return {
+        "executed": bool(executed), "trades": executed,
+        "txHash": str(executed[-1].get("txHash") if executed else ""),
+        "amountIn": sum(int(x.get("amountIn") or 0) for x in executed),
+        "amountOut": sum(int(x.get("quoteOut") or 0) for x in executed),
+        "chainId": chain_id, "settlementToken": settlement,
+    }
 
 
 def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
