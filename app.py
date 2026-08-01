@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-347-BNB-V2-LIVE-CLOSING-EXECUTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-348-STRATEGIST-SESSION-SIGNAL-AUDIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34302,6 +34302,83 @@ def api_nkr_bridge_plan():
 # The previous build only ticked when the React page was open and a local session
 # happened to exist. A live CoreVault session could therefore remain RUNNING with
 # Tick Count 0 forever. This worker owns the heartbeat in the backend.
+
+@app.get("/api/nexus/system-info/nkr-session-audit")
+def api_nexus_nkr_session_audit():
+    """Read-only proof that every live NKR session keeps its own rules and signals."""
+    authenticated_wallet = _require_auth()
+    if not authenticated_wallet:
+        return err("unauthorized", 401)
+    wallet = _norm_addr(request.args.get("wallet") or authenticated_wallet)
+    if wallet.lower() != _norm_addr(authenticated_wallet).lower():
+        return jsonify({"status": "error", "error": "wallet_mismatch"}), 403
+    rows = _live_active_sessions(wallet, "NKR")
+    market_rows = _nkr_live_market_rows(wallet)
+    required_signal_groups = {
+        "price": ("price", "priceUsd"),
+        "momentum": ("change24h", "change_24h", "momentumScore", "strategistMomentumScore"),
+        "volume": ("volume24h", "volume_24h", "rvol", "relativeVolume", "strategistRvol"),
+        "score": ("score", "systemScore", "ratingScore", "strategistPerformanceScore"),
+        "risk_quality": ("riskScore", "strategistRiskScore", "overextension", "overextensionScore", "volumeConfirmation"),
+        "chain_route": ("chain", "chainKey", "wrapToken", "internalSymbol"),
+    }
+    signal_coverage = {}
+    for group, keys in required_signal_groups.items():
+        present = sum(1 for r in market_rows if isinstance(r, dict) and any(r.get(k) not in (None, "") for k in keys))
+        signal_coverage[group] = {"presentRows": present, "totalRows": len(market_rows), "ok": bool(present > 0)}
+    session_audits = []
+    modes = []
+    for row in rows:
+        cfg = _nkr_settings_for_exact_live_session(wallet, row, {})
+        cid = int(row.get("chain_id") or 0)
+        sid = str(row.get("onchain_session_id") or "")
+        mode = _nkr_normalize_performance_mode(cfg.get("nkrCapitalMode") or "DYNAMIC")
+        modes.append((f"{cid}:{sid}", mode))
+        session_audits.append({
+            "sessionConfigKey": cfg.get("session_config_key"),
+            "chainId": cid,
+            "chain": _nkr_chain_key_from_id(cid),
+            "sessionId": sid,
+            "status": str(row.get("status") or "").upper(),
+            "locked": bool(cfg.get("session_config_locked")),
+            "mode": mode,
+            "observationWindow": cfg.get("nkrObservationWindow"),
+            "profitMode": cfg.get("nkrProfitMode"),
+            "periodDays": cfg.get("nkrPeriodDays"),
+            "maxActiveAssets": cfg.get("maxActiveAssets"),
+            "maxCapitalPerAssetPct": cfg.get("maxCapitalPerAssetPct"),
+            "payoutAsset": cfg.get("payoutAsset"),
+            "budgetUsd": cfg.get("budgetUsd"),
+            "modeThreshold": {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0),
+        })
+    duplicate_keys = len({k for k, _ in modes}) != len(modes)
+    all_locked = all(x.get("locked") for x in session_audits) if session_audits else True
+    signals_ok = all(v.get("ok") for v in signal_coverage.values()) if signal_coverage else False
+    return jsonify({
+        "status": "ready" if all_locked and signals_ok and not duplicate_keys else "blocked",
+        "readonly": True,
+        "transactionsSent": 0,
+        "wallet": wallet,
+        "sessionCount": len(session_audits),
+        "sessions": session_audits,
+        "modeIsolation": {
+            "ok": bool(all_locked and not duplicate_keys),
+            "scope": "wallet+chainId+onchainSessionId",
+            "proof": modes,
+            "nextSessionDraftCannotOverrideRunningSession": True,
+        },
+        "strategistSignals": {
+            "marketRows": len(market_rows),
+            "coverage": signal_coverage,
+            "complete": signals_ok,
+        },
+        "entryPipeline": [
+            "exact_session_config", "watchlist_and_chain_route", "price", "momentum_24h",
+            "volume_and_rvol", "score_and_risk_quality", "market_regime", "capital_release",
+            "router_quote", "vault_preflight", "privy_backend_execution", "onchain_position_verify",
+        ],
+    })
+
 _NKR_LIVE_WORKER_STARTED = False
 _NKR_LIVE_WORKER_THREAD = None
 _NKR_LIVE_WORKER_LOCK = threading.RLock()
@@ -34591,6 +34668,19 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
                 pass
         rows.append(row)
     enriched = _binance_enrich_market_rows(rows)
+    # ENGINE-348: the live Strategist must consume the same enriched signal contract
+    # on every chain. This adds deterministic score/rating, momentum, RVOL/volume
+    # confirmation, overextension and risk-quality fields before any entry decision.
+    # The function is defined later in the module but is available when worker ticks run.
+    try:
+        enriched = _nkr_prepare_strategist_signals(enriched or [])
+    except Exception as signal_exc:
+        # Market rows remain usable, but surface the loss of signal depth instead of
+        # silently pretending the Strategist received the complete signal set.
+        for r in (enriched or []):
+            if isinstance(r, dict):
+                r["strategistSignalError"] = str(signal_exc)[:240]
+                r["strategistSignalsComplete"] = False
     if isinstance(enriched, list) and skipped_non_live > 0:
         for r in enriched:
             if isinstance(r, dict):
@@ -37845,15 +37935,45 @@ def _nkr_live_worker_cycle() -> None:
             # simulator. Local rows remain the UI/control projection of on-chain state.
             processed = list(nkr_sessions)
             summary = {"mode": "LIVE_PORTFOLIO", "sessions": len(processed)}
-            # Multi-EVM Strategist plan (all live chains + future allowlisted chains).
-            multi_plan = _nkr_strategist_multi_chain_plan(wallet, market_rows, runnable_rows, settings)
-            # Strategist autonomy within user mode rules: open sessions / release idle.
-            # Buy/Sell continue below via _nkr_live_execute_portfolio on each active session.
+            # ENGINE-348: build Strategist plans per exact on-chain session. Never let
+            # the current NEXT-SESSION draft (for example Dynamic) alter an already
+            # running Aggressive session, or vice versa. Each plan/action receives the
+            # immutable config keyed by wallet + chainId + on-chain sessionId.
+            session_plans = []
             strategist_actions = []
-            try:
-                strategist_actions = _nkr_strategist_apply_actions(wallet, multi_plan, runnable_rows, settings)
-            except Exception as act_exc:
-                strategist_actions = [{"ok": False, "error": f"apply_actions:{str(act_exc)[:200]}"}]
+            for _plan_row in (runnable_rows or []):
+                try:
+                    _exact_settings = _nkr_settings_for_exact_live_session(wallet, _plan_row, settings)
+                    if not _exact_settings.get("session_config_locked"):
+                        raise RuntimeError(f"missing immutable NKR session config for {_exact_settings.get('session_config_key')}")
+                    _plan = _nkr_strategist_multi_chain_plan(wallet, market_rows, [_plan_row], _exact_settings)
+                    _plan = dict(_plan or {})
+                    _plan["sessionConfigKey"] = _exact_settings.get("session_config_key")
+                    _plan["sessionMode"] = _exact_settings.get("nkrCapitalMode")
+                    _plan["observationWindow"] = _exact_settings.get("nkrObservationWindow")
+                    _plan["profitMode"] = _exact_settings.get("nkrProfitMode")
+                    _plan["periodDays"] = _exact_settings.get("nkrPeriodDays")
+                    session_plans.append(_plan)
+                    try:
+                        strategist_actions.extend(
+                            _nkr_strategist_apply_actions(wallet, _plan, [_plan_row], _exact_settings) or []
+                        )
+                    except Exception as act_exc:
+                        strategist_actions.append({
+                            "ok": False,
+                            "sessionConfigKey": _exact_settings.get("session_config_key"),
+                            "mode": _exact_settings.get("nkrCapitalMode"),
+                            "error": f"apply_actions:{str(act_exc)[:200]}",
+                        })
+                except Exception as plan_exc:
+                    strategist_actions.append({"ok": False, "error": f"session_plan:{str(plan_exc)[:240]}"})
+            # Compact aggregate is diagnostics-only; execution below still resolves the
+            # exact immutable settings again for every session.
+            multi_plan = {
+                "mode": "PER_SESSION_IMMUTABLE",
+                "sessionPlans": session_plans,
+                "tip": next((str(p.get("tip") or "") for p in session_plans if p.get("tip")), ""),
+            }
             if any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
                 # Refresh runnable set so the new session can trade in a later tick (or same if registered).
                 try:
@@ -37894,11 +38014,23 @@ def _nkr_live_worker_cycle() -> None:
                 except Exception:
                     tradable_syms = []
 
+            # Diagnostics must describe the same exact session rules used by execution,
+            # not the mutable setup draft for the next session.
+            _diag_settings = settings
+            if working_rows:
+                try:
+                    _diag_settings = _nkr_settings_for_exact_live_session(wallet, working_rows[0], settings)
+                except Exception:
+                    _diag_settings = settings
             diag = _nkr_runtime_decision_diagnostics(
-                processed, market_rows, settings, summary,
+                processed, market_rows, _diag_settings, summary,
                 session_chain_id=primary_chain_id or None,
                 tradable_symbols=tradable_syms,
             )
+            diag["sessionMode"] = _diag_settings.get("nkrCapitalMode")
+            diag["sessionConfigKey"] = _diag_settings.get("session_config_key")
+            diag["sessionConfigLocked"] = bool(_diag_settings.get("session_config_locked"))
+            diag["strategistPlanScope"] = "PER_SESSION_IMMUTABLE"
             diag["working_chains"] = [_nkr_chain_key_from_id(cid) for cid in working_chain_ids]
             diag["paused_chains"] = [_nkr_chain_key_from_id(cid) for cid in paused_chain_ids]
             diag["session_states"] = [
