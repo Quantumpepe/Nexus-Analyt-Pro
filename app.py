@@ -31450,31 +31450,98 @@ def _diag_uint_call(chain_id: int, contract: str, selector: str, *words: str) ->
     return int(decoded[0], 16) if decoded else 0
 
 
+def _diag_resolve_live_session(wallet: str, engine: str, chain_id: int, explicit_session_id=None):
+    """Resolve the exact live session from the chain-aware registry.
+
+    Diagnostic reads must use the same composite identity as session cards and the
+    worker: wallet + engine + chain id + on-chain session id.  This prevents BNB #1
+    and POL #1 from being mixed and lets diagnostics work even when the frontend
+    runtime snapshot did not contain session_states yet.
+    """
+    if str(explicit_session_id or "").isdigit() and int(str(explicit_session_id)) > 0:
+        return int(str(explicit_session_id)), None
+    try:
+        rows = _live_active_sessions(wallet, str(engine or "NKR").upper())
+    except Exception:
+        rows = []
+    matches = [r for r in rows if int(r.get("chain_id") or 0) == int(chain_id)]
+    matches.sort(key=lambda r: (str(r.get("status") or "").upper() != "ACTIVE", -int(r.get("updated_ts") or 0)))
+    if matches:
+        row = matches[0]
+        sid = int(str(row.get("onchain_session_id") or "0"))
+        return (sid if sid > 0 else None), row
+    return None, None
+
+
+def _diag_read_erc20_symbol(chain_id: int, token: str) -> str:
+    try:
+        raw = _eth_call(int(chain_id), _norm_addr(token), "0x95d89b41")
+        body = str(raw or "0x")[2:]
+        if len(body) >= 128:
+            off = int(body[:64], 16) * 2
+            ln = int(body[off:off+64], 16)
+            return bytes.fromhex(body[off+64:off+64+ln*2]).decode("utf-8", "ignore").strip("\x00")
+        if len(body) >= 64:
+            return bytes.fromhex(body[:64]).decode("utf-8", "ignore").strip("\x00")
+    except Exception:
+        pass
+    return ""
+
+
+def _diag_token_snapshot(chain_id: int, vault: str, token: str, owner: str, router: str) -> dict:
+    token = _norm_addr(token)
+    if not _looks_like_evm_addr(token):
+        return {"address": token, "configured": False, "error": "token_missing"}
+    cfg = _read_token_config(vault, token, chain_id) if vault else {}
+    decimals = int(cfg.get("decimals") or 18)
+    vault_balance = _diag_uint_call(chain_id, token, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(vault)) if vault else 0
+    owner_balance = _diag_uint_call(chain_id, token, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(owner)) if owner else 0
+    allowance = _diag_uint_call(chain_id, token, _ERC20_ALLOWANCE_SELECTOR, _addr_to_32(vault), _addr_to_32(router)) if vault and router else 0
+    return {
+        "address": token,
+        "symbol": _diag_read_erc20_symbol(chain_id, token),
+        "configured": bool(cfg.get("configured")),
+        "depositEnabled": bool(cfg.get("depositEnabled")),
+        "withdrawEnabled": bool(cfg.get("withdrawEnabled")),
+        "executionEnabled": bool(cfg.get("executionEnabled")),
+        "paymentEnabled": bool(cfg.get("paymentEnabled")),
+        "settlementToken": bool(cfg.get("settlementToken")),
+        "decimals": decimals,
+        "maxSingleDeposit": int(cfg.get("maxSingleDeposit") or 0),
+        "maxSessionBudget": int(cfg.get("maxSessionBudget") or 0),
+        "profitThreshold": int(cfg.get("profitThreshold") or 0),
+        "vaultBalanceRaw": int(vault_balance),
+        "vaultBalance": float(vault_balance) / float(10 ** decimals) if decimals >= 0 else 0.0,
+        "ownerBalanceRaw": int(owner_balance),
+        "ownerBalance": float(owner_balance) / float(10 ** decimals) if decimals >= 0 else 0.0,
+        "routerAllowanceRaw": int(allowance),
+        "routerAllowance": float(allowance) / float(10 ** decimals) if decimals >= 0 else 0.0,
+    }
+
+
 def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", session_id=None) -> dict:
     cid = int(chain_id)
     cfg = _privy_trading_cfg(cid)
+    engine_u = str(engine or "NKR").upper()
     vault = _norm_addr(cfg.get("vault") or _VAULT_BY_CHAIN.get(cid) or "")
     router = _norm_addr(cfg.get("router") or "")
     quoter = _norm_addr(cfg.get("quoter") or "")
     token_in = _norm_addr(cfg.get("usdc") or "")
     token_out = _norm_addr(cfg.get("weth") or "")
     chain_name = str(cfg.get("chainKey") or cfg.get("chain") or (_EVM_CHAIN_KEY_BY_ID.get(cid) if "_EVM_CHAIN_KEY_BY_ID" in globals() else None) or cid).upper()
+    resolved_sid, registry_row = _diag_resolve_live_session(wallet, engine_u, cid, session_id)
     report = {
-        "chainId": cid,
-        "chain": chain_name,
-        "engine": str(engine or "NKR").upper(),
-        "wallet": _norm_addr(wallet),
-        "vault": vault,
-        "router": router,
-        "quoter": quoter,
-        "tokenIn": token_in,
-        "tokenOut": token_out,
-        "sessionId": int(session_id) if str(session_id or "").isdigit() else None,
-        "checks": {},
-        "selectors": [],
-        "blockers": [],
+        "chainId": cid, "chain": chain_name, "engine": engine_u,
+        "wallet": _norm_addr(wallet), "vault": vault, "router": router,
+        "quoter": quoter, "tokenIn": token_in, "tokenOut": token_out,
+        "sessionId": resolved_sid, "sessionSource": "request" if str(session_id or "").isdigit() else ("registry" if resolved_sid else "none"),
+        "registryRow": {k: registry_row.get(k) for k in ("status","chain_id","vault_address","onchain_session_id","budget_units","updated_ts") if registry_row and k in registry_row},
+        "checks": {}, "selectors": [], "feeTiers": [], "blockers": [], "warnings": [], "actionPlan": [],
     }
     c = report["checks"]
+    session_detail = None
+    settlement_snapshot = {}
+    target_snapshot = {}
     try:
         c["vaultConfigured"] = _diag_bool(_looks_like_evm_addr(vault), detail=vault or "missing")
         c["vaultHasCode"] = _diag_bool(bool(vault and _contract_has_code(vault, cid)), detail=vault)
@@ -31483,85 +31550,151 @@ def _evm_execution_diagnostic(chain_id: int, wallet: str, engine: str = "NKR", s
         c["quoterConfigured"] = _diag_bool(_looks_like_evm_addr(quoter), detail=quoter or "missing")
         c["quoterHasCode"] = _diag_bool(bool(quoter and _contract_has_code(quoter, cid)), detail=quoter)
 
-        if vault and router:
-            router_cfg = _read_router_config(vault, router, cid)
-            c["routerEnabled"] = _diag_bool(bool(router_cfg.get("enabled")), detail=router_cfg)
-        else:
-            c["routerEnabled"] = _diag_bool(False, detail="vault_or_router_missing")
-
+        router_cfg = _read_router_config(vault, router, cid) if vault and router else {}
+        c["routerEnabled"] = _diag_bool(bool(router_cfg.get("enabled")), detail=router_cfg or "vault_or_router_missing")
         for selector in (_PRIVY_EXACT_INPUT_SINGLE_SELECTOR, _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR):
-            allowed = bool(vault and router and _read_router_selector_allowed(vault, router, selector, cid))
-            report["selectors"].append({"selector": selector, "allowed": allowed})
+            try:
+                allowed = bool(vault and router and _read_router_selector_allowed(vault, router, selector, cid))
+                selector_error = ""
+            except Exception as exc:
+                allowed, selector_error = False, str(exc)
+            report["selectors"].append({"selector": selector, "allowed": allowed, "error": selector_error})
+            c[f"selector_{selector}"] = _diag_bool(allowed, detail={"router": router, "selector": selector, "error": selector_error})
         c["anySelectorAllowed"] = _diag_bool(any(x["allowed"] for x in report["selectors"]), detail=report["selectors"])
 
-        if token_in:
-            tin = _read_token_config(vault, token_in, cid) if vault else {}
-            c["settlementTokenConfigured"] = _diag_bool(bool(tin.get("configured")), detail=tin)
-            c["settlementExecutionEnabled"] = _diag_bool(bool(tin.get("executionEnabled")), detail=tin)
-            vault_token_balance = _diag_uint_call(cid, token_in, _ERC20_BALANCE_OF_SELECTOR, _addr_to_32(vault)) if vault else 0
-            allowance = _diag_uint_call(cid, token_in, _ERC20_ALLOWANCE_SELECTOR, _addr_to_32(vault), _addr_to_32(router)) if vault and router else 0
-            c["vaultTokenBalance"] = _diag_bool(vault_token_balance > 0, detail={"raw": vault_token_balance, "decimals": tin.get("decimals")})
-            # A zero allowance is diagnostic, not automatically fatal: some routers are called
-            # through permit/approval helpers, while CoreVault implementations may approve in-call.
-            c["routerAllowance"] = _diag_bool(allowance > 0, ok_label="NON_ZERO", bad_label="ZERO", detail={"raw": allowance, "vault": vault, "spender": router})
-        else:
-            c["settlementTokenConfigured"] = _diag_bool(False, detail="token_in_missing")
-            c["settlementExecutionEnabled"] = _diag_bool(False, detail="token_in_missing")
-            c["vaultTokenBalance"] = _diag_bool(False, detail="token_in_missing")
-            c["routerAllowance"] = _diag_bool(False, bad_label="UNKNOWN", detail="token_in_or_router_missing")
-
-        if token_out:
-            tout = _read_token_config(vault, token_out, cid) if vault else {}
-            c["targetTokenConfigured"] = _diag_bool(bool(tout.get("configured")), detail=tout)
-            c["targetExecutionEnabled"] = _diag_bool(bool(tout.get("executionEnabled")), detail=tout)
-        else:
-            c["targetTokenConfigured"] = _diag_bool(False, detail="token_out_missing")
-            c["targetExecutionEnabled"] = _diag_bool(False, detail="token_out_missing")
-
-        if report["sessionId"] is not None and vault:
-            words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["sessionOf"], int(report["sessionId"])))
+        # Read the actual on-chain session before deciding which settlement token to inspect.
+        if resolved_sid is not None and vault:
+            words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["sessionOf"], int(resolved_sid)))
             if len(words) >= 13:
                 owner = _norm_addr("0x" + words[0][-40:])
                 settlement = _norm_addr("0x" + words[1][-40:])
-                status = int(words[3], 16)
-                budget = int(words[8], 16)
-                cash = int(words[9], 16)
-                open_assets = int(words[12], 16)
-                session_detail = {"owner": owner, "settlementToken": settlement, "system": int(words[2],16), "status": status, "budget": budget, "settlementCash": cash, "openAssetCount": open_assets}
+                session_detail = {
+                    "owner": owner, "settlementToken": settlement, "system": int(words[2],16),
+                    "status": int(words[3],16), "startsAt": int(words[4],16), "endsAt": int(words[5],16),
+                    "maxSlippageBps": int(words[6],16), "maxLossBps": int(words[7],16),
+                    "budget": int(words[8],16), "settlementCash": int(words[9],16),
+                    "realizedProfit": int(words[10],16), "realizedLoss": int(words[11],16),
+                    "openAssetCount": int(words[12],16),
+                }
+                token_in = settlement if _looks_like_evm_addr(settlement) else token_in
+                report["tokenIn"] = token_in
                 c["sessionFound"] = _diag_bool(owner != ZERO_ADDRESS, detail=session_detail)
                 c["sessionOwnerMatches"] = _diag_bool(owner.lower() == _norm_addr(wallet).lower(), detail=session_detail)
-                c["sessionActive"] = _diag_bool(status == 1, detail=session_detail)
+                c["sessionSystemMatches"] = _diag_bool(int(session_detail["system"]) == int((cfg.get("systemIds") or {}).get(engine_u, -1)), detail={"actual": session_detail["system"], "expected": (cfg.get("systemIds") or {}).get(engine_u)})
+                c["sessionActive"] = _diag_bool(int(session_detail["status"]) == 1, detail=session_detail)
                 c["sessionSettlementMatches"] = _diag_bool(settlement.lower() == token_in.lower(), detail=session_detail)
-                c["sessionHasCash"] = _diag_bool(cash > 0, detail=session_detail)
+                c["sessionHasCash"] = _diag_bool(int(session_detail["settlementCash"]) > 0, detail=session_detail)
+                c["sessionNotExpired"] = _diag_bool(int(session_detail["endsAt"]) == 0 or int(session_detail["endsAt"]) > now_ts(), detail=session_detail)
             else:
-                c["sessionFound"] = _diag_bool(False, detail="session_decode_failed")
+                c["sessionFound"] = _diag_bool(False, detail={"error": "session_decode_failed", "wordCount": len(words)})
+        else:
+            c["sessionFound"] = _diag_bool(False, bad_label="NOT_SELECTED", detail="No live session resolved for this chain/engine")
 
-        # Small quote probe only; no transaction and no state mutation.
+        settlement_snapshot = _diag_token_snapshot(cid, vault, token_in, wallet, router)
+        target_snapshot = _diag_token_snapshot(cid, vault, token_out, wallet, router)
+        report["settlementToken"] = settlement_snapshot
+        report["targetToken"] = target_snapshot
+        c["settlementTokenConfigured"] = _diag_bool(bool(settlement_snapshot.get("configured")), detail=settlement_snapshot)
+        c["settlementDepositEnabled"] = _diag_bool(bool(settlement_snapshot.get("depositEnabled")), detail=settlement_snapshot)
+        c["settlementWithdrawEnabled"] = _diag_bool(bool(settlement_snapshot.get("withdrawEnabled")), detail=settlement_snapshot)
+        c["settlementExecutionEnabled"] = _diag_bool(bool(settlement_snapshot.get("executionEnabled")), detail=settlement_snapshot)
+        c["settlementMarkedAsSettlement"] = _diag_bool(bool(settlement_snapshot.get("settlementToken")), detail=settlement_snapshot)
+        c["vaultTokenBalance"] = _diag_bool(int(settlement_snapshot.get("vaultBalanceRaw") or 0) > 0, detail=settlement_snapshot)
+        c["routerAllowance"] = _diag_bool(int(settlement_snapshot.get("routerAllowanceRaw") or 0) > 0, ok_label="NON_ZERO", bad_label="ZERO", detail=settlement_snapshot)
+        c["targetTokenConfigured"] = _diag_bool(bool(target_snapshot.get("configured")), detail=target_snapshot)
+        c["targetExecutionEnabled"] = _diag_bool(bool(target_snapshot.get("executionEnabled")), detail=target_snapshot)
+        c["targetWithdrawEnabled"] = _diag_bool(bool(target_snapshot.get("withdrawEnabled")), detail=target_snapshot)
+
+        # Probe all common V3 fee tiers. This makes pool/fee mismatches visible at once.
         if quoter and token_in and token_out and c.get("quoterHasCode", {}).get("ok"):
-            try:
-                probe_in = 1_000_000
-                probe_out = int(_privy_quote(cfg, token_in, token_out, probe_in))
-                c["quoteProbe"] = _diag_bool(probe_out > 0, detail={"amountIn": probe_in, "amountOut": probe_out, "fee": cfg.get("fee")})
-            except Exception as exc:
-                c["quoteProbe"] = _diag_bool(False, detail=str(exc))
+            probe_decimals = int(settlement_snapshot.get("decimals") or 6)
+            probe_in = max(1, 10 ** probe_decimals)  # exactly one settlement token
+            for fee in (100, 500, 2500, 3000, 10000):
+                try:
+                    out = int(_privy_quote(cfg, token_in, token_out, probe_in, fee=fee))
+                    report["feeTiers"].append({"fee": fee, "ok": out > 0, "amountIn": probe_in, "amountOut": out})
+                except Exception as exc:
+                    report["feeTiers"].append({"fee": fee, "ok": False, "amountIn": probe_in, "error": str(exc)[:300]})
+            working_fees = [x for x in report["feeTiers"] if x.get("ok")]
+            c["quoteProbe"] = _diag_bool(bool(working_fees), detail={"workingFees": working_fees, "allFees": report["feeTiers"]})
+            configured_fee = int(cfg.get("poolFee") or 0)
+            c["configuredFeeHasQuote"] = _diag_bool(any(int(x.get("fee") or 0) == configured_fee and x.get("ok") for x in report["feeTiers"]), detail={"configuredFee": configured_fee, "feeTiers": report["feeTiers"]})
         else:
             c["quoteProbe"] = _diag_bool(False, detail="quoter_or_token_missing")
+            c["configuredFeeHasQuote"] = _diag_bool(False, detail="quoter_or_token_missing")
+
+        # Full executeTrade preflight: read-only simulation with the real wallet as msg.sender.
+        if session_detail and int(session_detail.get("status") or 0) == 1 and int(session_detail.get("settlementCash") or 0) > 0 and target_snapshot.get("configured") and target_snapshot.get("executionEnabled"):
+            amount_in = min(int(session_detail["settlementCash"]), max(1, 10 ** int(settlement_snapshot.get("decimals") or 6)))
+            fee_candidates = [int(x["fee"]) for x in report["feeTiers"] if x.get("ok")]
+            preflights = []
+            for fee in fee_candidates[:5]:
+                try:
+                    quote = int(_privy_quote(cfg, token_in, token_out, amount_in, fee=fee))
+                    min_out = quote * (10000 - max(1, int(cfg.get("slippageBps") or 100))) // 10000
+                    deadline = now_ts() + 300
+                    for exact_selector in _exact_input_selector_candidates(vault, router, cid, cfg):
+                        try:
+                            router_data, outer_selector = _native_router_trade_data(cfg, token_in, token_out, vault, amount_in, min_out, fee, exact_selector=exact_selector, deadline=deadline)
+                            call = _encode_execute_trade(int(resolved_sid), router, token_in, token_out, amount_in, min_out, deadline, router_data)
+                            _eth_call_from(cid, wallet, vault, call)
+                            preflights.append({"ok": True, "fee": fee, "exactSelector": exact_selector, "outerSelector": outer_selector, "amountIn": amount_in, "quote": quote, "minOut": min_out})
+                        except Exception as exc:
+                            preflights.append({"ok": False, "fee": fee, "exactSelector": exact_selector, "amountIn": amount_in, "quote": quote, "minOut": min_out, "error": str(exc)[:500]})
+                except Exception as exc:
+                    preflights.append({"ok": False, "fee": fee, "error": f"quote:{str(exc)[:400]}"})
+            c["executeTradePreflight"] = _diag_bool(any(x.get("ok") for x in preflights), detail=preflights)
+        else:
+            reasons = []
+            if not session_detail: reasons.append("session_not_resolved")
+            elif int(session_detail.get("status") or 0) != 1: reasons.append("session_not_active")
+            elif int(session_detail.get("settlementCash") or 0) <= 0: reasons.append("session_has_no_cash")
+            if not target_snapshot.get("configured"): reasons.append("target_not_configured")
+            if not target_snapshot.get("executionEnabled"): reasons.append("target_execution_disabled")
+            c["executeTradePreflight"] = _diag_bool(False, bad_label="BLOCKED", detail=reasons)
     except Exception as exc:
         report["diagnosticError"] = str(exc)
 
     fatal_keys = [
-        "vaultConfigured", "vaultHasCode", "routerConfigured", "routerHasCode",
-        "routerEnabled", "anySelectorAllowed", "settlementTokenConfigured",
-        "settlementExecutionEnabled", "targetTokenConfigured", "targetExecutionEnabled",
-        "quoterHasCode", "quoteProbe",
+        "vaultConfigured", "vaultHasCode", "routerConfigured", "routerHasCode", "routerEnabled",
+        "anySelectorAllowed", "settlementTokenConfigured", "settlementExecutionEnabled",
+        "targetTokenConfigured", "targetExecutionEnabled", "quoterHasCode", "quoteProbe",
+        "configuredFeeHasQuote",
     ]
-    if report["sessionId"] is not None:
-        fatal_keys += ["sessionFound", "sessionOwnerMatches", "sessionActive", "sessionSettlementMatches", "sessionHasCash"]
+    if resolved_sid is not None:
+        fatal_keys += ["sessionFound", "sessionOwnerMatches", "sessionSystemMatches", "sessionActive", "sessionHasCash", "sessionNotExpired"]
     for key in fatal_keys:
         if not bool((c.get(key) or {}).get("ok")):
             report["blockers"].append(key)
-    # Keep allowance visible but do not declare it fatal without knowing the router's approval model.
+    if not bool((c.get("routerAllowance") or {}).get("ok")):
+        report["warnings"].append("routerAllowance")
+    if resolved_sid is not None and not bool((c.get("executeTradePreflight") or {}).get("ok")):
+        report["blockers"].append("executeTradePreflight")
+
+    # Human-readable, complete action plan. No automatic mutation is performed.
+    if not bool((c.get("targetTokenConfigured") or {}).get("ok")):
+        report["actionPlan"].append({"priority": 1, "code": "CONFIGURE_TARGET_TOKEN", "title": "Target token im CoreVault konfigurieren", "detail": {"token": token_out, "symbol": target_snapshot.get("symbol") or cfg.get("nativeSymbol"), "required": {"configured": True, "withdrawEnabled": True, "executionEnabled": True}, "note": "configureToken mit den korrekten Token-Decimalseinstellungen ausführen."}})
+    elif not bool((c.get("targetExecutionEnabled") or {}).get("ok")):
+        report["actionPlan"].append({"priority": 1, "code": "ENABLE_TARGET_EXECUTION", "title": "Execution für Target Token aktivieren", "detail": {"token": token_out, "currentConfig": target_snapshot}})
+    if not bool((c.get("configuredFeeHasQuote") or {}).get("ok")):
+        working = [x.get("fee") for x in report.get("feeTiers", []) if x.get("ok")]
+        report["actionPlan"].append({"priority": 2, "code": "SET_WORKING_POOL_FEE", "title": "Pool-Fee der Chain korrigieren", "detail": {"configured": cfg.get("poolFee"), "working": working}})
+    if not bool((c.get("routerAllowance") or {}).get("ok")):
+        report["actionPlan"].append({"priority": 3, "code": "CHECK_ROUTER_APPROVAL_MODEL", "title": "Router-Allowance/Approval-Modell prüfen", "detail": {"allowanceRaw": settlement_snapshot.get("routerAllowanceRaw"), "token": token_in, "vault": vault, "router": router, "note": "ZERO ist nur dann ein Blocker, wenn executeTrade nicht selbst forceApprove ausführt."}})
+    if resolved_sid is None:
+        report["actionPlan"].append({"priority": 2, "code": "RESOLVE_SESSION", "title": "Aktive Session für Diagnose auswählen", "detail": {"chain": chain_name, "engine": engine_u}})
+    if resolved_sid is not None and not bool((c.get("executeTradePreflight") or {}).get("ok")):
+        report["actionPlan"].append({"priority": 1, "code": "FIX_EXECUTE_TRADE_PREFLIGHT", "title": "executeTrade-Preflight beheben", "detail": (c.get("executeTradePreflight") or {}).get("detail")})
+
+    report["blockers"] = list(dict.fromkeys(report["blockers"]))
+    report["warnings"] = list(dict.fromkeys(report["warnings"]))
     report["status"] = "READY" if not report["blockers"] else "CHECK_REQUIRED"
+    report["summary"] = {
+        "ready": report["status"] == "READY", "blockerCount": len(report["blockers"]),
+        "warningCount": len(report["warnings"]), "targetToken": token_out,
+        "targetSymbol": target_snapshot.get("symbol") or cfg.get("nativeSymbol"),
+        "sessionResolved": resolved_sid is not None,
+    }
     return report
 
 
