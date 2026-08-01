@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-333-CLOSING-PIPELINE-FULL-AUDIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-334-BNB-CLOSING-FAST-EXIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -36469,31 +36469,57 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     except Exception:
         pass
 
-    # Recover every dynamically traded token from authoritative TradeExecuted logs.
-    # This closes assets even when the watchlist changed, the UI card vanished, or
-    # the target never had a static route entry.
-    event_history = _nkr_session_trade_events(chain_id, vault, int(session_id))
-    route_by_token = {
-        _norm_addr((r or {}).get("token") or "").lower(): (sym, r)
-        for sym, r in routes.items()
-        if _looks_like_evm_addr(_norm_addr((r or {}).get("token") or ""))
-    }
-    for ev in event_history:
-        for token in (_norm_addr(ev.get("tokenIn") or ""), _norm_addr(ev.get("tokenOut") or "")):
-            if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
-                continue
-            if token.lower() in route_by_token:
-                continue
-            symbol = f"TOKEN_{token[-6:].upper()}"
-            event_router = _norm_addr(ev.get("router") or cfg.get("router") or "")
-            routes[symbol] = {
-                "symbol": symbol, "token": token, "decimals": 18,
-                "router": event_router, "fee": int(cfg.get("poolFee") or 500),
-                "feeCandidates": [100, 500, 2500, 3000, 10000],
-                "live": True, "source": "onchain_trade_event_recovery",
-                "chain": _nkr_chain_key_from_id(chain_id),
-            }
-            route_by_token[token.lower()] = (symbol, routes[symbol])
+    # ENGINE-334: Do not scan hundreds of thousands of blocks before checking the
+    # canonical route registry. On BNB this made a simple WBNB -> USDC close wait
+    # for hundreds of public-RPC eth_getLogs calls while the session remained CLOSING.
+    # First compare the known positive positions with the authoritative openAssetCount.
+    raw_before = _eth_call(
+        chain_id, vault,
+        _core_selector("sessionOf(uint256)") + _uint_to_32(session_id)
+    )
+    words_before = _core_words(raw_before)
+    if len(words_before) < 13:
+        raise RuntimeError(f"closing_session_decode_failed_before_discovery:chain={chain_id}:session={session_id}")
+    expected_open_assets = int(words_before[12])
+
+    known_positive_tokens = set()
+    for _known_route in routes.values():
+        _known_token = _norm_addr((_known_route or {}).get("token") or "")
+        if not _looks_like_evm_addr(_known_token) or _known_token.lower() == settlement.lower():
+            continue
+        try:
+            if _position_amount(vault, session_id, _known_token, chain_id=chain_id) > 0:
+                known_positive_tokens.add(_known_token.lower())
+        except Exception:
+            continue
+
+    # Only use the expensive log-recovery path when a position is genuinely not
+    # represented by the canonical routes/cards. Normal WETH/WBNB/WPOL closes now
+    # proceed immediately and do not depend on historical log scanning.
+    event_history = []
+    if len(known_positive_tokens) < expected_open_assets:
+        event_history = _nkr_session_trade_events(chain_id, vault, int(session_id))
+        route_by_token = {
+            _norm_addr((r or {}).get("token") or "").lower(): (sym, r)
+            for sym, r in routes.items()
+            if _looks_like_evm_addr(_norm_addr((r or {}).get("token") or ""))
+        }
+        for ev in event_history:
+            for token in (_norm_addr(ev.get("tokenIn") or ""), _norm_addr(ev.get("tokenOut") or "")):
+                if not _looks_like_evm_addr(token) or token.lower() == settlement.lower():
+                    continue
+                if token.lower() in route_by_token:
+                    continue
+                symbol = f"TOKEN_{token[-6:].upper()}"
+                event_router = _norm_addr(ev.get("router") or cfg.get("router") or "")
+                routes[symbol] = {
+                    "symbol": symbol, "token": token, "decimals": 18,
+                    "router": event_router, "fee": int(cfg.get("poolFee") or 500),
+                    "feeCandidates": [100, 500, 2500, 3000, 10000],
+                    "live": True, "source": "onchain_trade_event_recovery",
+                    "chain": _nkr_chain_key_from_id(chain_id),
+                }
+                route_by_token[token.lower()] = (symbol, routes[symbol])
 
     executed = []
     discovered = []
