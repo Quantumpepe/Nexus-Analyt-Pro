@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.01-ENGINE-351-ETH-POL-READONLY-READINESS-AUDIT"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-352-MULTICHAIN-ENTRY-DEDUP-LIVE-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37145,6 +37145,79 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     }
 
 
+
+# ENGINE-352: cross-worker entry mutex. Gunicorn workers are separate processes, so
+# an in-memory cooldown cannot prevent two workers from submitting the same OPEN
+# before the first receipt/position read is visible. SQLite is the shared authority.
+def _nkr_entry_guard_key(wallet: str, live_row: dict) -> str:
+    return "|".join([
+        _norm_addr(wallet).lower(),
+        str(int((live_row or {}).get("chain_id") or 0)),
+        _norm_addr((live_row or {}).get("vault_address") or "").lower(),
+        str((live_row or {}).get("onchain_session_id") or ""),
+    ])
+
+
+def _nkr_entry_guard_acquire(wallet: str, live_row: dict, ttl_sec: int = 180) -> bool:
+    key = _nkr_entry_guard_key(wallet, live_row)
+    if not key or key.endswith("|"):
+        return False
+    nowi = int(time.time())
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_nkr_entry_guards (
+                    guard_key TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    acquired_ts INTEGER NOT NULL,
+                    expires_ts INTEGER NOT NULL
+                )
+            """)
+            conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE expires_ts<=?", (nowi,))
+            token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO nexus_nkr_entry_guards(guard_key,owner_token,state,acquired_ts,expires_ts) VALUES(?,?,?,?,?)",
+                (key, token, "SUBMITTING", nowi, nowi + max(30, int(ttl_sec))),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0) == 1
+    finally:
+        conn.close()
+
+
+def _nkr_entry_guard_hold(wallet: str, live_row: dict, hold_sec: int = 90, state: str = "CONFIRMED") -> None:
+    key = _nkr_entry_guard_key(wallet, live_row)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(
+                "UPDATE nexus_nkr_entry_guards SET state=?, expires_ts=? WHERE guard_key=?",
+                (str(state or "CONFIRMED"), int(time.time()) + max(5, int(hold_sec)), key),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nkr_entry_guard_release(wallet: str, live_row: dict) -> None:
+    key = _nkr_entry_guard_key(wallet, live_row)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE guard_key=?", (key,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nkr_session_open_asset_count(chain_id: int, vault: str, sid: int) -> int:
+    raw = _eth_call(int(chain_id), _norm_addr(vault), _core_selector("sessionOf(uint256)") + _uint_to_32(int(sid)))
+    words = _core_words(raw)
+    return int(words[12]) if len(words) >= 13 else -1
+
+
 def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
     chain_id = int(live_row.get("chain_id") or 1)
     chain_key = _nkr_chain_key_from_id(chain_id)
@@ -37357,12 +37430,35 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             cfg["usdc"],
             chain_id=chain_id,
         )
+        entry_guard = False
         try:
             if action in {"CLOSE", "REDUCE"}:
                 result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
             else:
+                # Authoritative duplicate-entry barrier shared by every backend process.
+                # Re-read openAssetCount after the mutex is acquired so a stale portfolio
+                # snapshot can never submit a second OPEN/ADD on ETH, BNB or POL.
+                entry_guard = _nkr_entry_guard_acquire(wallet, live_row)
+                if not entry_guard:
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
+                    }
+                open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
+                if open_assets_now > 0 and action == "OPEN":
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=45, state="POSITION_ALREADY_OPEN")
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already has {open_assets_now} open asset(s); duplicate OPEN blocked.",
+                    }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
         except Exception as trade_exc:
+            if entry_guard:
+                try:
+                    _nkr_entry_guard_release(wallet, live_row)
+                except Exception:
+                    pass
             err = str(trade_exc)[:240]
             # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
             if any(x in err.lower() for x in ("quoter_failed", "quoter_not_configured", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
@@ -37408,8 +37504,23 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             amt = min(int(settlement_cash), max(0, int(round(_usd * _scale))))
             if amt < int(round(0.20 * _scale)):
                 continue
+            entry_guard = False
             try:
+                entry_guard = _nkr_entry_guard_acquire(wallet, live_row)
+                if not entry_guard:
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
+                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
+                    }
+                open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
+                if open_assets_now > 0:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=45, state="POSITION_ALREADY_OPEN")
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
+                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has {open_assets_now} open asset(s); forced duplicate OPEN blocked.",
+                    }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
                 return {
                     "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
                     "asset": nsym,
@@ -37418,6 +37529,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets},
                 }
             except Exception as native_exc:
+                if entry_guard:
+                    try:
+                        _nkr_entry_guard_release(wallet, live_row)
+                    except Exception:
+                        pass
                 last_skip = f"native {nsym} on {chain_key}: {str(native_exc)[:160]}"
                 continue
     if active:
