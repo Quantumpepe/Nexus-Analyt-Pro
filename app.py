@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-360-IMMUTABLE-SESSION-MODE-CAPTURE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-361-ETH-ASYNC-SESSION-LIFECYCLE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -777,6 +777,28 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
         _live_engine_mark(engine, status="error", decision="STOP_FAILED", reason="Safe stop requires owner review", pending_tx="", last_error=str(exc)[:1000])
 
 
+
+def _live_exact_registry_rows_fast(wallet, engine, target_session_id, target_chain):
+    """Read one exact local registry row without RPC reconciliation.
+
+    Used for ETH Stop & Exit so the HTTP request can return immediately. The
+    background worker still validates sessionOf/positionOf before every mutation.
+    """
+    tail=str(target_session_id or "").split("-")[-1]
+    cid=int(_nkr_chain_id_from_key(str(target_chain or "").upper()) or 0)
+    if not tail or cid <= 0:
+        return []
+    _live_engine_tables_init(); conn=_db()
+    try:
+        rows=conn.execute(
+            "SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine=? AND chain_id=? AND onchain_session_id=? AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') ORDER BY updated_ts DESC LIMIT 1",
+            (_norm_addr(wallet),str(engine).upper(),cid,str(tail)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, target_chain=None):
     """Queue a browser-independent safe stop for one exact CoreVault session.
 
@@ -784,9 +806,12 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, targe
     The local NKR session stays STOPPING until a real exit transaction and the
     CoreVault FINALIZED receipt are confirmed.
     """
-    rows = _live_active_sessions(wallet, engine)
     target_sid = str(target_session_id or "").strip()
     target_chain_key = str(target_chain or "").strip().upper()
+    # ETH control must not wait for a full multi-chain reconcile in the browser
+    # request. Use the durable exact registry row and let the background worker
+    # perform all authoritative on-chain validation.
+    rows = _live_exact_registry_rows_fast(wallet, engine, target_sid, target_chain_key) if (target_sid and target_chain_key in {"ETH","ETHEREUM","1"}) else _live_active_sessions(wallet, engine)
     target_chain_id = int(_nkr_chain_id_from_key(target_chain_key) or 0) if target_chain_key else 0
     if target_sid:
         matched = []
@@ -2277,6 +2302,119 @@ def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     result["usdcCandidatesProbed"] = probed if sym == "USDC" else []
     return result
 
+
+# ENGINE-361: Ethereum session creation is queued so the browser request is not
+# blocked by Privy + receipt confirmation. POL/BNB keep their proven fast path.
+def _eth_session_jobs_init():
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_eth_session_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    wallet_address TEXT NOT NULL,
+                    system TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    step TEXT NOT NULL,
+                    tx_hash TEXT,
+                    session_id TEXT,
+                    chain_id INTEGER NOT NULL DEFAULT 1,
+                    error TEXT,
+                    created_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_eth_session_jobs_wallet ON nexus_eth_session_jobs(wallet_address,updated_ts DESC)")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _eth_session_job_write(job_id, **patch):
+    _eth_session_jobs_init()
+    allowed = {"status","step","tx_hash","session_id","error","updated_ts"}
+    fields=[]; vals=[]
+    for key,val in patch.items():
+        if key in allowed:
+            fields.append(f"{key}=?"); vals.append(val)
+    if "updated_ts" not in patch:
+        fields.append("updated_ts=?"); vals.append(int(time.time()))
+    if not fields:
+        return
+    vals.append(str(job_id))
+    conn=_db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("UPDATE nexus_eth_session_jobs SET " + ",".join(fields) + " WHERE job_id=?", vals)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _eth_session_job_get(job_id, wallet):
+    _eth_session_jobs_init(); conn=_db()
+    try:
+        row=conn.execute("SELECT * FROM nexus_eth_session_jobs WHERE job_id=? AND wallet_address=?",(str(job_id),_norm_addr(wallet))).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _run_eth_session_create_job(job_id, payload):
+    wallet=payload["wallet"]; system_name=payload["system_name"]; wallet_id=payload["wallet_id"]
+    vault=payload["vault"]; calldata=payload["calldata"]; amount_units=payload["amount_units"]
+    nkr_start_config=payload.get("nkr_start_config") or {}; settlement_symbol=payload["settlement_symbol"]
+    try:
+        _eth_session_job_write(job_id,status="RUNNING",step="SUBMITTING",error="")
+        _live_engine_mark(system_name,status="starting",decision="SESSION_SUBMITTING",reason="Ethereum CoreVault session transaction is being submitted",pending_tx="submitting",last_error="")
+        sent=_send_vault_tx(wallet_id,wallet,vault,calldata,f"nexus-{system_name.lower()}-eth-session-{job_id}",chain_id=1)
+        tx_hash=str(sent.get("hash") or "")
+        _eth_session_job_write(job_id,status="RUNNING",step="CONFIRMATION_PENDING",tx_hash=tx_hash)
+        _live_engine_mark(system_name,status="starting",decision="CONFIRMATION_PENDING",reason="Ethereum session transaction submitted; waiting for confirmation",pending_tx=tx_hash or "confirmation_pending",last_error="")
+        session_id=_session_id_from_receipt(sent.get("receipt") or {},vault)
+        if session_id is None:
+            raise RuntimeError("core_vault_session_id_missing_from_receipt")
+        if system_name == "NKR":
+            _nkr_save_exact_start_config(wallet,1,session_id,nkr_start_config)
+        _live_session_register(wallet,system_name,wallet_id,vault,session_id,tx_hash,amount_units,chain_id=1)
+        if system_name == "NKR":
+            try:
+                rows=_live_active_sessions(wallet,"NKR")
+                row=next((r for r in rows if int(r.get("chain_id") or 0)==1 and str(r.get("onchain_session_id") or "")==str(session_id)),None)
+                if row:
+                    _nkr_ensure_local_live_session(wallet,row)
+                    _nkr_stamp_exact_session_start_config(wallet,1,session_id,nkr_start_config)
+                _ensure_nkr_live_worker_started()
+            except Exception as exc:
+                _live_engine_mark("NKR",status="running",decision="SESSION_CARD_PENDING",reason="Ethereum session confirmed; UI projection will reconcile",last_error=str(exc)[:1000])
+        _eth_session_job_write(job_id,status="SUCCESS",step="ACTIVE",session_id=str(session_id),tx_hash=tx_hash,error="")
+        _live_engine_mark(system_name,status="running",decision="SESSION_READY",reason=f"Ethereum V5 session {session_id} confirmed",active_asset=settlement_symbol,pending_tx="",last_error="")
+    except Exception as exc:
+        _eth_session_job_write(job_id,status="ERROR",step="FAILED",error=str(exc)[:1000])
+        _live_engine_mark(system_name,status="error",decision="SESSION_START_FAILED",reason="Ethereum session could not be confirmed",pending_tx="",last_error=str(exc)[:1000])
+
+
+@app.get("/api/nexus/core-vault/session/create-status/<job_id>")
+def api_core_vault_session_create_status(job_id):
+    wa=_require_auth() or _pick_wallet_from_request()
+    if not wa:
+        return err("unauthorized",401)
+    row=_eth_session_job_get(job_id,wa)
+    if not row:
+        return jsonify({"status":"error","error":"job_not_found"}),404
+    public={
+        "status":str(row.get("status") or "PENDING").lower(),
+        "jobId":str(row.get("job_id") or job_id),
+        "step":str(row.get("step") or "QUEUED"),
+        "txHash":str(row.get("tx_hash") or ""),
+        "sessionId":str(row.get("session_id") or ""),
+        "chain":"ETH","chainId":1,"system":str(row.get("system") or "NKR"),
+        "error":str(row.get("error") or ""),
+        "transactionsSent":1 if row.get("tx_hash") else 0,
+    }
+    return jsonify(public)
+
+
 @app.post("/api/nexus/core-vault/session/create-auto")
 def api_core_vault_create_system_session_auto():
     """Create a CoreVault session through the server-side Privy wallet API.
@@ -2447,6 +2585,41 @@ def api_core_vault_create_system_session_auto():
             max_loss_bps=max_loss_bps,
             settlement_token=settlement_token,
         )
+        # Ethereum only: return immediately after durable queue creation. The same
+        # safe send/receipt/register path continues in a daemon thread and does not
+        # block NKR, Grid, Trader, POL or BNB requests.
+        if chain_id == 1:
+            _eth_session_jobs_init()
+            job_id = "ethsess-" + uuid.uuid4().hex
+            now_job = int(time.time())
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    conn.execute(
+                        "INSERT INTO nexus_eth_session_jobs(job_id,wallet_address,system,status,step,tx_hash,session_id,chain_id,error,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (job_id,_norm_addr(wallet),system_name,"QUEUED","QUEUED","","",1,"",now_job,now_job),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            _live_engine_mark(system_name,status="starting",decision="STARTING",reason="Ethereum session request accepted",pending_tx=f"job:{job_id}",last_error="")
+            threading.Thread(
+                target=_run_eth_session_create_job,
+                args=(job_id,{
+                    "wallet":wallet,"system_name":system_name,"wallet_id":wallet_id,
+                    "vault":vault,"calldata":calldata,"amount_units":amount_units,
+                    "nkr_start_config":nkr_start_config,"settlement_symbol":settlement_symbol,
+                }),
+                daemon=True,name=f"eth-session-start-{job_id[-8:]}",
+            ).start()
+            return jsonify({
+                "status":"starting","execution":"server_side_privy_async",
+                "userApprovalRequired":False,"wallet":wallet,"chain":"ETH","chainId":1,
+                "vault":vault,"system":system_name,"jobId":job_id,"txHash":"",
+                "sessionId":"","step":"QUEUED","confirmationPending":True,
+                "budgetAmount":round(amount_units / float(10 ** decimals),8),
+                "settlementAsset":settlement_symbol,
+            }), 202
         reference = f"nexus-{system_name.lower()}-session-{wallet.lower()}-{int(time.time())}"
         sent = _send_vault_tx(wallet_id, wallet, vault, calldata, reference, chain_id=chain_id)
         session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
@@ -39033,7 +39206,17 @@ def api_nkr_control():
         # Ensure an on-chain-only card has an exact registry projection before finalization.
         if target_id and target_chain:
             try:
-                _exact = _nkr_resolve_exact_core_session(wa, target_id, target_chain)
+                _fast_eth_rows = _live_exact_registry_rows_fast(wa, "NKR", target_id, target_chain) if str(target_chain).upper() in {"ETH","ETHEREUM","1"} else []
+                if _fast_eth_rows:
+                    _exact = {
+                        "privy_wallet_id": _fast_eth_rows[0].get("privy_wallet_id"),
+                        "vault_address": _fast_eth_rows[0].get("vault_address"),
+                        "onchain_session_id": _fast_eth_rows[0].get("onchain_session_id"),
+                        "chain_id": _fast_eth_rows[0].get("chain_id"),
+                        "status": _fast_eth_rows[0].get("status") or "ACTIVE",
+                    }
+                else:
+                    _exact = _nkr_resolve_exact_core_session(wa, target_id, target_chain)
                 _live_session_register(wa, "NKR", _exact["privy_wallet_id"], _exact["vault_address"], int(_exact["onchain_session_id"]), "", 0, int(_exact["chain_id"]))
                 conn = _db()
                 try:
