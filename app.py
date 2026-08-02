@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-365-NKR-CLOSING-FINALIZE-OPS-TRADER-INFO"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD385-ETH-ASYNC-SESSION-LIFECYCLE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-366-GRID-VAULT-USDC-DIAG"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD386-ONCHAIN-SESSIONS-NKR-TRADER"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -195,11 +195,13 @@ SHADOW_EXIT_MODE = "BREAK_EVEN_RECOVERY_EXIT_V1"
 NEXUS_CAPITAL_CORE_MODE = "STABLECOIN_CAPITAL_CORE_V1"
 NEXUS_DEFAULT_CAPITAL_STATE = "USDC_USDT"
 NEXUS_TOKEN_POSITION_POLICY = "TOKEN_ONLY_DURING_ACTIVE_TRADE"
-NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_USDT_UNLESS_USER_REQUESTS_ORIGINAL_ASSET"
+# ENGINE-366: exits always settle to USDC or USDT. Original-token payout removed.
+NEXUS_DEFAULT_EXIT_POLICY = "EXIT_TO_USDC_OR_USDT_ONLY"
 NEXUS_CORE_VAULT_ABI_VERSION = "NEXUS_CORE_MULTIVAULT_V5_NATIVE_FINAL_ABI_V1"
 # ENGINE-364: persistent atomic live operations + canonical session identity.
 # Stability plan 02.08.2026 sections 3.1-3.3 (identity, ops table, privy separation).
 NEXUS_LIVE_OPS_SCHEMA_VERSION = "LIVE_OPS_V1_ATOMIC_SESSION_IDENTITY"
+NEXUS_GRID_PAYOUT_ASSETS = frozenset({"USDC", "USDT"})
 _LIVE_OP_TYPES = ("CREATE", "ENTRY", "START_CLOSING", "EXIT", "FINALIZE", "ADD_CAPITAL")
 _LIVE_OP_ACTIVE_STATES = ("RESERVED", "SUBMITTING", "CONFIRMING", "RECOVERING")
 _LIVE_OP_TERMINAL_STATES = ("SUCCEEDED", "FAILED", "ABORTED")
@@ -2941,7 +2943,8 @@ def api_core_vault_create_system_session_auto():
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
     settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
-    if settlement_symbol not in {"USDC", "USDT"} and system_name in {"NKR", "TRADER"}:
+    # ENGINE-366: NKR, Trader and Grid always settle to USDC or USDT (no token payout).
+    if settlement_symbol not in {"USDC", "USDT"} and system_name in {"NKR", "TRADER", "GRID"}:
         settlement_symbol = "USDC"
     try:
         funding = _v5_engine_funding_state(wallet, chain_key, settlement_symbol)
@@ -23877,6 +23880,111 @@ GRID_STABLE_ASSETS = {"USDC", "USDT", "DAI", "FRAX", "FDUSD", "TUSD", "PYUSD", "
 def _grid_asset_symbol(item_id: str) -> str:
     return str(item_id or "").split(":")[-1].upper().strip()
 
+
+def _grid_normalize_payout_asset(value, default: str = "USDC") -> str:
+    """ENGINE-366: Grid (and live exits) settle only to USDC or USDT. Token payout removed."""
+    asset = str(value or default or "USDC").upper().strip()
+    if asset in ("USDT.E", "USDTE"):
+        asset = "USDT"
+    if asset in ("USDC.E", "USDCE"):
+        asset = "USDC"
+    if asset not in NEXUS_GRID_PAYOUT_ASSETS:
+        asset = "USDC" if str(default or "USDC").upper() != "USDT" else "USDT"
+    return asset
+
+
+def _grid_chain_id_from_key(chain_key: str) -> int:
+    key = str(chain_key or "").upper().strip()
+    return {"ETH": 1, "BNB": 56, "POL": 137, "MATIC": 137, "BASE": 8453, "ARB": 42161}.get(key, 0)
+
+
+def _grid_find_live_vault_row(wallet: str, chain_id: int = 0) -> dict | None:
+    """Find an active GRID CoreVault session for this wallet (optional chain filter)."""
+    wa = _norm_addr(wallet)
+    if not wa:
+        return None
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            if chain_id > 0:
+                row = conn.execute(
+                    "SELECT * FROM nexus_live_core_vault_sessions "
+                    "WHERE wallet_address=? AND engine='GRID' AND chain_id=? "
+                    "AND status IN ('ACTIVE','PAUSED','CLOSING','ERROR') "
+                    "ORDER BY updated_ts DESC LIMIT 1",
+                    (wa, int(chain_id)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM nexus_live_core_vault_sessions "
+                    "WHERE wallet_address=? AND engine='GRID' "
+                    "AND status IN ('ACTIVE','PAUSED','CLOSING','ERROR') "
+                    "ORDER BY updated_ts DESC LIMIT 1",
+                    (wa,),
+                ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_price: float) -> dict:
+    """On Grid SELL fill: execute Vault exit to USDC/USDT when a GRID live session exists.
+
+    Uses the same CoreVault executeTrade path as NKR/Trader. Without a live GRID
+    session the order is marked FILLED for monitoring and vault_exit is deferred
+    with a clear reason (no silent token payout).
+    """
+    result = {
+        "attempted": False, "executed": False, "txHash": "", "payoutAsset": "USDC",
+        "reason": "", "liveSessionId": "",
+    }
+    wa = _norm_addr(wallet or (session or {}).get("wallet_address") or "")
+    payout = _grid_normalize_payout_asset(
+        (order or {}).get("payout_asset") or (order or {}).get("payoutAsset") or "USDC"
+    )
+    result["payoutAsset"] = payout
+    item_id = str((session or {}).get("item_id") or (session or {}).get("item") or "")
+    chain_key = ""
+    try:
+        chain_key = _grid_chain_key(item_id, (session or {}).get("chain") or "")
+    except Exception:
+        chain_key = str((session or {}).get("chain") or "").upper()
+    chain_id = _grid_chain_id_from_key(chain_key)
+    live_row = _grid_find_live_vault_row(wa, chain_id)
+    if not live_row:
+        # Fallback: any GRID session for wallet
+        live_row = _grid_find_live_vault_row(wa, 0)
+    if not live_row:
+        result["reason"] = "no_grid_corevault_session"
+        return result
+    sid = str(live_row.get("onchain_session_id") or "")
+    result["liveSessionId"] = sid
+    result["attempted"] = True
+    try:
+        # Prefer chain-aware exit used by NKR stop path.
+        exit_out = _nkr_exit_all_open_positions(wa, dict(live_row), int(sid))
+        result["executed"] = bool((exit_out or {}).get("executed") or (exit_out or {}).get("txHash"))
+        result["txHash"] = str((exit_out or {}).get("txHash") or "")
+        result["reason"] = "vault_exit_submitted" if result["executed"] else "vault_exit_no_position"
+        result["detail"] = exit_out
+        if result["executed"]:
+            _live_engine_mark(
+                "GRID", status="running", decision="VAULT_SELL_FILLED",
+                reason=f"Grid SELL filled @ {fill_price}; Vault exit to {payout} for session #{sid}",
+                active_asset=_grid_asset_symbol(item_id), pending_tx=result["txHash"], last_error="",
+            )
+    except Exception as exc:
+        result["reason"] = f"vault_exit_failed:{str(exc)[:200]}"
+        _live_engine_mark(
+            "GRID", status="running", decision="VAULT_SELL_ERROR",
+            reason=f"Grid SELL fill vault exit failed: {str(exc)[:160]}",
+            last_error=str(exc)[:400],
+        )
+    return result
+
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
     """Add a manual order (OPEN) into an existing grid session.
@@ -24018,12 +24126,20 @@ def api_grid_manual_add():
             "status": "OPEN",
             "source": source,
             "origin_module": str(payload.get("origin_module") or source.lower()).strip(),
-            "session_id": str(payload.get("session_id") or "").strip(),
+            "session_id": str(
+                payload.get("session_id")
+                or payload.get("core_vault_session_id")
+                or payload.get("onchainSessionId")
+                or ""
+            ).strip(),
             "strategy_id": str(payload.get("strategy_id") or "").strip(),
-            "payout_asset": str(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC").upper().strip(),
+            # ENGINE-366: settlement only USDC or USDT (token payout removed).
+            "payout_asset": _grid_normalize_payout_asset(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC"),
+            "payoutAsset": _grid_normalize_payout_asset(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC"),
             "original_asset": str(payload.get("original_asset") or _grid_asset_symbol(item_id)).upper().strip(),
             "max_loss_pct": max(0.0, min(100.0, float(payload.get("max_loss_pct") or payload.get("maxLossPct") or 0.0))),
             "rule_mode": "EXIT_ONLY" if source == "GRID" else "ORDER",
+            "vault_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
             "funding_approved": bool(funding_approved),
             "funding_source_asset": str(payload.get("funding_source_asset") or payload.get("fundingSourceAsset") or "").upper().strip(),
             "funding_required": bool(funding_report.get("funding_required")),
@@ -29807,11 +29923,32 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
 
         elif side == "SELL":
             crossed = (prev_price < op and price >= op) or (prev_price == 0 and price >= op)
-            if crossed or price >= op:  # jump-through safety
+            # Max-loss path: if order carries max_loss_pct and entry/ref price is known.
+            max_loss_hit = False
+            try:
+                mlp = float(o.get("max_loss_pct") or 0.0)
+                ref = float(o.get("entry_price") or o.get("ref_price") or session.get("entry_price") or 0.0)
+                if mlp > 0 and ref > 0 and price > 0:
+                    max_loss_hit = price <= ref * (1.0 - (mlp / 100.0))
+            except Exception:
+                max_loss_hit = False
+            if crossed or price >= op or max_loss_hit:  # target or max-loss
                 o["status"] = "FILLED"
                 o["filled_ts"] = int(time.time())
                 o["fill_price"] = round(float(price), 8)
-                fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd")})
+                o["fill_trigger"] = "MAX_LOSS" if max_loss_hit and not (crossed or price >= op) else "TARGET_PRICE"
+                o["payout_asset"] = _grid_normalize_payout_asset(o.get("payout_asset") or o.get("payoutAsset") or "USDC")
+                # ENGINE-366: attempt CoreVault sell → USDC/USDT when GRID live session exists.
+                try:
+                    vault_res = _grid_try_vault_sell_on_fill(
+                        str(session.get("wallet_address") or ""), session, o, float(price),
+                    )
+                    o["vault_exit"] = vault_res
+                    if vault_res.get("txHash"):
+                        o["tx_hash"] = vault_res.get("txHash")
+                except Exception as vault_exc:
+                    o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
+                fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd", "payout_asset", "fill_trigger", "tx_hash")})
                 filled_now += 1
 
     session["fills"] = fills[-500:]
@@ -42304,6 +42441,136 @@ def api_nexus_system_info_evm_diagnostics():
     wallet = _norm_addr(request.args.get("wallet") or owner)
     if not _looks_like_evm_addr(wallet):
         wallet = _norm_addr(owner)
+
+    # ENGINE-366: Grid diagnostics are order/monitor oriented. Missing CoreVault
+    # session is normal for Grid (target price / max-loss). Do not report
+    # session_context_missing / vault_not_configured as hard blockers.
+    if engine == "GRID":
+        checks = {}
+        blockers = []
+        warnings = []
+        execution_trace = []
+        def g_check(name, ok, status, detail=None, blocker=None, warning=None):
+            checks[name] = {"ok": bool(ok), "status": str(status), "detail": detail}
+            if blocker and not ok:
+                blockers.append(blocker)
+            if warning and not ok:
+                warnings.append(warning)
+        def g_trace(stage, name, ok, detail=None, error=None, remediation=None):
+            execution_trace.append({
+                "stage": stage, "name": name, "ok": bool(ok), "detail": detail,
+                "error": error, "remediation": remediation,
+            })
+        # Vault map for live chains (platform config — not session-bound).
+        vault_map = {}
+        for cid, label in ((1, "ETH"), (56, "BNB"), (137, "POL")):
+            v = _norm_addr((_VAULT_BY_CHAIN or {}).get(cid) or "")
+            vault_map[label] = v if _looks_like_evm_addr(v) else None
+        any_vault = any(vault_map.values())
+        g_check("vaultConfigured", any_vault, "READY" if any_vault else "MISSING",
+                {"vaults": vault_map, "note": "Platform CoreVault addresses for Grid sells"},
+                blocker=("platform_vault_missing" if not any_vault else None))
+        g_trace("VAULT", "Platform vault map", any_vault, detail=vault_map,
+                remediation="Set CORE_VAULT addresses for ETH/BNB/POL" if not any_vault else None)
+        # Optional GRID live session (not required for monitor mode).
+        live_row = _grid_find_live_vault_row(wallet, chain_id if chain_id > 0 else 0)
+        if live_row:
+            g_check("gridLiveSession", True, "BOUND", {
+                "chainId": live_row.get("chain_id"),
+                "sessionId": live_row.get("onchain_session_id"),
+                "vault": live_row.get("vault_address"),
+                "status": live_row.get("status"),
+            })
+            if chain_id <= 0:
+                chain_id = int(live_row.get("chain_id") or 0)
+            if session_id <= 0:
+                try:
+                    session_id = int(str(live_row.get("onchain_session_id") or "0"))
+                except Exception:
+                    session_id = 0
+        else:
+            g_check("gridLiveSession", True, "MONITOR_ONLY", {
+                "note": "No GRID CoreVault session — Grid still monitors target price / max-loss orders",
+            }, warning="no_grid_corevault_session")
+        g_check("requestContext", True, "GRID_MONITOR", {
+            "wallet": wallet, "engine": "GRID", "chainId": chain_id or None,
+            "sessionId": session_id or None, "sessionRequired": False,
+            "payoutPolicy": NEXUS_DEFAULT_EXIT_POLICY,
+            "payoutAssets": sorted(NEXUS_GRID_PAYOUT_ASSETS),
+        })
+        # Open Grid orders from DB
+        open_orders = 0
+        try:
+            conn = _db()
+            try:
+                rows = conn.execute(
+                    "SELECT COUNT(*) AS c FROM grid_orders WHERE lower(wallet_address)=? AND upper(status)='OPEN'",
+                    (wallet.lower(),),
+                ).fetchone()
+                open_orders = int((rows["c"] if rows else 0) or 0)
+            finally:
+                conn.close()
+        except Exception:
+            open_orders = 0
+        g_check("openGridOrders", True, "READY" if open_orders >= 0 else "UNKNOWN",
+                {"openOrders": open_orders})
+        runtime = {}
+        try:
+            runtime = _live_engine_health_payload(wallet).get("GRID") or {}
+            g_check("workerRuntime", True, str(runtime.get("decision") or runtime.get("status") or "UNKNOWN").upper(), runtime)
+        except Exception as exc:
+            g_check("workerRuntime", False, "UNKNOWN", {"error": str(exc)}, warning="runtime_unavailable")
+        overall = "BLOCKED" if blockers else ("WARNING" if warnings else "READY")
+        if blockers:
+            root = {
+                "status": "BLOCKED", "stage": "VAULT",
+                "title": "Platform vault configuration missing",
+                "remediation": "Configure CoreVault addresses for ETH/BNB/POL.",
+            }
+        elif warnings:
+            root = {
+                "status": "WARNING", "stage": "GRID_MONITOR",
+                "title": "Grid monitor mode (no bound CoreVault session)",
+                "remediation": "Orders still track target price / max-loss. Vault exit runs when a GRID session is bound and a SELL fills.",
+            }
+        else:
+            root = {
+                "status": "READY", "stage": "GRID_MONITOR",
+                "title": "Grid diagnostics ready",
+                "remediation": None,
+            }
+        report = {
+            "chainId": chain_id or None,
+            "chain": chain_names.get(chain_id, "—"),
+            "engine": "GRID",
+            "sessionId": session_id or None,
+            "status": overall,
+            "summary": {
+                "blockerCount": len(set(blockers)),
+                "warningCount": len(set(warnings)),
+                "targetSymbol": "—",
+                "openOrders": open_orders,
+                "payoutPolicy": NEXUS_DEFAULT_EXIT_POLICY,
+            },
+            "vault": (live_row or {}).get("vault_address") if live_row else (vault_map.get("ETH") or next((v for v in vault_map.values() if v), None)),
+            "router": None, "quoter": None, "settlement": None, "target": None,
+            "sessionSource": "GRID_MONITOR_ORDERS",
+            "checks": checks, "blockers": list(dict.fromkeys(blockers)),
+            "warnings": list(dict.fromkeys(warnings)),
+            "diagnosticError": None, "rootCause": root,
+            "executionTrace": execution_trace, "session": None,
+            "settlementToken": {"policy": NEXUS_DEFAULT_EXIT_POLICY, "assets": sorted(NEXUS_GRID_PAYOUT_ASSETS)},
+            "targetToken": None, "selectors": [], "feeTiers": [],
+            "contractMap": {"vaults": vault_map},
+            "runtime": runtime, "readOnly": True, "transactionsSent": 0,
+            "gridPolicy": {
+                "sellTriggers": ["TARGET_PRICE", "MAX_LOSS"],
+                "payoutAssets": sorted(NEXUS_GRID_PAYOUT_ASSETS),
+                "tokenPayout": False,
+                "sessionLifecycleRequired": False,
+            },
+        }
+        return jsonify({"status": "ok", "overall": overall, "engine": "GRID", "reports": [report], "ts": now_ts()})
 
     # Resolve omitted chain/session from the persistent live registry only. This
     # avoids scanning hundreds of session ids merely to open the diagnostics UI.
