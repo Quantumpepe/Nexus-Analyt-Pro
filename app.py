@@ -33000,22 +33000,43 @@ def _evm_registry_enabled_chain_ids() -> list[int]:
 
 
 def _evm_registry_route_fallback_addr(symbol: str, chain_id: int) -> str:
-    """Known Nexus route contracts when CoinGecko has no EVM platform (e.g. DOGE on BNB)."""
+    """Known Nexus route contracts when CoinGecko has no EVM platform (e.g. DOGE on BNB).
+
+    ENGINE-369 fix: technical routes live under technicalRoutes, not top-level keys.
+    """
     sym = str(symbol or "").upper().strip()
     chain_key = _EVM_CHAIN_KEY_BY_ID.get(int(chain_id or 0), "")
     if not sym or not chain_key:
         return ""
+    # Hardcoded pegs (always available even if registry shape changes)
+    hard = {
+        ("DOGE", "BNB"): "0xbA2aE424d960c26247Dd6c32edC70B295c744C43",
+        ("BTC", "ETH"): "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+        ("BTC", "BNB"): "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c",
+        ("XRP", "BNB"): "0x1D2F0dA169ceB9Fc7B3144628dB156f3F6c60dBE",
+        ("SOL", "BNB"): "0x570A5D26f7765Ecb712C0924E4De545B89fD43dF",
+        ("ADA", "BNB"): "0x3EE2200Efb3400fAbB9AacF31297cBdD1d435D47",
+        ("LTC", "BNB"): "0x4338665CBB7B2485A8855A139b75D5e34AB0DB94",
+        ("BCH", "BNB"): "0x8fF795a6F4D97E7887C79beA79aba5cc76444aDf",
+        ("DOT", "BNB"): "0x7083609fCE4d1d8Dc0C979AAb8c869Ea2c873402",
+    }
+    hard_addr = hard.get((sym, chain_key), "")
+    if _looks_like_evm_addr(hard_addr):
+        return _norm_addr(hard_addr)
+    # Registry path: technicalRoutes[symbol].routes[chain].tokenContract
     try:
         reg = _nexus_asset_router_registry(include_technical=True) or {}
     except Exception:
         reg = {}
-    entry = reg.get(sym) if isinstance(reg, dict) else None
+    technical = reg.get("technicalRoutes") if isinstance(reg, dict) else None
+    if not isinstance(technical, dict):
+        technical = reg if isinstance(reg, dict) else {}
+    entry = technical.get(sym) if isinstance(technical, dict) else None
     if not isinstance(entry, dict):
         return ""
     routes = entry.get("routes") if isinstance(entry.get("routes"), dict) else {}
     route = routes.get(chain_key) if isinstance(routes, dict) else None
     if not isinstance(route, dict):
-        # try aliases
         for alt in ({"BNB": ["BSC"], "POL": ["POLYGON"], "ETH": ["ETHEREUM"]}.get(chain_key) or []):
             route = routes.get(alt)
             if isinstance(route, dict):
@@ -33023,7 +33044,7 @@ def _evm_registry_route_fallback_addr(symbol: str, chain_id: int) -> str:
     if not isinstance(route, dict):
         return ""
     addr = str(route.get("tokenContract") or route.get("token_address") or "").strip()
-    return addr if _looks_like_evm_addr(addr) else ""
+    return _norm_addr(addr) if _looks_like_evm_addr(addr) else ""
 
 
 def _evm_registry_upsert(row: dict):
@@ -33397,17 +33418,38 @@ def api_nexus_evm_token_registry():
 
 @app.post("/api/nexus/evm-token-registry/scan")
 def api_nexus_evm_token_registry_scan():
-    owner,denied=_require_owner_system_info()
-    if denied:return denied
-    conn=_db(); items=[]
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    conn = _db()
+    items = []
     try:
-        cur=conn.cursor(); cur.execute("SELECT items_json FROM user_watchlists")
+        cur = conn.cursor()
+        cur.execute("SELECT items_json FROM user_watchlists")
         for row in cur.fetchall():
-            try: items.extend(json.loads(row["items_json"] or "[]"))
-            except Exception: pass
-    finally: conn.close()
-    result=_evm_registry_scan_watch_items(items)
-    result["registry"]=_evm_registry_summary()
+            try:
+                items.extend(json.loads(row["items_json"] or "[]"))
+            except Exception:
+                pass
+    finally:
+        conn.close()
+    # Optional: force-include symbols (e.g. DOGE) even if missing from DB snapshot
+    extra = body.get("symbols") or body.get("forceSymbols") or []
+    if isinstance(extra, str):
+        extra = [x.strip() for x in extra.split(",") if x.strip()]
+    if isinstance(extra, list):
+        for x in extra:
+            if isinstance(x, str) and x.strip():
+                items.append({"symbol": x.strip().upper(), "mode": "market"})
+            elif isinstance(x, dict) and (x.get("symbol") or x.get("contract")):
+                items.append(x)
+    # Always try known pegged route symbols that appear nowhere else when owner asks full scan
+    if body.get("includeKnownRoutes") or not body.get("skipKnownRoutes"):
+        for sym in ("DOGE", "BTC", "XRP", "SOL", "ADA", "LTC", "BCH", "DOT"):
+            items.append({"symbol": sym, "mode": "market"})
+    result = _evm_registry_scan_watch_items(items)
+    result["registry"] = _evm_registry_summary()
     return jsonify(result)
 
 
