@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-373-PRIVY-GAS-LIMIT-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD392-ADD-CAPITAL-SESSION"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-374-PRIVY-GAS-LIMIT-FIELD"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1556,14 +1556,14 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
         if raw_status in (1,2):
             _recovery_job_write(job_id, step=3, step_label="START_CLOSING_SUBMIT", receipt_status="submitting")
             ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-close"
-            sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_core_selector("startClosing(uint256)")+_uint_to_32(sid),"value":"0x0"},ref)
+            sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_core_selector("startClosing(uint256)")+_uint_to_32(sid),"value":"0x0"},ref,chain_id=int(chain_id))
             txh=str(sent.get("hash") or "")
             _recovery_job_write(job_id,start_closing_tx_hash=txh,receipt_status="waiting_start_closing_receipt",step_label="START_CLOSING_WAIT")
             _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
             _recovery_job_write(job_id,receipt_status="start_closing_confirmed",step_label="START_CLOSING_CONFIRMED")
         _recovery_job_write(job_id, step=4, step_label="FINALIZE_SUBMIT", receipt_status="submitting_finalize")
         ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-finalize"
-        sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),"value":"0x0"},ref)
+        sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),"value":"0x0"},ref,chain_id=int(chain_id))
         txh=str(sent.get("hash") or "")
         _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
         _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
@@ -31816,23 +31816,45 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
 
-    # ENGINE-373: always attach an explicit gas limit. Privy policy "gas required
-    # exceeds allowance (63013)" happens when estimate > policy max OR when no
-    # gas is set and the policy default is too low for createSession/executeTrade.
+    # ENGINE-374: Privy Wallet API expects snake_case `gas_limit` (not gas/gasLimit).
+    # ENGINE-373 set gas/gasLimit → Privy ignored them → default ~63k →
+    # "gas required exceeds allowance (63013)" on createSession.
     tx = dict(transaction or {})
-    if not (tx.get("gas") or tx.get("gasLimit")):
+    cid = int(chain_id or 1)
+    if not (tx.get("gas_limit") or tx.get("gas") or tx.get("gasLimit")):
         try:
-            gas_units = _privy_estimate_tx_gas(int(chain_id or 1), tx)
+            gas_units = _privy_estimate_tx_gas(cid, tx)
         except Exception:
-            gas_units = {1: 280_000, 56: 350_000, 137: 400_000}.get(int(chain_id or 1), 300_000)
-        tx["gas"] = hex(int(gas_units))
-        # also set gasLimit for clients that prefer that key
-        tx["gasLimit"] = tx["gas"]
+            gas_units = {1: 280_000, 56: 350_000, 137: 400_000}.get(cid, 300_000)
+        gas_hex = hex(int(gas_units))
+        tx["gas_limit"] = gas_hex
+        # keep aliases for any intermediate tooling
+        tx["gas"] = gas_hex
+        tx["gasLimit"] = gas_hex
+    else:
+        # Normalize whatever the caller provided into gas_limit
+        raw_g = tx.get("gas_limit") or tx.get("gas") or tx.get("gasLimit")
+        try:
+            if isinstance(raw_g, str) and raw_g.startswith("0x"):
+                units = int(raw_g, 16)
+            else:
+                units = int(raw_g)
+        except Exception:
+            units = {1: 280_000, 56: 350_000, 137: 400_000}.get(cid, 300_000)
+        floor = {1: 220_000, 56: 280_000, 137: 350_000}.get(cid, 250_000)
+        units = max(units, floor)
+        gas_hex = hex(int(units))
+        tx["gas_limit"] = gas_hex
+        tx["gas"] = gas_hex
+        tx["gasLimit"] = gas_hex
+    # Privy docs also accept chain_id on the transaction object
+    if tx.get("chain_id") is None and tx.get("chainId") is None:
+        tx["chain_id"] = cid
 
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
         "method": "eth_sendTransaction",
-        "caip2": f"eip155:{int(chain_id)}",
+        "caip2": f"eip155:{cid}",
         "chain_type": "ethereum",
         "params": {"transaction": tx},
     }
