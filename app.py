@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-383-POSITION-DISPLAY-FORCE"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-384-BNB-DECIMALS-PNL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15523,6 +15523,11 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
             qty = int(ps.get("amount") or 0) / float(10 ** max(0, min(36, token_decimals)))
             value = max(0.0, _safe_float(ps.get("valueUsd"), 0.0))
             cost_basis = max(0.0, _safe_float(ps.get("costBasisUsd"), 0.0))
+            # ENGINE-384: reject absurd BNB decimal blow-ups
+            if cost_basis > 1_000_000:
+                cost_basis = 0.0
+            if value > 1_000_000:
+                value = 0.0
             # When the quoter is temporarily unavailable, costBasis still proves
             # the position. Never show it as zero/open-none in that case.
             if value <= 0 and cost_basis > 0:
@@ -15575,9 +15580,15 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 scale = float(10 ** max(0, min(18, int(dec))))
                 budget_usd = budget_units / scale if budget_units else 0.0
                 cash_usd = settlement_cash_units / scale if settlement_cash_units else 0.0
+                # ENGINE-384: if 6-dec scale produces trillions, retry as 18-dec
+                if budget_usd > 1_000_000 and budget_units >= 10**15:
+                    scale = 1e18
+                    budget_usd = budget_units / scale
+                    cash_usd = settlement_cash_units / scale
                 invested = max(0.0, budget_usd - cash_usd)
                 if invested <= 0 and budget_usd > 0:
-                    invested = budget_usd * 0.95
+                    invested = min(budget_usd * 0.95, 100000.0)
+                invested = min(max(0.0, invested), 100000.0)
             except Exception:
                 invested = 0.0
             chain_native = {1: "ETH", 56: "BNB", 137: "POL"}.get(int(chain_id), "ASSET")
@@ -37927,8 +37938,42 @@ def _nkr_position_snapshot(vault: str, sid: int, route: dict, cfg: dict) -> dict
             value_units = _privy_quote(cfg, token, cfg["usdc"], amount, fee=int(route["fee"]))
         except Exception:
             value_units = 0
-    return {"amount": amount, "costBasisUnits": cost_basis, "valueUnits": value_units,
-            "valueUsd": value_units / 1_000_000.0, "costBasisUsd": cost_basis / 1_000_000.0}
+    # ENGINE-384: settlement decimals are chain-specific.
+    # ETH/POL USDC = 6; BNB Binance-Peg USDC/USDT often = 18.
+    # Always dividing by 1e6 made BNB Invest show trillions (e.g. 4.6e18 / 1e6).
+    settle = _norm_addr(cfg.get("usdc") or cfg.get("usdt") or "")
+    dec = 6
+    try:
+        if settle and _looks_like_evm_addr(vault):
+            tc = _read_token_config(vault, settle, chain_id) or {}
+            dec = int(tc.get("decimals") or 6)
+    except Exception:
+        dec = 6
+    if dec < 0 or dec > 24:
+        dec = 6
+    # Heuristic: cost basis units that only make sense as 18-dec for a ~$1–$100k session
+    if cost_basis >= 10**15 and dec <= 6:
+        dec = 18
+    if value_units >= 10**15 and dec <= 6:
+        dec = 18
+    scale = float(10 ** int(dec))
+    cost_usd = (float(cost_basis) / scale) if cost_basis else 0.0
+    value_usd = (float(value_units) / scale) if value_units else 0.0
+    if value_usd <= 0 and cost_usd > 0 and amount > 0:
+        value_usd = cost_usd
+    # Clamp absurd values (still protects UI if config is wrong)
+    if cost_usd > 1_000_000:
+        cost_usd = cost_usd / (10 ** max(0, 18 - 6)) if dec == 18 else 0.0
+    if value_usd > 1_000_000:
+        value_usd = value_usd / (10 ** max(0, 18 - 6)) if dec == 18 else cost_usd
+    return {
+        "amount": amount,
+        "costBasisUnits": cost_basis,
+        "valueUnits": value_units,
+        "valueUsd": value_usd,
+        "costBasisUsd": cost_usd,
+        "settlementDecimals": int(dec),
+    }
 
 
 def _nkr_live_market_regime(rows: list[dict]) -> tuple[str, float]:
