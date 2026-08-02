@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-361-ETH-ASYNC-SESSION-LIFECYCLE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-362-POL-EXIT-BROADCAST-AND-RECOVERY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37055,8 +37055,58 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         f"nkr-{op_for_key}-c{chain_id}-s{sid}-"
         f"{_norm_addr(target_for_key).lower()}"
     )
-    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
-    txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
+    # ENGINE-362: expose the real EXIT broadcast immediately and never leave the
+    # runtime showing an old createSession hash.  For EXIT we split submission
+    # from receipt waiting so a missing Privy broadcast is reported as EXIT_FAILED
+    # instead of looking like a pending on-chain trade. ENTRY keeps the established
+    # synchronous helper.
+    if is_exit:
+        _live_engine_mark(
+            "NKR", status="closing", decision="EXIT_SUBMITTING",
+            gate_status="EXIT_PENDING", active_asset=str((route or {}).get("symbol") or ""),
+            position_state="EXITING", tx_hash="", pending_tx="submitting", last_error="",
+            reason=f"Submitting exit executeTrade for session #{sid} on {_nkr_chain_key_from_id(chain_id)}",
+        )
+        try:
+            submitted = _privy_send_delegated_transaction(
+                wallet_id,
+                {"from": _norm_addr(wallet), "to": _norm_addr(vault), "data": call, "value": "0x0"},
+                ref, chain_id=int(chain_id),
+            )
+        except Exception as submit_exc:
+            raise RuntimeError(
+                f"exit_privy_broadcast_failed:chain={chain_id}:session={sid}:token={token_in}:"
+                f"{str(submit_exc)[:900]}"
+            )
+        txh = str((submitted or {}).get("hash") or (submitted or {}).get("txHash") or "").strip()
+        if not txh.startswith("0x") or len(txh) < 20:
+            raise RuntimeError(
+                f"exit_privy_broadcast_missing_hash:chain={chain_id}:session={sid}:response={str(submitted)[:700]}"
+            )
+        _live_engine_mark(
+            "NKR", status="closing", decision="EXIT_CONFIRMING",
+            gate_status="EXIT_PENDING", active_asset=str((route or {}).get("symbol") or ""),
+            position_state="EXITING", tx_hash=txh, pending_tx="confirmation", last_error="",
+            reason=f"Exit executeTrade broadcast for session #{sid}; waiting for receipt",
+        )
+        try:
+            receipt = _privy_wait_receipt(txh, chain_id=int(chain_id))
+        except Exception as receipt_exc:
+            raise RuntimeError(
+                f"exit_receipt_wait_failed:chain={chain_id}:session={sid}:tx={txh}:"
+                f"{str(receipt_exc)[:900]}"
+            )
+        status_raw = (receipt or {}).get("status") if isinstance(receipt, dict) else None
+        try:
+            status_int = int(str(status_raw), 16) if isinstance(status_raw, str) and str(status_raw).startswith("0x") else int(status_raw)
+        except Exception:
+            status_int = 1 if status_raw in (True, "1") else -1
+        if status_int == 0:
+            raise RuntimeError(f"exit_transaction_reverted:chain={chain_id}:session={sid}:tx={txh}")
+        sent = {"hash": txh, "receipt": receipt}
+    else:
+        sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
+        txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
     # Do not report success until the exact session changes on-chain. This closes the
     # race that previously allowed the next worker tick to submit another executeTrade.
     confirmed_position = 0
@@ -38328,6 +38378,7 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
         _NKR_CLOSING_FINALIZE_INFLIGHT.add(key)
 
     def _runner():
+        stage = "EXIT"
         try:
             _nkr_set_exact_local_session_state(
                 wallet, key[0], key[2], "CLOSING",
@@ -38344,6 +38395,7 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
             # not invoke it here, so the worker repeatedly attempted finalization
             # while the contract correctly remained CLOSING.
             exit_result = _nkr_exit_all_open_positions(wallet, dict(row), int(key[2]))
+            stage = "FINALIZE"
             _live_engine_mark(
                 "NKR", status="closing", decision="FINALIZING",
                 gate_status="EXIT_PENDING",
@@ -38382,11 +38434,17 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
                     conn.commit()
             finally:
                 conn.close()
+            failed_decision = "EXIT_FAILED" if stage == "EXIT" else "FINALIZE_FAILED"
+            failed_reason = (
+                f"Session {key[2]} remains CLOSING; exit executeTrade failed before the position was closed"
+                if stage == "EXIT" else
+                f"Session {key[2]} positions are closed, but finalizeSession failed"
+            )
             _live_engine_mark(
-                "NKR", status="closing", decision="FINALIZE_FAILED",
+                "NKR", status="closing", decision=failed_decision,
                 gate_status="EXIT_PENDING",
-                reason=f"Session {key[2]} remains CLOSING; finalizeSession failed",
-                pending_tx="", last_error=msg,
+                reason=failed_reason,
+                tx_hash="", pending_tx="", last_error=msg,
             )
         finally:
             with _NKR_CLOSING_FINALIZE_LOCK:
