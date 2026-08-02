@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-366-GRID-VAULT-USDC-DIAG"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD386-ONCHAIN-SESSIONS-NKR-TRADER"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-367-GRID-PAUSE-STOP-SESSION"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD388-GRID-PAUSE-STOP-PNL"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1008,8 +1008,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
 
     exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
     if open_assets != 0:
-        # NKR and TRADER both support orderly exit; GRID does not use this path.
-        if eng not in ("NKR", "TRADER"):
+        # ENGINE-367: GRID stop also exits open positions then finalizes (same as NKR/Trader).
+        if eng not in ("NKR", "TRADER", "GRID"):
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
         exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
         raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
@@ -7883,7 +7883,8 @@ def _grid_db_insert_order(conn, wallet_address: str, item_id: str, order: dict, 
 
 def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, chain: str = "") -> int:
     """
-    Cancel an order. Primary key is (wallet_address, order_id).
+    Pause an order (ENGINE-367: status PAUSED, not hard-cancel).
+    Primary key is (wallet_address, order_id).
     We keep item_id/chain filters for fast-path, but fall back to order_id-only
     to tolerate UI/backend item_id mismatches.
     """
@@ -7894,23 +7895,23 @@ def _grid_db_cancel_order(conn, wallet_address: str, item_id: str, oid: str, cha
     # Fast-path: match the expected item_id (+ optional chain)
     if chain:
         cur.execute(
-            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
-            "WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=?",
+            "UPDATE grid_orders SET status='PAUSED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=? AND chain=? AND upper(status)='OPEN'",
             (nowi, nowi, str(oid), wa, item_id, chain),
         )
     else:
         cur.execute(
-            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
-            "WHERE order_id=? AND wallet_address=? AND item_id=?",
+            "UPDATE grid_orders SET status='PAUSED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND item_id=? AND upper(status)='OPEN'",
             (nowi, nowi, str(oid), wa, item_id),
         )
     rc = cur.rowcount
 
-    # Fallback: cancel by (wallet_address, order_id) only
+    # Fallback: pause by (wallet_address, order_id) only
     if rc <= 0:
         cur.execute(
-            "UPDATE grid_orders SET status='CANCELLED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
-            "WHERE order_id=? AND wallet_address=?",
+            "UPDATE grid_orders SET status='PAUSED', cancelled_ts=COALESCE(cancelled_ts, ?), updated_ts=? "
+            "WHERE order_id=? AND wallet_address=? AND upper(status) IN ('OPEN','CANCELLED')",
             (nowi, nowi, str(oid), wa),
         )
         rc = cur.rowcount
@@ -23524,11 +23525,9 @@ def api_grid_budgets_by_chain():
 @app.route("/api/grid/order/stop", methods=["POST"])
 @app.route("/api/grid/order/pause", methods=["POST"])
 def api_grid_order_stop():
-    """Fast-path stop/cancel for a single visible SQLite order.
+    """ENGINE-367 Pause: order → PAUSED + on-chain setSessionPaused(true) for GRID session.
 
-    Important: this endpoint intentionally does NOT rebuild vault/order summaries,
-    refresh insight profiles, persist GRID_SESSIONS, or walk runtime session state.
-    The UI reloads /api/grid/orders after the action.
+    Same semantics as NKR/Trader Pause: monitoring stops, session stays, capital reserved.
     """
     wa = _require_auth()
     if not wa:
@@ -23544,9 +23543,24 @@ def api_grid_order_stop():
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
+    session_id = str(payload.get("session_id") or payload.get("core_vault_session_id") or payload.get("onchainSessionId") or "").strip()
+    chain_id = _grid_chain_id_from_key(chain or _grid_chain_key(item_id, chain) or "")
+
     conn = _db()
     try:
         with DB_WRITE_LOCK:
+            # Prefer session_id from order meta if present
+            if not session_id:
+                try:
+                    row = conn.execute(
+                        "SELECT meta_json FROM grid_orders WHERE order_id=? AND wallet_address=? LIMIT 1",
+                        (str(oid), _norm_addr(wa)),
+                    ).fetchone()
+                    if row and row["meta_json"]:
+                        meta = json.loads(row["meta_json"] or "{}")
+                        session_id = str(meta.get("session_id") or meta.get("core_vault_session_id") or "").strip()
+                except Exception:
+                    pass
             rc = _grid_db_cancel_order(conn, wa, item_id, str(oid), chain=chain)
             try:
                 _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
@@ -23555,22 +23569,35 @@ def api_grid_order_stop():
             conn.commit()
         if rc <= 0:
             return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
-        return jsonify({
-            "status": "ok",
-            "action": "stopped",
-            "order_id": str(oid),
-            "item": item_id,
-            "chain": chain,
-            "orders_source": "sqlite",
-            "fast_path": True,
-            "ts": now_ts(),
-        })
     finally:
         conn.close()
 
+    onchain = []
+    onchain_error = ""
+    try:
+        onchain = _grid_set_onchain_pause(wa, True, session_id=session_id or None, chain_id=chain_id)
+    except Exception as exc:
+        onchain_error = str(exc)[:300]
+
+    return jsonify({
+        "status": "ok",
+        "action": "paused",
+        "order_id": str(oid),
+        "item": item_id,
+        "chain": chain,
+        "order_status": "PAUSED",
+        "onchain": onchain,
+        "onchain_error": onchain_error or None,
+        "orders_source": "sqlite",
+        "ts": now_ts(),
+    })
+
 @app.route("/api/grid/order/delete", methods=["POST", "DELETE"])
 def api_grid_order_delete():
-    """Fast-path hard delete for a single visible SQLite order."""
+    """ENGINE-367 Stop: remove order + finalize GRID CoreVault session (like NKR/Trader Stop).
+
+    Button label in UI is Stop (not Delete). Ends monitoring and closes the on-chain session.
+    """
     wa = _require_auth()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
@@ -23585,9 +23612,23 @@ def api_grid_order_delete():
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
+    session_id = str(payload.get("session_id") or payload.get("core_vault_session_id") or payload.get("onchainSessionId") or "").strip()
+    chain_id = _grid_chain_id_from_key(chain or _grid_chain_key(item_id, chain) or "")
+
     conn = _db()
     try:
         with DB_WRITE_LOCK:
+            if not session_id:
+                try:
+                    row = conn.execute(
+                        "SELECT meta_json FROM grid_orders WHERE order_id=? AND wallet_address=? LIMIT 1",
+                        (str(oid), _norm_addr(wa)),
+                    ).fetchone()
+                    if row and row["meta_json"]:
+                        meta = json.loads(row["meta_json"] or "{}")
+                        session_id = str(meta.get("session_id") or meta.get("core_vault_session_id") or "").strip()
+                except Exception:
+                    pass
             rc = _grid_db_delete_order(conn, wa, item_id, str(oid), chain=chain)
             try:
                 _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
@@ -23596,24 +23637,34 @@ def api_grid_order_delete():
             conn.commit()
         if rc <= 0:
             return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
-        return jsonify({
-            "status": "ok",
-            "action": "deleted",
-            "order_id": str(oid),
-            "item": item_id,
-            "chain": chain,
-            "orders_source": "sqlite",
-            "fast_path": True,
-            "ts": now_ts(),
-        })
     finally:
         conn.close()
+
+    finalize_results = []
+    finalize_error = ""
+    try:
+        finalize_results = _grid_stop_finalize_sessions(wa, chain_id=chain_id, session_id=session_id or None)
+    except Exception as exc:
+        finalize_error = str(exc)[:300]
+
+    return jsonify({
+        "status": "ok",
+        "action": "stopped",
+        "order_id": str(oid),
+        "item": item_id,
+        "chain": chain,
+        "order_status": "STOPPED",
+        "onchain_finalize": finalize_results,
+        "onchain_error": finalize_error or None,
+        "orders_source": "sqlite",
+        "ts": now_ts(),
+    })
 
 @app.route("/api/grid/order/resume", methods=["POST"])
 @app.route("/api/grid/order/start", methods=["POST"])
 @app.route("/api/grid/order/restart", methods=["POST"])
 def api_grid_order_resume():
-    """Fast-path resume for a single visible SQLite order."""
+    """ENGINE-367 Resume: order → OPEN + on-chain setSessionPaused(false)."""
     wa = _require_auth()
     if not wa:
         return jsonify({"error": "unauthorized"}), 401
@@ -23628,9 +23679,23 @@ def api_grid_order_resume():
     if oid is None or str(oid).strip() == "":
         return jsonify({"error": "missing id"}), 400
 
+    session_id = str(payload.get("session_id") or payload.get("core_vault_session_id") or payload.get("onchainSessionId") or "").strip()
+    chain_id = _grid_chain_id_from_key(chain or _grid_chain_key(item_id, chain) or "")
+
     conn = _db()
     try:
         with DB_WRITE_LOCK:
+            if not session_id:
+                try:
+                    row = conn.execute(
+                        "SELECT meta_json FROM grid_orders WHERE order_id=? AND wallet_address=? LIMIT 1",
+                        (str(oid), _norm_addr(wa)),
+                    ).fetchone()
+                    if row and row["meta_json"]:
+                        meta = json.loads(row["meta_json"] or "{}")
+                        session_id = str(meta.get("session_id") or meta.get("core_vault_session_id") or "").strip()
+                except Exception:
+                    pass
             rc = _grid_db_resume_order(conn, wa, item_id, str(oid), chain=chain)
             try:
                 _grid_ui_state_put(conn, wa, active_chain=(_grid_chain_key(item_id, chain) or chain or "POL"), active_item=item_id)
@@ -23639,18 +23704,28 @@ def api_grid_order_resume():
             conn.commit()
         if rc <= 0:
             return jsonify({"error": "order not found", "order_id": str(oid), "item": item_id, "chain": chain}), 404
-        return jsonify({
-            "status": "ok",
-            "action": "resumed",
-            "order_id": str(oid),
-            "item": item_id,
-            "chain": chain,
-            "orders_source": "sqlite",
-            "fast_path": True,
-            "ts": now_ts(),
-        })
     finally:
         conn.close()
+
+    onchain = []
+    onchain_error = ""
+    try:
+        onchain = _grid_set_onchain_pause(wa, False, session_id=session_id or None, chain_id=chain_id)
+    except Exception as exc:
+        onchain_error = str(exc)[:300]
+
+    return jsonify({
+        "status": "ok",
+        "action": "resumed",
+        "order_id": str(oid),
+        "item": item_id,
+        "chain": chain,
+        "order_status": "OPEN",
+        "onchain": onchain,
+        "onchain_error": onchain_error or None,
+        "orders_source": "sqlite",
+        "ts": now_ts(),
+    })
 
 @app.route("/api/grid/order/cancel", methods=["POST"])
 def api_grid_order_cancel_alias():
@@ -23928,6 +24003,142 @@ def _grid_find_live_vault_row(wallet: str, chain_id: int = 0) -> dict | None:
             conn.close()
     except Exception:
         return None
+
+
+def _grid_set_onchain_pause(wallet: str, paused: bool, session_id: str | int | None = None, chain_id: int = 0) -> list[dict]:
+    """ENGINE-367: Pause/Resume GRID CoreVault session on-chain via setSessionPaused."""
+    wa = _norm_addr(wallet)
+    results = []
+    rows = []
+    live = _grid_find_live_vault_row(wa, int(chain_id or 0))
+    if live:
+        rows = [live]
+    else:
+        try:
+            rows = list(_live_active_sessions(wa, "GRID") or [])
+        except Exception:
+            rows = []
+    sid_filter = str(session_id or "").strip()
+    for row in rows:
+        sid = int(str(row.get("onchain_session_id") or "0"))
+        if sid_filter and str(sid) != sid_filter:
+            continue
+        wallet_id = str(row.get("privy_wallet_id") or _privy_wallet_id_for_user(wa) or "").strip()
+        vault = _norm_addr(row.get("vault_address") or "")
+        cid = int(row.get("chain_id") or 0)
+        if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault) or cid <= 0:
+            results.append({"sessionId": sid, "status": "incomplete_mapping", "confirmed": False})
+            continue
+        expected = 2 if paused else 1
+        try:
+            raw = _eth_call(cid, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            words = _core_words(raw)
+            status_id = int(words[3]) if len(words) > 3 else -1
+            if status_id == 4:
+                results.append({"sessionId": sid, "status": "already_finalized", "txHash": "", "confirmed": True})
+                continue
+            if status_id == expected:
+                conn = _db()
+                try:
+                    with DB_WRITE_LOCK:
+                        conn.execute(
+                            "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL WHERE id=?",
+                            ("PAUSED" if paused else "ACTIVE", int(time.time()), row.get("id")),
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                results.append({"sessionId": sid, "status": "paused" if paused else "active", "txHash": "", "confirmed": True})
+                continue
+        except Exception as read_exc:
+            results.append({"sessionId": sid, "status": "read_failed", "error": str(read_exc)[:200], "confirmed": False})
+            continue
+        data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
+        ref = f"nexus-grid-{'pause' if paused else 'resume'}-{cid}-{sid}-{int(time.time())}"
+        txh = ""
+        try:
+            sent = _privy_send_delegated_transaction(
+                wallet_id,
+                {"from": wa, "to": vault, "data": data, "value": "0x0"},
+                ref,
+                chain_id=int(cid),
+            )
+            txh = str(sent.get("hash") or "")
+            if not txh:
+                raise RuntimeError("Privy returned no transaction hash")
+            _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(cid))
+            confirmed = False
+            for _ in range(8):
+                chk = _eth_call(cid, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+                ww = _core_words(chk)
+                actual = int(ww[3]) if len(ww) > 3 else -1
+                if actual == expected:
+                    confirmed = True
+                    break
+                time.sleep(1.2)
+            if not confirmed:
+                results.append({"sessionId": sid, "status": "confirmation_failed", "txHash": txh, "confirmed": False})
+                continue
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    conn.execute(
+                        "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL WHERE id=?",
+                        ("PAUSED" if paused else "ACTIVE", int(time.time()), row.get("id")),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+            _live_engine_mark(
+                "GRID",
+                status="paused" if paused else "running",
+                decision="SESSION_PAUSED" if paused else "SESSION_RESUMED",
+                reason=f"Grid session #{sid} {'paused' if paused else 'resumed'} on-chain",
+                pending_tx=txh,
+                last_error="",
+            )
+            results.append({"sessionId": sid, "chainId": cid, "status": "paused" if paused else "active", "txHash": txh, "confirmed": True})
+        except Exception as send_exc:
+            results.append({"sessionId": sid, "status": "send_failed", "error": str(send_exc)[:240], "txHash": txh, "confirmed": False})
+    return results
+
+
+def _grid_stop_finalize_sessions(wallet: str, chain_id: int = 0, session_id: str | int | None = None) -> list[dict]:
+    """ENGINE-367: Stop Grid = exit open assets if needed + startClosing + finalizeSession."""
+    wa = _norm_addr(wallet)
+    out = []
+    rows = []
+    live = _grid_find_live_vault_row(wa, int(chain_id or 0))
+    if live:
+        rows = [live]
+    try:
+        for r in (_live_active_sessions(wa, "GRID") or []):
+            if not any(str(x.get("onchain_session_id")) == str(r.get("onchain_session_id")) and int(x.get("chain_id") or 0) == int(r.get("chain_id") or 0) for x in rows):
+                rows.append(r)
+    except Exception:
+        pass
+    sid_filter = str(session_id or "").strip()
+    for row in rows:
+        sid = str(row.get("onchain_session_id") or "")
+        if sid_filter and sid != sid_filter:
+            continue
+        try:
+            res = _finalize_one_live_session(wa, "GRID", dict(row))
+            out.append({"sessionId": sid, "status": "finalized", "result": res, "ok": True})
+            _live_engine_mark(
+                "GRID", status="idle", decision="SESSION_FINALIZED",
+                reason=f"Grid session #{sid} stopped and finalized",
+                pending_tx=str((res or {}).get("finalizeTxHash") or (res or {}).get("startClosingTxHash") or ""),
+                last_error="",
+            )
+        except Exception as exc:
+            out.append({"sessionId": sid, "status": "finalize_failed", "error": str(exc)[:300], "ok": False})
+            _live_engine_mark(
+                "GRID", status="error", decision="STOP_FINALIZE_FAILED",
+                reason=f"Grid stop finalize failed for session #{sid}",
+                last_error=str(exc)[:400],
+            )
+    return out
 
 
 def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_price: float) -> dict:
