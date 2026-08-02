@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-379-HOLD-WHILE-PROFIT"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-380-HARVEST-UNLIMITED-ENTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37212,9 +37212,9 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
 _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ASSET_COOLDOWN_SEC", "60")))
 # ENGINE-378: shadow-like behaviour — never lock re-entry for a whole day.
 # After a flat exit the next OPEN may happen after a short cool-down only.
-_NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(30, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "120")))
-_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(60, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "1200")))  # 20 min default
-_NKR_LIVE_REENTRY_COOLDOWN_SEC = max(30, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "180")))  # 3 min after exit
+_NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "45")))
+_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(60, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "180")))  # ENGINE-380: 3 min min hold then harvest allowed
+_NKR_LIVE_REENTRY_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "45")))  # ENGINE-380: fast re-entry after harvest
 
 # Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
 _NKR_LIVE_MIN_REBALANCE_USD = max(0.20, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "0.50")))
@@ -39266,18 +39266,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             previous_meta[str(sess.get("symbol") or sess.get("targetAsset") or "").upper()] = meta
     row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
-    # ENGINE-379: hold while profitable (shadow behaviour).
-    # - Never exit on noise (0.02%–0.2% pullbacks).
-    # - Trail only after a real peak and a meaningful give-back.
-    # - Full profit-lock only at solid net edge after costs.
-    # - Hard stop only when net is clearly negative beyond session max-loss band.
-    profit_lock = {"AGGRESSIVE": 4.5, "DYNAMIC": 3.5, "TACTICAL": 3.0, "DEFENSIVE": 2.5}.get(mode, 3.5)
-    activation = {"AGGRESSIVE": 1.80, "DYNAMIC": 1.50, "TACTICAL": 1.20, "DEFENSIVE": 1.00}.get(mode, 1.50)
-    # Trail width in percentage-points of net_pct from peak (NOT tiny 0.12/0.55)
-    trail_base = {"AGGRESSIVE": 1.80, "DYNAMIC": 1.50, "TACTICAL": 1.20, "DEFENSIVE": 1.00}.get(mode, 1.50)
-    cost_multiple = {"AGGRESSIVE": 2.25, "DYNAMIC": 2.50, "TACTICAL": 2.75, "DEFENSIVE": 3.0}.get(mode, 2.5)
-    # Momentum reversal needs a real red print, not -0.35% noise
-    reversal_change = {"AGGRESSIVE": -1.20, "DYNAMIC": -1.00, "TACTICAL": -0.85, "DEFENSIVE": -0.70}.get(mode, -1.00)
+    # ENGINE-380: harvest every net win, then re-enter freely (shadow cycle logic).
+    # - Take profit when net-after-costs is positive and min-hold elapsed
+    # - Trail/reversal only on meaningful pullback from peak (not 0.02%)
+    # - No lifetime entry cap — maxActiveAssets = concurrent slots only
+    profit_lock = {"AGGRESSIVE": 0.35, "DYNAMIC": 0.45, "TACTICAL": 0.55, "DEFENSIVE": 0.70}.get(mode, 0.45)
+    activation = {"AGGRESSIVE": 0.25, "DYNAMIC": 0.30, "TACTICAL": 0.35, "DEFENSIVE": 0.40}.get(mode, 0.30)
+    trail_base = {"AGGRESSIVE": 1.20, "DYNAMIC": 1.40, "TACTICAL": 1.60, "DEFENSIVE": 1.80}.get(mode, 1.40)
+    cost_multiple = {"AGGRESSIVE": 1.50, "DYNAMIC": 1.75, "TACTICAL": 2.0, "DEFENSIVE": 2.25}.get(mode, 1.75)
+    reversal_change = {"AGGRESSIVE": -1.00, "DYNAMIC": -0.90, "TACTICAL": -0.80, "DEFENSIVE": -0.70}.get(mode, -0.90)
     hard_stop_pct = {"AGGRESSIVE": -2.50, "DYNAMIC": -2.00, "TACTICAL": -1.60, "DEFENSIVE": -1.20}.get(mode, -2.00)
     metrics = {}; forced_exits = {}
     for sym, snap in snapshots.items():
@@ -39291,29 +39288,36 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net)
         peak_pct = max(_safe_float(pm.get("nkr_peak_net_profit_pct"), 0.0), net_pct)
         drawdown = max(0.0, peak_pct - net_pct)
-        min_protected = max(0.05, exit_costs * cost_multiple, cost * activation / 100.0)
+        min_protected = max(0.03, exit_costs * cost_multiple, cost * activation / 100.0)
         protected = peak_pct >= activation and peak_net >= min_protected and peak_net > 0
-        # Widen trail as peak grows; never thinner than ~1.0 pp — kills 0.02% noise exits
-        adaptive_trail = trail_base * (0.75 if peak_pct >= profit_lock * 2 else 0.90 if peak_pct >= profit_lock else 1.0)
+        adaptive_trail = trail_base * (0.80 if peak_pct >= profit_lock * 3 else 1.0)
         adaptive_trail = max(1.00, adaptive_trail)
         change = _nkr_row_change_pct(row_by_symbol.get(sym) or {})
-        # HOLD while net is positive and drawdown is small — strategist keeps the trade.
-        full_lock = False  # do NOT force-exit just because a profit target was touched; ride the trend
+        held_ok = True
+        try:
+            opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
+            if opened > 0:
+                held_ok = (int(time.time()) - opened) >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+        except Exception:
+            held_ok = True
+        # Shadow-like harvest: lock every net win after min-hold (then re-enter).
+        harvest = held_ok and net > 0 and net_pct >= profit_lock and net >= max(0.03, exit_costs * 0.5)
         trailing = protected and net > 0 and drawdown >= adaptive_trail
         reversal = protected and net > 0 and change <= reversal_change and drawdown >= max(1.00, adaptive_trail * 0.70)
         hard_stop = net_pct <= hard_stop_pct and net < -max(0.05, exit_costs)
         metrics[sym] = {"netUsd": net, "netPct": net_pct, "peakNetUsd": peak_net,
                         "peakNetPct": peak_pct, "peakDrawdownPct": drawdown, "exitCostsUsd": exit_costs,
-                        "holdWhileProfit": bool(net > 0 and not trailing and not reversal and not hard_stop)}
+                        "harvestReady": bool(harvest), "holdWhileProfit": bool(net > 0 and not harvest and not trailing and not reversal and not hard_stop)}
         if hard_stop:
             targets[sym] = 0.0
             forced_exits[sym] = "hard_stop_net_loss"
+        elif harvest:
+            targets[sym] = 0.0
+            forced_exits[sym] = "net_profit_harvest"
         elif trailing or reversal:
             targets[sym] = 0.0
             forced_exits[sym] = "peak_profit_trailing_protection" if trailing else "profit_momentum_reversal"
         elif net > 0:
-            # Explicit: keep target at current value so plan cannot zero-out a winning trade
-            # just because score rotation prefers another asset this tick.
             targets[sym] = max(float(targets.get(sym) or 0.0), float(value))
     plan["targetsUsd"] = targets; plan["metrics"] = metrics; plan["forcedExits"] = forced_exits
     # ENGINE-378: min hold before discretionary CLOSE (shadow never flipped in 60s).
@@ -39338,11 +39342,17 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             # ENGINE-379: only CLOSE a winning/open position on explicit protection signals,
             # never because the strategist preferred a different candidate this tick.
             is_protect = reason in (
-                "peak_profit_trailing_protection", "profit_momentum_reversal",
+                "net_profit_harvest", "peak_profit_trailing_protection", "profit_momentum_reversal",
                 "hard_stop_net_loss", "max_loss", "hard_stop",
-            ) or reason.startswith("max_loss") or reason.startswith("hard_stop")
+            ) or reason.startswith("max_loss") or reason.startswith("hard_stop") or reason.startswith("net_profit")
             snap_net = float((metrics.get(sym) or {}).get("netUsd") or 0.0)
-            if is_protect and (snap_net <= 0 or _position_held_long_enough(sym) or reason.startswith("hard_stop") or reason.startswith("max_loss")):
+            if is_protect and (
+                reason == "net_profit_harvest"
+                or snap_net <= 0
+                or _position_held_long_enough(sym)
+                or reason.startswith("hard_stop")
+                or reason.startswith("max_loss")
+            ):
                 actions.append((0, abs(delta), "CLOSE", sym, snap["amount"]))
             else:
                 # Hold while the trade still makes sense — plan rotation must not eject winners.
@@ -39385,7 +39395,12 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 # ENGINE-378: flat after exit → allow re-entry after short cool-down (not 24h).
                 try:
                     if result and (result.get("ok") or result.get("txHash") or result.get("tx_hash") or result.get("executed")):
+                        # Short cool-down only — unlimited harvest cycles in one session.
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_REENTRY_COOLDOWN_SEC, state="EXIT_CONFIRMED")
+                        try:
+                            _nkr_entry_guard_release(wallet, live_row)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             else:
@@ -39413,18 +39428,21 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "executed": False, "decision": "HOLD", "gate": "POSITION_SYNC_PENDING",
                         "asset": sym, "detail": f"{chain_key} session #{sid} still has open assets; duplicate {action} blocked until position sync.",
                     }
-                max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
+                # ENGINE-380: maxActiveAssets = concurrent open positions only.
+                # 0 / soft = 1 concurrent slot, unlimited sequential entries over the session.
+                _cfg_max = int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 0)
+                max_assets_now = max(1, _cfg_max) if _cfg_max > 0 else 1
                 if same_asset_amount > 0 and action in {"OPEN", "ADD"}:
                     _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="SAME_ASSET_ALREADY_FUNDED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
-                        "asset": sym, "detail": f"{chain_key} session #{sid} already holds {sym}; repeated {action} blocked.",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already holds {sym}; wait for exit before next entry.",
                     }
                 if action == "OPEN" and open_assets_now >= max_assets_now:
                     _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="MAX_ASSETS_REACHED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "MAX_ASSETS_REACHED",
-                        "asset": sym, "detail": f"{chain_key} session #{sid} already has {open_assets_now}/{max_assets_now} open asset(s); duplicate OPEN blocked.",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} concurrent slots full ({open_assets_now}/{max_assets_now}); exit frees the next entry.",
                     }
                 if action == "ADD":
                     _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="AUTOMATIC_ADD_BLOCKED")
