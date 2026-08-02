@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-356-ONCHAIN-SESSION-STATE-AUTHORITY-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-357-ENTRY-CONFIRM-POSITION-CARD-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -35594,7 +35594,7 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
                                price_usd: float, tx_hash: str, amount_out_raw: int = 0) -> None:
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
     nowi = _nkr_now_ms()
-    local_id = f"NKR-LIVE-{session_id}"
+    local_id = f"NKR-LIVE-{_nkr_chain_key_from_id(int(chain_id or 1))}-{session_id}"
     updated = []
     patched = False
     for src in sessions:
@@ -35602,7 +35602,10 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
             continue
         row = dict(src)
         rid = str(row.get("id") or row.get("session_id") or "")
-        if rid == local_id:
+        meta0 = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_sid = str(row.get("onchainSessionId") or row.get("onchain_session_id") or row.get("coreVaultSessionId") or meta0.get("onchain_session_id") or "")
+        row_chain = int(row.get("chainId") or row.get("chain_id") or meta0.get("chain_id") or 0)
+        if rid == local_id or (row_sid == str(session_id) and row_chain == int(chain_id or 1)):
             patched = True
             trade_id = f"LIVE-{session_id}-{str(tx_hash)[-10:]}"
             event = {
@@ -35700,7 +35703,7 @@ def _nkr_live_exit_cost_estimate(position_value_usd: float, current_price_usd: f
     }
 
 
-def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float) -> dict:
+def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, amount_out_raw: int, current_price_usd: float, chain_id: int = 1, token_decimals: int = 18) -> dict:
     """Synchronize the live CoreVault position and its unrealized economics.
 
     Gross, estimated costs and net are live previews while the position is open.
@@ -35710,16 +35713,19 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
     """Keep the wallet-bound UI session synchronized with the real CoreVault position."""
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
     nowi = _nkr_now_ms()
-    local_id = f"NKR-LIVE-{session_id}"
+    local_id = f"NKR-LIVE-{_nkr_chain_key_from_id(int(chain_id or 1))}-{session_id}"
     updated = []
     patched = False
-    qty = float(int(amount_out_raw or 0)) / 1e18
+    qty = float(int(amount_out_raw or 0)) / float(10 ** max(0, min(36, int(token_decimals or 18))))
     for src in sessions:
         if not isinstance(src, dict):
             continue
         row = dict(src)
         rid = str(row.get("id") or row.get("session_id") or "")
-        if rid == local_id:
+        meta0 = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_sid = str(row.get("onchainSessionId") or row.get("onchain_session_id") or row.get("coreVaultSessionId") or meta0.get("onchain_session_id") or "")
+        row_chain = int(row.get("chainId") or row.get("chain_id") or meta0.get("chain_id") or 0)
+        if rid == local_id or (row_sid == str(session_id) and row_chain == int(chain_id or 1)):
             patched = True
             open_pos = dict(row.get("openRotation") if isinstance(row.get("openRotation"), dict) else {})
             entry = _safe_float(open_pos.get("entryPriceUsd") or (row.get("meta") or {}).get("nkr_entry_price_usd"), 0.0)
@@ -36746,17 +36752,51 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     ref = f"nexus-nkr-{mode.lower()}-{sid}-{(route or {}).get('symbol','TOKEN')}-{int(time.time())}"
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
+    # Do not report success until the exact session changes on-chain. This closes the
+    # race that previously allowed the next worker tick to submit another executeTrade.
+    confirmed_position = 0
+    confirmed_open_assets = -1
+    confirmed_settlement_cash = settlement_cash
+    confirmed = False
+    for _attempt in range(20):
+        try:
+            check_raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            check_words = _core_words(check_raw)
+            confirmed_open_assets = int(check_words[12]) if len(check_words) >= 13 else -1
+            confirmed_settlement_cash = int(check_words[9]) if len(check_words) >= 10 else settlement_cash
+            position_token = token_in if is_exit else token_out
+            confirmed_position = _position_amount(vault, sid, position_token, chain_id=chain_id)
+            if is_exit:
+                confirmed = confirmed_position < int(ai)
+            else:
+                confirmed = bool(confirmed_position > 0 or confirmed_open_assets > 0 or confirmed_settlement_cash < settlement_cash)
+            if confirmed:
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+    if not confirmed:
+        raise RuntimeError(
+            f"trade_receipt_without_session_mutation:chain={chain_id}:session={sid}:tx={txh}:"
+            f"position={confirmed_position}:openAssets={confirmed_open_assets}:cashBefore={settlement_cash}:cashAfter={confirmed_settlement_cash}"
+        )
     return {
         "txHash": txh, "quoteOut": quote, "minOut": min_out, "router": router,
         "exactSelector": exact_selector, "outerSelector": required_selector,
         "fee": fee_used, "chainId": chain_id, "action": mode,
         "tokenIn": token_in, "tokenOut": token_out, "amountIn": amount_in,
+        "postTradePositionRaw": str(confirmed_position), "postTradeOpenAssetCount": confirmed_open_assets,
+        "postTradeSettlementCash": str(confirmed_settlement_cash), "postTradeConfirmed": True,
     }
 
 
 def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapshots: dict, market_rows: list[dict], plan: dict) -> None:
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
-    sid = str(live_row.get("onchain_session_id") or ""); master_id = f"NKR-LIVE-{sid}"; nowi = _nkr_now_ms()
+    sid = str(live_row.get("onchain_session_id") or "")
+    chain_id = int(live_row.get("chain_id") or 1)
+    chain_key = _nkr_chain_key_from_id(chain_id) or str(chain_id)
+    master_id = f"NKR-LIVE-{chain_key}-{sid}"
+    nowi = _nkr_now_ms()
     row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
     kept = []
     previous_children = {}
@@ -36787,7 +36827,8 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
         prior_meta = dict(previous.get("meta") if isinstance(previous.get("meta"), dict) else {})
         metric = (plan.get("metrics") or {}).get(sym) or {}
         prior_meta.update({"nkr_session": True, "nkr_asset_session": True, "parent_nkr_session_id": master_id,
-                     "onchain_session_id": sid, "token_address": route["token"], "token_decimals": route.get("decimals", 18),
+                     "onchain_session_id": sid, "chain": chain_key, "chain_id": chain_id,
+                     "token_address": route["token"], "token_decimals": route.get("decimals", 18),
                      "pool_fee": route.get("fee"), "router_address": route.get("router"), "position_state": "OPEN",
                      "execution_mode": "live", "visible_in_active_sessions": True,
                      "nkr_peak_net_profit_usd": metric.get("peakNetUsd", prior_meta.get("nkr_peak_net_profit_usd", 0)),
@@ -36797,7 +36838,8 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
         card = dict(previous)
         card.update({"id": cid, "session_id": cid, "type": "NKR_ASSET", "engineType": "NKR",
             "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "OPEN", "active": True,
-            "visibleInActiveSessions": True, "executionMode": "live", "targetAsset": sym, "symbol": sym,
+            "visibleInActiveSessions": True, "executionMode": "live", "chain": chain_key, "chainId": chain_id,
+            "onchainSessionId": sid, "coreVaultSessionId": sid, "targetAsset": sym, "symbol": sym,
             "budgetUsd": cost, "workingCapitalUsd": cost, "investedUsd": value, "positionValueUsd": value,
             "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
             "currentPriceUsd": price, "score": _nkr_session_score({}, mrow), "updatedAt": nowi,
@@ -37569,6 +37611,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
+                # A lower settlementCash is authoritative proof that this session already
+                # spent capital. Block another automatic entry even if positionOf/openAssetCount
+                # is temporarily lagging or the route registry has not resolved the token yet.
+                if int(settlement_cash) < int(_bu) and action in {"OPEN", "ADD"}:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="SESSION_CAPITAL_ALREADY_SPENT")
+                    return {
+                        "executed": False, "decision": "HOLD", "gate": "POSITION_SYNC_PENDING",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} already spent settlement capital; duplicate {action} blocked while the position is synchronized.",
+                    }
                 max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
                 # A confirmed position must never be filled again on every worker tick.
                 # OPEN is only valid for a genuinely new slot; ADD is reserved for an
@@ -37592,7 +37643,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "asset": sym, "detail": f"Automatic repeated ADD for {sym} is disabled; only an explicit capital top-up may increase an existing position.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
-                _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_CONFIRMED")
         except Exception as trade_exc:
             if entry_guard:
                 try:
@@ -37662,11 +37713,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "asset": nsym, "detail": f"{chain_key} session #{sid} already has a funded position ({open_assets_now}/{max_assets_now}); forced duplicate OPEN blocked.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
-                _nkr_entry_guard_hold(wallet, live_row, hold_sec=90, state="ENTRY_CONFIRMED")
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_CONFIRMED")
+                # Forced-native entries previously returned before rebuilding the wallet-bound
+                # session cards. The UI therefore showed no position and the next tick bought again.
+                forced_snapshots = {s: _nkr_position_snapshot(vault, sid, r, cfg) for s, r in routes.items()}
+                _nkr_sync_live_asset_cards(wallet, live_row, routes, forced_snapshots, market_rows, plan)
                 return {
                     "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
                     "asset": nsym,
-                    "detail": f"OPEN {nsym} forced native entry on {chain_key} for ~${amt/1_000_000:.2f}.",
+                    "detail": f"OPEN {nsym} forced native entry on {chain_key} for ~${amt/float(10 ** max(0, min(18, int(_dec)))):.2f}.",
                     **result,
                     "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets},
                 }
@@ -37763,7 +37818,8 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         live_change = _nkr_row_change_pct(eth_row) if isinstance(eth_row, dict) else 0.0
         live_score = _nkr_session_score({"score": (eth_row or {}).get("score") or (eth_row or {}).get("systemScore") or (eth_row or {}).get("ratingScore") or 0}, eth_row or {})
         live_metrics = _nkr_sync_local_open_position(
-            wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price
+            wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price,
+            chain_id=chain_id, token_decimals=int((routes.get("ETH") or routes.get("WETH") or {}).get("decimals") or 18)
         )
 
         # ENGINE-212: bridge the backend NKR decision into the real CoreVault route.
