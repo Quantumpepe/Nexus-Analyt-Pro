@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-357-ENTRY-CONFIRM-POSITION-CARD-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-359-POSITION-TRUTH-SESSION-PROJECTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -14780,6 +14780,106 @@ def api_rotation_session_delete(session_id):
         conn.close()
 
 
+
+def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row: dict) -> dict:
+    """Project the real CoreVault position into the public NKR session card.
+
+    This is deliberately read-only. It prevents a successful executeTrade from
+    remaining invisible merely because a worker-local presentation write failed
+    or another Gunicorn process served the next /rotation-sessions request.
+    sessionOf + positionOf are the authority for position/open-asset state.
+    """
+    out = dict(sess or {})
+    meta = dict(out.get("meta") if isinstance(out.get("meta"), dict) else {})
+    try:
+        sid = int(str(live_row.get("onchain_session_id") or out.get("onchainSessionId") or meta.get("onchain_session_id") or "0"))
+        chain_id = int(live_row.get("chain_id") or out.get("chainId") or meta.get("chain_id") or 1)
+        vault = _norm_addr(live_row.get("vault_address") or out.get("vault") or out.get("vaultAddress") or meta.get("vault") or "")
+        if sid <= 0 or not _looks_like_evm_addr(vault):
+            return out
+        snap = _read_core_session_snapshot(chain_id, vault, sid)
+        status_id = int(snap.get("statusId") or snap.get("status_id") or 0)
+        status = {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING", 4: "FINALIZED"}.get(status_id, str(out.get("status") or "ACTIVE").upper())
+        open_count = int(snap.get("openAssetCount") or snap.get("open_asset_count") or 0)
+        settlement_cash_units = int(str(snap.get("settlementCashUnits") or snap.get("settlement_cash_units") or 0))
+        budget_units = int(str(snap.get("budgetUnits") or snap.get("budget_units") or live_row.get("budget_units") or 0))
+        cfg = _privy_trading_cfg(chain_id)
+        cfg["vault"] = vault
+        routes = _nkr_live_route_registry(cfg)
+        found = None
+        for sym, route in routes.items():
+            try:
+                ps = _nkr_position_snapshot(vault, sid, route, cfg)
+            except Exception:
+                continue
+            if int(ps.get("amount") or 0) > 0:
+                found = (str(sym or "ASSET").upper(), route, ps)
+                break
+        out.update({
+            "status": status, "statusLabel": status, "onchainStatus": status,
+            "lifecycleState": status, "rawStatusId": status_id or out.get("rawStatusId"),
+            "statusId": status_id or out.get("statusId"), "onchainStatusId": status_id or out.get("onchainStatusId"),
+            "openAssetCount": open_count, "open_asset_count": open_count,
+            "settlementCashUnits": str(settlement_cash_units), "budgetUnits": str(budget_units),
+        })
+        meta.update({
+            "session_status": status, "lifecycle_state": status,
+            "raw_status_id": status_id, "status_id": status_id,
+            "open_asset_count": open_count, "settlement_cash_units": str(settlement_cash_units),
+            "budget_units": str(budget_units), "chain_id": chain_id, "vault": vault,
+        })
+        if found:
+            sym, route, ps = found
+            token_decimals = int(route.get("decimals") or 18)
+            qty = int(ps.get("amount") or 0) / float(10 ** max(0, min(36, token_decimals)))
+            value = max(0.0, _safe_float(ps.get("valueUsd"), 0.0))
+            cost_basis = max(0.0, _safe_float(ps.get("costBasisUsd"), 0.0))
+            # When the quoter is temporarily unavailable, costBasis still proves
+            # the position. Never show it as zero/open-none in that case.
+            if value <= 0 and cost_basis > 0:
+                value = cost_basis
+            current_price = (value / qty) if qty > 0 and value > 0 else 0.0
+            gross = value - cost_basis
+            cost_preview = _nkr_live_exit_cost_estimate(value, current_price, chain_id) if value > 0 else {}
+            costs = max(0.0, _safe_float((cost_preview or {}).get("totalCostUsd"), 0.0))
+            net = gross - costs
+            entry_price = (cost_basis / qty) if qty > 0 and cost_basis > 0 else current_price
+            open_rotation = dict(out.get("openRotation") if isinstance(out.get("openRotation"), dict) else {})
+            open_rotation.update({
+                "asset": sym, "symbol": sym, "quantity": qty, "positionQty": qty,
+                "amountOutRaw": str(int(ps.get("amount") or 0)), "entryPriceUsd": entry_price,
+                "currentPriceUsd": current_price, "currentValueUsd": value,
+                "capitalUsd": cost_basis, "currentGrossUsd": gross,
+                "currentCostsUsd": costs, "currentNetUsd": net, "executionMode": "live",
+            })
+            out.update({
+                "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
+                "asset": sym, "symbol": sym, "positionQty": qty, "positionAmount": qty,
+                "entryPriceUsd": entry_price, "currentPriceUsd": current_price,
+                "positionValueUsd": value, "workingCapitalUsd": cost_basis,
+                "investedUsd": cost_basis, "grossProfitUsd": gross,
+                "costsUsd": costs, "netProfitUsd": net,
+                "liveGrossProfitUsd": gross, "liveCostsUsd": costs, "liveNetProfitUsd": net,
+                "openRotation": open_rotation, "active": status in {"ACTIVE", "PAUSED", "CLOSING"},
+            })
+            meta.update({
+                "position_state": "OPEN", "nkr_active_asset": sym,
+                "nkr_position_qty": qty, "nkr_entry_price_usd": entry_price,
+                "nkr_current_price_usd": current_price, "nkr_position_value_usd": value,
+                "nkr_live_gross_profit_usd": gross, "nkr_live_costs_usd": costs,
+                "nkr_live_net_profit_usd": net, "nkr_exit_cost_breakdown": cost_preview,
+            })
+        elif open_count <= 0:
+            # Only clear when CoreVault itself confirms no open assets.
+            out["positionState"] = "WAITING"
+            meta["position_state"] = "WAITING"
+        out["meta"] = meta
+        return out
+    except Exception as exc:
+        meta["position_projection_error"] = str(exc)[:240]
+        out["meta"] = meta
+        return out
+
 @app.route("/api/rotation-sessions", methods=["GET", "POST"])
 def api_rotation_sessions():
     """Return backend-owned live NKR sessions only.
@@ -14885,6 +14985,12 @@ def api_rotation_sessions():
         })
         present.add(key)
 
+    live_by_key = {_live_key_from_row(row): row for row in (live_rows or []) if _live_key_from_row(row)}
+    sessions = [
+        _nkr_enrich_session_from_onchain_position(wa, sess, live_by_key.get(_onchain_key(sess), {}))
+        if _onchain_key(sess) in live_by_key else sess
+        for sess in sessions
+    ]
     active = str(sessions[0].get("id") or sessions[0].get("session_id") or "") if sessions else ""
     summary = {
         "active_count": len(sessions),
@@ -35591,7 +35697,8 @@ def _nkr_route_allowed(vault: str, session_id: int, route_id: str) -> bool:
 
 
 def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amount_usd: float,
-                               price_usd: float, tx_hash: str, amount_out_raw: int = 0) -> None:
+                               price_usd: float, tx_hash: str, amount_out_raw: int = 0,
+                               chain_id: int = 1) -> None:
     sessions, active_id, _ = _db_get_rotation_sessions(wallet)
     nowi = _nkr_now_ms()
     local_id = f"NKR-LIVE-{_nkr_chain_key_from_id(int(chain_id or 1))}-{session_id}"
@@ -36749,7 +36856,18 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
             f"tokenIn={token_in}:tokenOut={token_out}:fee={fee_used}:amountIn={amount_in}:quote={quote}:minOut={min_out}:"
             f"attempts={' | '.join(preflight_errors)[:900]}"
         )
-    ref = f"nexus-nkr-{mode.lower()}-{sid}-{(route or {}).get('symbol','TOKEN')}-{int(time.time())}"
+    # ENGINE-358: the automatic first fill must use one deterministic Privy
+    # idempotency key per exact CoreVault session and target token.  The previous
+    # timestamp suffix created a new key on every worker tick, so two workers (or
+    # a retry after a delayed position read) could broadcast two executeTrade
+    # transactions even though the SQLite guard existed.  Explicit future top-ups
+    # must use a separate command-specific key and must not pass through this path.
+    target_for_key = token_in if is_exit else token_out
+    op_for_key = "exit" if is_exit else "entry"
+    ref = (
+        f"nkr-{op_for_key}-c{chain_id}-s{sid}-"
+        f"{_norm_addr(target_for_key).lower()}"
+    )
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, chain_id=chain_id)
     txh = str(sent.get("hash") or sent.get("txHash") or ((sent.get("receipt") or {}).get("transactionHash") if isinstance(sent.get("receipt"), dict) else ""))
     # Do not report success until the exact session changes on-chain. This closes the
@@ -37645,12 +37763,25 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
                 _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_CONFIRMED")
         except Exception as trade_exc:
+            err = str(trade_exc)[:240]
+            # Quote/config/preflight errors happen before transaction submission and
+            # may be retried later. Any other error can occur after Privy accepted the
+            # transaction (for example a delayed RPC position read); keep the guard so
+            # the next tick cannot create a second executeTrade.
+            pre_submit_markers = (
+                "quoter_failed", "quoter_not_configured", "quoter_returned",
+                "quote_amount", "quote_min_out", "router_config_decode",
+                "live_trade_preflight_failed", "router_not_enabled",
+                "selector_not_allowed", "invalid_live_trade_addresses",
+            )
             if entry_guard:
                 try:
-                    _nkr_entry_guard_release(wallet, live_row)
+                    if any(marker in err.lower() for marker in pre_submit_markers):
+                        _nkr_entry_guard_release(wallet, live_row)
+                    else:
+                        _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_RESULT_UNCERTAIN")
                 except Exception:
                     pass
-            err = str(trade_exc)[:240]
             # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
             if any(x in err.lower() for x in ("quoter_failed", "quoter_not_configured", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
                 last_skip = f"{action} {sym} skipped on {chain_key}: {err}"
@@ -37726,12 +37857,22 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets},
                 }
             except Exception as native_exc:
+                native_err = str(native_exc)[:240]
+                pre_submit_markers = (
+                    "quoter_failed", "quoter_not_configured", "quoter_returned",
+                    "quote_amount", "quote_min_out", "router_config_decode",
+                    "live_trade_preflight_failed", "router_not_enabled",
+                    "selector_not_allowed", "invalid_live_trade_addresses",
+                )
                 if entry_guard:
                     try:
-                        _nkr_entry_guard_release(wallet, live_row)
+                        if any(marker in native_err.lower() for marker in pre_submit_markers):
+                            _nkr_entry_guard_release(wallet, live_row)
+                        else:
+                            _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_RESULT_UNCERTAIN")
                     except Exception:
                         pass
-                last_skip = f"native {nsym} on {chain_key}: {str(native_exc)[:160]}"
+                last_skip = f"native {nsym} on {chain_key}: {native_err[:160]}"
                 continue
     if active:
         detail = f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve."
@@ -37902,7 +38043,8 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     deadline = now_ts() + 300
     router_data = _privy_exact_input_single_data(cfg["usdc"], cfg["weth"], vault, amount, min_out, cfg["poolFee"])
     call = _encode_execute_trade(sid, cfg["router"], cfg["usdc"], cfg["weth"], amount, min_out, deadline, router_data)
-    ref = f"nexus-nkr-live-buy-{sid}-{int(time.time())}"
+    # Same exact-session idempotency rule for the legacy ETH route.
+    ref = f"nkr-entry-c1-s{sid}-{_norm_addr(cfg['weth']).lower()}"
     _live_engine_mark("NKR", status="running", decision="SUBMITTING", gate_status="EXECUTION", reason="Submitting CoreVault trade", pending_tx="submitting")
     sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
     tx_hash = str(sent.get("hash") or sent.get("txHash") or "")
@@ -37913,8 +38055,8 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
     if amount_out <= 0:
         raise RuntimeError("weth_position_zero_after_confirmed_buy")
     _nkr_patch_local_execution(wallet, sid, symbol="ETH", amount_usd=amount / 1_000_000.0,
-                               price_usd=price, tx_hash=tx_hash, amount_out_raw=amount_out)
-    _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=amount_out, current_price_usd=price)
+                               price_usd=price, tx_hash=tx_hash, amount_out_raw=amount_out, chain_id=1)
+    _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=amount_out, current_price_usd=price, chain_id=1)
     return {
         "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
         "detail": f"Bought ETH through the CoreVault with {amount / 1_000_000:.2f} USDC.",
