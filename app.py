@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-381-ONCHAIN-SCAN-ALL-CHAINS"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-382-POSITION-UI-SYNC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15462,7 +15462,20 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
         budget_units = int(str(snap.get("budgetUnits") or snap.get("budget_units") or live_row.get("budget_units") or 0))
         cfg = _privy_trading_cfg(chain_id)
         cfg["vault"] = vault
-        routes = _nkr_live_route_registry(cfg)
+        routes = dict(_nkr_live_route_registry(cfg) or {})
+        # ENGINE-382: for *reading* open positions also probe wrapped-native even if
+        # a technical route was filtered by enabledForLive (registry is for new opens).
+        try:
+            native_sym = str(cfg.get("nativeSymbol") or {1: "ETH", 56: "BNB", 137: "POL"}.get(chain_id, "ETH")).upper()
+            wnative = _norm_addr(cfg.get("weth") or "")
+            if wnative and native_sym not in routes:
+                routes[native_sym] = {
+                    "symbol": native_sym, "token": wnative, "decimals": 18,
+                    "router": _norm_addr(cfg.get("router") or ""), "fee": int(cfg.get("poolFee") or 500),
+                    "live": True, "source": "position_read_native_fallback",
+                }
+        except Exception:
+            pass
         found = None
         for sym, route in routes.items():
             try:
@@ -15518,6 +15531,7 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 "costsUsd": costs, "netProfitUsd": net,
                 "liveGrossProfitUsd": gross, "liveCostsUsd": costs, "liveNetProfitUsd": net,
                 "openRotation": open_rotation, "active": status in {"ACTIVE", "PAUSED", "CLOSING"},
+                "exitReason": "", "reason": f"Open {sym} position on-chain",
             })
             meta.update({
                 "position_state": "OPEN", "nkr_active_asset": sym,
@@ -15525,11 +15539,55 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 "nkr_current_price_usd": current_price, "nkr_position_value_usd": value,
                 "nkr_live_gross_profit_usd": gross, "nkr_live_costs_usd": costs,
                 "nkr_live_net_profit_usd": net, "nkr_exit_cost_breakdown": cost_preview,
+                "nkr_exit_reason": "", "open_asset_count": open_count,
             })
-        elif open_count <= 0:
+        elif open_count > 0:
+            # ENGINE-382: CoreVault reports open assets but route registry could not
+            # resolve the token (missing enabledForLive / quoter lag). Still show OPEN
+            # so the card never lies with "no buy yet / watching".
+            try:
+                dec = 6
+                try:
+                    set_tok = _norm_addr(snap.get("settlementToken") or snap.get("settlement_token") or "")
+                    if set_tok:
+                        dec = int((_v5_read_token_config(chain_id, vault, set_tok) or {}).get("decimals") or 6)
+                except Exception:
+                    dec = 6 if int(chain_id) in (1, 137) else 18
+                scale = float(10 ** max(0, min(18, int(dec))))
+                budget_usd = budget_units / scale if budget_units else 0.0
+                cash_usd = settlement_cash_units / scale if settlement_cash_units else 0.0
+                invested = max(0.0, budget_usd - cash_usd)
+                if invested <= 0 and budget_usd > 0:
+                    invested = budget_usd * 0.95
+            except Exception:
+                invested = 0.0
+            chain_native = {1: "ETH", 56: "BNB", 137: "POL"}.get(int(chain_id), "ASSET")
+            sym = str(out.get("positionAsset") or out.get("targetAsset") or meta.get("nkr_active_asset") or chain_native).upper()
+            if sym in ("", "WAITING", "USDC", "USDT"):
+                sym = chain_native
+            open_rotation = dict(out.get("openRotation") if isinstance(out.get("openRotation"), dict) else {})
+            open_rotation.update({
+                "asset": sym, "symbol": sym, "quantity": open_rotation.get("quantity") or 0,
+                "currentValueUsd": invested, "capitalUsd": invested, "executionMode": "live",
+                "openAssetCount": open_count, "projectedFromOpenCount": True,
+            })
+            out.update({
+                "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
+                "asset": sym, "symbol": sym,
+                "positionValueUsd": invested, "workingCapitalUsd": invested, "investedUsd": invested,
+                "openRotation": open_rotation, "active": status in {"ACTIVE", "PAUSED", "CLOSING"},
+                "exitReason": "", "reason": f"On-chain open assets ({open_count}) — position syncing",
+            })
+            meta.update({
+                "position_state": "OPEN", "nkr_active_asset": sym,
+                "nkr_position_value_usd": invested, "open_asset_count": open_count,
+                "nkr_exit_reason": "", "position_projected_from_open_count": True,
+            })
+        else:
             # Only clear when CoreVault itself confirms no open assets.
             out["positionState"] = "WAITING"
             meta["position_state"] = "WAITING"
+            meta["open_asset_count"] = 0
         out["meta"] = meta
         return out
     except Exception as exc:
