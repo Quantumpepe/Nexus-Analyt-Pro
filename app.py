@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-367-GRID-PAUSE-STOP-SESSION"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD388-GRID-PAUSE-STOP-PNL"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-369-EVM-ALLOWLIST-GROUP-LIVE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD389-EVM-ALLOWLIST-GROUP"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -32971,14 +32971,59 @@ _EVM_NATIVE_BY_CHAIN = {1:"ETH",56:"BNB",137:"POL",8453:"ETH",42161:"ETH",10:"ET
 
 
 def _evm_registry_enabled_chain_ids() -> list[int]:
+    """ENGINE-369: Allowlist scan only on live vault chains (ETH/BNB/POL today).
+
+    BASE/ARB etc. stay out of the registry until vaults are deployed there.
+    """
+    live_keys = []
+    try:
+        live_keys = [str(x).upper() for x in (NEXUS_VAULT_ALLOWED_CHAINS or []) if str(x).strip()]
+    except Exception:
+        live_keys = []
+    if not live_keys:
+        live_keys = ["ETH", "BNB", "POL"]
+    key_to_id = {"ETH": 1, "BNB": 56, "BSC": 56, "POL": 137, "POLYGON": 137}
     ids = []
-    for key in list(globals().get("_ENABLED_EVM_CHAINS", []) or []):
-        cid = int((globals().get("_CHAIN_ID_BY_KEY", {}) or {}).get(key, 0) or 0)
+    for key in live_keys:
+        cid = int(key_to_id.get(key, 0) or 0)
         if cid > 0 and cid not in ids:
             ids.append(cid)
+    # Fallback if vault allowlist is empty/misconfigured
+    if not ids:
+        for key in list(globals().get("_ENABLED_EVM_CHAINS", []) or []):
+            cid = int((globals().get("_CHAIN_ID_BY_KEY", {}) or {}).get(key, 0) or 0)
+            if cid in (1, 56, 137) and cid not in ids:
+                ids.append(cid)
     if not ids:
         ids = [1, 56, 137]
     return ids
+
+
+def _evm_registry_route_fallback_addr(symbol: str, chain_id: int) -> str:
+    """Known Nexus route contracts when CoinGecko has no EVM platform (e.g. DOGE on BNB)."""
+    sym = str(symbol or "").upper().strip()
+    chain_key = _EVM_CHAIN_KEY_BY_ID.get(int(chain_id or 0), "")
+    if not sym or not chain_key:
+        return ""
+    try:
+        reg = _nexus_asset_router_registry(include_technical=True) or {}
+    except Exception:
+        reg = {}
+    entry = reg.get(sym) if isinstance(reg, dict) else None
+    if not isinstance(entry, dict):
+        return ""
+    routes = entry.get("routes") if isinstance(entry.get("routes"), dict) else {}
+    route = routes.get(chain_key) if isinstance(routes, dict) else None
+    if not isinstance(route, dict):
+        # try aliases
+        for alt in ({"BNB": ["BSC"], "POL": ["POLYGON"], "ETH": ["ETHEREUM"]}.get(chain_key) or []):
+            route = routes.get(alt)
+            if isinstance(route, dict):
+                break
+    if not isinstance(route, dict):
+        return ""
+    addr = str(route.get("tokenContract") or route.get("token_address") or "").strip()
+    return addr if _looks_like_evm_addr(addr) else ""
 
 
 def _evm_registry_upsert(row: dict):
@@ -33199,35 +33244,61 @@ def _evm_registry_scan_contract(chain_id: int, token_address: str, symbol: str, 
 
 
 def _evm_registry_scan_watch_items(items: list) -> dict:
-    scanned=[]; unresolved=[]
+    """Scan watchlist items onto live vault chains only (ENGINE-369).
+
+    Address resolution order:
+      1) CoinGecko platforms for the chain
+      2) DEX item contract when mode=dex and chain matches
+      3) Nexus known route fallback (DOGE/BNB, BTC/ETH, …)
+    """
+    scanned = []
+    skipped = []
     for it in _watch_items_normalize(items or []):
-        sym=str(it.get("symbol") or "").upper(); coin_id=str(it.get("coingecko_id") or it.get("id") or "")
-        cg=_evm_registry_cg_coin(coin_id) if coin_id else {}
-        platforms=cg.get("platforms") if isinstance(cg.get("platforms"),dict) else {}
+        sym = str(it.get("symbol") or "").upper()
+        coin_id = str(it.get("coingecko_id") or it.get("id") or "")
+        cg = _evm_registry_cg_coin(coin_id) if coin_id else {}
+        platforms = cg.get("platforms") if isinstance(cg.get("platforms"), dict) else {}
+        found_any = False
         for cid in _evm_registry_enabled_chain_ids():
-            native_sym=_EVM_NATIVE_BY_CHAIN.get(cid,"")
+            native_sym = _EVM_NATIVE_BY_CHAIN.get(cid, "")
+            # Skip pure native gas token of this chain (no ERC20 allowlist entry needed).
             if sym == native_sym:
                 continue
-            platform=_EVM_PLATFORM_BY_CHAIN.get(cid,"")
-            addr=str(platforms.get(platform) or "").strip()
-            if not addr and str(it.get("mode") or "").lower()=="dex":
+            platform = _EVM_PLATFORM_BY_CHAIN.get(cid, "")
+            addr = str(platforms.get(platform) or "").strip()
+            source = "watchlist"
+            if not addr and str(it.get("mode") or "").lower() == "dex":
                 item_chain = str(it.get("chain") or "").strip().lower()
                 allowed_item_chains = {
                     1: {"eth", "ethereum"},
                     56: {"bnb", "bsc", "binance-smart-chain"},
                     137: {"pol", "polygon", "polygon-pos", "matic"},
-                    8453: {"base"},
-                    42161: {"arb", "arbitrum", "arbitrum-one"},
-                    10: {"op", "optimism", "optimistic-ethereum"},
-                    43114: {"avax", "avalanche"},
                 }.get(cid, set())
                 if item_chain in allowed_item_chains:
-                    addr=str(it.get("contract") or it.get("tokenAddress") or "").strip()
+                    addr = str(it.get("contract") or it.get("tokenAddress") or "").strip()
+                    source = "watchlist_dex"
+            if not _looks_like_evm_addr(addr):
+                # ENGINE-369: known Nexus route contracts (e.g. BNB-peg DOGE)
+                addr = _evm_registry_route_fallback_addr(sym, cid)
+                if _looks_like_evm_addr(addr):
+                    source = "nexus_route_fallback"
             if not _looks_like_evm_addr(addr):
                 continue
-            row=_evm_registry_scan_contract(cid,addr,sym,str(it.get("name") or cg.get("name") or sym),coin_id)
+            row = _evm_registry_scan_contract(
+                cid, addr, sym, str(it.get("name") or cg.get("name") or sym), coin_id, source=source
+            )
             scanned.append(row)
-    return {"status":"ok","scanned":len(scanned),"items":scanned,"ts":now_ts()}
+            found_any = True
+        if not found_any and sym and sym not in (_EVM_NATIVE_BY_CHAIN.values()):
+            skipped.append({"symbol": sym, "reason": "no_evm_contract_on_live_chains"})
+    return {
+        "status": "ok",
+        "scanned": len(scanned),
+        "items": scanned,
+        "skipped": skipped,
+        "liveChains": [_EVM_CHAIN_KEY_BY_ID.get(x, str(x)) for x in _evm_registry_enabled_chain_ids()],
+        "ts": now_ts(),
+    }
 
 
 def _evm_registry_rows() -> list[dict]:
@@ -33246,9 +33317,75 @@ def _evm_registry_rows() -> list[dict]:
     finally: conn.close()
 
 
+def _evm_registry_group_by_symbol(rows: list) -> list[dict]:
+    """Group registry rows by symbol for compact UI: LINK → ETH, BNB, POL."""
+    groups = {}
+    order = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol") or "?").upper()
+        if sym not in groups:
+            groups[sym] = {
+                "symbol": sym,
+                "name": str(r.get("name") or sym),
+                "chains": [],
+                "chainKeys": [],
+                "entries": [],
+                "status": str(r.get("status") or ""),
+            }
+            order.append(sym)
+        g = groups[sym]
+        ck = str(r.get("chain_key") or r.get("chain_id") or "")
+        if ck and ck not in g["chainKeys"]:
+            g["chainKeys"].append(ck)
+            g["chains"].append(ck)
+        g["entries"].append(r)
+    out = []
+    for sym in order:
+        g = groups[sym]
+        g["label"] = f"{sym} → {', '.join(g['chainKeys'])}" if g["chainKeys"] else sym
+        out.append(g)
+    return out
+
+
 def _evm_registry_summary() -> dict:
-    rows=_evm_registry_rows()
-    return {"status":"ok","mode":"MULTI_EVM_TOKEN_REGISTRY_V2_AUTO_APPROVAL","chains":[_EVM_CHAIN_KEY_BY_ID.get(x,str(x)) for x in _evm_registry_enabled_chain_ids()],"pending":[x for x in rows if x.get("status")=="PENDING_OWNER"],"blocked":[x for x in rows if x.get("status")=="BLOCKED"],"approved":[x for x in rows if x.get("status")=="APPROVED"],"rejected":[x for x in rows if x.get("status")=="REJECTED"],"counts":{"total":len(rows),"pending":sum(x.get("status")=="PENDING_OWNER" for x in rows),"blocked":sum(x.get("status")=="BLOCKED" for x in rows),"approved":sum(x.get("status")=="APPROVED" for x in rows),"rejected":sum(x.get("status")=="REJECTED" for x in rows)},"rules":{"userTokenApprovalRequired":False,"ownerReviewInSystemInfo":True,"exactContractRequired":True,"nkrUsesApprovedOnly":True,"onchainCoreVaultConfigurationStillRequired":True},"ts":now_ts()}
+    rows = _evm_registry_rows()
+    # ENGINE-369: only show live-chain rows in System Info lists (hide BASE/ARB leftovers).
+    live_ids = set(_evm_registry_enabled_chain_ids())
+    live_rows = [x for x in rows if int(x.get("chain_id") or 0) in live_ids]
+    approved = [x for x in live_rows if x.get("status") == "APPROVED"]
+    pending = [x for x in live_rows if x.get("status") == "PENDING_OWNER"]
+    blocked = [x for x in live_rows if x.get("status") == "BLOCKED"]
+    rejected = [x for x in live_rows if x.get("status") == "REJECTED"]
+    return {
+        "status": "ok",
+        "mode": "MULTI_EVM_TOKEN_REGISTRY_V3_LIVE_CHAINS_GROUPED",
+        "chains": [_EVM_CHAIN_KEY_BY_ID.get(x, str(x)) for x in _evm_registry_enabled_chain_ids()],
+        "pending": pending,
+        "blocked": blocked,
+        "approved": approved,
+        "approvedGrouped": _evm_registry_group_by_symbol(approved),
+        "rejected": rejected,
+        "counts": {
+            "total": len(live_rows),
+            "pending": len(pending),
+            "blocked": len(blocked),
+            "approved": len(approved),
+            "approvedSymbols": len(_evm_registry_group_by_symbol(approved)),
+            "rejected": len(rejected),
+        },
+        "rules": {
+            "userTokenApprovalRequired": False,
+            "ownerReviewInSystemInfo": True,
+            "exactContractRequired": True,
+            "nkrUsesApprovedOnly": True,
+            "liveChainsOnly": True,
+            "routeFallbackEnabled": True,
+            "onchainCoreVaultConfigurationStillRequired": True,
+        },
+        "ts": now_ts(),
+    }
 
 
 @app.get("/api/nexus/evm-token-registry")
@@ -37579,14 +37716,88 @@ def _nkr_live_market_regime(rows: list[dict]) -> tuple[str, float]:
 
 
 def _nkr_observation_minutes(value) -> int:
-    text = str(value or "1h").strip().lower()
-    mapping = {"15m": 15, "1h": 60, "4h": 240, "12h": 720, "24h": 1440}
+    """Parse user observation window. Stability plan 02.08.2026 §4.
+
+    Sofort/immediate/0 → 0 (search after start, still needs signal).
+    5m → 5, 15m → 15. ENGINE-368: same for NKR and Trader.
+    """
+    text = str(value or "1h").strip().lower().replace(" ", "")
+    mapping = {
+        "sofort": 0, "immediate": 0, "now": 0, "0": 0, "0m": 0, "0min": 0,
+        "5m": 5, "5min": 5, "5minutes": 5, "5": 5,
+        "15m": 15, "15min": 15, "15minutes": 15, "15": 15,
+        "1h": 60, "60m": 60, "60": 60,
+        "4h": 240, "12h": 720, "24h": 1440,
+    }
     if text in mapping:
-        return mapping[text]
+        return int(mapping[text])
     try:
-        return max(15, min(1440, int(float(text))))
+        n = int(float(str(value).strip().lower().replace("m", "").replace("min", "")))
+        return max(0, min(1440, n))
     except Exception:
         return 60
+
+
+def _nkr_session_observation_gate(live_row: dict, settings: dict, starts_at: int = 0) -> dict:
+    """OBSERVING until earliestEntryAt; then SEARCHING. NKR + Trader. Modes cannot bypass."""
+    eng = str((live_row or {}).get("engine") or (settings or {}).get("engine") or "NKR").upper()
+    if eng == "TRADING":
+        eng = "TRADER"
+    obs_raw = (
+        (settings or {}).get("nkrObservationWindow")
+        or (settings or {}).get("nkr_observation_window")
+        or (settings or {}).get("observationWindow")
+        or (settings or {}).get("observation_window")
+        or (live_row or {}).get("nkrObservationWindow")
+        or (live_row or {}).get("observation_window")
+        or "1h"
+    )
+    obs_min = _nkr_observation_minutes(obs_raw)
+    nowi = int(time.time())
+    try:
+        starts = int(starts_at or 0)
+    except Exception:
+        starts = 0
+    if starts <= 0:
+        try:
+            starts = int((live_row or {}).get("starts_at") or (live_row or {}).get("startsAt") or 0)
+        except Exception:
+            starts = 0
+    if starts <= 0:
+        try:
+            starts = int((live_row or {}).get("created_ts") or (live_row or {}).get("createdAt") or 0)
+        except Exception:
+            starts = 0
+    if starts <= 0:
+        starts = nowi
+    earliest = int(starts) + int(obs_min) * 60
+    remaining = max(0, earliest - nowi)
+    if remaining > 0:
+        return {
+            "allowed": False,
+            "phase": "OBSERVING",
+            "engine": eng,
+            "observationMinutes": obs_min,
+            "startsAt": starts,
+            "earliestEntryAt": earliest,
+            "remainingSec": remaining,
+            "gate": "OBSERVATION_WINDOW",
+            "detail": (
+                f"{eng} observing {obs_min} min (startsAt={starts}, earliestEntryAt={earliest}, "
+                f"remaining={remaining}s). No executeTrade until observation ends."
+            ),
+        }
+    return {
+        "allowed": True,
+        "phase": "SEARCHING" if obs_min > 0 else "SEARCHING_IMMEDIATE",
+        "engine": eng,
+        "observationMinutes": obs_min,
+        "startsAt": starts,
+        "earliestEntryAt": earliest,
+        "remainingSec": 0,
+        "gate": "ENTRY_SEARCH_ALLOWED",
+        "detail": f"{eng} observation complete; entry search allowed.",
+    }
 
 
 def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: float, settings: dict) -> dict:
@@ -38854,6 +39065,34 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                       + (" (FINALIZED — capital released; start a new session)." if status_id == 4 else ".")
                       + (" Resume if PAUSED." if status_id == 2 else ""),
         }
+    # ENGINE-368: hard observation window for NKR and Trader (stability plan §4).
+    # startsAt from on-chain sessionOf; modes must never bypass earliestEntryAt.
+    starts_at_onchain = int(words[4]) if len(words) > 4 else 0
+    obs_gate = _nkr_session_observation_gate(live_row, settings or {}, starts_at=starts_at_onchain)
+    if not obs_gate.get("allowed"):
+        eng_mark = str((live_row or {}).get("engine") or "NKR").upper()
+        if eng_mark == "TRADING":
+            eng_mark = "TRADER"
+        if eng_mark not in ("NKR", "TRADER"):
+            eng_mark = "NKR"
+        try:
+            _live_engine_mark(
+                eng_mark, status="running", decision="OBSERVING",
+                gate_status="OBSERVATION_WINDOW",
+                reason=str(obs_gate.get("detail") or "Observation window active")[:240],
+                last_error="",
+            )
+        except Exception:
+            pass
+        return {
+            "executed": False,
+            "decision": "WAIT",
+            "gate": "OBSERVATION_WINDOW",
+            "phase": "OBSERVING",
+            "detail": obs_gate.get("detail"),
+            "observation": obs_gate,
+            "asset": "",
+        }
     settlement_cash = int(words[9]) if len(words) > 9 else 0
     _bu_reg = int(str(live_row.get("budget_units") or "0") or 0)
     _bu_chain = int(words[8] or 0) if len(words) > 8 else 0
@@ -39502,7 +39741,10 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
 
 
 def _nkr_live_worker_cycle() -> None:
-    """Process every recoverable NKR registry row.
+    """Process every recoverable NKR and TRADER registry row.
+
+    ENGINE-368: Trader uses the same CoreVault lifecycle + observation gate as NKR
+    (slots are extra on Trader; entry/observe/exit/finalize stay shared).
 
     ERROR is intentionally recoverable: a failed pause/close request must not remove an
     otherwise still-active on-chain session from the trading worker.  Earlier builds
@@ -39514,7 +39756,7 @@ def _nkr_live_worker_cycle() -> None:
     try:
         rows = conn.execute(
             "SELECT * FROM nexus_live_core_vault_sessions "
-            "WHERE engine='NKR' AND status IN ('ACTIVE','PAUSED','ERROR','CLOSING') "
+            "WHERE engine IN ('NKR','TRADER') AND status IN ('ACTIVE','PAUSED','ERROR','CLOSING') "
             "ORDER BY updated_ts DESC"
         ).fetchall()
         live_rows = [dict(r) for r in rows]
@@ -39522,17 +39764,18 @@ def _nkr_live_worker_cycle() -> None:
         conn.close()
 
     if not live_rows:
-        _live_engine_mark(
-            "NKR", status="idle", decision="NO_REGISTERED_SESSION",
-            reason="No recoverable NKR CoreVault session was found", last_error="",
-            assets_scanned=0, tradable_assets=0,
-            best_candidate="", candidate_score=0.0,
-            candidate_momentum_24h=0.0, candidate_price=0.0,
-            gate_status="NO_ACTIVE_SESSION", decision_detail="",
-            active_asset="", position_state="", position_value_usd=0,
-            tx_hash="", pending_tx="", session_chain="",
-            working_chains=[], paused_chains=[], session_states=[],
-        )
+        for _eng in ("NKR", "TRADER"):
+            _live_engine_mark(
+                _eng, status="idle", decision="NO_REGISTERED_SESSION",
+                reason=f"No recoverable {_eng} CoreVault session was found", last_error="",
+                assets_scanned=0, tradable_assets=0,
+                best_candidate="", candidate_score=0.0,
+                candidate_momentum_24h=0.0, candidate_price=0.0,
+                gate_status="NO_ACTIVE_SESSION", decision_detail="",
+                active_asset="", position_state="", position_value_usd=0,
+                tx_hash="", pending_tx="", session_chain="",
+                working_chains=[], paused_chains=[], session_states=[],
+            )
         return
 
     by_wallet = {}
@@ -39807,7 +40050,10 @@ def _nkr_live_worker_cycle() -> None:
             if any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
                 # Refresh runnable set so the new session can trade in a later tick (or same if registered).
                 try:
-                    wallet_rows = _live_active_sessions(wallet, "NKR") or wallet_rows
+                    # ENGINE-368: refresh NKR + Trader runnable set after strategist open.
+                    nkr_rows = list(_live_active_sessions(wallet, "NKR") or [])
+                    trader_rows = list(_live_active_sessions(wallet, "TRADER") or [])
+                    wallet_rows = nkr_rows + trader_rows or wallet_rows
                     runnable_rows = [
                         r for r in wallet_rows
                         if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
