@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-375-PRIVY-GAS-LIMIT-CLEAN"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-376-PRIVY-GAS-AUTO"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31816,52 +31816,26 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
 
-    # ENGINE-375: Privy docs only accept a clean transaction object:
-    #   to, data, value, chain_id, gas_limit, gas_price / max_fee_per_gas, ...
-    # Do NOT send `gas` or `gasLimit` aliases — they can be ignored or confuse the
-    # signer, leaving a ~63k default ("gas required exceeds allowance (63013)").
-    raw_in = dict(transaction or {})
+    # ENGINE-376: Do NOT inject gas/gas_limit.
+    # BNB createSession worked for a long time with Privy auto-filling gas.
+    # Forcing gas fields correlated with "gas required exceeds allowance (63013)".
+    # Pass through caller fields only; strip residual gas keys so Privy populates them.
+    tx = dict(transaction or {})
     cid = int(chain_id or 1)
-    floor = {1: 250_000, 56: 400_000, 137: 450_000}.get(cid, 300_000)
-    try:
-        gas_units = _privy_estimate_tx_gas(cid, raw_in)
-    except Exception:
-        gas_units = floor
-    gas_units = max(int(gas_units or 0), floor, 400_000 if cid == 56 else floor)
-
-    clean = {}
-    to_addr = raw_in.get("to") or raw_in.get("toAddress") or ""
-    if to_addr:
-        clean["to"] = _norm_addr(to_addr)
-    data = raw_in.get("data") or "0x"
-    clean["data"] = data if str(data).startswith("0x") else ("0x" + str(data))
-    clean["value"] = raw_in.get("value") or "0x0"
-    clean["chain_id"] = cid
-    # Prefer decimal integer — Privy accepts string|number; integer avoids hex-parse bugs
-    clean["gas_limit"] = int(gas_units)
-
-    # Fee fields: let Privy fill EIP-1559 on ETH/POL; on BNB set legacy gas_price as fallback
-    if cid == 56 and not raw_in.get("gas_price") and not raw_in.get("max_fee_per_gas"):
-        try:
-            gp = _rpc_call(56, "eth_gasPrice", [])
-            if isinstance(gp, str) and gp.startswith("0x"):
-                # bump 20% for inclusion
-                clean["gas_price"] = hex(int(int(gp, 16) * 1.2))
-            elif gp:
-                clean["gas_price"] = hex(int(int(gp) * 1.2))
-        except Exception:
-            pass
-    for fee_key in ("gas_price", "max_fee_per_gas", "max_priority_fee_per_gas", "nonce", "type"):
-        if raw_in.get(fee_key) is not None and fee_key not in clean:
-            clean[fee_key] = raw_in.get(fee_key)
+    for k in ("gas", "gasLimit", "gas_limit", "maxFeePerGas", "max_fee_per_gas",
+              "maxPriorityFeePerGas", "max_priority_fee_per_gas", "gasPrice", "gas_price"):
+        tx.pop(k, None)
+    if "chain_id" not in tx and "chainId" not in tx:
+        tx["chain_id"] = cid
 
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
         "method": "eth_sendTransaction",
         "caip2": f"eip155:{cid}",
         "chain_type": "ethereum",
-        "params": {"transaction": clean},
+        "params": {"transaction": tx},
     }
+
     if reference_id:
         body["reference_id"] = reference_id
     expiry = str(int(time.time() * 1000) + 60_000)
