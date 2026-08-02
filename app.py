@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-369-EVM-ALLOWLIST-GROUP-LIVE"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-370-OPS-RECONCILER-NKR-TRADER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD389-EVM-ALLOWLIST-GROUP"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -513,11 +513,19 @@ def _live_op_reserve(
     conn = _db()
     try:
         with DB_WRITE_LOCK:
-            # Expire stale RESERVED/SUBMITTING locks so a crashed worker cannot block forever.
+            # ENGINE-370: only abort RESERVED/SUBMITTING without a broadcast tx.
+            # CONFIRMING with tx_hash moves to RECOVERING so the reconciler can finish the receipt.
             conn.execute(
                 "UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, error_text='expired_without_completion' "
-                "WHERE status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING') AND expires_ts<=?",
+                "WHERE status IN ('RESERVED','SUBMITTING') AND expires_ts<=? "
+                "AND (tx_hash IS NULL OR tx_hash='' OR tx_hash='0x')",
                 (nowi, nowi),
+            )
+            conn.execute(
+                "UPDATE nexus_live_operations SET status='RECOVERING', updated_ts=?, expires_ts=?, "
+                "error_text=COALESCE(NULLIF(error_text,''), 'confirming_expired_moved_to_recovering') "
+                "WHERE status='CONFIRMING' AND expires_ts<=? AND tx_hash IS NOT NULL AND length(tx_hash)>=10",
+                (nowi, nowi + 300, nowi),
             )
             # If a successful op already exists for this business key, refuse a duplicate.
             existing = conn.execute(
@@ -39782,17 +39790,155 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
     return True
 
 
+
+def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
+    """ENGINE-370: finish CONFIRMING/RECOVERING ops by receipt (Privy timeout recovery).
+
+    Stability plan: after broadcast, never open a second trade; find Tx/Receipt and continue.
+    Applies to NKR and Trader (and any engine that writes nexus_live_operations).
+    """
+    _live_ops_init()
+    out = {"checked": 0, "succeeded": 0, "failed": 0, "pending": 0, "errors": []}
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM nexus_live_operations "
+            "WHERE status IN ('CONFIRMING','RECOVERING') AND tx_hash IS NOT NULL AND length(tx_hash)>=10 "
+            "ORDER BY updated_ts ASC LIMIT ?",
+            (max(1, int(limit or 40)),),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+    finally:
+        conn.close()
+    for row in rows:
+        out["checked"] += 1
+        oid = str(row.get("operation_id") or "")
+        txh = str(row.get("tx_hash") or "").strip()
+        try:
+            chain_id = int(row.get("chain_id") or 1)
+        except Exception:
+            chain_id = 1
+        try:
+            receipt = _rpc_call(chain_id, "eth_getTransactionReceipt", [txh])
+        except Exception as exc:
+            out["pending"] += 1
+            out["errors"].append(f"{oid}:rpc:{str(exc)[:80]}")
+            continue
+        if not receipt:
+            # still in flight — extend TTL so it is not aborted
+            try:
+                _live_op_update(oid, "RECOVERING", tx_hash=txh, expires_ts=int(time.time()) + 180)
+            except Exception:
+                pass
+            out["pending"] += 1
+            continue
+        try:
+            status = int(str(receipt.get("status") or "0x0"), 16)
+        except Exception:
+            status = 0
+        if status == 1:
+            try:
+                _live_op_update(oid, "SUCCEEDED", tx_hash=txh, error_text="")
+                out["succeeded"] += 1
+            except Exception as exc:
+                out["failed"] += 1
+                out["errors"].append(f"{oid}:mark_ok:{str(exc)[:80]}")
+        else:
+            try:
+                _live_op_update(oid, "FAILED", tx_hash=txh, error_text=f"transaction_reverted:{txh}")
+                out["failed"] += 1
+            except Exception as exc:
+                out["errors"].append(f"{oid}:mark_fail:{str(exc)[:80]}")
+    return out
+
+
+def _live_sessions_reconcile_closing(limit: int = 20) -> dict:
+    """ENGINE-370: after restart / timeout, continue CLOSING sessions to FINALIZED (NKR+Trader)."""
+    _live_engine_tables_init()
+    out = {"checked": 0, "continued": 0, "skipped": 0, "errors": []}
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM nexus_live_core_vault_sessions "
+            "WHERE engine IN ('NKR','TRADER') AND status IN ('CLOSING','STOPPING') "
+            "ORDER BY updated_ts ASC LIMIT ?",
+            (max(1, int(limit or 20)),),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+    finally:
+        conn.close()
+    for row in rows:
+        out["checked"] += 1
+        eng = str(row.get("engine") or "NKR").upper()
+        if eng == "TRADING":
+            eng = "TRADER"
+        wa = _norm_addr(row.get("wallet_address") or "")
+        if not wa:
+            out["skipped"] += 1
+            continue
+        try:
+            # Prefer async path so the worker cycle is not blocked for minutes.
+            if eng == "NKR" and "_nkr_finalize_closing_session_async" in globals():
+                ok = _nkr_finalize_closing_session_async(wa, row)
+                if ok:
+                    out["continued"] += 1
+                else:
+                    out["skipped"] += 1
+            else:
+                res = _finalize_one_live_session(wa, eng, row)
+                out["continued"] += 1
+                try:
+                    _live_engine_mark(
+                        eng, status="idle", decision="RECONCILE_FINALIZED",
+                        reason=f"Reconciler finalized session #{row.get('onchain_session_id')} after CLOSING recovery",
+                        pending_tx=str((res or {}).get("finalizeTxHash") or (res or {}).get("startClosingTxHash") or ""),
+                        last_error="",
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            out["errors"].append(f"{eng}:{row.get('onchain_session_id')}:{str(exc)[:120]}")
+            try:
+                _live_engine_mark(
+                    eng, status="closing", decision="RECONCILE_CLOSING_PENDING",
+                    reason=f"Reconciler could not finish session #{row.get('onchain_session_id')} yet",
+                    last_error=str(exc)[:400],
+                )
+            except Exception:
+                pass
+    return out
+
+
+def _nexus_ops_reconcile_cycle() -> dict:
+    """Periodic ops + closing reconciler (stability plan §5 recovery rules)."""
+    result = {"ops": {}, "closing": {}, "ts": int(time.time())}
+    try:
+        result["ops"] = _live_ops_reconcile_confirming()
+    except Exception as exc:
+        result["ops"] = {"error": str(exc)[:240]}
+    try:
+        result["closing"] = _live_sessions_reconcile_closing()
+    except Exception as exc:
+        result["closing"] = {"error": str(exc)[:240]}
+    return result
+
+
 def _nkr_live_worker_cycle() -> None:
     """Process every recoverable NKR and TRADER registry row.
 
     ENGINE-368: Trader uses the same CoreVault lifecycle + observation gate as NKR
     (slots are extra on Trader; entry/observe/exit/finalize stay shared).
+    ENGINE-370: each cycle runs ops reconciler (CONFIRMING receipts + CLOSING finalize).
 
     ERROR is intentionally recoverable: a failed pause/close request must not remove an
     otherwise still-active on-chain session from the trading worker.  Earlier builds
     selected only ACTIVE/PAUSED rows, so a single failed StartClosing transaction changed
     the registry row to ERROR and the worker completed empty cycles forever.
     """
+    try:
+        _nexus_ops_reconcile_cycle()
+    except Exception:
+        pass
     _live_engine_tables_init()
     conn = _db()
     try:
