@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-372-ENGINE-RUNTIME-ISOLATION"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-373-PRIVY-GAS-LIMIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD392-ADD-CAPITAL-SESSION"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31776,6 +31776,31 @@ def nexus_system_info_privy_policy_apply():
         return jsonify({"status": "error", "error": str(exc), "ts": now_ts()}), 400
 
 
+def _privy_estimate_tx_gas(chain_id: int, transaction: dict) -> int:
+    """Estimate gas for a vault call; fall back to safe floors per chain."""
+    cid = int(chain_id or 1)
+    floors = {1: 220_000, 56: 280_000, 137: 350_000}
+    floor = int(floors.get(cid, 250_000))
+    tx = dict(transaction or {})
+    params = {
+        "from": tx.get("from") or tx.get("fromAddress") or "",
+        "to": tx.get("to") or "",
+        "data": tx.get("data") or "0x",
+        "value": tx.get("value") or "0x0",
+    }
+    try:
+        raw = _rpc_call(cid, "eth_estimateGas", [params])
+        if isinstance(raw, str) and raw.startswith("0x"):
+            est = int(raw, 16)
+        else:
+            est = int(raw or 0)
+    except Exception:
+        est = floor
+    # 35% buffer + small constant; clamp to sane bounds
+    units = int(max(est, floor) * 1.35) + 25_000
+    return max(floor, min(units, 1_500_000))
+
+
 def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id="", chain_id=1):
     # Privy accepts at most 64 characters for reference_id. Keep the value
     # deterministic so the same operation also keeps the same idempotency key.
@@ -31790,12 +31815,26 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     cfg = _privy_trading_cfg(chain_id)
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
+
+    # ENGINE-373: always attach an explicit gas limit. Privy policy "gas required
+    # exceeds allowance (63013)" happens when estimate > policy max OR when no
+    # gas is set and the policy default is too low for createSession/executeTrade.
+    tx = dict(transaction or {})
+    if not (tx.get("gas") or tx.get("gasLimit")):
+        try:
+            gas_units = _privy_estimate_tx_gas(int(chain_id or 1), tx)
+        except Exception:
+            gas_units = {1: 280_000, 56: 350_000, 137: 400_000}.get(int(chain_id or 1), 300_000)
+        tx["gas"] = hex(int(gas_units))
+        # also set gasLimit for clients that prefer that key
+        tx["gasLimit"] = tx["gas"]
+
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
         "method": "eth_sendTransaction",
         "caip2": f"eip155:{int(chain_id)}",
         "chain_type": "ethereum",
-        "params": {"transaction": transaction},
+        "params": {"transaction": tx},
     }
     if reference_id:
         body["reference_id"] = reference_id
@@ -31843,6 +31882,13 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     except Exception:
         data = {"raw": (response.text or "")[:2000]}
     if response.status_code >= 300:
+        blob = str(data or "")
+        if "gas required exceeds allowance" in blob.lower() or "transaction_broadcast_failure" in blob.lower():
+            raise RuntimeError(
+                f"privy_gas_policy_too_low:chain={int(chain_id)}:"
+                f"tx_gas={tx.get('gas') or tx.get('gasLimit') or 'unset'}:"
+                f"raise_privy_policy_max_gas_to_at_least_500000:{blob[:400]}"
+            )
         raise RuntimeError(f"privy_rpc_{response.status_code}:{data}")
     tx_hash = str(((data or {}).get("data") or {}).get("hash") or (data or {}).get("hash") or "")
     if not tx_hash:
