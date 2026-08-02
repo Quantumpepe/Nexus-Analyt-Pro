@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-371-ADD-CAPITAL-SESSION-BIND"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-372-ENGINE-RUNTIME-ISOLATION"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD392-ADD-CAPITAL-SESSION"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -39951,19 +39951,34 @@ def _nkr_live_worker_cycle() -> None:
     finally:
         conn.close()
 
+    # ENGINE-372: idle marks are per-engine only. GRID is never written here.
+    nkr_live = [r for r in live_rows if str((r or {}).get("engine") or "").upper() == "NKR"]
+    trader_live = [r for r in live_rows if str((r or {}).get("engine") or "").upper() in ("TRADER", "TRADING")]
+    if not nkr_live:
+        _live_engine_mark(
+            "NKR", status="idle", decision="NO_REGISTERED_SESSION",
+            reason="No recoverable NKR CoreVault session was found", last_error="",
+            assets_scanned=0, tradable_assets=0,
+            best_candidate="", candidate_score=0.0,
+            candidate_momentum_24h=0.0, candidate_price=0.0,
+            gate_status="NO_ACTIVE_SESSION", decision_detail="",
+            active_asset="", position_state="", position_value_usd=0,
+            tx_hash="", pending_tx="", session_chain="",
+            working_chains=[], paused_chains=[], session_states=[],
+        )
+    if not trader_live:
+        _live_engine_mark(
+            "TRADER", status="idle", decision="NO_REGISTERED_SESSION",
+            reason="No recoverable TRADER CoreVault session was found", last_error="",
+            assets_scanned=0, tradable_assets=0,
+            best_candidate="", candidate_score=0.0,
+            candidate_momentum_24h=0.0, candidate_price=0.0,
+            gate_status="NO_ACTIVE_SESSION", decision_detail="",
+            active_asset="", position_state="", position_value_usd=0,
+            tx_hash="", pending_tx="", session_chain="",
+            working_chains=[], paused_chains=[], session_states=[],
+        )
     if not live_rows:
-        for _eng in ("NKR", "TRADER"):
-            _live_engine_mark(
-                _eng, status="idle", decision="NO_REGISTERED_SESSION",
-                reason=f"No recoverable {_eng} CoreVault session was found", last_error="",
-                assets_scanned=0, tradable_assets=0,
-                best_candidate="", candidate_score=0.0,
-                candidate_momentum_24h=0.0, candidate_price=0.0,
-                gate_status="NO_ACTIVE_SESSION", decision_detail="",
-                active_asset="", position_state="", position_value_usd=0,
-                tx_hash="", pending_tx="", session_chain="",
-                working_chains=[], paused_chains=[], session_states=[],
-            )
         return
 
     by_wallet = {}
@@ -40498,38 +40513,62 @@ def _nkr_live_worker_cycle() -> None:
                     bits.append(f"{ch}:{g}" + (f"/{a}" if a else ""))
                 if bits:
                     detail = (detail + " | " + ", ".join(bits)).strip(" |")[:400]
-            runtime_status = "running" if working_rows else ("paused" if paused_rows else "idle")
-            _live_engine_mark(
-                "NKR", tick=True, status=runtime_status,
-                assets_scanned=len(market_rows),
-                tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0),
-                best_candidate=(exec_asset or diag.get("best_candidate") or "") if working_rows else "",
-                candidate_score=execution.get("score", diag.get("candidate_score", 0.0)),
-                candidate_momentum_24h=execution.get("change", diag.get("candidate_momentum_24h", 0.0)),
-                candidate_price=execution.get("price", diag.get("candidate_price", 0.0)),
-                decision=(execution.get("decision") or diag.get("decision") or "WAIT") if working_rows else diag.get("decision", "IDLE"),
-                gate_status=(execution.get("gate") or diag.get("gate_status") or "") if working_rows else diag.get("gate_status", "NO_ACTIVE_SESSION"),
-                decision_detail=(detail[:400] if working_rows else str(diag.get("decision_detail") or "")[:400]),
-                reason=("CoreVault trade confirmed" if execution.get("executed") else "backend worker tick completed") if working_rows else ("all NKR sessions paused" if paused_rows else "no active NKR session"),
-                pending_tx=execution.get("txHash", "") if working_rows else "",
-                last_error=err_keep if working_rows else "",
-                # Multi-EVM Strategist fields (user panel + System Info)
-                best_overall=diag.get("best_overall") or "",
-                best_overall_score=diag.get("best_overall_score") or 0,
-                best_overall_chain=diag.get("best_overall_chain") or "",
-                session_chain=(diag.get("session_chain") or (_nkr_chain_key_from_id(primary_chain_id) if primary_chain_id else "")),
-                working_chains=diag.get("working_chains") or [],
-                paused_chains=diag.get("paused_chains") or [],
-                session_states=diag.get("session_states") or [],
-                active_asset=(execution.get("asset") or diag.get("active_asset") or "") if working_rows else "",
-                position_state=(execution.get("positionState") or diag.get("position_state") or "") if working_rows else "",
-                position_value_usd=(execution.get("positionValueUsd") or diag.get("position_value_usd") or 0) if working_rows else 0,
-                tx_hash=(execution.get("txHash") or diag.get("tx_hash") or "") if working_rows else "",
-                recommendation=diag.get("recommendation") or "",
-                multi_chain_tip=(diag.get("multi_chain_plan") or {}).get("tip") or "",
-                multi_chain_actions=(diag.get("multi_chain_plan") or {}).get("actions") or [],
-                live_chains=list((diag.get("multi_chain_plan") or {}).get("liveChains") or sorted(_nkr_live_chain_keys())),
-            )
+            # ENGINE-372: mark NKR and TRADER separately — never write one engine into another.
+            # GRID is never touched by this worker.
+            def _eng_of(lr):
+                e = str((lr or {}).get("engine") or "NKR").upper()
+                return "TRADER" if e in ("TRADER", "TRADING") else "NKR"
+            for _eng_name in ("NKR", "TRADER"):
+                eng_working = [r for r in (working_rows or []) if _eng_of(r) == _eng_name]
+                eng_paused = [r for r in (paused_rows or []) if _eng_of(r) == _eng_name]
+                eng_exec = None
+                for lr, er in (executions or []):
+                    if _eng_of(lr) == _eng_name:
+                        eng_exec = er
+                        break
+                eng_exec = eng_exec if isinstance(eng_exec, dict) else {}
+                has_w = bool(eng_working)
+                has_p = bool(eng_paused)
+                eng_all = [r for r in (wallet_rows or []) if _eng_of(r) == _eng_name]
+                if not eng_all:
+                    continue
+                runtime_status = "running" if has_w else ("paused" if has_p else "idle")
+                e_asset = str(eng_exec.get("asset") or "") if has_w else ""
+                e_detail = str(eng_exec.get("detail") or "")[:400] if has_w else ""
+                e_err = str(eng_exec.get("error") or "") if has_w else ""
+                _live_engine_mark(
+                    _eng_name, tick=True, status=runtime_status,
+                    assets_scanned=len(market_rows) if has_w else 0,
+                    tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0) if has_w else 0,
+                    best_candidate=(e_asset or (diag.get("best_candidate") or "")) if has_w and _eng_name == "NKR" else (e_asset if has_w else ""),
+                    candidate_score=(eng_exec.get("score", diag.get("candidate_score", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
+                    candidate_momentum_24h=(eng_exec.get("change", diag.get("candidate_momentum_24h", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
+                    candidate_price=(eng_exec.get("price", diag.get("candidate_price", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
+                    decision=(eng_exec.get("decision") or (diag.get("decision") if _eng_name == "NKR" else "WAIT") or "WAIT") if has_w else ("PAUSED" if has_p else "IDLE"),
+                    gate_status=(eng_exec.get("gate") or (diag.get("gate_status") if _eng_name == "NKR" else "") or "") if has_w else ("PAUSED" if has_p else "NO_ACTIVE_SESSION"),
+                    decision_detail=e_detail if has_w else "",
+                    reason=(
+                        ("CoreVault trade confirmed" if eng_exec.get("executed") else f"{_eng_name} worker tick completed")
+                        if has_w else (f"all {_eng_name} sessions paused" if has_p else f"no active {_eng_name} session")
+                    ),
+                    pending_tx=eng_exec.get("txHash", "") if has_w else "",
+                    last_error=e_err,
+                    best_overall=(diag.get("best_overall") or "") if _eng_name == "NKR" and has_w else "",
+                    best_overall_score=(diag.get("best_overall_score") or 0) if _eng_name == "NKR" and has_w else 0,
+                    best_overall_chain=(diag.get("best_overall_chain") or "") if _eng_name == "NKR" and has_w else "",
+                    session_chain=(diag.get("session_chain") or (_nkr_chain_key_from_id(primary_chain_id) if primary_chain_id else "")) if _eng_name == "NKR" else (_nkr_chain_key_from_id((eng_all[0] or {}).get("chain_id") or 0) if eng_all else ""),
+                    working_chains=(diag.get("working_chains") or []) if _eng_name == "NKR" else [],
+                    paused_chains=(diag.get("paused_chains") or []) if _eng_name == "NKR" else [],
+                    session_states=(diag.get("session_states") or []) if _eng_name == "NKR" else [],
+                    active_asset=e_asset if has_w else "",
+                    position_state=(eng_exec.get("positionState") or "") if has_w else "",
+                    position_value_usd=(eng_exec.get("positionValueUsd") or 0) if has_w else 0,
+                    tx_hash=(eng_exec.get("txHash") or "") if has_w else "",
+                    recommendation=(diag.get("recommendation") or "") if _eng_name == "NKR" else "",
+                    multi_chain_tip=((diag.get("multi_chain_plan") or {}).get("tip") or "") if _eng_name == "NKR" else "",
+                    multi_chain_actions=((diag.get("multi_chain_plan") or {}).get("actions") or []) if _eng_name == "NKR" else [],
+                    live_chains=list((diag.get("multi_chain_plan") or {}).get("liveChains") or sorted(_nkr_live_chain_keys())) if _eng_name == "NKR" else [],
+                )
         except Exception as exc:
             err_txt = str(exc)[:1000] or repr(exc)[:1000] or "unknown_worker_exception"
             _live_engine_mark(
