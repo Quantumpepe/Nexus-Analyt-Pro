@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-380-HARVEST-UNLIMITED-ENTRY"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-381-ONCHAIN-SCAN-ALL-CHAINS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1604,15 +1604,49 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
 
 def _discover_wallet_core_sessions(wallet, engine="NKR", chain_id=1, vault=""):
     wa = _norm_addr(wallet)
+    cid = int(chain_id or 1)
+    # ENGINE-381: always resolve vault for THIS chain first.
+    # Old order preferred CORE_VAULTV5_ADDRESS_ETH even when scanning BNB/POL,
+    # so System Info showed only ETH sessions and Next IDs for BNB/POL stayed "—".
+    chain_vault = ""
+    try:
+        chain_vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(cid) or "")
+    except Exception:
+        chain_vault = ""
+    eth_only_env = ""
+    if cid == 1:
+        eth_only_env = (
+            os.getenv("CORE_VAULTV5_ADDRESS_ETH")
+            or os.getenv("NEXUS_CORE_VAULT_V5_ETH_ADDRESS")
+            or os.getenv("CORE_VAULT_ETH_ADDRESS")
+            or ""
+        )
+    bnb_env = ""
+    if cid == 56:
+        bnb_env = (
+            os.getenv("CORE_VAULTV5_ADDRESS_BNB")
+            or os.getenv("NEXUS_CORE_VAULT_V5_BNB_ADDRESS")
+            or os.getenv("CORE_VAULT_BNB_ADDRESS")
+            or ""
+        )
+    pol_env = ""
+    if cid == 137:
+        pol_env = (
+            os.getenv("CORE_VAULTV5_ADDRESS_POL")
+            or os.getenv("NEXUS_CORE_VAULT_V5_POL_ADDRESS")
+            or os.getenv("CORE_VAULT_POL_ADDRESS")
+            or ""
+        )
     vault_addr = _norm_addr(
         vault
-        or os.getenv("CORE_VAULTV5_ADDRESS_ETH")
-        or os.getenv("NEXUS_CORE_VAULT_V5_ETH_ADDRESS")
-        or _VAULT_BY_CHAIN.get(int(chain_id))
+        or chain_vault
+        or bnb_env
+        or pol_env
+        or eth_only_env
         or ""
     )
     if not wa or not _looks_like_evm_addr(vault_addr):
-        raise RuntimeError("wallet_or_vault_invalid")
+        raise RuntimeError(f"wallet_or_vault_invalid:chain={cid}")
     raw_next = _eth_call(int(chain_id), vault_addr, _core_selector("nextSessionId()"))
     next_words = _core_words(raw_next)
     if not next_words:
@@ -35730,6 +35764,8 @@ def api_nexus_system_info_onchain_sessions():
     sections = []
     all_sessions = []
     errors = []
+    next_by_chain = {}
+    vault_by_chain = {}
     for eng in engines:
         eng_sessions = []
         for cid in chain_ids:
@@ -35738,9 +35774,17 @@ def api_nexus_system_info_onchain_sessions():
             except Exception as exc:
                 errors.append({
                     "engine": eng["key"], "engineLabel": eng["label"],
-                    "chainId": cid, "error": str(exc)[:240],
+                    "chainId": cid,
+                    "chain": _nkr_chain_key_from_id(cid) if "_nkr_chain_key_from_id" in globals() else str(cid),
+                    "error": str(exc)[:240],
                 })
                 continue
+            try:
+                ck = _nkr_chain_key_from_id(cid) if "_nkr_chain_key_from_id" in globals() else str(cid)
+                next_by_chain[ck] = max(int(next_by_chain.get(ck) or 0), int(next_id or 0))
+                vault_by_chain[ck] = vault_addr
+            except Exception:
+                pass
             for s in found or []:
                 status_id = int(s.get("statusId") or 0)
                 item = dict(s)
@@ -35800,6 +35844,8 @@ def api_nexus_system_info_onchain_sessions():
             "labels": {"NKR": "NKR", "TRADER": "Trader"},
         },
         "chainIds": chain_ids,
+        "nextSessionIdByChain": next_by_chain,
+        "vaultByChain": vault_by_chain,
         "sections": sections,
         "sessions": all_sessions,
         "localRegistry": local_rows,
