@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-382-POSITION-UI-SYNC"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-383-POSITION-DISPLAY-FORCE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15449,10 +15449,29 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
     out = dict(sess or {})
     meta = dict(out.get("meta") if isinstance(out.get("meta"), dict) else {})
     try:
-        sid = int(str(live_row.get("onchain_session_id") or out.get("onchainSessionId") or meta.get("onchain_session_id") or "0"))
-        chain_id = int(live_row.get("chain_id") or out.get("chainId") or meta.get("chain_id") or 1)
-        vault = _norm_addr(live_row.get("vault_address") or out.get("vault") or out.get("vaultAddress") or meta.get("vault") or "")
-        if sid <= 0 or not _looks_like_evm_addr(vault):
+        sid = int(str(live_row.get("onchain_session_id") or out.get("onchainSessionId") or out.get("onchain_session_id") or meta.get("onchain_session_id") or "0"))
+        # ENGINE-383: never default a BNB/POL session to chain_id=1 (ETH).
+        chain_raw = (
+            live_row.get("chain_id") or out.get("chainId") or out.get("chain_id")
+            or meta.get("chain_id") or meta.get("chainId") or ""
+        )
+        chain_key = str(out.get("chain") or out.get("chainKey") or meta.get("chain") or meta.get("chain_key") or live_row.get("chain") or "").upper()
+        if str(chain_raw).isdigit() and int(chain_raw) > 0:
+            chain_id = int(chain_raw)
+        elif chain_key in ("BNB", "BSC"):
+            chain_id = 56
+        elif chain_key in ("POL", "POLYGON", "MATIC"):
+            chain_id = 137
+        elif chain_key in ("ETH", "ETHEREUM"):
+            chain_id = 1
+        else:
+            chain_id = int(live_row.get("chain_id") or 0)
+        vault = _norm_addr(
+            live_row.get("vault_address") or out.get("vault") or out.get("vaultAddress")
+            or out.get("vault_address") or meta.get("vault") or meta.get("vault_address")
+            or (_VAULT_BY_CHAIN.get(chain_id) if chain_id else "") or ""
+        )
+        if sid <= 0 or chain_id <= 0 or not _looks_like_evm_addr(vault):
             return out
         snap = _read_core_session_snapshot(chain_id, vault, sid)
         status_id = int(snap.get("statusId") or snap.get("status_id") or 0)
