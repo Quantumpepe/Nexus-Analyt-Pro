@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-376-PRIVY-GAS-AUTO"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-379-HOLD-WHILE-PROFIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -31816,17 +31816,10 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
 
-    # ENGINE-376: Do NOT inject gas/gas_limit.
-    # BNB createSession worked for a long time with Privy auto-filling gas.
-    # Forcing gas fields correlated with "gas required exceeds allowance (63013)".
-    # Pass through caller fields only; strip residual gas keys so Privy populates them.
+    # ENGINE-377: exact historical pass-through (as when BNB sessions worked).
+    # Zero mutation of the transaction object — Privy fills gas/nonce/fees.
     tx = dict(transaction or {})
     cid = int(chain_id or 1)
-    for k in ("gas", "gasLimit", "gas_limit", "maxFeePerGas", "max_fee_per_gas",
-              "maxPriorityFeePerGas", "max_priority_fee_per_gas", "gasPrice", "gas_price"):
-        tx.pop(k, None)
-    if "chain_id" not in tx and "chainId" not in tx:
-        tx["chain_id"] = cid
 
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
@@ -31882,13 +31875,18 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     except Exception:
         data = {"raw": (response.text or "")[:2000]}
     if response.status_code >= 300:
-        blob = str(data or "")
-        if "gas required exceeds allowance" in blob.lower() or "transaction_broadcast_failure" in blob.lower():
-            gl = body.get("params", {}).get("transaction", {}).get("gas_limit")
-            raise RuntimeError(
-                f"privy_gas_broadcast_failed:chain={cid}:gas_limit={gl}:detail:{blob[:500]}"
-            )
-        raise RuntimeError(f"privy_rpc_{response.status_code}:{data}")
+        # Keep the raw Privy body so the UI can show a precise, non-generic message.
+        blob = data if isinstance(data, str) else json.dumps(data, default=str)[:1200]
+        low = blob.lower()
+        if "insufficient funds" in low or "insufficient balance" in low:
+            raise RuntimeError(f"privy_insufficient_native_gas:chain={cid}:{blob[:300]}")
+        if "gas required exceeds allowance" in low:
+            raise RuntimeError(f"privy_gas_allowance:chain={cid}:{blob[:400]}")
+        if "transaction_broadcast_failure" in low:
+            raise RuntimeError(f"privy_broadcast_failure:chain={cid}:{blob[:400]}")
+        if "policy" in low and ("violat" in low or "denied" in low):
+            raise RuntimeError(f"privy_policy_denied:chain={cid}:{blob[:400]}")
+        raise RuntimeError(f"privy_rpc_{response.status_code}:chain={cid}:{blob[:500]}")
     tx_hash = str(((data or {}).get("data") or {}).get("hash") or (data or {}).get("hash") or "")
     if not tx_hash:
         raise RuntimeError(f"privy_rpc_missing_hash:{data}")
@@ -37212,6 +37210,12 @@ def _nkr_sync_local_open_position(wallet: str, session_id: int, *, symbol: str, 
 # Strategy decisions remain in the existing NKR logic; this layer only translates
 # the resulting target state into confirmed CoreVault OPEN/ADD/REDUCE/CLOSE deltas.
 _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ASSET_COOLDOWN_SEC", "60")))
+# ENGINE-378: shadow-like behaviour — never lock re-entry for a whole day.
+# After a flat exit the next OPEN may happen after a short cool-down only.
+_NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(30, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "120")))
+_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(60, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "1200")))  # 20 min default
+_NKR_LIVE_REENTRY_COOLDOWN_SEC = max(30, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "180")))  # 3 min after exit
+
 # Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
 _NKR_LIVE_MIN_REBALANCE_USD = max(0.20, float(os.getenv("NEXUS_NKR_LIVE_MIN_REBALANCE_USD", "0.50")))
 _NKR_LIVE_LAST_ASSET_TRADE_TS: dict[tuple[str, int, str], int] = {}
@@ -39262,10 +39266,19 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             previous_meta[str(sess.get("symbol") or sess.get("targetAsset") or "").upper()] = meta
     row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
-    profit_lock = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}.get(mode, 2.0)
-    activation = {"AGGRESSIVE": 0.80, "DYNAMIC": 0.65, "TACTICAL": 0.50, "DEFENSIVE": 0.40}.get(mode, 0.65)
-    trail_base = {"AGGRESSIVE": 0.55, "DYNAMIC": 0.40, "TACTICAL": 0.30, "DEFENSIVE": 0.22}.get(mode, 0.40)
-    cost_multiple = {"AGGRESSIVE": 1.75, "DYNAMIC": 2.0, "TACTICAL": 2.25, "DEFENSIVE": 2.5}.get(mode, 2.0)
+    # ENGINE-379: hold while profitable (shadow behaviour).
+    # - Never exit on noise (0.02%–0.2% pullbacks).
+    # - Trail only after a real peak and a meaningful give-back.
+    # - Full profit-lock only at solid net edge after costs.
+    # - Hard stop only when net is clearly negative beyond session max-loss band.
+    profit_lock = {"AGGRESSIVE": 4.5, "DYNAMIC": 3.5, "TACTICAL": 3.0, "DEFENSIVE": 2.5}.get(mode, 3.5)
+    activation = {"AGGRESSIVE": 1.80, "DYNAMIC": 1.50, "TACTICAL": 1.20, "DEFENSIVE": 1.00}.get(mode, 1.50)
+    # Trail width in percentage-points of net_pct from peak (NOT tiny 0.12/0.55)
+    trail_base = {"AGGRESSIVE": 1.80, "DYNAMIC": 1.50, "TACTICAL": 1.20, "DEFENSIVE": 1.00}.get(mode, 1.50)
+    cost_multiple = {"AGGRESSIVE": 2.25, "DYNAMIC": 2.50, "TACTICAL": 2.75, "DEFENSIVE": 3.0}.get(mode, 2.5)
+    # Momentum reversal needs a real red print, not -0.35% noise
+    reversal_change = {"AGGRESSIVE": -1.20, "DYNAMIC": -1.00, "TACTICAL": -0.85, "DEFENSIVE": -0.70}.get(mode, -1.00)
+    hard_stop_pct = {"AGGRESSIVE": -2.50, "DYNAMIC": -2.00, "TACTICAL": -1.60, "DEFENSIVE": -1.20}.get(mode, -2.00)
     metrics = {}; forced_exits = {}
     for sym, snap in snapshots.items():
         if snap["amount"] <= 0:
@@ -39278,25 +39291,63 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net)
         peak_pct = max(_safe_float(pm.get("nkr_peak_net_profit_pct"), 0.0), net_pct)
         drawdown = max(0.0, peak_pct - net_pct)
-        min_protected = max(0.01, exit_costs * cost_multiple, cost * activation / 100.0)
-        protected = peak_pct >= activation and peak_net >= min_protected
-        adaptive_trail = trail_base * (0.60 if peak_pct >= profit_lock * 2 else 0.78 if peak_pct >= profit_lock else 1.0)
-        adaptive_trail = max(0.12, adaptive_trail)
+        min_protected = max(0.05, exit_costs * cost_multiple, cost * activation / 100.0)
+        protected = peak_pct >= activation and peak_net >= min_protected and peak_net > 0
+        # Widen trail as peak grows; never thinner than ~1.0 pp — kills 0.02% noise exits
+        adaptive_trail = trail_base * (0.75 if peak_pct >= profit_lock * 2 else 0.90 if peak_pct >= profit_lock else 1.0)
+        adaptive_trail = max(1.00, adaptive_trail)
         change = _nkr_row_change_pct(row_by_symbol.get(sym) or {})
-        full_lock = net > 0 and net_pct >= profit_lock and net >= min_protected
+        # HOLD while net is positive and drawdown is small — strategist keeps the trade.
+        full_lock = False  # do NOT force-exit just because a profit target was touched; ride the trend
         trailing = protected and net > 0 and drawdown >= adaptive_trail
-        reversal = protected and net > 0 and change <= -0.35 and drawdown >= max(0.12, adaptive_trail * 0.55)
+        reversal = protected and net > 0 and change <= reversal_change and drawdown >= max(1.00, adaptive_trail * 0.70)
+        hard_stop = net_pct <= hard_stop_pct and net < -max(0.05, exit_costs)
         metrics[sym] = {"netUsd": net, "netPct": net_pct, "peakNetUsd": peak_net,
-                        "peakNetPct": peak_pct, "peakDrawdownPct": drawdown, "exitCostsUsd": exit_costs}
-        if full_lock or trailing or reversal:
+                        "peakNetPct": peak_pct, "peakDrawdownPct": drawdown, "exitCostsUsd": exit_costs,
+                        "holdWhileProfit": bool(net > 0 and not trailing and not reversal and not hard_stop)}
+        if hard_stop:
             targets[sym] = 0.0
-            forced_exits[sym] = "target_profit_lock" if full_lock else "peak_profit_trailing_protection" if trailing else "profit_momentum_reversal"
+            forced_exits[sym] = "hard_stop_net_loss"
+        elif trailing or reversal:
+            targets[sym] = 0.0
+            forced_exits[sym] = "peak_profit_trailing_protection" if trailing else "profit_momentum_reversal"
+        elif net > 0:
+            # Explicit: keep target at current value so plan cannot zero-out a winning trade
+            # just because score rotation prefers another asset this tick.
+            targets[sym] = max(float(targets.get(sym) or 0.0), float(value))
     plan["targetsUsd"] = targets; plan["metrics"] = metrics; plan["forcedExits"] = forced_exits
+    # ENGINE-378: min hold before discretionary CLOSE (shadow never flipped in 60s).
+    # Hard max-loss still closes immediately via forced_exits with reason max_loss if present.
+    def _position_held_long_enough(sym_key: str) -> bool:
+        try:
+            pm = previous_meta.get(str(sym_key or "").upper()) or {}
+            opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
+            if opened <= 0:
+                # Unknown open time — allow close only after a short grace so a
+                # brand-new fill is not reversed on the next worker tick.
+                return True  # handled via trade cooldown below
+            return (int(time.time()) - opened) >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+        except Exception:
+            return True
+
     actions = []
     for sym, snap in snapshots.items():
         current = snap["valueUsd"]; target = targets.get(sym, 0.0); delta = target - current
         if current >= _NKR_LIVE_MIN_REBALANCE_USD and target < _NKR_LIVE_MIN_REBALANCE_USD:
-            actions.append((0, abs(delta), "CLOSE", sym, snap["amount"]))
+            reason = str((forced_exits or {}).get(sym) or "")
+            # ENGINE-379: only CLOSE a winning/open position on explicit protection signals,
+            # never because the strategist preferred a different candidate this tick.
+            is_protect = reason in (
+                "peak_profit_trailing_protection", "profit_momentum_reversal",
+                "hard_stop_net_loss", "max_loss", "hard_stop",
+            ) or reason.startswith("max_loss") or reason.startswith("hard_stop")
+            snap_net = float((metrics.get(sym) or {}).get("netUsd") or 0.0)
+            if is_protect and (snap_net <= 0 or _position_held_long_enough(sym) or reason.startswith("hard_stop") or reason.startswith("max_loss")):
+                actions.append((0, abs(delta), "CLOSE", sym, snap["amount"]))
+            else:
+                # Hold while the trade still makes sense — plan rotation must not eject winners.
+                targets[sym] = current
+                forced_exits.pop(sym, None)
         elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
             fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
             actions.append((1, abs(delta), "REDUCE", sym, amount))
@@ -39331,6 +39382,12 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         try:
             if action in {"CLOSE", "REDUCE"}:
                 result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
+                # ENGINE-378: flat after exit → allow re-entry after short cool-down (not 24h).
+                try:
+                    if result and (result.get("ok") or result.get("txHash") or result.get("tx_hash") or result.get("executed")):
+                        _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_REENTRY_COOLDOWN_SEC, state="EXIT_CONFIRMED")
+                except Exception:
+                    pass
             else:
                 # Authoritative duplicate-entry barrier shared by every backend process.
                 # Re-read openAssetCount after the mutex is acquired so a stale portfolio
@@ -39346,36 +39403,38 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 # A lower settlementCash is authoritative proof that this session already
                 # spent capital. Block another automatic entry even if positionOf/openAssetCount
                 # is temporarily lagging or the route registry has not resolved the token yet.
-                if int(settlement_cash) < int(_bu) and action in {"OPEN", "ADD"}:
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="SESSION_CAPITAL_ALREADY_SPENT")
+                # ENGINE-378: only block OPEN when a real open position still exists.
+                # Flat session with slightly lower settlementCash (fees after a round-trip)
+                # must be allowed to re-enter — the old 24h SESSION_CAPITAL_ALREADY_SPENT
+                # lock was not part of the shadow logic and killed all further buys.
+                if open_assets_now > 0 and int(settlement_cash) < int(_bu) and action in {"OPEN", "ADD"}:
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="SESSION_CAPITAL_ALREADY_SPENT")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "POSITION_SYNC_PENDING",
-                        "asset": sym, "detail": f"{chain_key} session #{sid} already spent settlement capital; duplicate {action} blocked while the position is synchronized.",
+                        "asset": sym, "detail": f"{chain_key} session #{sid} still has open assets; duplicate {action} blocked until position sync.",
                     }
                 max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
-                # A confirmed position must never be filled again on every worker tick.
-                # OPEN is only valid for a genuinely new slot; ADD is reserved for an
-                # explicit future top-up/rebalance command and is not an automatic tick action.
                 if same_asset_amount > 0 and action in {"OPEN", "ADD"}:
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="SAME_ASSET_ALREADY_FUNDED")
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="SAME_ASSET_ALREADY_FUNDED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
                         "asset": sym, "detail": f"{chain_key} session #{sid} already holds {sym}; repeated {action} blocked.",
                     }
                 if action == "OPEN" and open_assets_now >= max_assets_now:
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="MAX_ASSETS_REACHED")
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="MAX_ASSETS_REACHED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "MAX_ASSETS_REACHED",
                         "asset": sym, "detail": f"{chain_key} session #{sid} already has {open_assets_now}/{max_assets_now} open asset(s); duplicate OPEN blocked.",
                     }
                 if action == "ADD":
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="AUTOMATIC_ADD_BLOCKED")
+                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="AUTOMATIC_ADD_BLOCKED")
                     return {
                         "executed": False, "decision": "HOLD", "gate": "AUTOMATIC_ADD_BLOCKED",
                         "asset": sym, "detail": f"Automatic repeated ADD for {sym} is disabled; only an explicit capital top-up may increase an existing position.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
-                _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_CONFIRMED")
+                # Short duplicate-entry hold only (not 24h). Re-entry after a later exit is free.
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_CONFIRMED")
         except Exception as trade_exc:
             err = str(trade_exc)[:240]
             # Quote/config/preflight errors happen before transaction submission and
@@ -39393,7 +39452,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     if any(marker in err.lower() for marker in pre_submit_markers):
                         _nkr_entry_guard_release(wallet, live_row)
                     else:
-                        _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_RESULT_UNCERTAIN")
+                        _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_RESULT_UNCERTAIN")
                 except Exception:
                     pass
             # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
@@ -39458,7 +39517,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         "asset": nsym, "detail": f"{chain_key} session #{sid} already has a funded position ({open_assets_now}/{max_assets_now}); forced duplicate OPEN blocked.",
                     }
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
-                _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_CONFIRMED")
+                _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_CONFIRMED")
                 # Forced-native entries previously returned before rebuilding the wallet-bound
                 # session cards. The UI therefore showed no position and the next tick bought again.
                 forced_snapshots = {s: _nkr_position_snapshot(vault, sid, r, cfg) for s, r in routes.items()}
@@ -39483,7 +39542,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         if any(marker in native_err.lower() for marker in pre_submit_markers):
                             _nkr_entry_guard_release(wallet, live_row)
                         else:
-                            _nkr_entry_guard_hold(wallet, live_row, hold_sec=86400, state="ENTRY_RESULT_UNCERTAIN")
+                            _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_RESULT_UNCERTAIN")
                     except Exception:
                         pass
                 last_skip = f"native {nsym} on {chain_key}: {native_err[:160]}"
