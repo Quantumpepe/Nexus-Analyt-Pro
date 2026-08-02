@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-359-POSITION-TRUTH-SESSION-PROJECTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-360-IMMUTABLE-SESSION-MODE-CAPTURE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2289,13 +2289,27 @@ def api_core_vault_create_system_session_auto():
     if not authenticated_wallet:
         return err("unauthorized", 401)
     body = request.get_json(silent=True) or {}
+    # ENGINE-360: capture the exact mode/settings from the create request itself.
+    # Accept both the production top-level fields and a nested sessionConfig payload.
+    # Never reconstruct a running session from the mutable UI draft afterwards.
+    nested_cfg = body.get("sessionConfig") if isinstance(body.get("sessionConfig"), dict) else {}
+    def _start_cfg_value(camel, snake=None, default=None):
+        snake = snake or camel
+        value = body.get(camel)
+        if value is None or str(value).strip() == "":
+            value = body.get(snake)
+        if value is None or str(value).strip() == "":
+            value = nested_cfg.get(camel)
+        if value is None or str(value).strip() == "":
+            value = nested_cfg.get(snake)
+        return default if value is None or str(value).strip() == "" else value
     nkr_start_config = {
-        "nkrCapitalMode": body.get("nkrCapitalMode") or body.get("nkr_capital_mode"),
-        "nkrObservationWindow": body.get("nkrObservationWindow") or body.get("nkr_observation_window"),
-        "nkrProfitMode": body.get("nkrProfitMode") or body.get("nkr_profit_mode"),
-        "nkrPeriodDays": body.get("nkrPeriodDays") or body.get("nkr_period_days"),
-        "maxActiveAssets": body.get("maxActiveAssets") if body.get("maxActiveAssets") is not None else body.get("max_active_assets"),
-        "maxCapitalPerAssetPct": body.get("maxCapitalPerAssetPct") or body.get("max_capital_per_asset_pct"),
+        "nkrCapitalMode": _start_cfg_value("nkrCapitalMode", "nkr_capital_mode", "DYNAMIC"),
+        "nkrObservationWindow": _start_cfg_value("nkrObservationWindow", "nkr_observation_window", "1h"),
+        "nkrProfitMode": _start_cfg_value("nkrProfitMode", "nkr_profit_mode", "REINVEST"),
+        "nkrPeriodDays": _start_cfg_value("nkrPeriodDays", "nkr_period_days", 1),
+        "maxActiveAssets": _start_cfg_value("maxActiveAssets", "max_active_assets", 0),
+        "maxCapitalPerAssetPct": _start_cfg_value("maxCapitalPerAssetPct", "max_capital_per_asset_pct", 80),
         "budgetUsd": body.get("amountUsd") or body.get("budgetAmount") or body.get("budgetUsd"),
         "payoutAsset": body.get("settlementAsset") or body.get("payoutAsset"),
         "maxSlippageBps": body.get("maxSlippageBps"),
