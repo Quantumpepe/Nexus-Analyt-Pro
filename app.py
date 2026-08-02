@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-355-ENTRY-SINGLE-FILL-TARGETED-PAUSE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-356-ONCHAIN-SESSION-STATE-AUTHORITY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -401,7 +401,7 @@ def _live_engine_mark(engine: str, **patch):
     except Exception:
         pass
 
-def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1):
+def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1, status="ACTIVE"):
     """Upsert live CoreVault session into local registry.
 
     ENGINE-281: do NOT mark runtime health STARTED on every reconcile upsert.
@@ -412,6 +412,9 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
     _live_engine_tables_init()
     conn = _db()
     nowi = int(time.time())
+    status_u = str(status or "ACTIVE").upper()
+    if status_u not in {"ACTIVE", "PAUSED", "CLOSING", "STOPPING", "ERROR"}:
+        status_u = "ACTIVE"
     is_new = False
     try:
         with DB_WRITE_LOCK:
@@ -431,9 +434,9 @@ def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash
                     privy_wallet_id=excluded.privy_wallet_id,
                     tx_hash=CASE WHEN excluded.tx_hash IS NOT NULL AND trim(excluded.tx_hash)<>''
                                  THEN excluded.tx_hash ELSE nexus_live_core_vault_sessions.tx_hash END,
-                    budget_units=excluded.budget_units, status='ACTIVE', updated_ts=excluded.updated_ts,
+                    budget_units=excluded.budget_units, status=excluded.status, updated_ts=excluded.updated_ts,
                     finalized_tx_hash=NULL, last_error=NULL
-            """, (_norm_addr(wallet), str(engine).upper(), int(chain_id), _norm_addr(vault), str(wallet_id), str(session_id), str(tx_hash or ""), str(int(budget_units or 0)), "ACTIVE", nowi, nowi))
+            """, (_norm_addr(wallet), str(engine).upper(), int(chain_id), _norm_addr(vault), str(wallet_id), str(session_id), str(tx_hash or ""), str(int(budget_units or 0)), status_u, nowi, nowi))
             conn.commit()
     finally:
         conn.close()
@@ -478,22 +481,13 @@ def _reconcile_live_registry_from_corevault(wallet, engine):
             if sid <= 0:
                 continue
             budget_units = int(str(sess.get("budgetUnits") or "0"))
-            _live_session_register(
-                wa, eng, wallet_id, vault, sid, "", budget_units, chain_id
-            )
-            # Preserve the actual on-chain lifecycle instead of forcing ACTIVE.
+            # The CoreVault status is authoritative. Write it atomically during the
+            # upsert so no concurrent /rotation-sessions request can observe a brief
+            # false ACTIVE state between register() and a second UPDATE.
             db_status = {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING"}.get(status_id, "ACTIVE")
-            conn = _db()
-            try:
-                with DB_WRITE_LOCK:
-                    conn.execute(
-                        "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL "
-                        "WHERE wallet_address=? AND engine=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
-                        (db_status, int(time.time()), wa, eng, int(chain_id), vault.lower(), str(sid)),
-                    )
-                    conn.commit()
-            finally:
-                conn.close()
+            _live_session_register(
+                wa, eng, wallet_id, vault, sid, "", budget_units, chain_id, db_status
+            )
             found_count += 1
     return found_count
 
@@ -34892,9 +34886,34 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
         x_chain = int(x.get("chainId") or x.get("chain_id") or meta.get("chain_id") or 0)
         return x_sid == sid and x_chain == chain_id
     existing = next((x for x in sessions if _same_live_session(x)), None)
+    live_status = str(live_row.get("status") or "ACTIVE").upper()
+    if live_status not in {"ACTIVE", "PAUSED", "CLOSING", "STOPPING", "ERROR"}:
+        live_status = "ACTIVE"
+    live_status_id = {"ACTIVE": 1, "PAUSED": 2, "CLOSING": 3}.get(live_status, 0)
     if existing:
-        # Do not let an old terminal/local row suppress a confirmed active session.
+        # Do not let an old terminal/local row suppress a confirmed live session.
         st = str(existing.get("status") or existing.get("lifecycleState") or "").upper()
+        # CoreVault sessionOf() is the lifecycle authority. Mirror its exact state
+        # into the wallet-bound UI projection on every reconciliation.
+        if st not in {"STOPPING", "FINALIZING", "CLOSING", "EXITING", "EXIT_PENDING", "EXIT_REQUESTED", "STOPPED", "FINALIZED"} and st != live_status:
+            patched_state = dict(existing)
+            meta_state = dict(existing.get("meta") if isinstance(existing.get("meta"), dict) else {})
+            meta_state.update({
+                "lifecycle_state": live_status, "session_status": live_status,
+                "raw_status_id": live_status_id, "status_id": live_status_id,
+                "nkr_user_control": "PAUSED_BY_USER" if live_status == "PAUSED" else ("RESUMED_BY_USER" if live_status == "ACTIVE" else meta_state.get("nkr_user_control", "")),
+            })
+            patched_state.update({
+                "status": live_status, "statusLabel": live_status,
+                "onchainStatus": live_status, "lifecycleState": live_status,
+                "rawStatusId": live_status_id, "statusId": live_status_id,
+                "onchainStatusId": live_status_id, "active": live_status in {"ACTIVE", "PAUSED", "CLOSING"},
+                "meta": meta_state, "updatedAt": _nkr_now_ms(),
+            })
+            rest_state = [x for x in sessions if not _same_live_session(x)]
+            _db_set_rotation_sessions(wallet, rest_state + [patched_state], active_session_id=local_id, replace_missing=False)
+            existing = patched_state
+            st = live_status
         meta_ex = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
         user_ctrl = str(meta_ex.get("nkr_user_control") or existing.get("nkr_user_control") or "").upper()
         # User pause must stick until explicit RESUME — never force ACTIVE from registry/on-chain.
@@ -34965,7 +34984,9 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     max_pct = _safe_float(locked_cfg.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
     row = {
         "id": local_id, "session_id": local_id, "type": "NKR", "engineType": "NKR",
-        "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "WAITING",
+        "status": live_status, "statusLabel": live_status, "onchainStatus": live_status,
+        "lifecycleState": live_status, "rawStatusId": live_status_id, "statusId": live_status_id,
+        "onchainStatusId": live_status_id, "positionState": "WAITING",
         "active": True, "executionMode": "live", "liveVaultReady": True,
         "budgetUsd": budget, "budgetAmount": budget, "workingCapitalUsd": budget, "reservedUsd": budget,
         "nkrTotalBudgetUsd": budget, "sessionBudgetUsd": budget,
@@ -34984,7 +35005,10 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
             "chain": chain_key, "chain_id": chain_id, "vault": vault_addr,
             "settlement_asset": asset_symbol, "settlement_token": settlement_token, "decimals": decimals,
             "reserved_usd": budget, "nkr_total_budget_usd": budget,
-            "lifecycle_state": "ACTIVE", "position_state": "WAITING",
+            "lifecycle_state": live_status, "session_status": live_status,
+            "raw_status_id": live_status_id, "status_id": live_status_id,
+            "nkr_user_control": "PAUSED_BY_USER" if live_status == "PAUSED" else "",
+            "position_state": "WAITING",
             "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
             "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
             "nkr_period_days": days, "max_active_assets": max_active,
