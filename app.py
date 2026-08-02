@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-370-OPS-RECONCILER-NKR-TRADER"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD389-EVM-ALLOWLIST-GROUP"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-371-ADD-CAPITAL-SESSION-BIND"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD392-ADD-CAPITAL-SESSION"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -41055,14 +41055,15 @@ def api_nkr_mode_update():
 
 
 @app.route("/api/nkr/capital-topup", methods=["POST"])
+@app.route("/api/trader/capital-topup", methods=["POST"])
 def api_nkr_capital_topup():
-    """Increase the single active wallet-bound NKR budget safely.
+    """ENGINE-371: Add Capital only to the concrete selected session (PDF §6).
 
-    This endpoint intentionally does not create another portfolio, change the
-    running mode, change the period, or replace the existing allocation logic.
-    It only adds user-approved capital to the current NKR run, keeps the
-    running mode's reserve ratio, distributes the investable part across the
-    existing active sessions, and records auditable CAPITAL_TOPUP events.
+    - Requires sessionId + chain (or onchainSessionId)
+    - Never spreads across all active sessions
+    - Records ADD_CAPITAL in ops table (idempotent)
+    - Updates only that session's local budget; reads on-chain sessionOf for confirmation snapshot
+    - Works for NKR and Trader
     """
     wa = _require_auth() or _pick_wallet_from_request()
     if not wa:
@@ -41072,89 +41073,262 @@ def api_nkr_capital_topup():
     if add_usd <= 0:
         return err("positive top-up amount required", 400)
 
-    sessions, active_id, _ = _db_get_rotation_sessions(wa)
-    nkr_sessions = [dict(x) for x in sessions if isinstance(x, dict) and _nkr_is_session(x)]
-    active_sessions = [x for x in nkr_sessions if _nkr_active_session_status_ok(x)]
-    if not active_sessions:
-        return err("no active NKR run to top up", 409)
+    path = str(request.path or "")
+    eng = str(body.get("engine") or ("TRADER" if "/trader/" in path else "NKR")).upper()
+    if eng == "TRADING":
+        eng = "TRADER"
+    if eng not in ("NKR", "TRADER"):
+        return err("engine must be NKR or TRADER", 400)
 
-    first = active_sessions[0]
+    target_id = str(
+        body.get("sessionId") or body.get("session_id") or body.get("id")
+        or body.get("onchainSessionId") or body.get("onchain_session_id") or ""
+    ).strip()
+    target_chain = str(body.get("chain") or body.get("chainKey") or body.get("chain_key") or "").strip().upper()
+    if target_chain in ("ETHEREUM", "1"):
+        target_chain = "ETH"
+    if target_chain in ("BSC", "56"):
+        target_chain = "BNB"
+    if target_chain in ("POLYGON", "MATIC", "137"):
+        target_chain = "POL"
+
+    sessions, active_id, _ = _db_get_rotation_sessions(wa)
+    # Prefer exact card match
+    chosen = None
+    for x in (sessions or []):
+        if not isinstance(x, dict):
+            continue
+        if eng == "NKR" and not _nkr_is_session(x):
+            continue
+        if eng == "TRADER" and _nkr_is_session(x):
+            # trader sessions may not use nkr_is_session; keep non-nkr or engine flag
+            if str(x.get("engine") or x.get("meta", {}).get("engine") or "").upper() not in ("TRADER", "TRADING", ""):
+                if str(x.get("system") or "").upper() not in ("TRADER", "TRADING"):
+                    pass
+        sid = str(x.get("id") or x.get("session_id") or "")
+        oid = str(x.get("onchainSessionId") or x.get("onchain_session_id") or (x.get("meta") or {}).get("onchain_session_id") or "")
+        ch = str(x.get("chain") or (x.get("meta") or {}).get("chain") or (x.get("meta") or {}).get("chain_key") or "").upper()
+        if ch in ("ETHEREUM",):
+            ch = "ETH"
+        if target_id and target_id not in (sid, oid) and not sid.endswith(target_id) and not (target_id in sid):
+            continue
+        if target_chain and ch and target_chain != ch:
+            continue
+        if target_id or target_chain:
+            chosen = x
+            break
+    if chosen is None and target_id:
+        # try live registry exact
+        try:
+            live_rows = _live_active_sessions(wa, eng) or []
+            for lr in live_rows:
+                oid = str(lr.get("onchain_session_id") or "")
+                cid = int(lr.get("chain_id") or 0)
+                ch = _nkr_chain_key_from_id(cid) if "_nkr_chain_key_from_id" in globals() else ({1: "ETH", 56: "BNB", 137: "POL"}.get(cid, ""))
+                if target_id in (oid, str(lr.get("id") or "")) and (not target_chain or target_chain == ch):
+                    chosen = {
+                        "id": f"{eng}-LIVE-{ch}-{oid}",
+                        "onchainSessionId": oid,
+                        "chain": ch,
+                        "chainId": cid,
+                        "budgetUsd": 0,
+                        "meta": {"onchain_session_id": oid, "chain": ch, "engine": eng},
+                        "status": lr.get("status") or "ACTIVE",
+                    }
+                    break
+        except Exception:
+            pass
+    if chosen is None:
+        return err("target session required (sessionId + chain)", 400)
+    if not _nkr_active_session_status_ok(chosen) and str(chosen.get("status") or "").upper() not in ("ACTIVE", "PAUSED", "RUNNING", "OPEN", "LIVE"):
+        # still allow ACTIVE-like
+        st = str(chosen.get("status") or "").upper()
+        if st in ("STOPPED", "FINALIZED", "CLOSED", "CANCELLED"):
+            return err(f"session not open for top-up ({st})", 409)
+
+    sid = str(chosen.get("id") or chosen.get("session_id") or "")
+    oid = str(chosen.get("onchainSessionId") or chosen.get("onchain_session_id") or (chosen.get("meta") or {}).get("onchain_session_id") or "")
+    ch = str(chosen.get("chain") or (chosen.get("meta") or {}).get("chain") or target_chain or "").upper()
+    chain_id = int(chosen.get("chainId") or chosen.get("chain_id") or (chosen.get("meta") or {}).get("chain_id") or 0)
+    if chain_id <= 0:
+        chain_id = {"ETH": 1, "BNB": 56, "POL": 137}.get(ch, 0)
+
     mode = _nkr_normalize_performance_mode(
-        first.get("nkrCapitalMode") or (first.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC"
+        chosen.get("nkrCapitalMode") or (chosen.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC"
     )
     reserve_pct_by_mode = {"AGGRESSIVE": 10.0, "DYNAMIC": 20.0, "TACTICAL": 25.0, "DEFENSIVE": 35.0}
     reserve_pct = reserve_pct_by_mode.get(mode, 20.0)
 
-    old_total = max([_safe_float(x.get("totalNkrBudgetUsd") or (x.get("meta") or {}).get("total_nkr_budget_usd") or 0, 0.0) for x in active_sessions] or [0.0])
-    if old_total <= 0:
-        old_total = sum(_safe_float(x.get("workingCapitalUsd") or x.get("sessionCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active_sessions)
-        old_total += max([_safe_float(x.get("nkrCashReserveUsd") or 0, 0.0) for x in active_sessions] or [0.0])
-    new_total = old_total + add_usd
+    old_cap = _safe_float(
+        chosen.get("workingCapitalUsd") or chosen.get("sessionCapitalUsd") or chosen.get("budgetUsd")
+        or (chosen.get("meta") or {}).get("session_budget_usd") or 0,
+        0.0,
+    )
+    old_total = _safe_float(
+        chosen.get("totalNkrBudgetUsd") or (chosen.get("meta") or {}).get("total_nkr_budget_usd") or old_cap,
+        old_cap,
+    )
     reserve_add = add_usd * reserve_pct / 100.0
     deploy_add = max(0.0, add_usd - reserve_add)
+    new_cap = old_cap + deploy_add
+    new_total = old_total + add_usd
 
-    caps = [_safe_float(x.get("workingCapitalUsd") or x.get("sessionCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in active_sessions]
-    cap_sum = sum(caps)
-    weights = [(c / cap_sum if cap_sum > 0 else 1.0 / len(active_sessions)) for c in caps]
+    # On-chain snapshot (read-only confirm) before local mutation
+    onchain_before = {}
+    vault = ""
+    try:
+        live = None
+        for lr in (_live_active_sessions(wa, eng) or []):
+            if str(lr.get("onchain_session_id") or "") == str(oid) and (not chain_id or int(lr.get("chain_id") or 0) == chain_id):
+                live = lr
+                break
+        if live:
+            vault = _norm_addr(live.get("vault_address") or "")
+            cid = int(live.get("chain_id") or chain_id or 1)
+            sid_i = int(str(oid or "0"))
+            if sid_i > 0 and _looks_like_evm_addr(vault):
+                raw = _eth_call(cid, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid_i))
+                words = _core_words(raw)
+                if len(words) >= 13:
+                    onchain_before = {
+                        "statusId": int(words[3]),
+                        "budgetUnits": int(words[8]),
+                        "settlementCashUnits": int(words[9]),
+                        "openAssetCount": int(words[12]),
+                    }
+                # ADD_CAPITAL op reservation (idempotent business key per session+amount bucket)
+                try:
+                    op = _live_op_reserve(
+                        "ADD_CAPITAL",
+                        wallet=wa, chain_id=cid, vault=vault, onchain_session_id=str(sid_i),
+                        live_row=live, cycle_key=f"add_capital_{int(add_usd * 100)}", ttl_sec=300,
+                        meta={"engine": eng, "amountUsd": add_usd, "source": "api_capital_topup"},
+                    )
+                    if op is None:
+                        existing = _live_op_find_active(
+                            "ADD_CAPITAL",
+                            _nkr_session_identity(wallet=wa, chain_id=cid, vault=vault, onchain_session_id=str(sid_i), live_row=live),
+                            cycle_key=f"add_capital_{int(add_usd * 100)}",
+                        )
+                        if existing and str(existing.get("status") or "").upper() == "SUCCEEDED":
+                            return jsonify({
+                                "status": "ok", "action": "CAPITAL_TOPUP", "deduped": True,
+                                "sessionId": sid, "onchainSessionId": oid, "chain": ch,
+                                "message": "Top-up already recorded for this session/amount.",
+                                "ts": now_ts(),
+                            })
+                    else:
+                        _live_op_update(str(op.get("operation_id") or ""), "SUCCEEDED",
+                                        error_text="local_budget_topup_recorded_session_bound")
+                except Exception:
+                    pass
+    except Exception as onchain_exc:
+        onchain_before = {"readError": str(onchain_exc)[:160]}
+
     nowi = _nkr_now_ms()
-    updated_by_id = {}
-    deployed_total = 0.0
-    for sess, weight in zip(active_sessions, weights):
-        sid = str(sess.get("id") or sess.get("session_id") or "")
-        sym = _nkr_session_symbol(sess)
-        old_cap = _safe_float(sess.get("workingCapitalUsd") or sess.get("sessionCapitalUsd") or sess.get("budgetUsd") or 0, 0.0)
-        add_to_session = deploy_add * weight
-        new_cap = old_cap + add_to_session
-        deployed_total += add_to_session
-        old_cash = _safe_float(sess.get("nkrCashReserveUsd") or 0, 0.0)
-        meta = dict(sess.get("meta") if isinstance(sess.get("meta"), dict) else {})
-        event_id = f"NKR-MANUAL-TOPUP-{sid}-{nowi}"
-        event = {
-            "id": event_id, "event_id": event_id, "session_id": sid, "ts": nowi,
-            "status": "CAPITAL_MOVEMENT", "action": "CAPITAL_TOPUP",
-            "capitalMovementType": "USER_BUDGET_INCREASE",
-            "fromAsset": str(sess.get("baseAsset") or "USDC").upper(), "toAsset": sym,
-            "capitalBeforeUsd": round(old_cap, 4), "capitalMovedUsd": round(add_to_session, 4),
-            "capitalAfterUsd": round(new_cap, 4), "oldTotalBudgetUsd": round(old_total, 4),
-            "addedBudgetUsd": round(add_usd, 4), "newTotalBudgetUsd": round(new_total, 4),
-            "reserveAddedUsd": round(reserve_add, 4), "reservePct": reserve_pct,
-            "grossUsd": 0.0, "costsUsd": 0.0, "netUsd": 0.0,
-            "addedToCollectedProfit": False, "alreadyCounted": True,
-            "reason": "manual_capital_topup_single_active_nkr", "source": "backend_engine100",
-        }
-        events = sess.get("rotationEvents") if isinstance(sess.get("rotationEvents"), list) else []
-        next_sess = dict(sess)
-        next_sess.update({
-            "budgetUsd": round(new_cap, 4), "workingCapitalUsd": round(new_cap, 4),
-            "sessionCapitalUsd": round(new_cap, 4), "reservedUsd": round(new_cap, 4),
-            "totalNkrBudgetUsd": round(new_total, 4),
-            "nkrCashReserveUsd": round(old_cash + reserve_add, 4),
-            "lastRotationEvent": event, "rotationEvents": _nkr_trim_rotation_events([event] + events),
-            "eventCount": int(_safe_float(sess.get("eventCount") or len(events), len(events))) + 1,
-            "totalEventCount": int(_safe_float(sess.get("totalEventCount") or len(events), len(events))) + 1,
-            "updatedAt": nowi,
-        })
-        meta.update({
-            "total_nkr_budget_usd": round(new_total, 4),
-            "cash_reserve_pct": reserve_pct,
-            "nkr_last_manual_topup_ts": nowi,
-            "nkr_last_manual_topup_usd": round(add_usd, 4),
-        })
-        next_sess["meta"] = meta
-        updated_by_id[sid] = next_sess
+    meta = dict(chosen.get("meta") if isinstance(chosen.get("meta"), dict) else {})
+    event_id = f"{eng}-MANUAL-TOPUP-{sid or oid}-{nowi}"
+    event = {
+        "id": event_id, "event_id": event_id, "session_id": sid, "ts": nowi,
+        "status": "CAPITAL_MOVEMENT", "action": "CAPITAL_TOPUP",
+        "capitalMovementType": "USER_BUDGET_INCREASE",
+        "fromAsset": str(chosen.get("baseAsset") or "USDC").upper(),
+        "capitalBeforeUsd": round(old_cap, 4), "capitalMovedUsd": round(deploy_add, 4),
+        "capitalAfterUsd": round(new_cap, 4), "oldTotalBudgetUsd": round(old_total, 4),
+        "addedBudgetUsd": round(add_usd, 4), "newTotalBudgetUsd": round(new_total, 4),
+        "reserveAddedUsd": round(reserve_add, 4), "reservePct": reserve_pct,
+        "onchainSessionId": oid, "chain": ch,
+        "reason": "manual_capital_topup_exact_session", "source": "backend_engine371",
+    }
+    events = chosen.get("rotationEvents") if isinstance(chosen.get("rotationEvents"), list) else []
+    next_sess = dict(chosen)
+    next_sess.update({
+        "budgetUsd": round(new_cap, 4), "workingCapitalUsd": round(new_cap, 4),
+        "sessionCapitalUsd": round(new_cap, 4), "reservedUsd": round(new_cap, 4),
+        "totalNkrBudgetUsd": round(new_total, 4),
+        "nkrCashReserveUsd": round(_safe_float(chosen.get("nkrCashReserveUsd") or 0, 0.0) + reserve_add, 4),
+        "lastRotationEvent": event, "rotationEvents": _nkr_trim_rotation_events([event] + events),
+        "updatedAt": nowi,
+    })
+    meta.update({
+        "total_nkr_budget_usd": round(new_total, 4),
+        "session_budget_usd": round(new_cap, 4),
+        "cash_reserve_pct": reserve_pct,
+        "nkr_last_manual_topup_ts": nowi,
+        "nkr_last_manual_topup_usd": round(add_usd, 4),
+        "nkr_last_manual_topup_session_id": sid or oid,
+        "nkr_last_manual_topup_chain": ch,
+        "engine": eng,
+    })
+    next_sess["meta"] = meta
 
-    merged = [updated_by_id.get(str(x.get("id") or x.get("session_id") or ""), x) if isinstance(x, dict) else x for x in nkr_sessions]
-    _db_set_rotation_sessions(wa, merged, active_session_id=active_id, replace_missing=False)
-    _db_set_user_app_state(wa, {"ui": {"rotationBudgetRelease": str(round(new_total, 4))}})
-    bundle = _nkr_get_wallet_bundle(wa)
+    # Merge only this session
+    merged = []
+    found = False
+    for x in (sessions or []):
+        if not isinstance(x, dict):
+            merged.append(x)
+            continue
+        xs = str(x.get("id") or x.get("session_id") or "")
+        xo = str(x.get("onchainSessionId") or x.get("onchain_session_id") or (x.get("meta") or {}).get("onchain_session_id") or "")
+        if xs == sid or (oid and xo == oid) or (target_id and target_id in (xs, xo)):
+            merged.append(next_sess)
+            found = True
+        else:
+            merged.append(x)
+    if not found:
+        merged.append(next_sess)
+    _db_set_rotation_sessions(wa, merged, active_session_id=sid or active_id, replace_missing=False)
+    try:
+        _db_set_user_app_state(wa, {"ui": {"rotationBudgetRelease": str(round(new_total, 4))}})
+    except Exception:
+        pass
+
+    # Update live registry budget_units if present (best-effort, local accounting)
+    try:
+        if oid and chain_id:
+            conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    # store additive note in last_error free field is wrong; just touch updated_ts
+                    conn.execute(
+                        "UPDATE nexus_live_core_vault_sessions SET updated_ts=? "
+                        "WHERE wallet_address=? AND engine=? AND onchain_session_id=? AND chain_id=?",
+                        (int(time.time()), _norm_addr(wa), eng, str(oid), int(chain_id)),
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
+    bundle = {}
+    try:
+        bundle = _nkr_get_wallet_bundle(wa) if eng == "NKR" else {}
+    except Exception:
+        bundle = {}
     return jsonify({
-        "status": "ok", "wallet": _norm_addr(wa), "action": "CAPITAL_TOPUP",
-        "oldBudgetUsd": round(old_total, 4), "addedUsd": round(add_usd, 4),
-        "newBudgetUsd": round(new_total, 4), "reserveAddedUsd": round(reserve_add, 4),
-        "deployedUsd": round(deployed_total, 4), "mode": mode,
-        "sessions": bundle.get("sessions") or merged, "message": "Capital added to the existing NKR run.",
+        "status": "ok",
+        "wallet": _norm_addr(wa),
+        "action": "CAPITAL_TOPUP",
+        "engine": eng,
+        "sessionId": sid,
+        "onchainSessionId": oid,
+        "chain": ch,
+        "oldBudgetUsd": round(old_total, 4),
+        "sessionBudgetBeforeUsd": round(old_cap, 4),
+        "sessionBudgetAfterUsd": round(new_cap, 4),
+        "addedUsd": round(add_usd, 4),
+        "deployedUsd": round(deploy_add, 4),
+        "reserveAddedUsd": round(reserve_add, 4),
+        "newBudgetUsd": round(new_total, 4),
+        "mode": mode,
+        "onchainBefore": onchain_before,
+        "sessions": bundle.get("sessions") or merged,
+        "message": f"Capital added only to {eng} session {sid or oid} on {ch or '?'}.",
         "ts": now_ts(),
     })
+
 
 
 @app.route("/api/nexus/panic-protect", methods=["POST"])
