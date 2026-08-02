@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-362-POL-EXIT-BROADCAST-AND-RECOVERY-FIX"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-363-PRIVY-EXIT-IDEMPOTENCY-PAYLOAD-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.07.29-BUILD284-V5-POL-MULTICHAIN"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37051,11 +37051,18 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     # must use a separate command-specific key and must not pass through this path.
     target_for_key = token_in if is_exit else token_out
     op_for_key = "exit" if is_exit else "entry"
+    # ENGINE-363: Privy binds an idempotency key to the exact request body.
+    # EXIT route probing can legitimately change fee tier, minOut, deadline and
+    # therefore calldata. Reusing the old session-only key for a new calldata
+    # body makes Privy reject the request with invalid_data before broadcast.
+    # Bind the key to the exact executeTrade calldata. Identical retries keep the
+    # same key; a genuinely different route body gets a different key.
+    call_fingerprint = hashlib.sha256(str(call).encode("utf-8")).hexdigest()[:24]
     ref = (
         f"nkr-{op_for_key}-c{chain_id}-s{sid}-"
-        f"{_norm_addr(target_for_key).lower()}"
+        f"{_norm_addr(target_for_key).lower()}-{call_fingerprint}"
     )
-    # ENGINE-362: expose the real EXIT broadcast immediately and never leave the
+    # ENGINE-363: expose the real EXIT broadcast immediately and never leave the
     # runtime showing an old createSession hash.  For EXIT we split submission
     # from receipt waiting so a missing Privy broadcast is reported as EXIT_FAILED
     # instead of looking like a pending on-chain trade. ENTRY keeps the established
