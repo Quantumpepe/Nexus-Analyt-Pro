@@ -185,9 +185,9 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-386-LIVE-PNL-DISPLAY"
+BACKEND_BUILD_ID = "B-2026.08.03-ENGINE-388-NKR-SINGLE-POSITION-ROTATOR"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
-STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
+STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
@@ -232,7 +232,7 @@ NEXUS_WRAPPED_ASSET_POLICY = "INTERNAL_ONLY_VERIFIED_ALLOWLIST"
 NEXUS_DEFAULT_WITHDRAW_POLICY = "USDC_USDT_DEFAULT_ORIGINAL_ASSET_ONLY_ON_USER_REQUEST"
 NEXUS_NKR_WATCHLIST_MODE = "NKR_WATCHLIST_ROTATION_V1"
 NEXUS_NKR_WATCHLIST_POLICY = "ALLOCATE_ONLY_ALLOWED_WATCHLIST_ASSETS_WITH_STABLECOIN_CAPITAL"
-NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 0  # 0 = unlimited (soft allocator only)
+NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT = 1  # current live NKR: one position per chain/session
 NEXUS_NKR_MAX_ACTIVE_SESSIONS_LIMIT = 0  # 0 = user-defined, no enforced hard cap
 
 # ENGINE-097: Central backend price-cache tiers.
@@ -248,7 +248,7 @@ NEXUS_PRICE_ACTIVE_POLICY = "ACTIVE_TRADER_AND_NKR_SYMBOLS_REFRESH_10_TO_15_SECO
 NEXUS_PRICE_HOT_POLICY = "ENTRY_EXIT_REBALANCE_AND_STRONG_MOMENTUM_SYMBOLS_REFRESH_5_SECONDS_TEMPORARILY"
 NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
 NEXUS_NKR_CAPITAL_MANAGER_MODE = "NKR_CAPITAL_MANAGER_V1"
-NEXUS_NKR_CAPITAL_MANAGER_POLICY = "ALLOCATE_STABLE_CAPITAL_BY_STRATEGIST_SCORE_WITH_CASH_RESERVE"
+NEXUS_NKR_CAPITAL_MANAGER_POLICY = "SINGLE_POSITION_ROTATION_BY_STRATEGIST_SCORE_WITH_SETTLEMENT_RESERVE"
 NEXUS_NKR_CASH_RESERVE_GREEN_PCT = 15
 NEXUS_NKR_CASH_RESERVE_NEUTRAL_PCT = 25
 NEXUS_NKR_CASH_RESERVE_RED_PCT = 45
@@ -37045,6 +37045,8 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
         if home and home not in live_chains:
             continue
         internal = str(row.get("internalSymbol") or resolved.get("internalSymbol") or sym).upper()
+        full_gate = _nkr_live_entry_gate(row, dispatch_min, mode)
+        full_quality = full_gate.get("quality") or {}
         entry = {
             "symbol": sym,
             "score": score,
@@ -37053,6 +37055,11 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
             "chain": home or session_chain,
             "internalSymbol": internal,
             "wrapConfigured": bool(resolved.get("configured") or row.get("wrapConfigured")),
+            "fullSignalAllowed": bool(full_gate.get("allowed")),
+            "fullSignalReason": str(full_gate.get("reason") or ""),
+            "momentumScore": full_quality.get("momentum_score"),
+            "recoveryScore": full_quality.get("recovery_momentum_score"),
+            "shadowQuality": full_quality.get("quality"),
         }
         ranked_all.append(entry)
         # Session-tradable:
@@ -37115,9 +37122,14 @@ def _nkr_runtime_decision_diagnostics(processed, market_rows, settings, summary=
         detail = f"{best_sym} ({session_chain}) score {best['score']:.1f} is below {mode} entry gate {dispatch_min:.1f}."
         if recommendation:
             detail = f"{detail} {recommendation}"
-    elif best["change"] <= -0.25:
-        decision, gate = "WAIT", "MOMENTUM_BLOCKED"
-        detail = f"{best_sym} cleared score but 24h momentum is {best['change']:+.2f}%."
+    elif not bool(best.get("fullSignalAllowed", True)):
+        decision, gate = "WAIT", str(best.get("fullSignalReason") or "FULL_SIGNAL_BLOCKED")
+        detail = (
+            f"{best_sym} full Strategist signal gate blocked entry: {gate}; "
+            f"momentum={_safe_float(best.get('momentumScore'), 0.0):+.2f}, "
+            f"recovery={_safe_float(best.get('recoveryScore'), 0.0):.1f}, "
+            f"24h={best['change']:+.2f}%."
+        )
     elif open_trade or position_state == "OPEN":
         decision, gate = "HOLD", "POSITION_ACTIVE"
         detail = f"{best_sym} has an active NKR position and is being tracked."
@@ -37207,6 +37219,9 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
                 },
             })
             meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
+            if not int(meta.get("nkr_position_opened_ts") or meta.get("position_opened_ts") or 0):
+                meta["nkr_position_opened_ts"] = int(time.time())
+                meta["position_opened_ts"] = int(time.time())
             meta.update({
                 "position_state": "OPEN", "nkr_active_asset": symbol,
                 "nkr_entry_price_usd": round(float(price_usd), 10),
@@ -37379,7 +37394,7 @@ _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_A
 # ENGINE-378: shadow-like behaviour — never lock re-entry for a whole day.
 # After a flat exit the next OPEN may happen after a short cool-down only.
 _NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "45")))
-_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(60, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "180")))  # ENGINE-380: 3 min min hold then harvest allowed
+_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(180, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "180")))  # ENGINE-387: never close a new live position after only one minute
 _NKR_LIVE_REENTRY_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "45")))  # ENGINE-380: fast re-entry after harvest
 
 # Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
@@ -38100,89 +38115,90 @@ def _nkr_session_observation_gate(live_row: dict, settings: dict, starts_at: int
 
 
 def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: float, settings: dict) -> dict:
-    row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
-    # Route keys are often wraps (WBTC/WETH/WBNB). Market rows use display symbols (BTC/ETH/BNB).
-    _alias_to_display = {
+    """Build the live NKR plan as a single-position rotator.
+
+    NKR does not distribute capital across assets yet.  It ranks only routes that
+    are genuinely live on the current chain, keeps a deterministic fallback list,
+    and assigns the complete released amount to exactly one candidate at a time.
+    The executor may try the next ranked candidate in the same tick when quote or
+    preflight fails, but it stops after the first confirmed OPEN.
+    """
+    prepared_rows = _nkr_prepare_strategist_signals(list(market_rows or []))
+    row_by_symbol = {str(r.get("symbol") or r.get("sym") or "").upper(): r for r in prepared_rows if isinstance(r, dict)}
+    alias_to_display = {
         "WBTC": "BTC", "CBBTC": "BTC", "BTCB": "BTC",
         "WETH": "ETH", "WBNB": "BNB", "WMATIC": "POL", "MATIC": "POL",
     }
     mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC")
-    max_active = max(1, min(50, int(_safe_float(settings.get("maxActiveAssets"), NEXUS_NKR_MAX_ACTIVE_ASSETS_DEFAULT))))
-    # ENGINE-283: Aggressive must feel aggressive — lower gate, stronger softener.
+    # Current NKR architecture: one open position per chain/session.  The value from
+    # old capital-allocation settings must not silently create multiple live slots.
+    max_active = 1
     threshold = {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
-    regime, avg_change = _nkr_live_market_regime(market_rows)
+    regime, avg_change = _nkr_live_market_regime(prepared_rows)
     soft = 0.0
     if str(regime or "").upper() in {"GREEN", "RISK_ON", "BULL", "RISKON"} or avg_change >= 0.20:
         soft = {"AGGRESSIVE": 8.0, "DYNAMIC": 3.0, "TACTICAL": 2.0, "DEFENSIVE": 0.0}.get(mode, 2.0)
     elif avg_change >= 0.0:
         soft = {"AGGRESSIVE": 4.0, "DYNAMIC": 1.0, "TACTICAL": 0.0, "DEFENSIVE": 0.0}.get(mode, 0.0)
     effective_threshold = max(42.0 if mode == "AGGRESSIVE" else 48.0, threshold - soft)
+
     ranked = []
-    for sym, route in routes.items():
-        display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
+    for sym, route in (routes or {}).items():
+        if not isinstance(route, dict) or not route.get("live"):
+            continue
+        token = _norm_addr(route.get("token") or "")
+        router = _norm_addr(route.get("router") or "")
+        if not (_looks_like_evm_addr(token) and _looks_like_evm_addr(router)):
+            continue
+        display = alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
         row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
         if not isinstance(row, dict):
             continue
-        price = _nkr_row_price_usd(row); change = _nkr_row_change_pct(row)
+        price = _nkr_row_price_usd(row)
+        change = _nkr_row_change_pct(row)
+        if price <= 0:
+            continue
         score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
-        mom_floor = -1.0 if mode == "AGGRESSIVE" else -4.0
-        if change >= 0.5:
-            score = max(score, 58.0 if mode == "AGGRESSIVE" else score)
-        if change >= 2.0:
-            score = max(score, 70.0)
-        if price > 0 and score >= effective_threshold and change > mom_floor:
-            ranked.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
-    def _rank_key(x):
-        sym_u = str(x.get("symbol") or "").upper()
-        is_native = sym_u in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC"}
-        return (x["score"] + (6.0 if is_native else 0.0), x["change"], 1 if is_native else 0)
-    ranked.sort(key=_rank_key, reverse=True)
-    if ranked:
-        cut = max(effective_threshold, ranked[0]["score"] - 14.0)
-        selected = [x for x in ranked if x["score"] >= cut][:max_active]
-        selected.sort(key=lambda x: (0 if str(x.get("symbol") or "").upper() in {"ETH","WETH","BNB","WBNB","POL","MATIC","WMATIC"} else 1, -float(x.get("score") or 0)))
-    else:
-        selected = []
-    # ENGINE-280: never stay blank when a native route has a live price + green momentum.
-    # Score-only ratings may be missing from backend market rows; momentum fills the gap.
-    if not selected:
-        native_fallback = []
-        for sym, route in routes.items():
-            display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
-            row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
-            if not isinstance(row, dict):
-                continue
-            price = _nkr_row_price_usd(row)
-            change = _nkr_row_change_pct(row)
-            if price <= 0:
-                continue
-            score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or 0}, row)
-            if change >= 2.0:
-                score = max(score, 70.0)
-            elif change >= 0.5:
-                score = max(score, 58.0)
-            elif change >= 0.0:
-                score = max(score, 55.0 if mode == "AGGRESSIVE" else 52.0)
-            # Aggressive: accept flat-to-green natives; other modes keep mild floor.
-            mom_ok = change > (-0.50 if mode == "AGGRESSIVE" else -0.25)
-            if score >= effective_threshold and mom_ok:
-                native_fallback.append({"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route})
-        native_fallback.sort(key=lambda x: (x["score"], x["change"]), reverse=True)
-        selected = native_fallback[:max_active]
-        # Aggressive last resort: any priced native with non-crash momentum
-        if not selected and mode == "AGGRESSIVE":
-            for sym, route in routes.items():
-                display = _alias_to_display.get(str(sym or "").upper(), str(sym or "").upper())
-                row = row_by_symbol.get(str(sym or "").upper()) or row_by_symbol.get(display)
-                if not isinstance(row, dict):
-                    continue
-                price = _nkr_row_price_usd(row)
-                change = _nkr_row_change_pct(row)
-                if price > 0 and change > -1.0:
-                    score = max(55.0, _nkr_session_score({"score": row.get("score") or 0}, row))
-                    selected = [{"symbol": sym, "display": display, "score": score, "change": change, "price": price, "route": route}]
-                    break
-    best_score = selected[0]["score"] if selected else 0.0
+        # Shadow-style confirmations: quality signals improve ordering but never
+        # manufacture an entry when the base gate is not met.
+        short_momentum = _safe_float(
+            row.get("momentum1m") or row.get("momentum_1m") or row.get("change1m")
+            or row.get("change_1m") or row.get("momentum5m") or row.get("change5m") or 0.0,
+            0.0,
+        )
+        rvol = _safe_float(row.get("strategist_rvol") or row.get("rvol") or 1.0, 1.0)
+        rel = _safe_float(row.get("strategist_relative_strength_pct") or 0.0, 0.0)
+        liquidity = _safe_float(row.get("liquidityUsd") or row.get("liquidity_usd") or row.get("liquidity") or 0.0, 0.0)
+        # Small deterministic tie-breaker, capped so 24h score remains primary.
+        rank_bonus = max(-4.0, min(4.0, short_momentum * 0.8 + rel * 0.25 + (1.0 if rvol >= 1.5 else 0.0)))
+        ranked_score = max(0.0, min(100.0, score + rank_bonus))
+        gate = _nkr_live_entry_gate(row, effective_threshold, mode)
+        if not gate.get("allowed"):
+            continue
+        shadow_q = gate.get("quality") or {}
+        ranked.append({
+            "symbol": str(sym).upper(), "display": display, "score": score,
+            "rankScore": ranked_score, "change": change, "shortMomentum": short_momentum,
+            "rvol": rvol, "relativeStrength": rel, "liquidityUsd": liquidity,
+            "momentumScore": shadow_q.get("momentum_score"),
+            "recoveryScore": shadow_q.get("recovery_momentum_score"),
+            "shadowQuality": shadow_q.get("quality"),
+            "signalVector": shadow_q.get("signal_vector"),
+            "price": price, "route": route, "executable": True,
+        })
+
+    # No native-asset preference.  The best strategist candidate wins regardless
+    # of whether it is native or wrapped, provided the live route is executable.
+    ranked.sort(
+        key=lambda x: (
+            float(x.get("rankScore") or 0.0), float(x.get("score") or 0.0),
+            float(x.get("shortMomentum") or 0.0), float(x.get("change") or 0.0),
+            float(x.get("rvol") or 0.0), float(x.get("liquidityUsd") or 0.0),
+        ),
+        reverse=True,
+    )
+    selected = ranked[:]  # ordered fallback candidates; executor tries them one by one
+    best_score = float(selected[0].get("score") or 0.0) if selected else 0.0
     release = _nkr_capital_release_decision(
         market_regime=regime, performance=mode,
         observation_minutes=_nkr_observation_minutes(settings.get("nkrObservationWindow")),
@@ -38196,41 +38212,21 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
             invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.92))
         elif invest_usd < max(_NKR_LIVE_MIN_REBALANCE_USD, budget_usd * 0.35):
             invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.85))
-        # Tiny sessions: if almost all capital is "invest" already, keep it
-        if budget_usd > 0 and budget_usd < 5.0 and invest_usd < budget_usd * 0.85:
+        if 0 < budget_usd < 5.0 and invest_usd < budget_usd * 0.85:
             invest_usd = min(budget_usd, max(invest_usd, budget_usd * 0.90))
-    targets = {}
-    min_for_targets = min(_NKR_LIVE_MIN_REBALANCE_USD, max(0.20, budget_usd * 0.40)) if budget_usd > 0 else _NKR_LIVE_MIN_REBALANCE_USD
-    if selected and invest_usd >= min_for_targets:
-        powers = [max(1.0, (x["score"] - threshold + 8.0) ** 2) for x in selected]
-        total_power = sum(powers)
-        max_weight = max(35.0, min(90.0, _safe_float(settings.get("maxCapitalPerAssetPct"), 80.0))) / 100.0
-        remaining = invest_usd
-        pending = list(zip(selected, powers))
-        # Capped weighted water-fill; permits concentration such as 70/30 while
-        # preventing one weakly differentiated candidate from consuming everything.
-        while pending and remaining > 0.005:
-            power_sum = sum(p for _, p in pending)
-            next_pending = []
-            spent = 0.0
-            for item, power in pending:
-                proposed = remaining * power / power_sum if power_sum > 0 else remaining / len(pending)
-                cap = invest_usd * max_weight
-                already = targets.get(item["symbol"], 0.0)
-                add = min(proposed, max(0.0, cap - already))
-                targets[item["symbol"]] = already + add; spent += add
-                if targets[item["symbol"]] + 0.005 < cap:
-                    next_pending.append((item, power))
-            if spent <= 0.005:
-                break
-            remaining -= spent
-            pending = next_pending
-        if remaining > 0.005:
-            targets[selected[0]["symbol"]] = targets.get(selected[0]["symbol"], 0.0) + remaining
-    return {"mode": mode, "regime": regime, "avgChange": avg_change, "maxActiveAssets": max_active,
-            "selected": selected, "targetsUsd": targets, "investUsd": invest_usd,
-            "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release}
 
+    targets = {}
+    if selected and invest_usd >= min(_NKR_LIVE_MIN_REBALANCE_USD, max(0.20, budget_usd * 0.40)):
+        # Only the top candidate is the current target.  rankedCandidates remains
+        # available so the executor can try #2/#3 in the same cycle on preflight fail.
+        targets[selected[0]["symbol"]] = invest_usd
+    return {
+        "mode": mode, "regime": regime, "avgChange": avg_change,
+        "maxActiveAssets": 1, "singlePosition": True,
+        "selected": selected, "rankedCandidates": selected,
+        "targetsUsd": targets, "investUsd": invest_usd,
+        "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release,
+    }
 
 def _live_session_settlement_token(vault: str, sid: int, fallback: str, chain_id: int = 1) -> str:
     """Read the settlement-token address from the live on-chain session.
@@ -38453,6 +38449,10 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     live_op_row = None
     live_op_id = str((live_row or {}).get("_live_operation_id") or "") if isinstance(live_row, dict) else ""
     if is_exit:
+        # One EXIT for each confirmed ENTRY round. A prior successful exit must not
+        # block later cycles in the same long-running session.
+        exit_cycle_no = _nkr_live_cycle_number(wallet, live_row, "ENTRY")
+        exit_cycle_key = f"exit-{max(1, exit_cycle_no)}"
         live_op_row = _live_op_reserve(
             "EXIT",
             wallet=wallet,
@@ -38461,7 +38461,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
             onchain_session_id=str(sid),
             live_row=live_row if isinstance(live_row, dict) else None,
             token=str(target_for_key or ""),
-            cycle_key="exit",
+            cycle_key=exit_cycle_key,
             ttl_sec=300,
             meta={"source": "nkr_live_trade_route", "symbol": str((route or {}).get("symbol") or "")},
         )
@@ -38470,7 +38470,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
                 "EXIT",
                 _nkr_session_identity(wallet=wallet, chain_id=int(chain_id), vault=vault, onchain_session_id=str(sid)),
                 token=str(target_for_key or ""),
-                cycle_key="exit",
+                cycle_key=exit_cycle_key,
             )
             if existing and str(existing.get("status") or "").upper() == "SUCCEEDED":
                 raise RuntimeError(
@@ -38667,10 +38667,13 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
             continue
         route = routes[sym]; mrow = row_by_symbol.get(sym) or {}; price = _nkr_row_price_usd(mrow)
         cost = _safe_float(snap.get("costBasisUsd"), 0.0); value = _safe_float(snap.get("valueUsd"), 0.0)
-        gross = value - cost; costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, 1).get("totalCostUsd"), 0.0); net = gross - costs
+        gross = value - cost; costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0); net = gross - costs
         cid = f"{master_id}-{sym}"
         previous = previous_children.get(sym) or {}
         prior_meta = dict(previous.get("meta") if isinstance(previous.get("meta"), dict) else {})
+        if not int(prior_meta.get("nkr_position_opened_ts") or prior_meta.get("position_opened_ts") or 0):
+            prior_meta["nkr_position_opened_ts"] = int(time.time())
+            prior_meta["position_opened_ts"] = int(time.time())
         metric = (plan.get("metrics") or {}).get(sym) or {}
         prior_meta.update({"nkr_session": True, "nkr_asset_session": True, "parent_nkr_session_id": master_id,
                      "onchain_session_id": sid, "chain": chain_key, "chain_id": chain_id,
@@ -39157,6 +39160,27 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
 
 
 
+# ENGINE-387: A session may perform unlimited sequential Shadow-like cycles.
+# The business operation key must deduplicate one cycle, not the whole session lifetime.
+def _nkr_live_cycle_number(wallet: str, live_row: dict, op_type: str) -> int:
+    ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
+    if not ident.get("controllable"):
+        return 0
+    _live_ops_init()
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM nexus_live_operations "
+            "WHERE op_type=? AND wallet_address=? AND chain_id=? AND vault_address=? "
+            "AND onchain_session_id=? AND status='SUCCEEDED'",
+            (str(op_type or "").upper(), ident["walletAddress"], int(ident["chainId"]),
+             ident["vaultAddress"], str(ident["onchainSessionId"])),
+        ).fetchone()
+        return int((row["n"] if row else 0) or 0)
+    finally:
+        conn.close()
+
+
 # ENGINE-352: cross-worker entry mutex. Gunicorn workers are separate processes, so
 # an in-memory cooldown cannot prevent two workers from submitting the same OPEN
 # before the first receipt/position read is visible. SQLite is the shared authority.
@@ -39173,13 +39197,14 @@ def _nkr_entry_guard_acquire(wallet: str, live_row: dict, ttl_sec: int = 180) ->
     key = _nkr_entry_guard_key(wallet, live_row)
     if not key:
         return False
-    # Persistent business op (survives restarts). cycle_key=entry keeps one ENTRY per session
-    # until SUCCEEDED/FAILED — prevents multi-worker double executeTrade.
+    # One ENTRY per completed round. After a confirmed EXIT, the next cycle gets a
+    # new business key and may re-enter; concurrent workers still share one key.
+    cycle_no = _nkr_live_cycle_number(wallet, live_row, "EXIT")
     live_op = _live_op_reserve(
         "ENTRY",
         wallet=wallet,
         live_row=live_row,
-        cycle_key="entry",
+        cycle_key=f"entry-{cycle_no}",
         ttl_sec=max(180, int(ttl_sec or 180)),
         meta={"source": "nkr_entry_guard_acquire", "schema": NEXUS_LIVE_OPS_SCHEMA_VERSION},
     )
@@ -39240,6 +39265,9 @@ def _nkr_entry_guard_hold(wallet: str, live_row: dict, hold_sec: int = 90, state
             try:
                 _live_op_update(op_id, terminal, error_text=("" if terminal == "SUCCEEDED" else st),
                                 expires_ts=int(time.time()) + max(5, int(hold_sec)))
+                if isinstance(live_row, dict):
+                    live_row.pop("_live_operation_id", None)
+                    live_row.pop("_live_operation_type", None)
             except Exception:
                 pass
         elif st in ("ENTRY_RESULT_UNCERTAIN",):
@@ -39525,11 +39553,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 held_sec = int(time.time()) - opened
                 held_ok = held_sec >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
             else:
-                held_ok = True  # unknown open time: allow harvest (CLOSE still has trade cooldown)
-                held_sec = int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+                # Missing projection timestamp is not permission to sell immediately.
+                # Keep the position open until reconciliation records a trustworthy open time.
+                held_ok = False
+                held_sec = 0
         except Exception:
-            held_ok = True
-            held_sec = int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+            held_ok = False
+            held_sec = 0
         # Harvest: gross OR net edge after min-hold (cost model must not freeze exits for 8h)
         harvest = held_ok and (
             (net > 0 and net_pct >= profit_lock)
@@ -39568,9 +39598,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             pm = previous_meta.get(str(sym_key or "").upper()) or {}
             opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
             if opened <= 0:
-                # Unknown open time — allow close only after a short grace so a
-                # brand-new fill is not reversed on the next worker tick.
-                return True  # handled via trade cooldown below
+                return False
             return (int(time.time()) - opened) >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
         except Exception:
             return True
@@ -39589,8 +39617,12 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 "peak_profit_trailing_protection", "profit_momentum_reversal",
                 "hard_stop_net_loss", "max_loss", "hard_stop",
             ) or reason.startswith("max_loss") or reason.startswith("hard_stop") or reason.startswith("net_profit") or reason.startswith("stale_")
-            if is_protect:
+            immediate_risk = reason in ("hard_stop_net_loss", "max_loss", "hard_stop") or reason.startswith("max_loss") or reason.startswith("hard_stop")
+            if is_protect and (immediate_risk or _position_held_long_enough(sym)):
                 actions.append((0, abs(delta) if delta else current, "CLOSE", sym, snap["amount"]))
+            elif is_protect:
+                targets[sym] = current
+                forced_exits.pop(sym, None)
             else:
                 targets[sym] = current
                 forced_exits.pop(sym, None)
@@ -39610,6 +39642,22 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     _scale = 1_000_000
                 _amt_units = max(1, int(round(float(delta) * _scale)))
                 actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(int(settlement_cash), _amt_units)))
+    # ENGINE-388: flat session = try every ranked executable candidate in the same
+    # decision cycle.  Only one can be submitted because the loop breaks after the
+    # first confirmed OPEN and the cross-worker entry guard is authoritative.
+    if not any(int((snap or {}).get("amount") or 0) > 0 for snap in snapshots.values()):
+        candidate_actions = []
+        scale = 10 ** max(0, min(18, int(_dec)))
+        open_usd = min(float(plan.get("investUsd") or 0.0), float(spendable_usd or budget_usd or 0.0))
+        open_units = min(int(settlement_cash), max(0, int(round(open_usd * scale))))
+        if open_units >= max(1, int(round(0.20 * scale))):
+            for idx, cand in enumerate(plan.get("rankedCandidates") or plan.get("selected") or []):
+                csym = str((cand or {}).get("symbol") or "").upper()
+                if csym in routes:
+                    candidate_actions.append((3, open_usd - idx * 1e-9, "OPEN", csym, open_units))
+        # Keep CLOSE/REDUCE actions if any reconciliation created them; replace old
+        # OPEN targets so failed candidate #1 can fall through to #2/#3.
+        actions = [a for a in actions if a[2] in {"CLOSE", "REDUCE"}] + candidate_actions
     actions.sort(key=lambda x: (x[0], -x[1]))
     execution = None
     last_skip = ""
@@ -39667,7 +39715,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 # ENGINE-380: maxActiveAssets = concurrent open positions only.
                 # 0 / soft = 1 concurrent slot, unlimited sequential entries over the session.
                 _cfg_max = int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 0)
-                max_assets_now = max(1, _cfg_max) if _cfg_max > 0 else 1
+                max_assets_now = 1
                 if same_asset_amount > 0 and action in {"OPEN", "ADD"}:
                     _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="SAME_ASSET_ALREADY_FUNDED")
                     return {
@@ -39732,83 +39780,16 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         return execution | {"plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets}}
     active = [sym for sym, snap in snapshots.items() if snap["amount"] > 0]
     sel = plan.get("selected") or []
-    # ENGINE-292: if we selected assets but never fired OPEN, try chain native once.
-    if not active and not execution and sel and settlement_cash > 0 and budget_usd > 0:
-        native_order = []
-        if chain_key == "BNB":
-            native_order = ["BNB", "WBNB"]
-        elif chain_key == "POL":
-            native_order = ["POL", "MATIC", "WMATIC"]
-        else:
-            native_order = ["ETH", "WETH"]
-        for nsym in native_order:
-            route = routes.get(nsym)
-            if not isinstance(route, dict):
-                continue
-            try:
-                _scale = 10 ** max(0, min(18, int(_dec)))
-            except Exception:
-                _scale = 1_000_000
-            _usd = float(min(budget_usd, max(float(plan.get("investUsd") or 0), budget_usd * 0.9)))
-            amt = min(int(settlement_cash), max(0, int(round(_usd * _scale))))
-            if amt < int(round(0.20 * _scale)):
-                continue
-            entry_guard = False
-            try:
-                entry_guard = _nkr_entry_guard_acquire(wallet, live_row)
-                if not entry_guard:
-                    return {
-                        "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
-                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
-                    }
-                open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
-                same_asset_amount = int((_nkr_position_snapshot(vault, sid, route, cfg) or {}).get("amount") or 0)
-                max_assets_now = max(1, int(plan.get("maxActiveAssets") or settings.get("maxActiveAssets") or 1))
-                if same_asset_amount > 0 or open_assets_now >= max_assets_now:
-                    _nkr_entry_guard_hold(wallet, live_row, hold_sec=300, state="POSITION_ALREADY_OPEN")
-                    return {
-                        "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
-                        "asset": nsym, "detail": f"{chain_key} session #{sid} already has a funded position ({open_assets_now}/{max_assets_now}); forced duplicate OPEN blocked.",
-                    }
-                result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amt), action="OPEN")
-                _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_CONFIRMED")
-                # Forced-native entries previously returned before rebuilding the wallet-bound
-                # session cards. The UI therefore showed no position and the next tick bought again.
-                forced_snapshots = {s: _nkr_position_snapshot(vault, sid, r, cfg) for s, r in routes.items()}
-                _nkr_sync_live_asset_cards(wallet, live_row, routes, forced_snapshots, market_rows, plan)
-                return {
-                    "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
-                    "asset": nsym,
-                    "detail": f"OPEN {nsym} forced native entry on {chain_key} for ~${amt/float(10 ** max(0, min(18, int(_dec)))):.2f}.",
-                    **result,
-                    "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets},
-                }
-            except Exception as native_exc:
-                native_err = str(native_exc)[:240]
-                pre_submit_markers = (
-                    "quoter_failed", "quoter_not_configured", "quoter_returned",
-                    "quote_amount", "quote_min_out", "router_config_decode",
-                    "live_trade_preflight_failed", "router_not_enabled",
-                    "selector_not_allowed", "invalid_live_trade_addresses",
-                )
-                if entry_guard:
-                    try:
-                        if any(marker in native_err.lower() for marker in pre_submit_markers):
-                            _nkr_entry_guard_release(wallet, live_row)
-                        else:
-                            _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_RESULT_UNCERTAIN")
-                    except Exception:
-                        pass
-                last_skip = f"native {nsym} on {chain_key}: {native_err[:160]}"
-                continue
+    # ENGINE-388: no forced-native fallback. A failed top route falls through to
+    # the next ranked executable candidate; if none works, NKR waits in settlement.
     if active:
         detail = f"Live target portfolio balanced: {len(active)}/{plan['maxActiveAssets']} active; ${plan['reserveUsd']:.2f} strategist reserve."
         gate = "PORTFOLIO_BALANCED"
         decision = "HOLD"
     elif not sel:
         detail = (
-            f"No entry candidate cleared the {mode} gate on this chain "
-            f"(need score/momentum on a routed asset). Reserve ${plan['reserveUsd']:.2f}."
+            f"No executable candidate cleared the {mode} strategist gate on this chain "
+            f"(score, momentum, route and quote required). Reserve ${plan['reserveUsd']:.2f}."
         )
         gate = "WAITING_ENTRY"
         decision = "WAIT"
@@ -41842,6 +41823,96 @@ def _nkr_session_symbol(sess):
     return str(sess.get("targetAsset") or sess.get("sourceSymbol") or sess.get("symbol") or meta.get("source_symbol") or meta.get("selected_symbol") or "ASSET").strip().upper() or "ASSET"
 
 
+
+def _nkr_live_full_signal_vector(row: dict) -> dict:
+    """Build the canonical Strategist signal vector used by both Shadow and Live.
+
+    No available signal is intentionally dropped. Existing nested ``signals`` values
+    win; aliases from the market row are copied only when the canonical field is
+    absent. The resulting vector is then evaluated by the existing Shadow quality
+    function, making the Shadow Strategist the decision source for live NKR ranking.
+    """
+    row = row if isinstance(row, dict) else {}
+    sig = dict(row.get("signals") if isinstance(row.get("signals"), dict) else {})
+
+    aliases = {
+        "price": ("price", "current_price", "currentPrice", "priceUsd", "price_usd"),
+        "momentum_1m": ("momentum_1m", "momentum1m", "change_1m", "change1m"),
+        "momentum_5m": ("momentum_5m", "momentum5m", "change_5m", "change5m"),
+        "momentum_15m": ("momentum_15m", "momentum15m", "change_15m", "change15m"),
+        "momentum_1h": ("momentum_1h", "momentum1h", "change_1h", "change1h", "price_change_percentage_1h"),
+        "momentum_4h": ("momentum_4h", "momentum4h", "change_4h", "change4h"),
+        "momentum_24h": ("momentum_24h", "momentum24h", "change_24h", "change24h", "price_change_percentage_24h"),
+        "momentum_7d": ("momentum_7d", "momentum7d", "change_7d", "change7d", "price_change_percentage_7d"),
+        "momentum_score": ("momentum_score", "momentumScore"),
+        "recovery_momentum_score": ("recovery_momentum_score", "recoveryMomentumScore", "recovery_score", "recoveryScore"),
+        "volume": ("volume", "volume24h", "volume_24h", "total_volume", "quoteVolume"),
+        "relative_volume": ("relative_volume", "relativeVolume", "rvol", "rVol", "strategist_rvol"),
+        "liquidity_score": ("liquidity_score", "liquidityScore"),
+        "liquidity_usd": ("liquidity_usd", "liquidityUsd", "liquidity"),
+        "volatility": ("volatility", "volatility_score", "volatilityScore"),
+        "trend": ("trend", "trend_state", "trendState"),
+        "market_structure": ("market_structure", "marketStructure", "structure"),
+        "overextension_pct": ("overextension_pct", "overextension", "overextensionPct"),
+        "drawdown_pct": ("drawdown_pct", "drawdownPct"),
+        "risk_score": ("risk_score", "riskScore"),
+        "confidence": ("confidence", "confidence_score", "confidenceScore"),
+        "priority": ("priority",),
+        "security": ("security", "security_status", "securityStatus"),
+        "correlation": ("correlation", "correlation_score", "correlationScore"),
+        "market_regime": ("market_regime", "marketRegime", "regime"),
+        "slippage_pct": ("slippage_pct", "slippagePct"),
+        "whale_sell_pressure": ("whale_sell_pressure", "whaleSellPressure"),
+        "exit_risk": ("exit_risk", "exitRisk", "exit_risk_score"),
+    }
+    for canonical, names in aliases.items():
+        if canonical in sig and sig.get(canonical) is not None:
+            continue
+        for name in names:
+            if row.get(name) is not None:
+                sig[canonical] = row.get(name)
+                break
+
+    # Derived fields are additions, never replacements for supplied data.
+    if sig.get("relative_volume") is None and row.get("strategist_rvol") is not None:
+        sig["relative_volume"] = row.get("strategist_rvol")
+    if sig.get("momentum_24h") is None:
+        sig["momentum_24h"] = _nkr_row_change_pct(row)
+    return sig
+
+
+def _nkr_live_shadow_quality(row: dict, mode: str = "DYNAMIC") -> dict:
+    """Evaluate a live market row with the exact existing Shadow quality function."""
+    item = dict(row or {})
+    item["signals"] = _nkr_live_full_signal_vector(item)
+    item.setdefault("confidence", item["signals"].get("confidence"))
+    item.setdefault("risk_score", item["signals"].get("risk_score"))
+    item.setdefault("priority", item["signals"].get("priority"))
+    risk_mode = "DEFENSIVE" if str(mode).upper() == "DEFENSIVE" else "BALANCED"
+    quality = _nexus_shadow_slot_quality(item, {"risk_mode": risk_mode})
+    quality["signal_vector"] = item["signals"]
+    quality["shadow_score"] = max(0.0, min(100.0, 50.0 + (_safe_float(quality.get("quality"), 0.0) / 2.0)))
+    return quality
+
+
+def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC") -> dict:
+    """Shared full-signal live entry gate; 24h red alone can no longer suppress recovery."""
+    q = _nkr_live_shadow_quality(row, mode)
+    score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
+    momentum = _safe_float(q.get("momentum_score"), 0.0)
+    recovery = _safe_float(q.get("recovery_momentum_score"), 0.0)
+    hard = bool(q.get("hard_block"))
+    allowed = (not hard) and score >= float(threshold) and (momentum >= -6.0 or recovery >= 55.0)
+    reason = "PASSED"
+    if hard:
+        reason = "SHADOW_HARD_BLOCK"
+    elif score < float(threshold):
+        reason = "FULL_SIGNAL_SCORE_BLOCKED"
+    elif momentum < -6.0 and recovery < 55.0:
+        reason = "FULL_SIGNAL_MOMENTUM_BLOCKED"
+    return {"allowed": allowed, "reason": reason, "score": score, "quality": q}
+
+
 def _nkr_prepare_strategist_signals(rows: list) -> list:
     """Attach conservative, optional quality signals to market rows for the Strategist.
 
@@ -41931,62 +42002,52 @@ def _nkr_prepare_strategist_signals(rows: list) -> list:
                 row["systemScore"] = round(_safe_float(row.get(key), 0.0), 4)
                 break
         row.pop("_strategist_vol", None)
+        # ENGINE-389: one canonical signal vector for Shadow and Live.
+        full_signals = _nkr_live_full_signal_vector(row)
+        row["signals"] = full_signals
+        shadow_quality = _nkr_live_shadow_quality(row, row.get("nkrCapitalMode") or row.get("mode") or "DYNAMIC")
+        row["strategist_live_quality"] = shadow_quality.get("quality")
+        row["strategist_live_shadow_score"] = shadow_quality.get("shadow_score")
+        row["strategist_live_hard_block"] = bool(shadow_quality.get("hard_block"))
+        row["strategist_live_momentum_score"] = shadow_quality.get("momentum_score")
+        row["strategist_live_recovery_score"] = shadow_quality.get("recovery_momentum_score")
         out.append(row)
     return out
 
 
 def _nkr_session_score(sess, row=None):
-    """NKR/Strategist decision score.
+    """Canonical NKR Strategist score with Shadow/Live signal parity.
 
-    Baseline behavior is preserved when quality signals are missing.
-    Optional overlays (RVOL, relative strength, on-chain delta) are additive and
-    hard-capped so the Strategist can improve without becoming noisier/worse.
+    The existing Shadow quality engine is authoritative whenever market signals are
+    available. Legacy score remains a fallback only for old rows with no signal data.
     """
     row = row if isinstance(row, dict) else {}
-    score = _safe_float(
-        (sess or {}).get("score") or (sess or {}).get("confidence")
-        or row.get("score") or row.get("systemScore") or row.get("strategistPerformanceScore") or 0,
+    sess = sess if isinstance(sess, dict) else {}
+    legacy = _safe_float(
+        sess.get("score") or sess.get("confidence") or row.get("score")
+        or row.get("systemScore") or row.get("strategistPerformanceScore") or 0,
         0.0,
     )
-    if score <= 0:
-        ch = _nkr_row_change_pct(row)
-        score = max(35.0, min(90.0, 55.0 + ch * 3.0))
-    # Binance futures intelligence is advisory only. Core NKR logic remains the
-    # primary score and this overlay is deliberately capped to avoid overreaction.
-    futures_adj = _safe_float(
-        row.get("futures_score_adjustment")
-        or ((row.get("binanceFutures") or {}).get("futuresScoreAdjustment") if isinstance(row.get("binanceFutures"), dict) else 0),
-        0.0,
-    )
-    score += max(-8.0, min(8.0, futures_adj))
+    if legacy <= 0:
+        legacy = max(35.0, min(90.0, 55.0 + _nkr_row_change_pct(row) * 3.0))
 
-    # --- Conservative quality overlays (0 when signal absent) ---
-    quality_adj = 0.0
-    rs = row.get("strategist_relative_strength_pct")
-    if rs is not None:
-        rs_v = _safe_float(rs, 0.0)
-        # Only reward clear outperformance; only penalize clear underperformance.
-        if rs_v >= 2.0:
-            quality_adj += min(3.0, rs_v * 0.35)
-        elif rs_v <= -3.0:
-            quality_adj -= min(3.0, abs(rs_v) * 0.30)
+    signals = _nkr_live_full_signal_vector(row)
+    has_signal = any(signals.get(k) is not None for k in (
+        "momentum_1m", "momentum_5m", "momentum_15m", "momentum_1h", "momentum_4h",
+        "momentum_24h", "momentum_7d", "relative_volume", "liquidity_score",
+        "market_structure", "risk_score", "confidence", "recovery_momentum_score",
+        "overextension_pct", "security", "volatility", "market_regime",
+    ))
+    if not has_signal:
+        return max(0.0, min(100.0, legacy))
 
-    rvol = row.get("strategist_rvol")
-    if rvol is not None:
-        rvol_v = _safe_float(rvol, 1.0)
-        ch = _nkr_row_change_pct(row)
-        # Volume confirms upside → mild boost. Upside without volume → mild penalty.
-        if rvol_v >= 1.5 and ch > 0.5:
-            quality_adj += min(2.5, (rvol_v - 1.0) * 1.0)
-        elif rvol_v < 0.55 and ch >= 3.0:
-            quality_adj -= min(2.5, 1.8 + (3.0 - ch) * 0.1)
-
-    oc = row.get("strategist_onchain_delta")
-    if oc is not None:
-        quality_adj += max(-3.0, min(3.0, _safe_float(oc, 0.0)))
-
-    quality_adj = max(-6.0, min(6.0, quality_adj))
-    score += quality_adj
+    q = _nkr_live_shadow_quality({**row, "signals": signals}, sess.get("nkrCapitalMode") or sess.get("mode") or "DYNAMIC")
+    if q.get("hard_block"):
+        return 0.0
+    shadow_score = _safe_float(q.get("shadow_score"), legacy)
+    confidence = _safe_float(q.get("confidence"), 0.0)
+    # Shadow quality is primary; existing rating is retained as supporting context.
+    score = (shadow_score * 0.70) + (legacy * 0.20) + (confidence * 0.10)
     return max(0.0, min(100.0, score))
 
 
