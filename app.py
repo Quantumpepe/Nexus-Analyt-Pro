@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-384-BNB-DECIMALS-PNL"
+BACKEND_BUILD_ID = "B-2026.08.02-ENGINE-386-LIVE-PNL-DISPLAY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15523,21 +15523,47 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
             qty = int(ps.get("amount") or 0) / float(10 ** max(0, min(36, token_decimals)))
             value = max(0.0, _safe_float(ps.get("valueUsd"), 0.0))
             cost_basis = max(0.0, _safe_float(ps.get("costBasisUsd"), 0.0))
-            # ENGINE-384: reject absurd BNB decimal blow-ups
+            # ENGINE-384/386: reject absurd BNB decimal blow-ups
             if cost_basis > 1_000_000:
                 cost_basis = 0.0
             if value > 1_000_000:
                 value = 0.0
-            # When the quoter is temporarily unavailable, costBasis still proves
-            # the position. Never show it as zero/open-none in that case.
             if value <= 0 and cost_basis > 0:
                 value = cost_basis
             current_price = (value / qty) if qty > 0 and value > 0 else 0.0
-            gross = value - cost_basis
-            cost_preview = _nkr_live_exit_cost_estimate(value, current_price, chain_id) if value > 0 else {}
-            costs = max(0.0, _safe_float((cost_preview or {}).get("totalCostUsd"), 0.0))
-            net = gross - costs
             entry_price = (cost_basis / qty) if qty > 0 and cost_basis > 0 else current_price
+            # ENGINE-386: mark-to-market like Shadow — Gross/Costs/Net never stuck at $0
+            # while a real position is open. Prefer live market price for the asset.
+            try:
+                mkt = 0.0
+                try:
+                    # pull from in-memory market cache / watchlist rows if available
+                    for _mr in (globals().get("_NKR_LAST_MARKET_ROWS") or []):
+                        if not isinstance(_mr, dict):
+                            continue
+                        rs = str(_mr.get("symbol") or "").upper()
+                        if rs in {str(sym).upper(), str(sym).upper().replace("W", "")}:
+                            mkt = _safe_float(_mr.get("price") or _mr.get("usd") or _mr.get("current_price"), 0.0)
+                            if mkt > 0:
+                                break
+                except Exception:
+                    mkt = 0.0
+                if mkt <= 0:
+                    mkt = _safe_float(ps.get("marketPriceUsd"), 0.0)
+                if mkt > 0 and qty > 0:
+                    current_price = mkt
+                    value = float(qty) * float(mkt)
+            except Exception:
+                pass
+            if cost_basis <= 0 and value > 0:
+                cost_basis = value
+            gross = value - cost_basis
+            cost_preview = _nkr_live_exit_cost_estimate(value if value > 0 else cost_basis, current_price, chain_id) if (value > 0 or cost_basis > 0) else {}
+            costs = max(0.0, _safe_float((cost_preview or {}).get("totalCostUsd"), 0.0))
+            # Always show a non-zero cost estimate for open positions (shadow behaviour)
+            if costs <= 0 and (value > 0 or cost_basis > 0):
+                costs = max(0.02, min(1.50, max(value, cost_basis) * 0.0035))
+            net = gross - costs
             open_rotation = dict(out.get("openRotation") if isinstance(out.get("openRotation"), dict) else {})
             open_rotation.update({
                 "asset": sym, "symbol": sym, "quantity": qty, "positionQty": qty,
@@ -37234,8 +37260,14 @@ def _nkr_live_exit_cost_estimate(position_value_usd: float, current_price_usd: f
     reserve_bps = max(0.0, _safe_float(os.getenv("NEXUS_NKR_EXIT_COST_RESERVE_BPS", "1"), 1.0))
     reserve_usd = value * (reserve_bps / 10000.0)
     total = max(0.0, gas_usd + router_fee_usd + slippage_usd + reserve_usd)
+    # ENGINE-385: never let cost model block small-session harvest.
+    # Cap exit cost at 0.6% of position (min $0.02, max $2.50 for micro sessions).
+    if value > 0:
+        cap = max(0.02, min(2.50, value * 0.006))
+        if total > cap:
+            total = cap
     return {
-        "model": "live_rpc_gas_route_fee_slippage_v1",
+        "model": "live_rpc_gas_route_fee_slippage_v1_capped",
         "gasSponsored": gas_sponsored,
         "gasUnits": gas_units,
         "gasPriceWei": str(gas_price_wei),
@@ -39448,44 +39480,85 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     for sym, snap in snapshots.items():
         if snap["amount"] <= 0:
             continue
-        value = snap["valueUsd"]; cost = snap["costBasisUsd"]; gross = value - cost
+        # ENGINE-385: never treat a live position as $0 — that blocked CLOSE for hours.
+        cost = max(0.0, _safe_float(snap.get("costBasisUsd"), 0.0))
+        value = max(0.0, _safe_float(snap.get("valueUsd"), 0.0))
+        if value <= 0 and cost > 0:
+            value = cost
+        if value <= 0 and cost <= 0:
+            # Unknown mark: assume ~session-sized so CLOSE gate can still fire
+            value = max(0.50, _safe_float(budget_usd, 1.0) * 0.9)
+            cost = value
         price = _nkr_row_price_usd(row_by_symbol.get(sym) or {})
+        # Prefer market mark-to-market for exit decisions when available
+        try:
+            token_dec = int((snap.get("settlementDecimals") or route.get("decimals") if False else 18) or 18)
+        except Exception:
+            token_dec = 18
+        try:
+            qty = float(int(snap.get("amount") or 0)) / float(10 ** max(0, min(18, int((routes.get(sym) or {}).get("decimals") or 18))))
+            if price > 0 and qty > 0:
+                mtm = qty * price
+                if mtm > 0:
+                    value = mtm
+        except Exception:
+            pass
         exit_costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0)
-        net = gross - exit_costs; net_pct = (net / cost * 100.0) if cost > 0 else 0.0
+        gross = value - cost
+        gross_pct = (gross / cost * 100.0) if cost > 0 else 0.0
+        net = gross - exit_costs
+        net_pct = (net / cost * 100.0) if cost > 0 else 0.0
         pm = previous_meta.get(sym) or {}
-        peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net)
-        peak_pct = max(_safe_float(pm.get("nkr_peak_net_profit_pct"), 0.0), net_pct)
-        drawdown = max(0.0, peak_pct - net_pct)
-        min_protected = max(0.03, exit_costs * cost_multiple, cost * activation / 100.0)
+        peak_net = max(_safe_float(pm.get("nkr_peak_net_profit_usd"), 0.0), net, gross)
+        peak_pct = max(_safe_float(pm.get("nkr_peak_net_profit_pct"), 0.0), net_pct, gross_pct)
+        drawdown = max(0.0, peak_pct - max(net_pct, gross_pct))
+        min_protected = max(0.02, min(exit_costs * 0.5, cost * activation / 100.0))
         protected = peak_pct >= activation and peak_net >= min_protected and peak_net > 0
         adaptive_trail = trail_base * (0.80 if peak_pct >= profit_lock * 3 else 1.0)
-        adaptive_trail = max(1.00, adaptive_trail)
+        adaptive_trail = max(0.80, adaptive_trail)
         change = _nkr_row_change_pct(row_by_symbol.get(sym) or {})
+        held_sec = 0
         held_ok = True
         try:
             opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
             if opened > 0:
-                held_ok = (int(time.time()) - opened) >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+                held_sec = int(time.time()) - opened
+                held_ok = held_sec >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+            else:
+                held_ok = True  # unknown open time: allow harvest (CLOSE still has trade cooldown)
+                held_sec = int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
         except Exception:
             held_ok = True
-        # Shadow-like harvest: lock every net win after min-hold (then re-enter).
-        harvest = held_ok and net > 0 and net_pct >= profit_lock and net >= max(0.03, exit_costs * 0.5)
-        trailing = protected and net > 0 and drawdown >= adaptive_trail
-        reversal = protected and net > 0 and change <= reversal_change and drawdown >= max(1.00, adaptive_trail * 0.70)
-        hard_stop = net_pct <= hard_stop_pct and net < -max(0.05, exit_costs)
-        metrics[sym] = {"netUsd": net, "netPct": net_pct, "peakNetUsd": peak_net,
-                        "peakNetPct": peak_pct, "peakDrawdownPct": drawdown, "exitCostsUsd": exit_costs,
-                        "harvestReady": bool(harvest), "holdWhileProfit": bool(net > 0 and not harvest and not trailing and not reversal and not hard_stop)}
+            held_sec = int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+        # Harvest: gross OR net edge after min-hold (cost model must not freeze exits for 8h)
+        harvest = held_ok and (
+            (net > 0 and net_pct >= profit_lock)
+            or (gross > 0 and gross_pct >= profit_lock and net >= -max(0.05, exit_costs * 0.25))
+        )
+        # Stale position: after 45 min any gross plus is banked; after 90 min flat/small loss is closed
+        stale_harvest = held_sec >= 45 * 60 and gross > 0 and gross_pct >= 0.10
+        stale_flat_exit = held_sec >= 90 * 60 and gross_pct >= -0.35
+        trailing = protected and (net > 0 or gross > 0) and drawdown >= adaptive_trail
+        reversal = protected and (net > 0 or gross > 0) and change <= reversal_change and drawdown >= max(0.80, adaptive_trail * 0.70)
+        hard_stop = (net_pct <= hard_stop_pct or gross_pct <= hard_stop_pct) and gross < -max(0.03, exit_costs * 0.25)
+        metrics[sym] = {"netUsd": net, "netPct": net_pct, "grossUsd": gross, "grossPct": gross_pct,
+                        "peakNetUsd": peak_net, "peakNetPct": peak_pct, "peakDrawdownPct": drawdown,
+                        "exitCostsUsd": exit_costs, "heldSec": held_sec,
+                        "harvestReady": bool(harvest or stale_harvest),
+                        "holdWhileProfit": bool((net > 0 or gross > 0) and not (harvest or stale_harvest or trailing or reversal or hard_stop))}
         if hard_stop:
             targets[sym] = 0.0
             forced_exits[sym] = "hard_stop_net_loss"
-        elif harvest:
+        elif harvest or stale_harvest:
             targets[sym] = 0.0
-            forced_exits[sym] = "net_profit_harvest"
+            forced_exits[sym] = "net_profit_harvest" if harvest else "stale_profit_harvest"
         elif trailing or reversal:
             targets[sym] = 0.0
             forced_exits[sym] = "peak_profit_trailing_protection" if trailing else "profit_momentum_reversal"
-        elif net > 0:
+        elif stale_flat_exit:
+            targets[sym] = 0.0
+            forced_exits[sym] = "stale_flat_exit"
+        elif net > 0 or gross > 0:
             targets[sym] = max(float(targets.get(sym) or 0.0), float(value))
     plan["targetsUsd"] = targets; plan["metrics"] = metrics; plan["forcedExits"] = forced_exits
     # ENGINE-378: min hold before discretionary CLOSE (shadow never flipped in 60s).
@@ -39504,26 +39577,21 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
 
     actions = []
     for sym, snap in snapshots.items():
-        current = snap["valueUsd"]; target = targets.get(sym, 0.0); delta = target - current
-        if current >= _NKR_LIVE_MIN_REBALANCE_USD and target < _NKR_LIVE_MIN_REBALANCE_USD:
+        # ENGINE-385: position with amount>0 is always closable; value may be 0 on quote fail.
+        current = max(_safe_float(snap.get("valueUsd"), 0.0), _safe_float(snap.get("costBasisUsd"), 0.0))
+        if current <= 0 and int(snap.get("amount") or 0) > 0:
+            current = max(0.50, _safe_float(budget_usd, 1.0) * 0.9)
+        target = targets.get(sym, 0.0); delta = target - current
+        if int(snap.get("amount") or 0) > 0 and target < max(_NKR_LIVE_MIN_REBALANCE_USD, 0.01):
             reason = str((forced_exits or {}).get(sym) or "")
-            # ENGINE-379: only CLOSE a winning/open position on explicit protection signals,
-            # never because the strategist preferred a different candidate this tick.
             is_protect = reason in (
-                "net_profit_harvest", "peak_profit_trailing_protection", "profit_momentum_reversal",
+                "net_profit_harvest", "stale_profit_harvest", "stale_flat_exit",
+                "peak_profit_trailing_protection", "profit_momentum_reversal",
                 "hard_stop_net_loss", "max_loss", "hard_stop",
-            ) or reason.startswith("max_loss") or reason.startswith("hard_stop") or reason.startswith("net_profit")
-            snap_net = float((metrics.get(sym) or {}).get("netUsd") or 0.0)
-            if is_protect and (
-                reason == "net_profit_harvest"
-                or snap_net <= 0
-                or _position_held_long_enough(sym)
-                or reason.startswith("hard_stop")
-                or reason.startswith("max_loss")
-            ):
-                actions.append((0, abs(delta), "CLOSE", sym, snap["amount"]))
+            ) or reason.startswith("max_loss") or reason.startswith("hard_stop") or reason.startswith("net_profit") or reason.startswith("stale_")
+            if is_protect:
+                actions.append((0, abs(delta) if delta else current, "CLOSE", sym, snap["amount"]))
             else:
-                # Hold while the trade still makes sense — plan rotation must not eject winners.
                 targets[sym] = current
                 forced_exits.pop(sym, None)
         elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
