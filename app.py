@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-392-CONSOLIDATED-LIFECYCLE-REVERT-CONFIG-DIAGNOSTICS-FIX"
+BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-393-PRIVY-SCHEMA-SAFE-GAS-LIMIT-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32074,15 +32074,43 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
 
-    # ENGINE-392: estimate the complete vault call before Privy submission.
-    # Preserve explicit caller gas, otherwise attach a buffered chain-specific estimate.
+    # ENGINE-393: Privy REST RPC uses its documented snake_case transaction schema.
+    # `gas` and `gasLimit` are not valid request keys for this endpoint. Normalize any
+    # legacy aliases and only attach a local estimate as `gas_limit` for executeTrade.
+    # Other calls (createSession, pause, startClosing, finalizeSession) keep Privy's
+    # automatic network-field resolution to avoid changing previously working paths.
     tx = dict(transaction or {})
     cid = int(chain_id or 1)
-    if not tx.get("gas") and not tx.get("gasLimit"):
+
+    legacy_gas = tx.pop("gas", None)
+    legacy_gas_limit = tx.pop("gasLimit", None)
+    if tx.get("gas_limit") is None:
+        explicit_gas_limit = legacy_gas_limit if legacy_gas_limit is not None else legacy_gas
+        if explicit_gas_limit is not None:
+            tx["gas_limit"] = explicit_gas_limit
+
+    alias_map = {
+        "gasPrice": "gas_price",
+        "maxFeePerGas": "max_fee_per_gas",
+        "maxPriorityFeePerGas": "max_priority_fee_per_gas",
+        "chainId": "chain_id",
+    }
+    for legacy_key, official_key in alias_map.items():
+        legacy_value = tx.pop(legacy_key, None)
+        if tx.get(official_key) is None and legacy_value is not None:
+            tx[official_key] = legacy_value
+
+    data_selector = str(tx.get("data") or "0x")[:10].lower()
+    execute_selector = str(_PRIVY_EXECUTE_TRADE_SELECTOR or "").lower()
+    estimated_gas_limit = 0
+    if data_selector == execute_selector and tx.get("gas_limit") is None:
         try:
-            tx["gas"] = hex(_privy_estimate_tx_gas(cid, tx))
+            estimated_gas_limit = int(_privy_estimate_tx_gas(cid, tx))
+            tx["gas_limit"] = hex(estimated_gas_limit)
         except Exception:
-            pass
+            # Privy can resolve missing network fields. Estimation failure must not
+            # block or mutate the transaction into an invalid request.
+            estimated_gas_limit = 0
 
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
@@ -32153,7 +32181,13 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     tx_hash = str(((data or {}).get("data") or {}).get("hash") or (data or {}).get("hash") or "")
     if not tx_hash:
         raise RuntimeError(f"privy_rpc_missing_hash:{data}")
-    return {"hash": tx_hash, "response": data, "idempotencyKey": reference_id}
+    return {
+        "hash": tx_hash,
+        "response": data,
+        "idempotencyKey": reference_id,
+        "estimatedGasLimit": estimated_gas_limit,
+        "submittedGasLimit": tx.get("gas_limit"),
+    }
 
 
 def _privy_revert_diagnostics(chain_id: int, tx_hash: str, receipt: dict) -> str:
