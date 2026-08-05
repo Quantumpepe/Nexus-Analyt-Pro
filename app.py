@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.03-ENGINE-388-NKR-SINGLE-POSITION-ROTATOR"
+BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-392-CONSOLIDATED-LIFECYCLE-REVERT-CONFIG-DIAGNOSTICS-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32074,10 +32074,15 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     if not cfg["appId"] or not cfg["appSecret"]:
         raise RuntimeError("privy_app_credentials_missing")
 
-    # ENGINE-377: exact historical pass-through (as when BNB sessions worked).
-    # Zero mutation of the transaction object — Privy fills gas/nonce/fees.
+    # ENGINE-392: estimate the complete vault call before Privy submission.
+    # Preserve explicit caller gas, otherwise attach a buffered chain-specific estimate.
     tx = dict(transaction or {})
     cid = int(chain_id or 1)
+    if not tx.get("gas") and not tx.get("gasLimit"):
+        try:
+            tx["gas"] = hex(_privy_estimate_tx_gas(cid, tx))
+        except Exception:
+            pass
 
     url = f"{_PRIVY_TRADING_API}/v1/wallets/{privy_wallet_id}/rpc"
     body = {
@@ -32151,8 +32156,46 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     return {"hash": tx_hash, "response": data, "idempotencyKey": reference_id}
 
 
+def _privy_revert_diagnostics(chain_id: int, tx_hash: str, receipt: dict) -> str:
+    """Return evidence-based revert classification for the exact mined transaction."""
+    cid = int(chain_id or 1)
+    txh = str(tx_hash or "")
+    gas_used = int(str((receipt or {}).get("gasUsed") or "0x0"), 16)
+    tx = {}
+    try:
+        tx = _rpc_call(cid, "eth_getTransactionByHash", [txh]) or {}
+    except Exception:
+        tx = {}
+    gas_limit = int(str(tx.get("gas") or "0x0"), 16) if tx else 0
+    classification = "CONTRACT_REVERT"
+    if gas_limit > 0 and gas_used >= max(0, gas_limit - 500):
+        classification = "OUT_OF_GAS"
+    reason = ""
+    if tx:
+        call_tx = {k: tx.get(k) for k in ("from", "to", "gas", "gasPrice", "maxFeePerGas", "maxPriorityFeePerGas", "value", "input") if tx.get(k) is not None}
+        if "input" in call_tx:
+            call_tx["data"] = call_tx.pop("input")
+        block_tag = (receipt or {}).get("blockNumber") or "latest"
+        try:
+            _rpc_call(cid, "eth_call", [call_tx, block_tag])
+        except Exception as exc:
+            reason = str(exc)[:700]
+            low = reason.lower()
+            if "slippage" in low or "too little received" in low or "minimum" in low:
+                classification = "SLIPPAGE_REVERT"
+            elif "allowance" in low or "transfer amount exceeds" in low or "insufficient balance" in low:
+                classification = "TOKEN_OR_ALLOWANCE_REVERT"
+            elif "deadline" in low or "expired" in low:
+                classification = "DEADLINE_REVERT"
+            elif "invalidstate" in low or "invalid state" in low:
+                classification = "COREVAULT_INVALID_STATE"
+            elif "router" in low or "swap" in low:
+                classification = "ROUTER_REVERT"
+    return f"{classification}:gasUsed={gas_used}:gasLimit={gas_limit}:reason={reason or 'unavailable'}"
+
+
 def _privy_wait_receipt(tx_hash, timeout_sec=90, chain_id=1):
-    """Poll receipt on the CORRECT chain. Wrong chain_id (always 1) stalls multi-chain workers."""
+    """Poll the correct chain and preserve the exact revert evidence."""
     cid = int(chain_id or 1)
     end = time.time() + max(5, int(timeout_sec or 90))
     txh = str(tx_hash or "").strip()
@@ -32161,14 +32204,14 @@ def _privy_wait_receipt(tx_hash, timeout_sec=90, chain_id=1):
     while time.time() < end:
         try:
             receipt = _rpc_call(cid, "eth_getTransactionReceipt", [txh])
-        except Exception as rpc_exc:
-            # Transient RPC — keep polling until timeout
+        except Exception:
             time.sleep(2)
             continue
         if receipt:
             status = int(str(receipt.get("status") or "0x0"), 16)
             if status != 1:
-                raise RuntimeError(f"transaction_reverted:{txh}:chain={cid}")
+                diag = _privy_revert_diagnostics(cid, txh, receipt)
+                raise RuntimeError(f"transaction_reverted:{txh}:chain={cid}:{diag}")
             return receipt
         time.sleep(2)
     raise RuntimeError(f"transaction_receipt_timeout:{txh}:chain={cid}")
@@ -36822,6 +36865,30 @@ def _nkr_settings_for_exact_live_session(wallet: str, live_row: dict, fallback: 
     out["maxCapitalPerAssetPct"] = _safe_float(source.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
     out["session_config_locked"] = bool(locked) or bool(source)
     out["session_config_key"] = f"{cid}:{sid}"
+    # ENGINE-392 migration recovery: an already-created on-chain session must never
+    # become un-runnable only because an older deployment missed the immutable row.
+    # Recover once from the exact live/session projection plus the worker fallback,
+    # persist that snapshot, and use it consistently from then on.
+    if not out["session_config_locked"] and cid > 0 and sid and sid not in {"0", "None", "null"}:
+        recovered = {
+            "nkrCapitalMode": out.get("nkrCapitalMode") or "DYNAMIC",
+            "nkrObservationWindow": out.get("nkrObservationWindow") or "1h",
+            "nkrProfitMode": out.get("nkrProfitMode") or "REINVEST",
+            "nkrPeriodDays": out.get("nkrPeriodDays") or 1,
+            "maxActiveAssets": out.get("maxActiveAssets") or 0,
+            "maxCapitalPerAssetPct": out.get("maxCapitalPerAssetPct"),
+            "budgetUsd": out.get("budgetUsd") or (live_row or {}).get("budgetUsd") or 0,
+            "payoutAsset": out.get("payoutAsset") or "USDC",
+            "recoveredFrom": "exact_live_session_migration",
+        }
+        try:
+            _nkr_save_exact_start_config(wallet, cid, int(sid), recovered)
+            locked = recovered
+            out.update(recovered)
+            out["session_config_locked"] = True
+            out["session_config_recovered"] = True
+        except Exception as exc:
+            out["session_config_recovery_error"] = str(exc)[:300]
     return out
 
 
@@ -40133,8 +40200,15 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
         ds_position = str(ds.get("positionState") or "").upper()
         ds_event = ds.get("lastRotationEvent") if isinstance(ds.get("lastRotationEvent"), dict) else {}
         ds_action = str(ds_event.get("action") or ds_event.get("status") or ds.get("lastAction") or "").upper()
+        shadow_exit = _nkr_live_shadow_exit_decision("ETH", eth_row or {}, {
+            "amount": current_weth,
+            "costBasisUsd": live_metrics.get("investedUsd") or live_metrics.get("costBasisUsd") or 0,
+            "valueUsd": live_metrics.get("positionValueUsd") or 0,
+        }, (ds.get("meta") if isinstance(ds.get("meta"), dict) else {}),
+            _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC"), chain_id)
         exit_requested = bool(
-            ds_status == "WAITING_REALLOCATION"
+            str(shadow_exit.get("decision") or "").upper() == "EXIT"
+            or ds_status == "WAITING_REALLOCATION"
             or ds_position in {"CLOSED_PROFIT", "EXIT_PENDING", "EXITING"}
             or ds_action in {"CLOSED_PROFIT", "SELL", "EXIT"}
         )
@@ -40993,7 +41067,8 @@ def _nkr_live_worker_cycle() -> None:
                         # draft and every stale local projection.
                         sess_settings = _nkr_settings_for_exact_live_session(wallet, live_row, sess_settings)
                         if not sess_settings.get("session_config_locked"):
-                            raise RuntimeError(f"missing immutable {_live_row_engine_name(live_row)} session config for {sess_settings.get('session_config_key')}")
+                            return_marker = f"session config unavailable for {sess_settings.get('session_config_key')}"
+                            raise RuntimeError(return_marker)
                         _eng_exec = _live_row_engine_name(live_row)
                         if _eng_exec == "TRADER":
                             sess_settings = dict(sess_settings or {})
@@ -41132,14 +41207,28 @@ def _nkr_live_worker_cycle() -> None:
                 e_asset = str(eng_exec.get("asset") or "") if has_w else ""
                 e_detail = str(eng_exec.get("detail") or "")[:400] if has_w else ""
                 e_err = str(eng_exec.get("error") or "") if has_w else ""
+                # ENGINE-392: candidate identity is atomic. Never combine an asset
+                # from one result with score/momentum/price from another candidate.
+                if has_w and e_asset:
+                    _cand_name = e_asset
+                    _cand_score = _safe_float(eng_exec.get("score"), 0.0)
+                    _cand_change = _safe_float(eng_exec.get("change"), 0.0)
+                    _cand_price = _safe_float(eng_exec.get("price"), 0.0)
+                elif has_w and _eng_name == "NKR":
+                    _cand_name = str(diag.get("best_candidate") or "")
+                    _cand_score = _safe_float(diag.get("candidate_score"), 0.0)
+                    _cand_change = _safe_float(diag.get("candidate_momentum_24h"), 0.0)
+                    _cand_price = _safe_float(diag.get("candidate_price"), 0.0)
+                else:
+                    _cand_name = ""; _cand_score = 0.0; _cand_change = 0.0; _cand_price = 0.0
                 _live_engine_mark(
                     _eng_name, tick=True, status=runtime_status,
                     assets_scanned=len(market_rows) if has_w else 0,
                     tradable_assets=sum(1 for x in market_rows if float(x.get("price") or 0) > 0) if has_w else 0,
-                    best_candidate=(e_asset or (diag.get("best_candidate") or "")) if has_w and _eng_name == "NKR" else (e_asset if has_w else ""),
-                    candidate_score=(eng_exec.get("score", diag.get("candidate_score", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
-                    candidate_momentum_24h=(eng_exec.get("change", diag.get("candidate_momentum_24h", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
-                    candidate_price=(eng_exec.get("price", diag.get("candidate_price", 0.0) if _eng_name == "NKR" else 0.0) if has_w else 0.0),
+                    best_candidate=_cand_name,
+                    candidate_score=_cand_score,
+                    candidate_momentum_24h=_cand_change,
+                    candidate_price=_cand_price,
                     decision=(eng_exec.get("decision") or (diag.get("decision") if _eng_name == "NKR" else "WAIT") or "WAIT") if has_w else ("PAUSED" if has_p else "IDLE"),
                     gate_status=(eng_exec.get("gate") or (diag.get("gate_status") if _eng_name == "NKR" else "") or "") if has_w else ("PAUSED" if has_p else "NO_ACTIVE_SESSION"),
                     decision_detail=e_detail if has_w else "",
