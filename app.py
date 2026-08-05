@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-393-PRIVY-SCHEMA-SAFE-GAS-LIMIT-FIX"
+BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-394-ATOMIC-CANDIDATE-RUNTIME-TRUTH-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1369,8 +1369,19 @@ def _live_engine_health_payload(wallet=""):
                     "tick_count": max(int(row.get("tick_count") or 0), int(current.get("eventCount") or current.get("totalEventCount") or 0), 1),
                     # Preserve worker tick diagnostics (assets_scanned, scores, WAIT/OPEN gates).
                     # Only override decision/gate when there is a real on-chain position or pause.
-                    "best_candidate": "" if paused else (asset or str(row.get("best_candidate") or "")),
-                    "candidate_price": 0.0 if paused else (price or float(row.get("candidate_price") or 0)),
+                    # ENGINE-394: when the on-chain position says the active asset is X,
+                    # all candidate fields must describe X or be empty.  Never keep a stale
+                    # BTC/global-candidate price after replacing the symbol with ETH/POL/BNB.
+                    "best_candidate": "" if paused else (asset if has_position else str(row.get("best_candidate") or "")),
+                    "candidate_price": 0.0 if paused else (price if has_position and price > 0 else (0.0 if has_position else float(row.get("candidate_price") or 0))),
+                    "candidate_score": 0.0 if paused else (
+                        _safe_float(current.get("candidateScore") or current.get("score") or meta.get("nkr_candidate_score"), 0.0)
+                        if has_position else _safe_float(row.get("candidate_score"), 0.0)
+                    ),
+                    "candidate_momentum_24h": 0.0 if paused else (
+                        _safe_float(current.get("candidateMomentum24h") or current.get("change24h") or current.get("change") or meta.get("nkr_candidate_momentum_24h"), 0.0)
+                        if has_position else _safe_float(row.get("candidate_momentum_24h"), 0.0)
+                    ),
                     "decision": (
                         "PAUSED" if paused else
                         ("EXITING" if exit_pending else
@@ -41241,13 +41252,31 @@ def _nkr_live_worker_cycle() -> None:
                 e_asset = str(eng_exec.get("asset") or "") if has_w else ""
                 e_detail = str(eng_exec.get("detail") or "")[:400] if has_w else ""
                 e_err = str(eng_exec.get("error") or "") if has_w else ""
-                # ENGINE-392: candidate identity is atomic. Never combine an asset
-                # from one result with score/momentum/price from another candidate.
+                # ENGINE-394: candidate identity is one atomic tuple.  A session/position
+                # asset may never inherit price, score or momentum from the global best row.
+                # Prefer fields returned by the exact execution result.  If one is missing,
+                # resolve only the market row whose symbol matches that same asset.
                 if has_w and e_asset:
+                    _asset_key = str(e_asset or "").upper().replace("WETH", "ETH").replace("WMATIC", "POL").replace("WBNB", "BNB")
+                    _asset_row = next(
+                        (x for x in (market_rows or [])
+                         if str((x or {}).get("symbol") or (x or {}).get("asset") or "").upper()
+                            .replace("WETH", "ETH").replace("WMATIC", "POL").replace("WBNB", "BNB") == _asset_key),
+                        None,
+                    )
                     _cand_name = e_asset
                     _cand_score = _safe_float(eng_exec.get("score"), 0.0)
+                    if _cand_score == 0.0 and isinstance(_asset_row, dict):
+                        _cand_score = _nkr_session_score({"score": _asset_row.get("score") or _asset_row.get("systemScore") or _asset_row.get("ratingScore") or 0}, _asset_row)
                     _cand_change = _safe_float(eng_exec.get("change"), 0.0)
+                    if _cand_change == 0.0 and isinstance(_asset_row, dict):
+                        _cand_change = _nkr_row_change_pct(_asset_row)
                     _cand_price = _safe_float(eng_exec.get("price"), 0.0)
+                    if _cand_price <= 0.0 and isinstance(_asset_row, dict):
+                        _cand_price = _nkr_row_price_usd(_asset_row)
+                    # Never retain/fill a price from another symbol. Unknown is safer than false.
+                    if _cand_price <= 0.0:
+                        _cand_price = 0.0
                 elif has_w and _eng_name == "NKR":
                     _cand_name = str(diag.get("best_candidate") or "")
                     _cand_score = _safe_float(diag.get("candidate_score"), 0.0)
