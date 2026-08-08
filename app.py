@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-396-LIVE-POSITION-PRICE-PNL-SYNC-FIX"
+BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-397-SESSION-CARD-CANONICAL-POSITION-SYNC-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -38965,6 +38965,88 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
             "currentPriceUsd": price, "score": _nkr_session_score({}, mrow), "updatedAt": nowi,
             "createdAt": previous.get("createdAt") or nowi, "meta": prior_meta})
         kept.append(card)
+
+    # ENGINE-397: the master NKR session card must consume the exact same position
+    # truth that the worker just calculated for the active asset cards.  Previously
+    # the worker correctly knew ETH was OPEN with a live price/value, while the public
+    # /api/rotation-sessions master row could still say "no position yet" because a
+    # second independent projection failed or lagged.  Persist one canonical master
+    # projection here, atomically with the child cards, so every Gunicorn process and
+    # every device receives the same OPEN / Invest / Gross / Costs / Net values.
+    active_cards = []
+    for _card in kept:
+        if not isinstance(_card, dict):
+            continue
+        _cm = _card.get("meta") if isinstance(_card.get("meta"), dict) else {}
+        if str(_cm.get("parent_nkr_session_id") or "") != master_id:
+            continue
+        if str(_card.get("positionState") or _cm.get("position_state") or "").upper() != "OPEN":
+            continue
+        active_cards.append(_card)
+
+    if active_cards:
+        total_value = sum(max(0.0, _safe_float(x.get("positionValueUsd"), 0.0)) for x in active_cards)
+        total_cost = sum(max(0.0, _safe_float(x.get("investedUsd") or x.get("workingCapitalUsd") or x.get("budgetUsd"), 0.0)) for x in active_cards)
+        total_gross = sum(_safe_float(x.get("grossProfitUsd"), 0.0) for x in active_cards)
+        total_costs = sum(max(0.0, _safe_float(x.get("costsUsd"), 0.0)) for x in active_cards)
+        total_net = sum(_safe_float(x.get("netProfitUsd"), 0.0) for x in active_cards)
+        primary = active_cards[0]
+        primary_meta = primary.get("meta") if isinstance(primary.get("meta"), dict) else {}
+        primary_sym = str(primary.get("positionAsset") or primary.get("targetAsset") or primary.get("symbol") or primary_meta.get("nkr_active_asset") or "ASSET").upper()
+        primary_qty = max(0.0, _safe_float(primary.get("positionQty") or primary_meta.get("nkr_position_qty"), 0.0))
+        primary_price = max(0.0, _safe_float(primary.get("currentPriceUsd") or primary_meta.get("nkr_current_price_usd"), 0.0))
+        primary_cost = max(0.0, _safe_float(primary.get("investedUsd") or primary.get("workingCapitalUsd") or primary.get("budgetUsd"), 0.0))
+        primary_entry = (primary_cost / primary_qty) if primary_qty > 0 and primary_cost > 0 else max(0.0, _safe_float(primary.get("entryPriceUsd"), 0.0))
+        primary_amount_raw = str(primary.get("amountOutRaw") or primary_meta.get("amount_out_raw") or "")
+        master_open_rotation = {
+            "asset": primary_sym, "symbol": primary_sym, "quantity": primary_qty,
+            "positionQty": primary_qty, "entryPriceUsd": primary_entry,
+            "currentPriceUsd": primary_price, "currentValueUsd": max(0.0, _safe_float(primary.get("positionValueUsd"), 0.0)),
+            "capitalUsd": primary_cost, "currentGrossUsd": _safe_float(primary.get("grossProfitUsd"), 0.0),
+            "currentCostsUsd": max(0.0, _safe_float(primary.get("costsUsd"), 0.0)),
+            "currentNetUsd": _safe_float(primary.get("netProfitUsd"), 0.0),
+            "executionMode": "live",
+        }
+        if primary_amount_raw:
+            master_open_rotation["amountOutRaw"] = primary_amount_raw
+
+        for _idx, _row in enumerate(kept):
+            if not isinstance(_row, dict):
+                continue
+            if str(_row.get("id") or _row.get("session_id") or "") != master_id:
+                continue
+            _mm = dict(_row.get("meta") if isinstance(_row.get("meta"), dict) else {})
+            _row.update({
+                "positionState": "OPEN" if len(active_cards) == 1 else "PORTFOLIO_ACTIVE",
+                "positionAsset": primary_sym, "targetAsset": primary_sym,
+                "asset": primary_sym, "symbol": primary_sym,
+                "positionQty": primary_qty, "positionAmount": primary_qty,
+                "entryPriceUsd": primary_entry, "currentPriceUsd": primary_price,
+                "positionValueUsd": total_value, "workingCapitalUsd": total_cost,
+                "investedUsd": total_cost, "grossProfitUsd": total_gross,
+                "costsUsd": total_costs, "netProfitUsd": total_net,
+                "liveGrossProfitUsd": total_gross, "liveCostsUsd": total_costs,
+                "liveNetProfitUsd": total_net, "openAssetCount": len(active_cards),
+                "open_asset_count": len(active_cards), "openRotation": master_open_rotation,
+                "activeAssetCount": len(active_cards), "active": True,
+                "reason": f"Tracking live {primary_sym} position from canonical worker snapshot",
+                "updatedAt": nowi,
+            })
+            _mm.update({
+                "position_state": "OPEN", "nkr_active_asset": primary_sym,
+                "nkr_position_qty": primary_qty, "nkr_entry_price_usd": primary_entry,
+                "nkr_current_price_usd": primary_price, "nkr_position_value_usd": total_value,
+                "nkr_live_gross_profit_usd": total_gross, "nkr_live_costs_usd": total_costs,
+                "nkr_live_net_profit_usd": total_net, "open_asset_count": len(active_cards),
+                "canonical_position_source": "worker_posttrade_snapshot",
+                "canonical_position_synced_ts": int(time.time()),
+                "position_projection_degraded": False,
+            })
+            _mm.pop("position_projection_error", None)
+            _row["meta"] = _mm
+            kept[_idx] = _row
+            break
+
     _db_set_rotation_sessions(wallet, kept, active_session_id=active_id or master_id, replace_missing=True)
 
 
