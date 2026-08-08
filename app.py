@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-398-CANONICAL-API-SESSION-PROJECTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-399-CHILD-IDENTITY-SESSION-CARD-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15948,6 +15948,24 @@ def api_rotation_sessions():
             return ""
         chain_id = int(sess.get("chainId") or sess.get("chain_id") or meta.get("chain_id") or 0)
         vault = _norm_addr(sess.get("vault") or sess.get("vaultAddress") or sess.get("vault_address") or meta.get("vault") or "").lower()
+        # ENGINE-399: older NKR_ASSET child rows were persisted without vaultAddress.
+        # They therefore had the same chain/session id as the master but could never
+        # match live_ids (whose canonical identity includes the vault), so the API
+        # silently discarded the exact OPEN row that carried Invest/Gross/Costs/Net.
+        # Recover the missing vault only when chain+session maps to one live registry row.
+        if not vault and chain_id > 0:
+            candidates = {
+                _norm_addr((lr or {}).get("vault_address") or "").lower()
+                for lr in (live_rows or [])
+                if int((lr or {}).get("chain_id") or 0) == chain_id
+                and str((lr or {}).get("onchain_session_id") or "") == str(raw)
+                and _looks_like_evm_addr((lr or {}).get("vault_address") or "")
+            }
+            candidates.discard("")
+            if len(candidates) == 1:
+                vault = next(iter(candidates))
+        if not vault:
+            return ""
         return f"{chain_id}:{vault}:{int(str(raw))}"
 
     # ENGINE-398: group all presentation rows by CoreVault identity before dedup.
@@ -39031,6 +39049,7 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
     sid = str(live_row.get("onchain_session_id") or "")
     chain_id = int(live_row.get("chain_id") or 1)
     chain_key = _nkr_chain_key_from_id(chain_id) or str(chain_id)
+    vault_addr = _norm_addr(live_row.get("vault_address") or "")
     master_id = f"NKR-LIVE-{chain_key}-{sid}"
     nowi = _nkr_now_ms()
     row_by_symbol = {str(r.get("symbol") or "").upper(): r for r in market_rows if isinstance(r, dict)}
@@ -39081,7 +39100,8 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
             prior_meta["position_opened_ts"] = int(time.time())
         metric = (plan.get("metrics") or {}).get(sym) or {}
         prior_meta.update({"nkr_session": True, "nkr_asset_session": True, "parent_nkr_session_id": master_id,
-                     "onchain_session_id": sid, "chain": chain_key, "chain_id": chain_id,
+                     "onchain_session_id": sid, "core_vault_session_id": sid, "chain": chain_key, "chain_id": chain_id,
+                     "vault": vault_addr, "vault_address": vault_addr,
                      "token_address": route["token"], "token_decimals": route.get("decimals", 18),
                      "pool_fee": route.get("fee"), "router_address": route.get("router"), "position_state": "OPEN",
                      "execution_mode": "live", "visible_in_active_sessions": True,
@@ -39096,6 +39116,7 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
         card.update({"id": cid, "session_id": cid, "type": "NKR_ASSET", "engineType": "NKR",
             "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "OPEN", "active": True,
             "visibleInActiveSessions": True, "executionMode": "live", "chain": chain_key, "chainId": chain_id,
+            "vault": vault_addr, "vaultAddress": vault_addr, "vault_address": vault_addr,
             "onchainSessionId": sid, "coreVaultSessionId": sid, "targetAsset": sym, "symbol": sym,
             "budgetUsd": cost, "workingCapitalUsd": cost, "investedUsd": cost, "positionValueUsd": value,
             "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
