@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.05-ENGINE-394-ATOMIC-CANDIDATE-RUNTIME-TRUTH-FIX"
+BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-395-SHADOW-EXIT-PROJECTION-TRUTH-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15565,6 +15565,12 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
     """
     out = dict(sess or {})
     meta = dict(out.get("meta") if isinstance(out.get("meta"), dict) else {})
+    # ENGINE-395: preserve the minimum on-chain truth even if a later price/route
+    # projection step fails. openAssetCount > 0 must never fall back to WAITING.
+    projection_open_count = 0
+    projection_chain_id = 0
+    projection_budget_units = 0
+    projection_cash_units = 0
     try:
         sid = int(str(live_row.get("onchain_session_id") or out.get("onchainSessionId") or out.get("onchain_session_id") or meta.get("onchain_session_id") or "0"))
         # ENGINE-383: never default a BNB/POL session to chain_id=1 (ETH).
@@ -15596,6 +15602,10 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
         open_count = int(snap.get("openAssetCount") or snap.get("open_asset_count") or 0)
         settlement_cash_units = int(str(snap.get("settlementCashUnits") or snap.get("settlement_cash_units") or 0))
         budget_units = int(str(snap.get("budgetUnits") or snap.get("budget_units") or live_row.get("budget_units") or 0))
+        projection_open_count = open_count
+        projection_chain_id = chain_id
+        projection_budget_units = budget_units
+        projection_cash_units = settlement_cash_units
         cfg = _privy_trading_cfg(chain_id)
         cfg["vault"] = vault
         routes = dict(_nkr_live_route_registry(cfg) or {})
@@ -15768,7 +15778,39 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
         out["meta"] = meta
         return out
     except Exception as exc:
-        meta["position_projection_error"] = str(exc)[:240]
+        # ENGINE-395: projection errors are diagnostic failures, not permission to
+        # lie about on-chain state. If CoreVault already told us openAssetCount > 0,
+        # force a visible OPEN card and preserve a conservative cost/net estimate.
+        msg = str(exc)[:240]
+        meta["position_projection_error"] = msg
+        if projection_open_count > 0:
+            chain_native = {1: "ETH", 56: "BNB", 137: "POL"}.get(int(projection_chain_id or 0), "ASSET")
+            sym = str(out.get("positionAsset") or out.get("targetAsset") or meta.get("nkr_active_asset") or chain_native).upper()
+            if sym in ("", "WAITING", "USDC", "USDT", "USD", "DAI"):
+                sym = chain_native
+            fallback_value = max(0.0, _safe_float(out.get("positionValueUsd") or out.get("investedUsd") or out.get("workingCapitalUsd") or out.get("budgetUsd") or 0, 0.0))
+            fallback_costs = max(0.0, _safe_float(out.get("costsUsd") or meta.get("nkr_live_costs_usd") or 0, 0.0))
+            if fallback_costs <= 0 and fallback_value > 0:
+                fallback_costs = max(0.02, min(1.50, fallback_value * 0.0035))
+            fallback_gross = _safe_float(out.get("grossProfitUsd") or meta.get("nkr_live_gross_profit_usd") or 0, 0.0)
+            fallback_net = fallback_gross - fallback_costs
+            out.update({
+                "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
+                "asset": sym, "symbol": sym, "openAssetCount": int(projection_open_count),
+                "open_asset_count": int(projection_open_count), "positionValueUsd": fallback_value,
+                "investedUsd": max(fallback_value, _safe_float(out.get("investedUsd"), 0.0)),
+                "grossProfitUsd": fallback_gross, "costsUsd": fallback_costs, "netProfitUsd": fallback_net,
+                "liveGrossProfitUsd": fallback_gross, "liveCostsUsd": fallback_costs, "liveNetProfitUsd": fallback_net,
+                "active": True, "reason": f"On-chain {sym} position detected; market projection recovering",
+            })
+            meta.update({
+                "position_state": "OPEN", "nkr_active_asset": sym,
+                "open_asset_count": int(projection_open_count),
+                "nkr_live_gross_profit_usd": fallback_gross,
+                "nkr_live_costs_usd": fallback_costs,
+                "nkr_live_net_profit_usd": fallback_net,
+                "position_projection_degraded": True,
+            })
         out["meta"] = meta
         return out
 
@@ -39946,12 +39988,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         target = targets.get(sym, 0.0); delta = target - current
         if int(snap.get("amount") or 0) > 0 and target < max(_NKR_LIVE_MIN_REBALANCE_USD, 0.01):
             reason = str((forced_exits or {}).get(sym) or "")
-            is_protect = reason in (
-                "net_profit_harvest", "stale_profit_harvest", "stale_flat_exit",
-                "peak_profit_trailing_protection", "profit_momentum_reversal",
-                "hard_stop_net_loss", "max_loss", "hard_stop",
-            ) or reason.startswith("max_loss") or reason.startswith("hard_stop") or reason.startswith("net_profit") or reason.startswith("stale_")
-            immediate_risk = reason in ("hard_stop_net_loss", "max_loss", "hard_stop") or reason.startswith("max_loss") or reason.startswith("hard_stop")
+            # ENGINE-395: the Shadow Strategist decision is authoritative.
+            # Do NOT apply a second legacy whitelist that silently converts a valid
+            # Shadow EXIT back into HOLD. Every non-empty forced_exits reason was
+            # produced by the shared Shadow decision layer and is therefore closable.
+            is_protect = bool(reason)
+            immediate_risk = (
+                reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "risk_exceeded")
+                or reason.startswith("max_loss") or reason.startswith("hard_stop")
+            )
             if is_protect and (immediate_risk or _position_held_long_enough(sym)):
                 actions.append((0, abs(delta) if delta else current, "CLOSE", sym, snap["amount"]))
             elif is_protect:
@@ -40185,162 +40230,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets, "selected": [x.get("symbol") for x in sel]}}
 
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
-    """Execute the already configured USDC/WETH CoreVault route for NKR.
+    """Compatibility entrypoint. ENGINE-395 removes the old ETH-only strategy.
 
-    This is the first real product-worker execution path. It never fabricates an
-    ACTION state: ACTION is returned only after a confirmed CoreVault receipt.
+    ETH now uses the same portfolio/Shadow Strategist execution path as every other
+    live NKR chain. Keeping this wrapper avoids breaking any older caller while
+    guaranteeing there is no parallel score+24h-momentum decision engine.
     """
-    cfg = _privy_trading_cfg()
-    sid = int(str(live_row.get("onchain_session_id") or "0"))
-    wallet_id = str(live_row.get("privy_wallet_id") or "").strip()
-    vault = _norm_addr(live_row.get("vault_address") or "")
-    if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault):
-        raise RuntimeError("incomplete_live_session_mapping")
-    if int(live_row.get("chain_id") or 1) != 1:
-        return {"executed": False, "decision": "WAIT", "gate": "CHAIN_NOT_EXECUTABLE", "detail": "NKR live execution is currently attached to the Ethereum CoreVault."}
-    if vault.lower() != _norm_addr(cfg.get("vault") or "").lower():
-        raise RuntimeError("corevault_address_mismatch")
-    # Live execution is controlled by the global execution switch. Route readiness
-    # is verified from the current CoreVault session and on-chain route config below.
-    # Do not block the worker because of a stale/manual environment flag.
-    if not cfg.get("liveEnabled"):
-        return {
-            "executed": False, "decision": "WAIT", "gate": "LIVE_EXECUTION_DISABLED",
-            "detail": "Live execution env is disabled (NEXUS_LIVE_EXECUTION_ENABLED). Session stays active; no on-chain buy until enabled.",
-            "asset": "",
-        }
-
-    raw = _eth_call(1, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
-    words = _core_words(raw)
-    if len(words) < 13:
-        raise RuntimeError("session_decode_failed")
-    status_id = int(words[3])
-    settlement_cash = int(words[9])
-    if status_id != 1:
-        return {"executed": False, "decision": "WAIT", "gate": "SESSION_NOT_ACTIVE", "detail": f"CoreVault session status is {status_id}."}
-
-    current_weth = _position_amount(vault, sid, cfg["weth"])
-    eth_row = next((x for x in market_rows if str((x or {}).get("symbol") or "").upper() in {"ETH", "WETH"}), None)
-    if current_weth > 0:
-        live_price = _nkr_row_price_usd(eth_row) if isinstance(eth_row, dict) else 0.0
-        if live_price <= 0:
-            fallback = _price_multi("ETH")
-            if isinstance(fallback, dict):
-                live_price = _safe_float(fallback.get("price") or fallback.get("priceUsd"), 0.0)
-        live_change = _nkr_row_change_pct(eth_row) if isinstance(eth_row, dict) else 0.0
-        live_score = _nkr_session_score({"score": (eth_row or {}).get("score") or (eth_row or {}).get("systemScore") or (eth_row or {}).get("ratingScore") or 0}, eth_row or {})
-        live_metrics = _nkr_sync_local_open_position(
-            wallet, sid, symbol="ETH", amount_out_raw=current_weth, current_price_usd=live_price,
-            chain_id=chain_id, token_decimals=int((routes.get("ETH") or routes.get("WETH") or {}).get("decimals") or 18)
-        )
-
-        # ENGINE-212: bridge the backend NKR decision into the real CoreVault route.
-        # Earlier builds returned HOLD immediately for every open WETH position, so
-        # the Strategist could calculate CLOSED_PROFIT / WAITING_REALLOCATION but the
-        # live executor never saw or acted on that decision.  We only sell when the
-        # backend-owned session decision explicitly requests a close; ordinary open
-        # positions continue to HOLD.
-        ds = decision_session if isinstance(decision_session, dict) else {}
-        ds_status = str(ds.get("status") or ds.get("lifecycleState") or "").upper()
-        ds_position = str(ds.get("positionState") or "").upper()
-        ds_event = ds.get("lastRotationEvent") if isinstance(ds.get("lastRotationEvent"), dict) else {}
-        ds_action = str(ds_event.get("action") or ds_event.get("status") or ds.get("lastAction") or "").upper()
-        shadow_exit = _nkr_live_shadow_exit_decision("ETH", eth_row or {}, {
-            "amount": current_weth,
-            "costBasisUsd": live_metrics.get("investedUsd") or live_metrics.get("costBasisUsd") or 0,
-            "valueUsd": live_metrics.get("positionValueUsd") or 0,
-        }, (ds.get("meta") if isinstance(ds.get("meta"), dict) else {}),
-            _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or "DYNAMIC"), chain_id)
-        exit_requested = bool(
-            str(shadow_exit.get("decision") or "").upper() == "EXIT"
-            or ds_status == "WAITING_REALLOCATION"
-            or ds_position in {"CLOSED_PROFIT", "EXIT_PENDING", "EXITING"}
-            or ds_action in {"CLOSED_PROFIT", "SELL", "EXIT"}
-        )
-        # ENGINE-214: a normal profit exit is allowed only when the current
-        # on-chain position is net-positive after the live estimated costs shown
-        # in the UI. This prevents a sell whose costs are larger than its gain.
-        live_gross = _safe_float(live_metrics.get("grossProfitUsd"), 0.0)
-        live_costs = max(0.0, _safe_float(live_metrics.get("costsUsd"), 0.0))
-        live_net = _safe_float(live_metrics.get("netProfitUsd"), live_gross - live_costs)
-        if exit_requested and live_net <= 0:
-            return {
-                "executed": False, "decision": "HOLD", "gate": "NET_AFTER_COST_BLOCKED",
-                "detail": f"Exit signal is waiting: gross ${live_gross:.4f}, estimated costs ${live_costs:.4f}, net ${live_net:.4f}.",
-                "asset": "ETH", "score": live_score, "change": live_change,
-                "price": live_price, "amountOutRaw": current_weth,
-                "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
-            }
-        if exit_requested:
-            exit_result = _nkr_exit_open_eth_position(wallet, live_row, sid)
-            return {
-                "executed": bool(exit_result.get("executed")),
-                "decision": "EXIT" if exit_result.get("executed") else "HOLD",
-                "gate": "ONCHAIN_EXIT_CONFIRMED" if exit_result.get("executed") else "POSITION_ACTIVE",
-                "detail": "NKR exit decision was executed and the Ethereum position returned to USDC." if exit_result.get("executed") else "Ethereum position remains open.",
-                "asset": "ETH", "score": live_score, "change": live_change,
-                "price": live_price, "amountOutRaw": current_weth,
-                "txHash": str(exit_result.get("txHash") or ""),
-                "amountInRaw": int(exit_result.get("amountIn") or 0),
-                "amountOutRaw": int(exit_result.get("amountOut") or 0),
-            }
-        return {
-            "executed": False, "decision": "HOLD", "gate": "POSITION_ACTIVE",
-            "detail": "Ethereum position is open and tracked by CoreVault; no backend exit decision is active.",
-            "asset": "ETH", "score": live_score, "change": live_change,
-            "price": live_price, "amountOutRaw": current_weth,
-            "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
-        }
-
-    if not isinstance(eth_row, dict):
-        return {"executed": False, "decision": "WAIT", "gate": "ETH_MARKET_DATA_MISSING", "detail": "No current Ethereum market row is available."}
-    price = _nkr_row_price_usd(eth_row)
-    change = _nkr_row_change_pct(eth_row)
-    score = _nkr_session_score({"score": eth_row.get("score") or eth_row.get("systemScore") or eth_row.get("ratingScore") or 0}, eth_row)
-    mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
-    threshold = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
-    if price <= 0:
-        return {"executed": False, "decision": "WAIT", "gate": "PRICE_MISSING", "detail": "Ethereum price is unavailable.", "asset": "ETH", "score": score, "change": change, "price": price}
-    if score < threshold:
-        return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_SCORE_BLOCKED", "detail": f"ETH score {score:.1f} is below {mode} entry gate {threshold:.1f}.", "asset": "ETH", "score": score, "change": change, "price": price}
-    if change <= -0.25:
-        return {"executed": False, "decision": "WAIT", "gate": "EXECUTABLE_MOMENTUM_BLOCKED", "detail": f"ETH cleared score but 24h momentum is {change:+.2f}%.", "asset": "ETH", "score": score, "change": change, "price": price}
-    budget_units = int(str(live_row.get("budget_units") or "0"))
-    # No hard-coded per-asset percentage cap. The user already defines the total
-    # NKR session budget. With one executable candidate, NKR may deploy the full
-    # currently available session cash; CoreVault budget and settlementCash remain
-    # the authoritative limits. When several executable routes are available, the
-    # portfolio allocator may split this same budget dynamically by score.
-    amount = min(settlement_cash, budget_units) if budget_units > 0 else settlement_cash
-    min_units = max(1, int(os.getenv("NEXUS_NKR_LIVE_MIN_ENTRY_USDC_UNITS", "1000000")))
-    if amount < min_units:
-        return {"executed": False, "decision": "WAIT", "gate": "ENTRY_AMOUNT_TOO_SMALL", "detail": f"Executable stable balance is below {min_units / 1_000_000:.2f} USDC.", "asset": "ETH", "score": score, "change": change, "price": price}
-
-    quote = _privy_quote(cfg, cfg["usdc"], cfg["weth"], amount)
-    min_out = quote * (10_000 - cfg["slippageBps"]) // 10_000
-    deadline = now_ts() + 300
-    router_data = _privy_exact_input_single_data(cfg["usdc"], cfg["weth"], vault, amount, min_out, cfg["poolFee"])
-    call = _encode_execute_trade(sid, cfg["router"], cfg["usdc"], cfg["weth"], amount, min_out, deadline, router_data)
-    # Same exact-session idempotency rule for the legacy ETH route.
-    ref = f"nkr-entry-c1-s{sid}-{_norm_addr(cfg['weth']).lower()}"
-    _live_engine_mark("NKR", status="running", decision="SUBMITTING", gate_status="EXECUTION", reason="Submitting CoreVault trade", pending_tx="submitting")
-    sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
-    tx_hash = str(sent.get("hash") or sent.get("txHash") or "")
-    receipt = sent.get("receipt") if isinstance(sent.get("receipt"), dict) else {}
-    if not tx_hash:
-        tx_hash = str(receipt.get("transactionHash") or "")
-    amount_out = _position_amount(vault, sid, cfg["weth"])
-    if amount_out <= 0:
-        raise RuntimeError("weth_position_zero_after_confirmed_buy")
-    _nkr_patch_local_execution(wallet, sid, symbol="ETH", amount_usd=amount / 1_000_000.0,
-                               price_usd=price, tx_hash=tx_hash, amount_out_raw=amount_out, chain_id=1)
-    _nkr_sync_local_open_position(wallet, sid, symbol="ETH", amount_out_raw=amount_out, current_price_usd=price, chain_id=1)
-    return {
-        "executed": True, "decision": "OPEN", "gate": "ONCHAIN_CONFIRMED",
-        "detail": f"Bought ETH through the CoreVault with {amount / 1_000_000:.2f} USDC.",
-        "asset": "ETH", "score": score, "change": change, "price": price,
-        "txHash": tx_hash, "amountInUnits": amount, "amountOutRaw": amount_out,
-    }
+    return _nkr_live_execute_portfolio(wallet, live_row, market_rows, settings)
 
 def _nkr_processed_session_for_live_row(processed: list[dict], live_row: dict) -> dict:
     """Return the wallet-local NKR session bound to one CoreVault registry row."""
