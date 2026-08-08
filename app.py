@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-397-SESSION-CARD-CANONICAL-POSITION-SYNC-FIX"
+BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-398-CANONICAL-API-SESSION-PROJECTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15803,6 +15803,122 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
         out["meta"] = meta
         return out
 
+def _nkr_canonical_api_session_from_group(group: list[dict], live_row: dict) -> dict:
+    """Build one public NKR session row from all DB rows for the same CoreVault session.
+
+    ENGINE-398: asset child cards and the master card intentionally share one
+    CoreVault identity.  The old API dedup kept whichever row appeared first,
+    so a stale WAITING master could hide a fresh OPEN child even while System
+    Info correctly showed the live position.  Merge the worker-owned position
+    truth into the master row before returning the public session.
+    """
+    rows = [dict(x) for x in (group or []) if isinstance(x, dict)]
+    if not rows:
+        return {}
+    sid = str((live_row or {}).get("onchain_session_id") or "")
+    chain_id = int((live_row or {}).get("chain_id") or 0)
+    chain_key = _nkr_chain_key_from_id(chain_id) or str(chain_id or "")
+    master_id = f"NKR-LIVE-{chain_key}-{sid}" if sid else ""
+
+    def _meta(x):
+        return x.get("meta") if isinstance(x.get("meta"), dict) else {}
+    def _is_child(x):
+        m = _meta(x)
+        return str(x.get("type") or "").upper() == "NKR_ASSET" or bool(m.get("nkr_asset_session"))
+    def _is_open(x):
+        m = _meta(x)
+        ps = str(x.get("positionState") or m.get("position_state") or "").upper()
+        qty = _safe_float(x.get("positionQty") or x.get("positionAmount") or m.get("nkr_position_qty"), 0.0)
+        val = _safe_float(x.get("positionValueUsd") or m.get("nkr_position_value_usd"), 0.0)
+        return ps in {"OPEN", "PORTFOLIO_ACTIVE", "POSITION_ACTIVE"} or qty > 0 or val > 0
+
+    base = next((x for x in rows if str(x.get("id") or x.get("session_id") or "") == master_id), None)
+    if base is None:
+        base = next((x for x in rows if not _is_child(x)), None)
+    if base is None:
+        base = rows[0]
+    out = dict(base)
+    out_meta = dict(_meta(base))
+
+    carriers = [x for x in rows if _is_open(x)]
+    child_carriers = [x for x in carriers if _is_child(x)]
+    position_rows = child_carriers or carriers
+    if position_rows:
+        # Deduplicate by asset so a master mirror cannot double-count a child.
+        by_asset = {}
+        for x in position_rows:
+            m = _meta(x)
+            sym = str(x.get("positionAsset") or x.get("targetAsset") or x.get("symbol") or x.get("asset") or m.get("nkr_active_asset") or "ASSET").upper()
+            prev = by_asset.get(sym)
+            if prev is None or int(_safe_float(x.get("updatedAt") or x.get("updated_at"), 0)) >= int(_safe_float(prev.get("updatedAt") or prev.get("updated_at"), 0)):
+                by_asset[sym] = x
+        position_rows = list(by_asset.values())
+        primary = max(position_rows, key=lambda x: _safe_float(x.get("positionValueUsd") or _meta(x).get("nkr_position_value_usd"), 0.0))
+        pm = _meta(primary)
+        sym = str(primary.get("positionAsset") or primary.get("targetAsset") or primary.get("symbol") or primary.get("asset") or pm.get("nkr_active_asset") or "ASSET").upper()
+        qty = max(0.0, _safe_float(primary.get("positionQty") or primary.get("positionAmount") or pm.get("nkr_position_qty"), 0.0))
+        price = max(0.0, _safe_float(primary.get("currentPriceUsd") or pm.get("nkr_current_price_usd"), 0.0))
+        total_value = sum(max(0.0, _safe_float(x.get("positionValueUsd") or _meta(x).get("nkr_position_value_usd"), 0.0)) for x in position_rows)
+        total_cost = sum(max(0.0, _safe_float(x.get("investedUsd") or x.get("workingCapitalUsd") or x.get("budgetUsd"), 0.0)) for x in position_rows)
+        total_gross = sum(_safe_float(x.get("grossProfitUsd") or _meta(x).get("nkr_live_gross_profit_usd"), 0.0) for x in position_rows)
+        total_costs = sum(max(0.0, _safe_float(x.get("costsUsd") or _meta(x).get("nkr_live_costs_usd"), 0.0)) for x in position_rows)
+        total_net = sum(_safe_float(x.get("netProfitUsd") or _meta(x).get("nkr_live_net_profit_usd"), 0.0) for x in position_rows)
+        entry = max(0.0, _safe_float(primary.get("entryPriceUsd") or pm.get("nkr_entry_price_usd"), 0.0))
+        if entry <= 0 and qty > 0 and total_cost > 0:
+            entry = total_cost / qty
+        open_rotation = dict(out.get("openRotation") if isinstance(out.get("openRotation"), dict) else {})
+        open_rotation.update({
+            "asset": sym, "symbol": sym, "quantity": qty, "positionQty": qty,
+            "entryPriceUsd": entry, "currentPriceUsd": price,
+            "currentValueUsd": total_value, "capitalUsd": total_cost,
+            "currentGrossUsd": total_gross, "currentCostsUsd": total_costs,
+            "currentNetUsd": total_net, "executionMode": "live",
+        })
+        out.update({
+            "positionState": "OPEN" if len(position_rows) == 1 else "PORTFOLIO_ACTIVE",
+            "positionAsset": sym, "targetAsset": sym, "asset": sym, "symbol": sym,
+            "positionQty": qty, "positionAmount": qty, "entryPriceUsd": entry,
+            "currentPriceUsd": price, "positionValueUsd": total_value,
+            "workingCapitalUsd": total_cost, "investedUsd": total_cost,
+            "grossProfitUsd": total_gross, "costsUsd": total_costs, "netProfitUsd": total_net,
+            "liveGrossProfitUsd": total_gross, "liveCostsUsd": total_costs, "liveNetProfitUsd": total_net,
+            "openAssetCount": len(position_rows), "open_asset_count": len(position_rows),
+            "activeAssetCount": len(position_rows), "openRotation": open_rotation, "active": True,
+            "reason": f"Tracking live {sym} position from canonical worker/API projection",
+            "updatedAt": max([int(_safe_float(x.get("updatedAt") or x.get("updated_at"), 0)) for x in rows] or [_nkr_now_ms()]),
+        })
+        out_meta.update({
+            "position_state": "OPEN", "nkr_active_asset": sym,
+            "nkr_position_qty": qty, "nkr_entry_price_usd": entry,
+            "nkr_current_price_usd": price, "nkr_position_value_usd": total_value,
+            "nkr_live_gross_profit_usd": total_gross, "nkr_live_costs_usd": total_costs,
+            "nkr_live_net_profit_usd": total_net, "open_asset_count": len(position_rows),
+            "canonical_position_source": "api_group_merge_worker_truth",
+            "canonical_position_synced_ts": int(time.time()),
+            "position_projection_degraded": False,
+        })
+        out_meta.pop("position_projection_error", None)
+
+    # Mirror lifecycle identity from the live registry without touching position truth.
+    if live_row:
+        live_status = str(live_row.get("status") or out.get("status") or "ACTIVE").upper()
+        if live_status:
+            out.update({"status": live_status, "statusLabel": live_status, "onchainStatus": live_status, "lifecycleState": live_status})
+        out["chainId"] = chain_id or out.get("chainId")
+        out["chain"] = chain_key or out.get("chain")
+        out["onchainSessionId"] = sid or out.get("onchainSessionId")
+        out["coreVaultSessionId"] = sid or out.get("coreVaultSessionId")
+        vault_addr = _norm_addr(live_row.get("vault_address") or out.get("vault") or out.get("vaultAddress") or "")
+        if vault_addr:
+            out["vault"] = vault_addr
+            out["vaultAddress"] = vault_addr
+            out_meta["vault"] = vault_addr
+        out_meta["chain_id"] = chain_id or out_meta.get("chain_id")
+        out_meta["onchain_session_id"] = sid or out_meta.get("onchain_session_id")
+    out["meta"] = out_meta
+    return out
+
+
 @app.route("/api/rotation-sessions", methods=["GET", "POST"])
 def api_rotation_sessions():
     """Return backend-owned live NKR sessions only.
@@ -15823,6 +15939,7 @@ def api_rotation_sessions():
         return f"{int(row.get('chain_id') or 0)}:{_norm_addr(row.get('vault_address') or '').lower()}:{int(sid)}"
 
     live_ids = {_live_key_from_row(row) for row in (live_rows or []) if _live_key_from_row(row)}
+    live_by_key = {_live_key_from_row(row): row for row in (live_rows or []) if _live_key_from_row(row)}
 
     def _onchain_key(sess: dict) -> str:
         meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
@@ -15833,19 +15950,27 @@ def api_rotation_sessions():
         vault = _norm_addr(sess.get("vault") or sess.get("vaultAddress") or sess.get("vault_address") or meta.get("vault") or "").lower()
         return f"{chain_id}:{vault}:{int(str(raw))}"
 
-    sessions = []
-    seen = set()
+    # ENGINE-398: group all presentation rows by CoreVault identity before dedup.
+    # Master and NKR_ASSET child rows intentionally share the same identity; choosing
+    # the first row used to discard the child that carried the actual OPEN position.
+    grouped = {}
     for sess in stored or []:
         if not isinstance(sess, dict) or not _nkr_is_session(sess):
             continue
         oid = _onchain_key(sess)
-        if not oid or oid not in live_ids or oid in seen:
+        if not oid or oid not in live_ids:
             continue
         st = str(sess.get("status") or "").upper()
         if st in ROTATION_TERMINAL_STATUSES:
             continue
-        seen.add(oid)
-        sessions.append(sess)
+        grouped.setdefault(oid, []).append(sess)
+    sessions = []
+    seen = set()
+    for oid, group in grouped.items():
+        merged = _nkr_canonical_api_session_from_group(group, live_by_key.get(oid, {}))
+        if merged:
+            sessions.append(merged)
+            seen.add(oid)
 
     # A live on-chain row without a local presentation row is created by the
     # backend worker, never by the browser.
@@ -15908,10 +16033,22 @@ def api_rotation_sessions():
         })
         present.add(key)
 
-    live_by_key = {_live_key_from_row(row): row for row in (live_rows or []) if _live_key_from_row(row)}
+    def _api_needs_secondary_onchain_projection(sess: dict) -> bool:
+        meta = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        ps = str(sess.get("positionState") or meta.get("position_state") or "").upper()
+        source = str(meta.get("canonical_position_source") or "")
+        # The worker has already performed sessionOf + positionOf and persisted the
+        # live price/PnL. Do not immediately run a second independent projection that
+        # can downgrade the same OPEN row to WAITING because of route/RPC lag.
+        if ps in {"OPEN", "PORTFOLIO_ACTIVE", "POSITION_ACTIVE"} and source in {
+            "worker_posttrade_snapshot", "api_group_merge_worker_truth"
+        }:
+            return False
+        return True
+
     sessions = [
         _nkr_enrich_session_from_onchain_position(wa, sess, live_by_key.get(_onchain_key(sess), {}))
-        if _onchain_key(sess) in live_by_key else sess
+        if _onchain_key(sess) in live_by_key and _api_needs_secondary_onchain_projection(sess) else sess
         for sess in sessions
     ]
     active = str(sessions[0].get("id") or sessions[0].get("session_id") or "") if sessions else ""
@@ -40361,7 +40498,9 @@ def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_row
 def _nkr_processed_session_for_live_row(processed: list[dict], live_row: dict) -> dict:
     """Return the wallet-local NKR session bound to one CoreVault registry row."""
     sid = str(live_row.get("onchain_session_id") or "")
-    local_id = f"NKR-LIVE-{sid}"
+    chain_id = int(live_row.get("chain_id") or 1)
+    chain_key = _nkr_chain_key_from_id(chain_id) or str(chain_id)
+    local_id = f"NKR-LIVE-{chain_key}-{sid}"
     for sess in processed or []:
         if not isinstance(sess, dict):
             continue
