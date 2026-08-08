@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-395-SHADOW-EXIT-PROJECTION-TRUTH-FIX"
+BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-396-LIVE-POSITION-PRICE-PNL-SYNC-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15663,26 +15663,15 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 value = cost_basis
             current_price = (value / qty) if qty > 0 and value > 0 else 0.0
             entry_price = (cost_basis / qty) if qty > 0 and cost_basis > 0 else current_price
-            # ENGINE-386: mark-to-market like Shadow — Gross/Costs/Net never stuck at $0
-            # while a real position is open. Prefer live market price for the asset.
+            # ENGINE-396: every open position is marked from its own current asset price.
+            # A chain-filtered worker list may omit ETH/BNB/POL even while that asset is
+            # already open, so resolve the exact symbol through the shared active cache.
             try:
-                mkt = 0.0
-                try:
-                    # pull from in-memory market cache / watchlist rows if available
-                    for _mr in (globals().get("_NKR_LAST_MARKET_ROWS") or []):
-                        if not isinstance(_mr, dict):
-                            continue
-                        rs = str(_mr.get("symbol") or "").upper()
-                        if rs in {str(sym).upper(), str(sym).upper().replace("W", "")}:
-                            mkt = _safe_float(_mr.get("price") or _mr.get("usd") or _mr.get("current_price"), 0.0)
-                            if mkt > 0:
-                                break
-                except Exception:
-                    mkt = 0.0
+                mkt, _mrow = _nkr_live_price_for_symbol(sym, globals().get("_NKR_LAST_MARKET_ROWS") or [])
                 if mkt <= 0:
                     mkt = _safe_float(ps.get("marketPriceUsd"), 0.0)
                 if mkt > 0 and qty > 0:
-                    current_price = mkt
+                    current_price = float(mkt)
                     value = float(qty) * float(mkt)
             except Exception:
                 pass
@@ -38929,9 +38918,24 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
     for sym, snap in snapshots.items():
         if int(snap.get("amount") or 0) <= 0:
             continue
-        route = routes[sym]; mrow = row_by_symbol.get(sym) or {}; price = _nkr_row_price_usd(mrow)
-        cost = _safe_float(snap.get("costBasisUsd"), 0.0); value = _safe_float(snap.get("valueUsd"), 0.0)
-        gross = value - cost; costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0); net = gross - costs
+        route = routes[sym]
+        price, resolved_mrow = _nkr_live_price_for_symbol(sym, market_rows)
+        mrow = resolved_mrow or row_by_symbol.get(sym) or {}
+        cost = _safe_float(snap.get("costBasisUsd"), 0.0)
+        value = _safe_float(snap.get("valueUsd"), 0.0)
+        try:
+            qty = float(int(snap.get("amount") or 0)) / float(10 ** max(0, min(36, int(route.get("decimals") or 18))))
+        except Exception:
+            qty = 0.0
+        if price > 0 and qty > 0:
+            value = qty * price
+        if value <= 0 and cost > 0:
+            value = cost
+        gross = value - cost
+        costs = _safe_float(_nkr_live_exit_cost_estimate(value if value > 0 else cost, price, chain_id).get("totalCostUsd"), 0.0)
+        if costs <= 0 and (value > 0 or cost > 0):
+            costs = max(0.02, min(1.50, max(value, cost) * 0.0035))
+        net = gross - costs
         cid = f"{master_id}-{sym}"
         previous = previous_children.get(sym) or {}
         prior_meta = dict(previous.get("meta") if isinstance(previous.get("meta"), dict) else {})
@@ -38947,13 +38951,16 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
                      "nkr_peak_net_profit_usd": metric.get("peakNetUsd", prior_meta.get("nkr_peak_net_profit_usd", 0)),
                      "nkr_peak_net_profit_pct": metric.get("peakNetPct", prior_meta.get("nkr_peak_net_profit_pct", 0)),
                      "nkr_peak_drawdown_pct": metric.get("peakDrawdownPct", 0),
-                     "nkr_target_allocation_usd": (plan.get("targetsUsd") or {}).get(sym, 0)})
+                     "nkr_target_allocation_usd": (plan.get("targetsUsd") or {}).get(sym, 0),
+                     "nkr_position_qty": qty, "nkr_current_price_usd": price,
+                     "nkr_position_value_usd": value, "nkr_live_gross_profit_usd": gross,
+                     "nkr_live_costs_usd": costs, "nkr_live_net_profit_usd": net})
         card = dict(previous)
         card.update({"id": cid, "session_id": cid, "type": "NKR_ASSET", "engineType": "NKR",
             "status": "ACTIVE", "lifecycleState": "ACTIVE", "positionState": "OPEN", "active": True,
             "visibleInActiveSessions": True, "executionMode": "live", "chain": chain_key, "chainId": chain_id,
             "onchainSessionId": sid, "coreVaultSessionId": sid, "targetAsset": sym, "symbol": sym,
-            "budgetUsd": cost, "workingCapitalUsd": cost, "investedUsd": value, "positionValueUsd": value,
+            "budgetUsd": cost, "workingCapitalUsd": cost, "investedUsd": cost, "positionValueUsd": value,
             "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
             "currentPriceUsd": price, "score": _nkr_session_score({}, mrow), "updatedAt": nowi,
             "createdAt": previous.get("createdAt") or nowi, "meta": prior_meta})
@@ -39881,8 +39888,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             # Unknown mark: assume ~session-sized so CLOSE gate can still fire
             value = max(0.50, _safe_float(budget_usd, 1.0) * 0.9)
             cost = value
-        price = _nkr_row_price_usd(row_by_symbol.get(sym) or {})
-        # Prefer market mark-to-market for exit decisions when available
+        price, live_market_row = _nkr_live_price_for_symbol(sym, market_rows)
+        if live_market_row:
+            row_by_symbol[sym] = live_market_row
+        # Prefer exact-asset mark-to-market for exit decisions when available
         try:
             token_dec = int((snap.get("settlementDecimals") or route.get("decimals") if False else 18) or 18)
         except Exception:
@@ -40223,8 +40232,37 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         )
         gate = "WAITING_ENTRY"
         decision = "WAIT"
+    active_sym = active[0] if active else (sel[0]["symbol"] if sel else "")
+    live_price = 0.0
+    live_value = 0.0
+    live_cost = 0.0
+    live_gross = 0.0
+    live_costs = 0.0
+    live_net = 0.0
+    live_position_state = "OPEN" if active else ""
+    if active:
+        _snap = snapshots.get(active_sym) or {}
+        _route = routes.get(active_sym) or {}
+        live_price, _ = _nkr_live_price_for_symbol(active_sym, market_rows)
+        live_cost = max(0.0, _safe_float(_snap.get("costBasisUsd"), 0.0))
+        try:
+            _qty = float(int(_snap.get("amount") or 0)) / float(10 ** max(0, min(36, int(_route.get("decimals") or 18))))
+        except Exception:
+            _qty = 0.0
+        live_value = max(0.0, _safe_float(_snap.get("valueUsd"), 0.0))
+        if live_price > 0 and _qty > 0:
+            live_value = _qty * live_price
+        if live_value <= 0 and live_cost > 0:
+            live_value = live_cost
+        live_gross = live_value - live_cost
+        live_costs = _safe_float(_nkr_live_exit_cost_estimate(live_value if live_value > 0 else live_cost, live_price, chain_id).get("totalCostUsd"), 0.0)
+        if live_costs <= 0 and (live_value > 0 or live_cost > 0):
+            live_costs = max(0.02, min(1.50, max(live_value, live_cost) * 0.0035))
+        live_net = live_gross - live_costs
     return {"executed": False, "decision": decision, "gate": gate,
-            "asset": active[0] if active else (sel[0]["symbol"] if sel else ""),
+            "asset": active_sym, "price": live_price, "positionState": live_position_state,
+            "positionValueUsd": live_value, "investedUsd": live_cost,
+            "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
             "detail": detail,
             "error": last_skip or "",
             "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets, "selected": [x.get("symbol") for x in sel]}}
@@ -41168,8 +41206,10 @@ def _nkr_live_worker_cycle() -> None:
                     if _cand_change == 0.0 and isinstance(_asset_row, dict):
                         _cand_change = _nkr_row_change_pct(_asset_row)
                     _cand_price = _safe_float(eng_exec.get("price"), 0.0)
-                    if _cand_price <= 0.0 and isinstance(_asset_row, dict):
-                        _cand_price = _nkr_row_price_usd(_asset_row)
+                    if _cand_price <= 0.0:
+                        _cand_price, _resolved_asset_row = _nkr_live_price_for_symbol(e_asset, market_rows)
+                        if _asset_row is None and _resolved_asset_row:
+                            _asset_row = _resolved_asset_row
                     # Never retain/fill a price from another symbol. Unknown is safer than false.
                     if _cand_price <= 0.0:
                         _cand_price = 0.0
@@ -42081,6 +42121,53 @@ def _nkr_market_row_map(rows):
         if sym:
             out[sym] = r
     return out
+
+
+def _nkr_live_price_for_symbol(symbol: str, market_rows=None) -> tuple[float, dict]:
+    """Resolve the current price for an already-open live position without cross-symbol fallback.
+
+    Order: exact symbol row -> wrapped/native alias row -> shared active price cache/upstream.
+    The helper never substitutes another candidate's price. It is used by NKR and Trader
+    position valuation, runtime diagnostics, and session-card projection.
+    """
+    raw = str(symbol or "").strip().upper()
+    aliases = {
+        "WETH": "ETH", "ETH": "ETH",
+        "WBNB": "BNB", "BNB": "BNB",
+        "WMATIC": "POL", "MATIC": "POL", "POL": "POL",
+    }
+    target = aliases.get(raw, raw)
+    rows = market_rows if isinstance(market_rows, list) else []
+    matched = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rs = str(row.get("symbol") or row.get("sym") or row.get("asset") or "").strip().upper()
+        rsn = aliases.get(rs, rs)
+        if rsn == target:
+            matched = row
+            try:
+                px = _nkr_row_price_usd(row)
+            except Exception:
+                px = 0.0
+            if px > 0:
+                return float(px), row
+    # The worker may receive a chain-filtered market list that omits the currently
+    # open asset. Resolve that exact symbol from the shared active price cache.
+    try:
+        _nexus_price_cache_mark(target, tier="active", reason="live_open_position_mark")
+    except Exception:
+        pass
+    try:
+        pxr = _price_multi_fresh_shadow(target)
+        px = _safe_float((pxr or {}).get("price") if isinstance(pxr, dict) else 0, 0.0)
+        if px > 0:
+            row = dict(matched or {})
+            row.update({"symbol": target, "price": px, "priceSource": (pxr or {}).get("source", "active_price_cache") if isinstance(pxr, dict) else "active_price_cache"})
+            return float(px), row
+    except Exception:
+        pass
+    return 0.0, dict(matched or {})
 
 
 def _nkr_row_change_pct(row):
