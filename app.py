@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.08-ENGINE-399-CHILD-IDENTITY-SESSION-CARD-FIX"
+BACKEND_BUILD_ID = "B-2026.08.09-ENGINE-400-EXIT-RETRY-OPERATION-REUSE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -541,7 +541,30 @@ def _live_op_reserve(
                     return None
                 if st in _LIVE_OP_ACTIVE_STATES:
                     return None
-                # FAILED/ABORTED may be retried with a new operation_id (new attempt row).
+                # ENGINE-400: the business key has a UNIQUE index, so FAILED/ABORTED
+                # operations cannot be retried by inserting a second row with the same
+                # key. Re-arm the existing durable row instead, incrementing attempt so
+                # _live_op_privy_key() produces a fresh request key while preserving
+                # exactly-once protection for SUCCEEDED/in-flight operations.
+                if st in {"FAILED", "ABORTED"}:
+                    retry_op_id = str(existing["operation_id"] or "").strip()
+                    retry_attempt = max(1, int(existing["attempt"] or 1)) + 1
+                    conn.execute(
+                        "UPDATE nexus_live_operations SET status='RESERVED', attempt=?, "
+                        "request_body_hash='', privy_idempotency_key='', tx_hash='', error_text='', "
+                        "meta_json=?, owner_token=?, reserved_ts=?, updated_ts=?, expires_ts=?, completed_ts=NULL "
+                        "WHERE operation_id=?",
+                        (retry_attempt, meta_json, owner, nowi, nowi, nowi + ttl, retry_op_id),
+                    )
+                    conn.commit()
+                    row = conn.execute(
+                        "SELECT * FROM nexus_live_operations WHERE operation_id=?",
+                        (retry_op_id,),
+                    ).fetchone()
+                    return dict(row) if row else {
+                        "operation_id": retry_op_id, "status": "RESERVED", "attempt": retry_attempt
+                    }
+                return None
             cur = conn.execute(
                 """INSERT OR IGNORE INTO nexus_live_operations(
                     operation_id, op_type, wallet_address, chain_id, vault_address, onchain_session_id,
