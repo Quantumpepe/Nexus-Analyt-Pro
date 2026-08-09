@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.09-ENGINE-400-EXIT-RETRY-OPERATION-REUSE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.09-ENGINE-401-RECOVERING-EXIT-CONTINUATION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40733,9 +40733,50 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
             out["errors"].append(f"{oid}:rpc:{str(exc)[:80]}")
             continue
         if not receipt:
-            # still in flight — extend TTL so it is not aborted
+            # ENGINE-401: a stored hash is not proof that the transaction was ever
+            # accepted by the chain. Privy/RPC timeouts can leave an EXIT operation
+            # in RECOVERING forever with a hash that eth_getTransactionByHash does not
+            # know. That permanently blocks the CLOSING session because EXIT remains
+            # an active business operation. First ask the chain whether the tx itself
+            # exists. If both tx and receipt are absent beyond the configurable recovery
+            # grace period, mark the operation FAILED so the normal atomic retry path
+            # can reuse the same business row with attempt+1.
+            tx_obj = None
+            tx_lookup_error = ""
             try:
-                _live_op_update(oid, "RECOVERING", tx_hash=txh, expires_ts=int(time.time()) + 180)
+                tx_obj = _rpc_call(chain_id, "eth_getTransactionByHash", [txh])
+            except Exception as tx_exc:
+                tx_lookup_error = str(tx_exc)[:240]
+
+            try:
+                recovery_grace_sec = max(60, int(os.getenv("NEXUS_TX_NOT_FOUND_RECOVERY_SEC", "600")))
+            except Exception:
+                recovery_grace_sec = 600
+            reserved_ts = int(row.get("reserved_ts") or row.get("updated_ts") or 0)
+            age_sec = max(0, int(time.time()) - reserved_ts) if reserved_ts else 0
+
+            if tx_obj is None and not tx_lookup_error and age_sec >= recovery_grace_sec:
+                try:
+                    _live_op_update(
+                        oid, "FAILED", tx_hash=txh,
+                        error_text=f"broadcast_not_found_after_recovery:{txh}:age={age_sec}s",
+                    )
+                    out["failed"] += 1
+                except Exception as exc:
+                    out["errors"].append(f"{oid}:mark_missing_failed:{str(exc)[:80]}")
+                continue
+
+            # Either the transaction is visible but still unmined, the grace period
+            # has not elapsed, or the lookup itself was unavailable. Keep recovering
+            # without allowing a duplicate broadcast.
+            try:
+                _live_op_update(
+                    oid, "RECOVERING", tx_hash=txh, expires_ts=int(time.time()) + 180,
+                    error_text=(
+                        f"tx_lookup_pending:{tx_lookup_error}" if tx_lookup_error
+                        else ("transaction_seen_awaiting_receipt" if tx_obj else "transaction_not_seen_within_grace")
+                    ),
+                )
             except Exception:
                 pass
             out["pending"] += 1
