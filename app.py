@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-403-ASYNC-CREATE-RECEIPT-RECOVERY-FIX"
+BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-404-NKR-IDLE-RELEASE-PERIOD-GUARD"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD405-NKR-PERIOD-HOURS-DAYS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -38199,7 +38199,23 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         open_assets = int(lr.get("open_asset_count") or lr.get("openAssetCount") or 0)
         has_pos = open_assets > 0
         entry_ok = bool(best and best["score"] >= threshold)
-        if has_pos or entry_ok:
+
+        # ENGINE-404: the user-approved NKR period is a hard session lifetime.
+        # An idle/no-entry window must never finalize an otherwise valid session early.
+        # Keep scanning until the exact immutable session period has expired.
+        try:
+            exact_cfg = _nkr_settings_for_exact_live_session(wallet, lr, settings)
+            period_hours = _nkr_normalize_period_hours(
+                exact_cfg.get("nkrPeriodHours"), exact_cfg.get("nkrPeriodValue"),
+                exact_cfg.get("nkrPeriodUnit"), exact_cfg.get("nkrPeriodDays") or 1,
+            )
+            started_sec = int(lr.get("created_ts") or 0)
+            period_expired = bool(started_sec > 0 and time.time() >= started_sec + (period_hours * 3600.0))
+        except Exception:
+            # Safety-first fallback: if expiry cannot be proven, do not auto-release.
+            period_expired = False
+
+        if has_pos or entry_ok or not period_expired:
             _NKR_STRATEGIST_IDLE_TICKS[key] = 0
             continue
         _NKR_STRATEGIST_IDLE_TICKS[key] = int(_NKR_STRATEGIST_IDLE_TICKS.get(key) or 0) + 1
@@ -38403,7 +38419,29 @@ def _nkr_strategist_release_idle_session(wallet: str, live_row: dict) -> dict:
             return {"ok": False, "error": "has_open_position", "openAssets": open_assets}
         if status_id == 4:
             return {"ok": True, "already": "FINALIZED", "sessionId": sid}
-        # No open assets → safe to close + finalize without sell path.
+
+        # ENGINE-404 hard guard: RELEASE_IDLE is never allowed to shorten the
+        # user-approved NKR period. Only a genuinely expired session may be
+        # auto-released for idleness. Manual Stop & Exit remains unaffected.
+        try:
+            exact_cfg = _nkr_settings_for_exact_live_session(wallet, live_row, {})
+            period_hours = _nkr_normalize_period_hours(
+                exact_cfg.get("nkrPeriodHours"), exact_cfg.get("nkrPeriodValue"),
+                exact_cfg.get("nkrPeriodUnit"), exact_cfg.get("nkrPeriodDays") or 1,
+            )
+            started_sec = int(live_row.get("created_ts") or 0)
+            expires_sec = started_sec + int(round(period_hours * 3600.0)) if started_sec > 0 else 0
+            now_sec = int(time.time())
+            if not expires_sec or now_sec < expires_sec:
+                return {
+                    "ok": False, "error": "period_still_active", "sessionId": sid,
+                    "chain": ch, "periodHours": period_hours,
+                    "expiresTs": expires_sec, "secondsRemaining": max(0, expires_sec - now_sec),
+                }
+        except Exception as guard_exc:
+            return {"ok": False, "error": f"period_guard_unresolved:{str(guard_exc)[:180]}", "sessionId": sid, "chain": ch}
+
+        # No open assets and the authorized period has expired -> safe to close/finalize.
         result = _finalize_one_live_session(wallet, "NKR", live_row)
         _nkr_strategist_mark_action(cd_key)
         idle_key = f"{_norm_addr(wallet)}:{ch}:{sid}"
