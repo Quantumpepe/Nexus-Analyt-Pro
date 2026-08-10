@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.09-ENGINE-401-RECOVERING-EXIT-CONTINUATION-FIX"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.02-BUILD397-GAS-ERROR-MSG"
+BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-402-NKR-PERIOD-HOURS-DAYS"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD405-NKR-PERIOD-HOURS-DAYS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -2947,6 +2947,9 @@ def api_core_vault_create_system_session_auto():
         "nkrCapitalMode": _start_cfg_value("nkrCapitalMode", "nkr_capital_mode", "DYNAMIC"),
         "nkrObservationWindow": _start_cfg_value("nkrObservationWindow", "nkr_observation_window", "1h"),
         "nkrProfitMode": _start_cfg_value("nkrProfitMode", "nkr_profit_mode", "REINVEST"),
+        "nkrPeriodValue": _start_cfg_value("nkrPeriodValue", "nkr_period_value", None),
+        "nkrPeriodUnit": _start_cfg_value("nkrPeriodUnit", "nkr_period_unit", "days"),
+        "nkrPeriodHours": _start_cfg_value("nkrPeriodHours", "nkr_period_hours", None),
         "nkrPeriodDays": _start_cfg_value("nkrPeriodDays", "nkr_period_days", 1),
         "maxActiveAssets": _start_cfg_value("maxActiveAssets", "max_active_assets", 0),
         "maxCapitalPerAssetPct": _start_cfg_value("maxCapitalPerAssetPct", "max_capital_per_asset_pct", 80),
@@ -3971,6 +3974,24 @@ def _nkr_normalize_period_days(raw=None) -> int:
     except Exception:
         val = int(NEXUS_NKR_DEFAULT_PERIOD_DAYS)
     return max(1, min(3650, val))
+
+
+def _nkr_normalize_period_hours(raw_hours=None, raw_value=None, raw_unit=None, raw_days=None) -> float:
+    """Canonical NKR runtime in hours while remaining backward-compatible with day-only settings."""
+    try:
+        if raw_hours is not None and str(raw_hours).strip() != "":
+            hours = float(raw_hours)
+        elif raw_value is not None and str(raw_value).strip() != "":
+            value = float(raw_value)
+            unit = str(raw_unit or "days").strip().lower()
+            hours = value * 24.0 if unit.startswith("day") or unit == "tage" else value
+        elif raw_days is not None and str(raw_days).strip() != "":
+            hours = float(raw_days) * 24.0
+        else:
+            hours = float(NEXUS_NKR_DEFAULT_PERIOD_DAYS) * 24.0
+    except Exception:
+        hours = float(NEXUS_NKR_DEFAULT_PERIOD_DAYS) * 24.0
+    return max(1.0, hours)
 
 
 def _nkr_weekly_payout_due(elapsed_days: float, last_payout_day: float = 0.0) -> bool:
@@ -35936,13 +35957,11 @@ def _nkr_session_update_for_control(sess: dict, action: str, nowi: int) -> dict:
     return src
 
 
-def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[dict], dict]:
+def _nkr_apply_campaign_clock(sessions: list[dict], period_days, period_hours=None) -> tuple[list[dict], dict]:
     rows = [dict(x) for x in (sessions or []) if isinstance(x, dict)]
     active = [x for x in rows if str(x.get("status") or "").upper() not in {"STOPPED","CLOSED","EXPIRED","CANCELLED","DELETED","ARCHIVED","REBALANCED_OUT"}]
-    try:
-        days = max(1, min(3650, int(float(period_days or 10))))
-    except Exception:
-        days = 10
+    hours = _nkr_normalize_period_hours(period_hours, None, None, period_days or 10)
+    days = hours / 24.0
     starts=[]; explicit=[]
     for x in active:
         m=x.get("meta") if isinstance(x.get("meta"),dict) else {}
@@ -35951,7 +35970,7 @@ def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[d
         if pos>0: starts.append(pos)
         if camp>0: explicit.append(camp)
     campaign_start=min(explicit or starts or [int(time.time()*1000)])
-    campaign_expires=campaign_start + days*86400000
+    campaign_expires=campaign_start + int(hours*3600000)
     out=[]
     for x in rows:
         m=dict(x.get("meta") if isinstance(x.get("meta"),dict) else {})
@@ -35962,16 +35981,18 @@ def _nkr_apply_campaign_clock(sessions: list[dict], period_days) -> tuple[list[d
         x["periodDays"] = days
         # ENGINE-127: NKR Period is the single hard runtime clock. Legacy 24h
         # expiresAt/runtimeHours values are normalized to the selected campaign.
-        x["runtimeHours"] = days * 24
+        x["runtimeHours"] = hours
+        x["nkrPeriodHours"] = hours
         x["expiresAt"] = campaign_expires
         m.update({
             "position_opened_at": pos,
             "campaign_started_at": campaign_start,
             "campaign_expires_at": campaign_expires,
             "nkr_period_days": days,
-            "runtime_hours": days * 24,
+            "runtime_hours": hours,
+            "nkr_period_hours": hours,
             "expires_at": campaign_expires,
-            "nkr_runtime_source": "PERIOD_DAYS_ONLY",
+            "nkr_runtime_source": "PERIOD_HOURS_OR_DAYS",
         })
         x["meta"] = m
         out.append(x)
@@ -36189,7 +36210,7 @@ def api_nkr_state():
             for src, dst in [
                 ("nkrBudgetUsd", "rotationBudgetRelease"), ("budgetUsd", "rotationBudgetRelease"),
                 ("nkrCapitalMode", "nkrCapitalMode"), ("nkrObservationWindow", "nkrObservationWindow"),
-                ("nkrProfitMode", "nkrProfitMode"), ("nkrPeriodDays", "nkrPeriodDays"),
+                ("nkrProfitMode", "nkrProfitMode"), ("nkrPeriodDays", "nkrPeriodDays"), ("nkrPeriodHours", "nkrPeriodHours"), ("nkrPeriodUnit", "nkrPeriodUnit"), ("nkrPeriodValue", "nkrPeriodValue"),
                 ("maxActiveAssets", "maxActiveAssets"), ("rotationMaxActiveSessions", "maxActiveAssets"),
                 ("maxCapitalPerAssetPct", "maxCapitalPerAssetPct"),
                 ("nkrControlState", "nkrControlState"), ("controlState", "nkrControlState"),
@@ -36198,7 +36219,7 @@ def api_nkr_state():
                     ui[dst] = body.get(src)
             if isinstance(body.get("ui"), dict):
                 ui.update({k: v for k, v in body.get("ui", {}).items() if k in {
-                    "rotationBudgetRelease", "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays", "nkrControlState",
+                    "rotationBudgetRelease", "nkrCapitalMode", "nkrObservationWindow", "nkrProfitMode", "nkrPeriodDays", "nkrPeriodHours", "nkrPeriodUnit", "nkrPeriodValue", "nkrControlState",
                     "maxActiveAssets", "rotationMaxActiveSessions", "maxCapitalPerAssetPct",
                     "rotationShadowSnapshot", "rotationShadowEvents"
                 }})
@@ -36954,7 +36975,11 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
     state, _ = _db_get_user_app_state(wallet)
     ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
     locked_cfg = _nkr_get_exact_start_config(wallet, chain_id, sid)
-    days = _nkr_normalize_period_days(locked_cfg.get("nkrPeriodDays") or 1)
+    period_hours = _nkr_normalize_period_hours(
+        locked_cfg.get("nkrPeriodHours"), locked_cfg.get("nkrPeriodValue"),
+        locked_cfg.get("nkrPeriodUnit"), locked_cfg.get("nkrPeriodDays") or 1,
+    )
+    days = period_hours / 24.0
     # Exact per-session start config is authoritative. The UI value is merely the
     # draft for the next start and may reset to Dynamic immediately after creation.
     capital_mode = _nkr_normalize_performance_mode(locked_cfg.get("nkrCapitalMode") or "DYNAMIC")
@@ -36975,7 +37000,10 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
         "payoutAsset": asset_symbol if str(asset_symbol).upper() in {"USDC", "USDT"} else "USDC",
         "asset": asset_symbol, "onchainSessionId": sid, "coreVaultSessionId": sid,
         "createdAt": nowi, "startedAt": nowi, "campaignStartedAt": nowi,
-        "campaignExpiresAt": nowi + days * 86400000, "periodDays": days,
+        "campaignExpiresAt": nowi + int(period_hours * 3600000), "periodDays": days,
+        "runtimeHours": period_hours, "nkrPeriodHours": period_hours,
+        "nkrPeriodUnit": str(locked_cfg.get("nkrPeriodUnit") or "days").lower(),
+        "nkrPeriodValue": locked_cfg.get("nkrPeriodValue") if locked_cfg.get("nkrPeriodValue") is not None else days,
         "nkrCapitalMode": capital_mode, "capitalMode": capital_mode,
         "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
         "nkrPeriodDays": days, "maxActiveAssets": max_active, "maxCapitalPerAssetPct": max_pct,
@@ -36991,7 +37019,10 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
             "position_state": "WAITING",
             "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
             "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
-            "nkr_period_days": days, "max_active_assets": max_active,
+            "nkr_period_days": days, "nkr_period_hours": period_hours,
+            "nkr_period_unit": str(locked_cfg.get("nkrPeriodUnit") or "days").lower(),
+            "nkr_period_value": locked_cfg.get("nkrPeriodValue") if locked_cfg.get("nkrPeriodValue") is not None else days,
+            "runtime_hours": period_hours, "max_active_assets": max_active,
             "max_capital_per_asset_pct": max_pct,
         },
     }
@@ -37033,7 +37064,20 @@ def _nkr_save_exact_start_config(wallet: str, chain_id: int, session_id: int, co
         "nkrCapitalMode": mode,
         "nkrObservationWindow": str((config or {}).get("nkrObservationWindow") or (config or {}).get("nkr_observation_window") or "1h"),
         "nkrProfitMode": str((config or {}).get("nkrProfitMode") or (config or {}).get("nkr_profit_mode") or "REINVEST").upper(),
-        "nkrPeriodDays": _nkr_normalize_period_days((config or {}).get("nkrPeriodDays") or (config or {}).get("nkr_period_days") or 1),
+        "nkrPeriodValue": _safe_float((config or {}).get("nkrPeriodValue") if (config or {}).get("nkrPeriodValue") is not None else (config or {}).get("nkr_period_value"), 0.0) or None,
+        "nkrPeriodUnit": str((config or {}).get("nkrPeriodUnit") or (config or {}).get("nkr_period_unit") or "days").lower(),
+        "nkrPeriodHours": _nkr_normalize_period_hours(
+            (config or {}).get("nkrPeriodHours") or (config or {}).get("nkr_period_hours"),
+            (config or {}).get("nkrPeriodValue") if (config or {}).get("nkrPeriodValue") is not None else (config or {}).get("nkr_period_value"),
+            (config or {}).get("nkrPeriodUnit") or (config or {}).get("nkr_period_unit"),
+            (config or {}).get("nkrPeriodDays") or (config or {}).get("nkr_period_days") or 1,
+        ),
+        "nkrPeriodDays": _nkr_normalize_period_hours(
+            (config or {}).get("nkrPeriodHours") or (config or {}).get("nkr_period_hours"),
+            (config or {}).get("nkrPeriodValue") if (config or {}).get("nkrPeriodValue") is not None else (config or {}).get("nkr_period_value"),
+            (config or {}).get("nkrPeriodUnit") or (config or {}).get("nkr_period_unit"),
+            (config or {}).get("nkrPeriodDays") or (config or {}).get("nkr_period_days") or 1,
+        ) / 24.0,
         "maxActiveAssets": max(0, int(_safe_float((config or {}).get("maxActiveAssets") if (config or {}).get("maxActiveAssets") is not None else (config or {}).get("max_active_assets"), 0))),
         "maxCapitalPerAssetPct": _safe_float((config or {}).get("maxCapitalPerAssetPct") or (config or {}).get("max_capital_per_asset_pct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
         "budgetUsd": _safe_float((config or {}).get("budgetUsd") or (config or {}).get("nkrBudgetUsd") or (config or {}).get("amountUsd"), 0.0),
@@ -37099,6 +37143,9 @@ def _nkr_settings_for_exact_live_session(wallet: str, live_row: dict, fallback: 
             "nkrCapitalMode": [(live_row or {}).get("nkrCapitalMode"), (live_row or {}).get("capitalMode"), meta.get("nkr_capital_mode"), meta.get("capital_mode")],
             "nkrObservationWindow": [(live_row or {}).get("nkrObservationWindow"), meta.get("nkr_observation_window")],
             "nkrProfitMode": [(live_row or {}).get("nkrProfitMode"), meta.get("nkr_profit_mode")],
+            "nkrPeriodHours": [(live_row or {}).get("nkrPeriodHours"), (live_row or {}).get("runtimeHours"), meta.get("nkr_period_hours"), meta.get("runtime_hours")],
+            "nkrPeriodUnit": [(live_row or {}).get("nkrPeriodUnit"), meta.get("nkr_period_unit")],
+            "nkrPeriodValue": [(live_row or {}).get("nkrPeriodValue"), meta.get("nkr_period_value")],
             "nkrPeriodDays": [(live_row or {}).get("nkrPeriodDays"), (live_row or {}).get("periodDays"), meta.get("nkr_period_days")],
             "maxActiveAssets": [(live_row or {}).get("maxActiveAssets"), meta.get("max_active_assets")],
             "maxCapitalPerAssetPct": [(live_row or {}).get("maxCapitalPerAssetPct"), meta.get("max_capital_per_asset_pct")],
@@ -37114,7 +37161,10 @@ def _nkr_settings_for_exact_live_session(wallet: str, live_row: dict, fallback: 
     out["mode"] = out["nkrCapitalMode"]
     out["nkrObservationWindow"] = str(source.get("nkrObservationWindow") or "1h")
     out["nkrProfitMode"] = _nkr_normalize_profit_mode(source.get("nkrProfitMode") or "REINVEST")
-    out["nkrPeriodDays"] = _nkr_normalize_period_days(source.get("nkrPeriodDays") or 1)
+    out["nkrPeriodHours"] = _nkr_normalize_period_hours(source.get("nkrPeriodHours"), source.get("nkrPeriodValue"), source.get("nkrPeriodUnit"), source.get("nkrPeriodDays") or 1)
+    out["nkrPeriodDays"] = out["nkrPeriodHours"] / 24.0
+    out["nkrPeriodUnit"] = str(source.get("nkrPeriodUnit") or ("hours" if out["nkrPeriodHours"] < 24 else "days")).lower()
+    out["nkrPeriodValue"] = source.get("nkrPeriodValue") if source.get("nkrPeriodValue") is not None else (out["nkrPeriodHours"] if out["nkrPeriodUnit"] == "hours" else out["nkrPeriodDays"])
     out["maxActiveAssets"] = max(0, int(_safe_float(source.get("maxActiveAssets"), 0)))
     out["maxCapitalPerAssetPct"] = _safe_float(source.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
     out["session_config_locked"] = bool(locked) or bool(source)
@@ -37173,7 +37223,17 @@ def _nkr_stamp_exact_session_start_config(wallet: str, chain_id: int, session_id
         mode = _nkr_normalize_performance_mode(config.get("nkrCapitalMode") or config.get("nkr_capital_mode") or "DYNAMIC")
         observation = str(config.get("nkrObservationWindow") or config.get("nkr_observation_window") or row.get("nkrObservationWindow") or "1h")
         profit_mode = str(config.get("nkrProfitMode") or config.get("nkr_profit_mode") or row.get("nkrProfitMode") or "REINVEST").upper()
-        days = _nkr_normalize_period_days(config.get("nkrPeriodDays") or config.get("nkr_period_days") or row.get("nkrPeriodDays") or 1)
+        period_hours = _nkr_normalize_period_hours(
+            config.get("nkrPeriodHours") or config.get("nkr_period_hours"),
+            config.get("nkrPeriodValue") if config.get("nkrPeriodValue") is not None else config.get("nkr_period_value"),
+            config.get("nkrPeriodUnit") or config.get("nkr_period_unit"),
+            config.get("nkrPeriodDays") or config.get("nkr_period_days") or row.get("nkrPeriodDays") or 1,
+        )
+        days = period_hours / 24.0
+        period_unit = str(config.get("nkrPeriodUnit") or config.get("nkr_period_unit") or ("hours" if period_hours < 24 else "days")).lower()
+        period_value = config.get("nkrPeriodValue") if config.get("nkrPeriodValue") is not None else config.get("nkr_period_value")
+        if period_value is None:
+            period_value = period_hours if period_unit == "hours" else days
         try:
             max_active = max(0, int(float(config.get("maxActiveAssets") if config.get("maxActiveAssets") is not None else config.get("max_active_assets", row.get("maxActiveAssets", 0)))))
         except Exception:
@@ -37182,14 +37242,18 @@ def _nkr_stamp_exact_session_start_config(wallet: str, chain_id: int, session_id
         new_meta.update({
             "nkr_capital_mode": mode, "capital_mode": mode, "performance_mode": mode,
             "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
-            "nkr_period_days": days, "max_active_assets": max_active,
+            "nkr_period_days": days, "nkr_period_hours": period_hours,
+            "nkr_period_unit": period_unit, "nkr_period_value": period_value,
+            "runtime_hours": period_hours, "max_active_assets": max_active,
             "start_mode_locked": True, "start_config_source": "create_auto_request",
         })
         new_row = dict(row)
         new_row.update({
             "nkrCapitalMode": mode, "capitalMode": mode, "performanceMode": mode,
             "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
-            "nkrPeriodDays": days, "periodDays": days, "maxActiveAssets": max_active,
+            "nkrPeriodDays": days, "periodDays": days, "nkrPeriodHours": period_hours,
+            "nkrPeriodUnit": period_unit, "nkrPeriodValue": period_value, "runtimeHours": period_hours,
+            "maxActiveAssets": max_active,
             "meta": new_meta,
         })
         patched_rows.append(new_row)
@@ -38233,13 +38297,12 @@ def _nkr_strategist_open_session(wallet: str, chain_key: str, amount_usd: float,
             "requestedUsd": amount_usd,
         }
 
-    duration_hours = max(1, min(int(_safe_float(settings.get("nkrPeriodDays"), 10) * 24), 24 * 30))
-    # Prefer UI period days as campaign length, capped reasonably.
-    try:
-        period_days = int(_safe_float(settings.get("nkrPeriodDays"), 10))
-        duration_sec = max(3600, min(period_days * 86400, 30 * 86400))
-    except Exception:
-        duration_sec = duration_hours * 3600
+    duration_hours = _nkr_normalize_period_hours(
+        settings.get("nkrPeriodHours"), settings.get("nkrPeriodValue"),
+        settings.get("nkrPeriodUnit"), settings.get("nkrPeriodDays") or 10,
+    )
+    # CoreVault accepts seconds; preserve sub-day NKR test periods such as 2 hours.
+    duration_sec = max(3600, min(int(round(duration_hours * 3600)), 30 * 86400))
 
     vault = funding["vault"]
     settlement_token = funding["token"]
@@ -41150,7 +41213,10 @@ def _nkr_live_worker_cycle() -> None:
                 "nkrCapitalMode": _nkr_normalize_performance_mode(ui.get("nkrCapitalMode") or ui.get("nkr_mode") or "DYNAMIC"),
                 "nkrProfitMode": str(ui.get("nkrProfitMode") or "REINVEST").upper(),
                 "nkrObservationWindow": str(ui.get("nkrObservationWindow") or "1h"),
-                "nkrPeriodDays": ui.get("nkrPeriodDays") or 1,
+                "nkrPeriodValue": ui.get("nkrPeriodValue"),
+                "nkrPeriodUnit": str(ui.get("nkrPeriodUnit") or "days").lower(),
+                "nkrPeriodHours": _nkr_normalize_period_hours(ui.get("nkrPeriodHours"), ui.get("nkrPeriodValue"), ui.get("nkrPeriodUnit"), ui.get("nkrPeriodDays") or 1),
+                "nkrPeriodDays": _nkr_normalize_period_hours(ui.get("nkrPeriodHours"), ui.get("nkrPeriodValue"), ui.get("nkrPeriodUnit"), ui.get("nkrPeriodDays") or 1) / 24.0,
                 "nkrBudgetUsd": ui.get("rotationBudgetRelease", 0),
                 "maxActiveAssets": ui.get("maxActiveAssets", ui.get("rotationMaxActiveSessions", 0)),
                 "maxCapitalPerAssetPct": ui.get("maxCapitalPerAssetPct", NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT),
@@ -41981,6 +42047,12 @@ def api_nkr_mode_update():
             ui["nkrProfitMode"] = str(body.get("nkrProfitMode")).upper()
         if body.get("nkrPeriodDays") is not None:
             ui["nkrPeriodDays"] = body.get("nkrPeriodDays")
+        if body.get("nkrPeriodHours") is not None:
+            ui["nkrPeriodHours"] = body.get("nkrPeriodHours")
+        if body.get("nkrPeriodUnit") is not None:
+            ui["nkrPeriodUnit"] = str(body.get("nkrPeriodUnit") or "days").lower()
+        if body.get("nkrPeriodValue") is not None:
+            ui["nkrPeriodValue"] = body.get("nkrPeriodValue")
         if body.get("maxActiveAssets") is not None:
             ui["maxActiveAssets"] = body.get("maxActiveAssets")
             ui["rotationMaxActiveSessions"] = body.get("maxActiveAssets")
@@ -43576,10 +43648,11 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     nowi = int(time.time() * 1000)
     # ENGINE-127: normalize every NKR session to the selected NKR Period before
     # any status or executor decision. Observation windows never expire a run.
-    period_days = settings.get("nkrPeriodDays") or settings.get("periodDays") or NEXUS_NKR_DEFAULT_PERIOD_DAYS
+    period_hours = _nkr_normalize_period_hours(settings.get("nkrPeriodHours"), settings.get("nkrPeriodValue"), settings.get("nkrPeriodUnit"), settings.get("nkrPeriodDays") or settings.get("periodDays") or NEXUS_NKR_DEFAULT_PERIOD_DAYS)
+    period_days = period_hours / 24.0
     sessions, campaign_clock = _nkr_apply_campaign_clock(
         [dict(x) for x in (sessions or []) if isinstance(x, dict)],
-        period_days,
+        period_days, period_hours=period_hours,
     )
     campaign_expires = int((campaign_clock or {}).get("expiresAt") or 0)
     default_mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
