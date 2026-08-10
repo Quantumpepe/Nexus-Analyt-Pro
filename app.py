@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-402-NKR-PERIOD-HOURS-DAYS"
+BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-403-ASYNC-CREATE-RECEIPT-RECOVERY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD405-NKR-PERIOD-HOURS-DAYS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2869,11 +2869,42 @@ def _run_eth_session_create_job(job_id, payload):
     try:
         _eth_session_job_write(job_id,status="RUNNING",step="SUBMITTING",error="")
         _live_engine_mark(system_name,status="starting",decision="SESSION_SUBMITTING",reason="Ethereum CoreVault session transaction is being submitted",pending_tx="submitting",last_error="")
-        sent=_send_vault_tx(wallet_id,wallet,vault,calldata,f"nexus-{system_name.lower()}-eth-session-{job_id}",chain_id=1)
-        tx_hash=str(sent.get("hash") or "")
+        # ENGINE-403: async CREATE must persist the broadcast hash before waiting for a receipt.
+        # The previous helper combined send+wait; if receipt polling timed out, the job lost
+        # the already-broadcast tx and incorrectly reported CREATE failed even when it later mined.
+        reference=f"nexus-{system_name.lower()}-eth-session-{job_id}"
+        submitted=_privy_send_delegated_transaction(wallet_id,{
+            "from":_norm_addr(wallet),"to":_norm_addr(vault),"data":calldata,"value":"0x0"
+        },reference,chain_id=1)
+        tx_hash=str(submitted.get("hash") or submitted.get("txHash") or "")
+        if not tx_hash:
+            raise RuntimeError("core_vault_session_create_missing_hash")
         _eth_session_job_write(job_id,status="RUNNING",step="CONFIRMATION_PENDING",tx_hash=tx_hash)
-        _live_engine_mark(system_name,status="starting",decision="CONFIRMATION_PENDING",reason="Ethereum session transaction submitted; waiting for confirmation",pending_tx=tx_hash or "confirmation_pending",last_error="")
-        session_id=_session_id_from_receipt(sent.get("receipt") or {},vault)
+        _live_engine_mark(system_name,status="starting",decision="CONFIRMATION_PENDING",reason="Ethereum session transaction submitted; waiting for confirmation",pending_tx=tx_hash,last_error="")
+        receipt=None
+        try:
+            receipt=_privy_wait_receipt(tx_hash,timeout_sec=90,chain_id=1)
+        except Exception as receipt_exc:
+            if "transaction_receipt_timeout" not in str(receipt_exc):
+                raise
+            _eth_session_job_write(job_id,status="RUNNING",step="RECOVERING_RECEIPT",tx_hash=tx_hash,error="")
+            _live_engine_mark(system_name,status="starting",decision="CREATE_RECEIPT_RECOVERING",reason="Create transaction was broadcast; recovering delayed Ethereum receipt",pending_tx=tx_hash,last_error="")
+            recover_deadline=time.time()+600
+            while time.time()<recover_deadline:
+                try:
+                    receipt=_rpc_call(1,"eth_getTransactionReceipt",[tx_hash])
+                except Exception:
+                    receipt=None
+                if receipt:
+                    status=int(str(receipt.get("status") or "0x0"),16)
+                    if status!=1:
+                        diag=_privy_revert_diagnostics(1,tx_hash,receipt)
+                        raise RuntimeError(f"transaction_reverted:{tx_hash}:chain=1:{diag}")
+                    break
+                time.sleep(5)
+            if not receipt:
+                raise RuntimeError(f"transaction_receipt_timeout_after_recovery:{tx_hash}:chain=1")
+        session_id=_session_id_from_receipt(receipt or {},vault)
         if session_id is None:
             raise RuntimeError("core_vault_session_id_missing_from_receipt")
         if system_name == "NKR":
