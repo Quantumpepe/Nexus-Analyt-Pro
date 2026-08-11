@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-405-NKR-ONCHAIN-ENDSAT-HARD-GUARD"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD405-NKR-PERIOD-HOURS-DAYS"
+BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-406-NKR-NET-PROFIT-EXIT-GUARD"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD407-NKR-PENDING-MODE-LOCK-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -15627,7 +15627,12 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     net_positive = net >= max(0.02, min(1.0, cost*0.0002))
     deep = worst_pct <= -1.2 or worst_usd <= -max(10.0,cost*0.008)
     near_be = gross_pct >= -0.35 and gross >= -max(10.0,min(20.0,cost*0.008))
-    recovery_exit = held >= min_hold and deep and near_be and not (regime in {"GREEN","STRONG_GREEN"} and quality >= 70 and recovery >= 65 and gross > 0)
+    # ENGINE-406: a discretionary Strategist exit may never realize a loss after
+    # estimated exit costs. The old break-even recovery branch could close a position
+    # while net was still negative, causing repeated churn. Manual Stop & Exit, true
+    # CoreVault period expiry and hard-risk / hard-stop exits use separate lifecycle
+    # paths and remain allowed to realize a loss when required.
+    recovery_exit = held >= min_hold and deep and near_be and net_positive and not (regime in {"GREEN","STRONG_GREEN"} and quality >= 70 and recovery >= 65 and gross > 0)
     trailing = peak_pct >= max(tp,0.25) and net_positive and drawdown >= {"AGGRESSIVE":1.2,"DYNAMIC":1.4,"TACTICAL":1.6,"DEFENSIVE":1.8}.get(m,1.4)
     take_profit = held >= min_hold and net_positive and net_pct >= tp
     micro_profit = held >= max(60,min_hold//2) and net_positive and net_pct >= 0.02
@@ -40417,17 +40422,35 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "risk_exceeded")
                 or reason.startswith("max_loss") or reason.startswith("hard_stop")
             )
-            if is_protect and (immediate_risk or _position_held_long_enough(sym)):
+            metric_now = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
+            net_now = _safe_float(metric_now.get("netUsd"), 0.0)
+            # ENGINE-406: NKR discretionary CLOSE requires positive net-after-costs.
+            # Hard risk is the only automatic loss-taking exception in this portfolio
+            # path. Manual stop and period-end closing do not come through this branch.
+            profit_guard_ok = bool(engine_name != "NKR" or immediate_risk or net_now > 0.0)
+            if is_protect and profit_guard_ok and (immediate_risk or _position_held_long_enough(sym)):
                 actions.append((0, abs(delta) if delta else current, "CLOSE", sym, snap["amount"]))
             elif is_protect:
                 targets[sym] = current
+                if engine_name == "NKR" and not profit_guard_ok:
+                    metric_now["exitBlockedByNetProfitGuard"] = True
+                    metric_now["exitBlockReason"] = f"discretionary_close_blocked_net={net_now:.8f}"
                 forced_exits.pop(sym, None)
             else:
                 targets[sym] = current
                 forced_exits.pop(sym, None)
         elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
-            fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
-            actions.append((1, abs(delta), "REDUCE", sym, amount))
+            metric_now = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
+            net_now = _safe_float(metric_now.get("netUsd"), 0.0)
+            if engine_name == "NKR" and net_now <= 0.0:
+                # Rebalancing is discretionary. Never sell part of an NKR position at
+                # a net loss merely because the target allocation moved lower.
+                targets[sym] = current
+                metric_now["reduceBlockedByNetProfitGuard"] = True
+                metric_now["exitBlockReason"] = f"discretionary_reduce_blocked_net={net_now:.8f}"
+            else:
+                fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
+                actions.append((1, abs(delta), "REDUCE", sym, amount))
         else:
             # Adaptive floor: never require more than ~40% of session budget to open.
             min_open = min(_NKR_LIVE_MIN_REBALANCE_USD, max(0.20, float(plan.get("investUsd") or budget_usd or 0) * 0.40))
@@ -40488,6 +40511,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         entry_guard = False
         try:
             if action in {"CLOSE", "REDUCE"}:
+                # ENGINE-406 final execution guard: protect against stale/reordered
+                # portfolio actions. A discretionary NKR SELL must still be net-positive
+                # at the execution boundary. Hard-risk exits are exempt.
+                if engine_name == "NKR":
+                    _reason = str((forced_exits or {}).get(sym) or "")
+                    _risk_exit = (
+                        _reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "risk_exceeded")
+                        or _reason.startswith("max_loss") or _reason.startswith("hard_stop")
+                    )
+                    _metric = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
+                    _net_now = _safe_float(_metric.get("netUsd"), 0.0)
+                    if not _risk_exit and _net_now <= 0.0:
+                        last_skip = f"NET_PROFIT_GUARD:{sym}:{action}:net={_net_now:.8f}"
+                        continue
                 result = _nkr_live_trade_route(wallet, live_row, route, route["token"], settlement, int(amount), action=action)
                 # ENGINE-378: flat after exit → allow re-entry after short cool-down (not 24h).
                 try:
