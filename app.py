@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-404-NKR-IDLE-RELEASE-PERIOD-GUARD"
+BACKEND_BUILD_ID = "B-2026.08.10-ENGINE-405-NKR-ONCHAIN-ENDSAT-HARD-GUARD"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD405-NKR-PERIOD-HOURS-DAYS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -962,7 +962,7 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     return {"executed": True, "txHash": tx_hash, "amountIn": amount_in, "amountOut": quote, "liveOperationId": exit_op_id}
 
 
-def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
+def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_early_nkr_stop: bool = False) -> dict:
     """Stop path: START_CLOSING → EXIT open assets → FINALIZE.
 
     ENGINE-365: START_CLOSING and FINALIZE use the persistent ops table so parallel
@@ -990,7 +990,23 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict) -> dict:
     if len(words) < 13:
         raise RuntimeError("session_decode_failed_before_stop")
     status_id = int(words[3])
+    starts_at = int(words[4]) if len(words) > 4 else 0
+    ends_at = int(words[5]) if len(words) > 5 else 0
     open_assets = int(words[12])
+
+    # ENGINE-405: the CoreVault endsAt timestamp is the authoritative NKR period
+    # boundary. Automatic/session-management code may never submit startClosing
+    # before endsAt. Only an explicit user Stop & Exit may override the period.
+    # This guard lives in the mutation function itself so a future caller cannot
+    # accidentally bypass the higher-level RELEASE_IDLE checks.
+    if eng == "NKR" and status_id in (1, 2) and not bool(allow_early_nkr_stop):
+        now_sec = int(time.time())
+        if ends_at <= 0 or now_sec < ends_at:
+            remaining = max(0, ends_at - now_sec) if ends_at > 0 else None
+            raise RuntimeError(
+                f"nkr_period_still_active_onchain:session={sid}:startsAt={starts_at}:"
+                f"endsAt={ends_at}:now={now_sec}:secondsRemaining={remaining if remaining is not None else 'unknown'}"
+            )
 
     close_tx = ""
     close_op_id = ""
@@ -1175,7 +1191,7 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
     try:
         for row in rows:
             try:
-                results.append(_finalize_one_live_session(wallet, engine, row))
+                results.append(_finalize_one_live_session(wallet, engine, row, allow_early_nkr_stop=(str(engine).upper() == "NKR")))
             except Exception as exc:
                 msg = str(exc)[:1000]
                 conn = _db()
@@ -38200,7 +38216,7 @@ def _nkr_strategist_multi_chain_plan(wallet: str, market_rows: list, runnable_ro
         has_pos = open_assets > 0
         entry_ok = bool(best and best["score"] >= threshold)
 
-        # ENGINE-404: the user-approved NKR period is a hard session lifetime.
+        # ENGINE-405: the user-approved NKR period is a hard session lifetime.
         # An idle/no-entry window must never finalize an otherwise valid session early.
         # Keep scanning until the exact immutable session period has expired.
         try:
@@ -38420,7 +38436,7 @@ def _nkr_strategist_release_idle_session(wallet: str, live_row: dict) -> dict:
         if status_id == 4:
             return {"ok": True, "already": "FINALIZED", "sessionId": sid}
 
-        # ENGINE-404 hard guard: RELEASE_IDLE is never allowed to shorten the
+        # ENGINE-405 hard guard: RELEASE_IDLE is never allowed to shorten the
         # user-approved NKR period. Only a genuinely expired session may be
         # auto-released for idleness. Manual Stop & Exit remains unaffected.
         try:
