@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-407-WATCHLIST-CG-7D-SPARKLINE"
+BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-408-NKR-ONE-POSITION-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40497,6 +40497,12 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             return True
 
     actions = []
+    # ENGINE-408: snapshot-level one-position lock. When NKR already owns any
+    # position in this session, no target rebalance may create OPEN/ADD elsewhere.
+    # The only normal mutation while active is an explicit forced CLOSE.
+    nkr_any_open_position = bool(
+        engine_name == "NKR" and any(int((s or {}).get("amount") or 0) > 0 for s in snapshots.values())
+    )
     for sym, snap in snapshots.items():
         # ENGINE-385: position with amount>0 is always closable; value may be 0 on quote fail.
         current = max(_safe_float(snap.get("valueUsd"), 0.0), _safe_float(snap.get("costBasisUsd"), 0.0))
@@ -40534,12 +40540,16 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         elif delta < -_NKR_LIVE_MIN_REBALANCE_USD:
             metric_now = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
             net_now = _safe_float(metric_now.get("netUsd"), 0.0)
-            if engine_name == "NKR" and net_now <= 0.0:
-                # Rebalancing is discretionary. Never sell part of an NKR position at
-                # a net loss merely because the target allocation moved lower.
+            if engine_name == "NKR":
+                # ENGINE-408: NKR is a one-position rotator, not a continuously
+                # rebalanced portfolio. While a position is open, HOLD/RECOVERY must
+                # keep the full position unchanged. A target-weight change may never
+                # create a partial REDUCE. Profitable/risk exits are represented as
+                # explicit forced CLOSE actions above; manual/session-end exits use
+                # the separate closing lifecycle.
                 targets[sym] = current
-                metric_now["reduceBlockedByNetProfitGuard"] = True
-                metric_now["exitBlockReason"] = f"discretionary_reduce_blocked_net={net_now:.8f}"
+                metric_now["reduceBlockedByOnePositionLock"] = True
+                metric_now["exitBlockReason"] = f"nkr_one_position_lock_reduce_blocked_net={net_now:.8f}"
             else:
                 fraction = min(1.0, abs(delta) / max(current, 1e-9)); amount = max(1, int(snap["amount"] * fraction))
                 actions.append((1, abs(delta), "REDUCE", sym, amount))
@@ -40549,13 +40559,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             if min_open <= 0:
                 min_open = 0.20
             if delta >= min_open and settlement_cash >= int(min_open * 1_000_000):
-                _scale = 10 ** int(_dec if "_dec" in dir() else 6)
-                try:
-                    _scale = 10 ** max(0, min(18, int(_dec)))
-                except Exception:
-                    _scale = 1_000_000
-                _amt_units = max(1, int(round(float(delta) * _scale)))
-                actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(int(settlement_cash), _amt_units)))
+                metric_now = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
+                if engine_name == "NKR" and nkr_any_open_position:
+                    # ENGINE-408: never top up the current NKR position and never
+                    # rotate/open another asset while one position is still active.
+                    targets[sym] = current
+                    metric_now["entryBlockedByOnePositionLock"] = True
+                else:
+                    _scale = 10 ** int(_dec if "_dec" in dir() else 6)
+                    try:
+                        _scale = 10 ** max(0, min(18, int(_dec)))
+                    except Exception:
+                        _scale = 1_000_000
+                    _amt_units = max(1, int(round(float(delta) * _scale)))
+                    actions.append((2 if current > 0 else 3, delta, "ADD" if current > 0 else "OPEN", sym, min(int(settlement_cash), _amt_units)))
     if engine_name == "TRADER":
         # One confirmed tranche per worker cycle. The next slot requires a fresh
         # Strategist tick and fresh quote, matching Shadow slot recycling.
@@ -40603,6 +40620,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         entry_guard = False
         try:
             if action in {"CLOSE", "REDUCE"}:
+                # ENGINE-408 final defense-in-depth: NKR never performs a generic
+                # portfolio REDUCE. Forced strategist/risk exits are full CLOSEs.
+                if engine_name == "NKR" and action == "REDUCE":
+                    last_skip = f"ONE_POSITION_LOCK:{sym}:REDUCE"
+                    continue
                 # ENGINE-406 final execution guard: protect against stale/reordered
                 # portfolio actions. A discretionary NKR SELL must still be net-positive
                 # at the execution boundary. Hard-risk exits are exempt.
