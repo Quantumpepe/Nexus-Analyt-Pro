@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-406-NKR-NET-PROFIT-EXIT-GUARD"
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.10-BUILD407-NKR-PENDING-MODE-LOCK-FIX"
+BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-407-WATCHLIST-CG-7D-SPARKLINE"
+FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -13560,6 +13560,8 @@ def _gen_cache_get_fresh(key: str):
 # -------------------------
 _WATCH_SNAP_CACHE = {"by_key": {}, "ts": {}}
 _WATCH_SNAP_TTL_SEC = int(os.getenv("WATCH_SNAP_TTL_SEC", "120"))  # 1 min default
+_WATCH_SPARK_CACHE = {"by_key": {}, "ts": {}}
+_WATCH_SPARK_TTL_SEC = int(os.getenv("WATCH_SPARK_TTL_SEC", "300"))  # 5 min; live endpoint is appended in frontend
 
 _COMPARE_CACHE = {"by_key": {}, "ts": {}}
 _COMPARE_TTL_SEC = int(os.getenv("COMPARE_TTL_SEC", "900"))  # 15 min default
@@ -13786,6 +13788,88 @@ def _cg_market_snapshots_batch(coin_ids):
                 if stale is not None:
                     out[cid]=stale
     return out
+
+def _cg_market_sparklines_7d_batch(coin_ids):
+    """
+    Watchlist-only CoinGecko 7D sparklines.
+
+    Uses one batched /coins/markets?sparkline=true request for all missing/expired ids,
+    then caches each coin independently for WATCH_SPARK_TTL_SEC. This keeps /api/compare
+    and all Strategist/NKR history routing untouched.
+    """
+    if not coin_ids:
+        return {}
+
+    ids_unique = []
+    seen = set()
+    for cid in coin_ids:
+        cid = str(cid or "").strip()
+        if cid and cid not in seen:
+            ids_unique.append(cid)
+            seen.add(cid)
+
+    out = {}
+    missing = []
+    for cid in ids_unique:
+        key = f"watchspark7d|{cid}"
+        cached = _cache_get_fresh(_WATCH_SPARK_CACHE, key, _WATCH_SPARK_TTL_SEC)
+        if isinstance(cached, list) and len(cached) >= 8:
+            out[cid] = cached
+        else:
+            missing.append(cid)
+
+    if missing:
+        url = f"{COINGECKO_BASE}/coins/markets"
+        try:
+            arr = _cg_request_json(
+                url,
+                params={
+                    "vs_currency": "usd",
+                    "ids": ",".join(missing),
+                    "price_change_percentage": "24h",
+                    "per_page": 250,
+                    "page": 1,
+                    "sparkline": "true",
+                },
+                timeout=20,
+            ) or []
+            if not isinstance(arr, list):
+                arr = []
+
+            received = set()
+            for row in arr:
+                cid = str(row.get("id") or "").strip()
+                if not cid:
+                    continue
+                received.add(cid)
+                raw = ((row.get("sparkline_in_7d") or {}).get("price") or [])
+                vals = []
+                for v in raw:
+                    try:
+                        fv = float(v)
+                        if math.isfinite(fv) and fv > 0:
+                            vals.append(fv)
+                    except Exception:
+                        continue
+                if len(vals) >= 8:
+                    _cache_set(_WATCH_SPARK_CACHE, f"watchspark7d|{cid}", vals)
+                    out[cid] = vals
+
+            # Preserve the last real CoinGecko series on transient/missing rows.
+            for cid in missing:
+                if cid in received and cid in out:
+                    continue
+                stale = _cache_get_any(_WATCH_SPARK_CACHE, f"watchspark7d|{cid}")
+                if isinstance(stale, list) and len(stale) >= 8:
+                    out[cid] = stale
+        except Exception:
+            for cid in missing:
+                stale = _cache_get_any(_WATCH_SPARK_CACHE, f"watchspark7d|{cid}")
+                if isinstance(stale, list) and len(stale) >= 8:
+                    out[cid] = stale
+
+    return out
+
 def _cg_market_chart_usd(coin_id: str, days: int):
     key = f"chart|{coin_id}|{days}"
     cached = _cg_cache_get(key)
@@ -16496,6 +16580,10 @@ def api_watchlist_snapshot():
                 coin_ids.append(cid)
 
         snaps_by_id = _cg_market_snapshots_batch(coin_ids) if coin_ids else {}
+        # Watchlist chart history is intentionally separate from /api/compare.
+        # One CoinGecko batch request is cached for 5 minutes; the frontend appends
+        # the current snapshot price every normal watch refresh so the visible endpoint stays live.
+        sparks7d_by_id = _cg_market_sparklines_7d_batch(coin_ids) if coin_ids else {}
 
         # Backfill any misses one-by-one and finally via the generic price router.
         for it in market_items:
@@ -16613,6 +16701,8 @@ def api_watchlist_snapshot():
                     "market_cap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
                     "marketCap": snap.get("market_cap") if "market_cap" in snap else snap.get("marketCap"),
                     "liquidity": None,
+                    "sparkline7d": list(sparks7d_by_id.get(cid) or []),
+                    "sparkline7d_source": "coingecko" if sparks7d_by_id.get(cid) else None,
                     "source": snap.get("source") or "coingecko",
                 })
             else:
@@ -16627,6 +16717,8 @@ def api_watchlist_snapshot():
                     "market_cap": None,
                     "marketCap": None,
                     "liquidity": None,
+                    "sparkline7d": [],
+                    "sparkline7d_source": None,
                     "source": "error",
                 })
 
