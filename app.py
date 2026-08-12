@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-411-NKR-SELL-GATE-HARD-RISK-FIX"
+BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-412-NO-INSTANT-SELL-REENTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15705,25 +15705,21 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     peak_pct = max(_safe_float(prior_meta.get("nkr_peak_net_profit_pct"), net_pct), net_pct)
     drawdown = max(0.0, peak_pct-net_pct)
     m = str(mode or "DYNAMIC").upper()
-    min_hold = {"AGGRESSIVE":180,"DYNAMIC":240,"TACTICAL":300,"DEFENSIVE":360}.get(m,240)
-    tp = {"AGGRESSIVE":0.10,"DYNAMIC":0.16,"TACTICAL":0.22,"DEFENSIVE":0.28}.get(m,0.16)
+    # ENGINE-412: LIVE NKR must NOT mirror Shadow micro-harvest.
+    # micro_profit (0.02% after ~90s) caused buy→sell in ~1 minute on-chain.
+    # Live rules: hold at least 15 minutes, take profit only on real edge,
+    # trail only after a meaningful peak, never instant-flip.
+    min_hold = {"AGGRESSIVE":900,"DYNAMIC":1200,"TACTICAL":1500,"DEFENSIVE":1800}.get(m,1200)  # sec
+    tp = {"AGGRESSIVE":0.45,"DYNAMIC":0.55,"TACTICAL":0.70,"DEFENSIVE":0.90}.get(m,0.55)  # net %
     hard_stop = {"AGGRESSIVE":-15.0,"DYNAMIC":-10.0,"TACTICAL":-7.0,"DEFENSIVE":-5.0}.get(m,-10.0)
-    net_positive = net >= max(0.02, min(1.0, cost*0.0002))
+    net_positive = net >= max(0.03, min(1.0, cost*0.0003))
     deep = worst_pct <= -1.2 or worst_usd <= -max(10.0,cost*0.008)
     near_be = gross_pct >= -0.35 and gross >= -max(10.0,min(20.0,cost*0.008))
-    # ENGINE-406: a discretionary Strategist exit may never realize a loss after
-    # estimated exit costs. The old break-even recovery branch could close a position
-    # while net was still negative, causing repeated churn. Manual Stop & Exit, true
-    # CoreVault period expiry and hard-risk / hard-stop exits use separate lifecycle
-    # paths and remain allowed to realize a loss when required.
     recovery_exit = held >= min_hold and deep and near_be and net_positive and not (regime in {"GREEN","STRONG_GREEN"} and quality >= 70 and recovery >= 65 and gross > 0)
-    trailing = peak_pct >= max(tp,0.25) and net_positive and drawdown >= {"AGGRESSIVE":1.2,"DYNAMIC":1.4,"TACTICAL":1.6,"DEFENSIVE":1.8}.get(m,1.4)
+    trailing = held >= min_hold and peak_pct >= max(tp, 0.80) and net_positive and drawdown >= {"AGGRESSIVE":1.20,"DYNAMIC":1.40,"TACTICAL":1.60,"DEFENSIVE":1.80}.get(m,1.40)
     take_profit = held >= min_hold and net_positive and net_pct >= tp
-    micro_profit = held >= max(60,min_hold//2) and net_positive and net_pct >= 0.02
-    # ENGINE-411: elevated risk, low liquidity and high slippage are analysis /
-    # execution context only for an ALREADY OPEN NKR position. They may prevent a
-    # fresh BUY, but they do not authorize a loss-taking SELL. Only an explicit
-    # token security emergency or the configured hard-stop/max-loss condition can.
+    # ENGINE-412: micro_profit DISABLED on live — was the instant-sell source.
+    micro_profit = False
     security_emergency = bool(q.get("security_emergency"))
     execution_liquidity_block = bool(q.get("execution_liquidity_block"))
     execution_slippage_block = bool(q.get("execution_slippage_block"))
@@ -15735,7 +15731,7 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     elif recovery_exit: reason="break_even_recovery_exit"
     elif trailing: reason="peak_profit_trailing_protection"
     elif take_profit: reason="shadow_tactical_take_profit"
-    elif micro_profit: reason="shadow_micro_profit_harvest"
+    # micro_profit intentionally omitted (ENGINE-412)
     decision = "EXIT" if reason else ("RECOVERY" if gross < 0 and (recovery > 0 or momentum > -10) else "HOLD")
     return {"decision":decision,"reason":reason,"quality":quality,"risk":risk,"recovery":recovery,"momentum":momentum,
             "riskContextExceeded":risk_context_exceeded,"securityEmergency":security_emergency,
@@ -38051,7 +38047,7 @@ _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_A
 # ENGINE-378: shadow-like behaviour — never lock re-entry for a whole day.
 # After a flat exit the next OPEN may happen after a short cool-down only.
 _NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "45")))
-_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(180, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "180")))  # ENGINE-387: never close a new live position after only one minute
+_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(900, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "900")))  # ENGINE-412: 15 min minimum before discretionary CLOSE
 _NKR_LIVE_REENTRY_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "45")))  # ENGINE-380: fast re-entry after harvest
 
 # Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
@@ -40323,8 +40319,9 @@ def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict,
     net_pct = _safe_float(base.get("netPct"), 0.0)
     held = int(base.get("heldSec") or 0)
     m = str(mode or "DYNAMIC").upper()
-    min_hold = {"AGGRESSIVE": 120, "DYNAMIC": 180, "TACTICAL": 240, "DEFENSIVE": 300}.get(m, 180)
-    profit_gate = {"AGGRESSIVE": 0.08, "DYNAMIC": 0.12, "TACTICAL": 0.18, "DEFENSIVE": 0.24}.get(m, 0.12)
+    # ENGINE-412: Trader also needs real hold time (not 2 minutes)
+    min_hold = {"AGGRESSIVE": 900, "DYNAMIC": 1200, "TACTICAL": 1500, "DEFENSIVE": 1800}.get(m, 1200)
+    profit_gate = {"AGGRESSIVE": 0.35, "DYNAMIC": 0.45, "TACTICAL": 0.55, "DEFENSIVE": 0.70}.get(m, 0.45)
     profit_harvest = held >= min_hold and net > 0 and net_pct >= profit_gate
     if hard:
         decision, reason = "EXIT", "shadow_trader_confirmed_risk_cluster"
@@ -40868,10 +40865,18 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     if result and (result.get("ok") or result.get("txHash") or result.get("tx_hash") or result.get("executed")):
                         if engine_name == "NKR":
                             _nkr_position_lock_exit_pending(wallet, live_row, sym, result)
-                            # Unlock only if this confirmed CLOSE is already reflected
-                            # by CoreVault openAssetCount==0. Otherwise EXIT_PENDING
-                            # remains durable and blocks any duplicate re-entry.
                             _nkr_position_lock_reconcile_exit_pending(wallet, live_row)
+                            # ENGINE-412: after a confirmed CLOSE, re-read openAssetCount.
+                            # If flat, clear the lock immediately so the next tick can OPEN again.
+                            try:
+                                _oa = _nkr_session_open_asset_count(chain_id, vault, sid)
+                                if int(_oa or 0) <= 0:
+                                    _nkr_position_lock_clear(wallet, live_row)
+                            except Exception:
+                                try:
+                                    _nkr_position_lock_clear(wallet, live_row)
+                                except Exception:
+                                    pass
                         # Short cool-down only — unlimited harvest cycles in one session.
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_REENTRY_COOLDOWN_SEC, state="EXIT_CONFIRMED")
                         try:
@@ -40887,11 +40892,23 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 if engine_name == "NKR":
                     _lock_now = _nkr_position_lock_reconcile_exit_pending(wallet, live_row)
                     if _nkr_position_lock_active(_lock_now):
-                        return {
-                            "executed": False, "decision": "HOLD", "gate": "POSITION_LOCKED",
-                            "asset": str(_lock_now.get("asset_symbol") or sym),
-                            "detail": f"{chain_key} session #{sid} already has a confirmed NKR position lock; duplicate {action} blocked until confirmed full CLOSE.",
-                        }
+                        # ENGINE-412: if CoreVault is already flat, the lock is stale —
+                        # clear it so a new BUY can happen after the previous cycle.
+                        try:
+                            _oa_flat = int(_nkr_session_open_asset_count(chain_id, vault, sid) or 0)
+                        except Exception:
+                            _oa_flat = -1
+                        if _oa_flat == 0:
+                            try:
+                                _nkr_position_lock_clear(wallet, live_row)
+                            except Exception:
+                                pass
+                        else:
+                            return {
+                                "executed": False, "decision": "HOLD", "gate": "POSITION_LOCKED",
+                                "asset": str(_lock_now.get("asset_symbol") or sym),
+                                "detail": f"{chain_key} session #{sid} already has a confirmed NKR position lock; duplicate {action} blocked until confirmed full CLOSE.",
+                            }
                 # Authoritative duplicate-entry barrier shared by every backend process.
                 # Re-read openAssetCount after the mutex is acquired so a stale portfolio
                 # snapshot can never submit a second OPEN/ADD on ETH, BNB or POL.
