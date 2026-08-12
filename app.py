@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.11-ENGINE-408-NKR-ONE-POSITION-LOCK"
+BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-409-NKR-PERSISTENT-POSITION-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40093,6 +40093,155 @@ def _nkr_entry_guard_release(wallet: str, live_row: dict) -> None:
         conn.close()
 
 
+
+# ENGINE-409: durable NKR session-position lock. The old one-position protection was
+# derived from live position snapshots/openAssetCount. Those reads may lag a mined
+# executeTrade long enough for another worker tick to submit a duplicate OPEN. This
+# SQLite lock is shared by all Gunicorn workers and survives process restarts.
+def _nkr_position_lock_init() -> None:
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS nexus_nkr_position_locks (
+                    identity_key TEXT PRIMARY KEY,
+                    wallet_address TEXT NOT NULL,
+                    chain_id INTEGER NOT NULL,
+                    vault_address TEXT NOT NULL,
+                    onchain_session_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    asset_symbol TEXT,
+                    entry_tx_hash TEXT,
+                    exit_tx_hash TEXT,
+                    locked_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )
+            """)
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nkr_position_lock_get(wallet: str, live_row: dict) -> dict:
+    ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
+    if not ident.get("controllable"):
+        return {}
+    _nkr_position_lock_init()
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM nexus_nkr_position_locks WHERE identity_key=?",
+            (ident["identityKey"],),
+        ).fetchone()
+        return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _nkr_position_lock_active(lock_row: dict) -> bool:
+    return str((lock_row or {}).get("state") or "").upper() in {"LOCKED", "EXIT_PENDING"}
+
+
+def _nkr_position_lock_set(wallet: str, live_row: dict, state: str, asset: str = "", entry_tx: str = "", exit_tx: str = "") -> dict:
+    ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
+    if not ident.get("controllable"):
+        return {}
+    _nkr_position_lock_init()
+    nowi = int(time.time())
+    st = str(state or "LOCKED").upper().strip()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            prev = conn.execute(
+                "SELECT * FROM nexus_nkr_position_locks WHERE identity_key=?",
+                (ident["identityKey"],),
+            ).fetchone()
+            prev_d = dict(prev) if prev else {}
+            asset_v = str(asset or prev_d.get("asset_symbol") or "").upper().strip()
+            entry_v = str(entry_tx or prev_d.get("entry_tx_hash") or "").strip()
+            exit_v = str(exit_tx or prev_d.get("exit_tx_hash") or "").strip()
+            locked_ts = int(prev_d.get("locked_ts") or nowi)
+            conn.execute(
+                """
+                INSERT INTO nexus_nkr_position_locks(
+                    identity_key,wallet_address,chain_id,vault_address,onchain_session_id,
+                    state,asset_symbol,entry_tx_hash,exit_tx_hash,locked_ts,updated_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(identity_key) DO UPDATE SET
+                    state=excluded.state,
+                    asset_symbol=excluded.asset_symbol,
+                    entry_tx_hash=excluded.entry_tx_hash,
+                    exit_tx_hash=excluded.exit_tx_hash,
+                    updated_ts=excluded.updated_ts
+                """,
+                (ident["identityKey"], ident["walletAddress"], int(ident["chainId"]),
+                 ident["vaultAddress"], str(ident["onchainSessionId"]), st, asset_v,
+                 entry_v, exit_v, locked_ts, nowi),
+            )
+            conn.commit()
+        return _nkr_position_lock_get(wallet, live_row)
+    finally:
+        conn.close()
+
+
+def _nkr_position_lock_clear(wallet: str, live_row: dict) -> None:
+    ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
+    if not ident.get("controllable"):
+        return
+    _nkr_position_lock_init()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("DELETE FROM nexus_nkr_position_locks WHERE identity_key=?", (ident["identityKey"],))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nkr_result_tx_hash(result: dict) -> str:
+    if not isinstance(result, dict):
+        return ""
+    receipt = result.get("receipt") if isinstance(result.get("receipt"), dict) else {}
+    return str(result.get("txHash") or result.get("tx_hash") or result.get("hash") or receipt.get("transactionHash") or "").strip()
+
+
+def _nkr_position_lock_entry_confirmed(wallet: str, live_row: dict, asset: str, result: dict) -> dict:
+    return _nkr_position_lock_set(
+        wallet, live_row, "LOCKED", asset=asset, entry_tx=_nkr_result_tx_hash(result), exit_tx=""
+    )
+
+
+def _nkr_position_lock_exit_pending(wallet: str, live_row: dict, asset: str, result: dict) -> dict:
+    return _nkr_position_lock_set(
+        wallet, live_row, "EXIT_PENDING", asset=asset, exit_tx=_nkr_result_tx_hash(result)
+    )
+
+
+def _nkr_position_lock_reconcile_exit_pending(wallet: str, live_row: dict) -> dict:
+    """Only an explicitly confirmed CLOSE may unlock a session.
+
+    A plain LOCKED row is NEVER cleared from a zero/lagging snapshot. EXIT_PENDING is
+    created only after _nkr_live_trade_route returned from a CLOSE. Once CoreVault
+    confirms openAssetCount==0, re-entry may be enabled for the next profitable cycle.
+    """
+    lock_row = _nkr_position_lock_get(wallet, live_row)
+    if str((lock_row or {}).get("state") or "").upper() != "EXIT_PENDING":
+        return lock_row
+    try:
+        ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
+        if not ident.get("controllable"):
+            return lock_row
+        count = _nkr_session_open_asset_count(
+            int(ident["chainId"]), ident["vaultAddress"], int(str(ident["onchainSessionId"]))
+        )
+        if int(count) == 0:
+            _nkr_position_lock_clear(wallet, live_row)
+            return {}
+    except Exception:
+        pass
+    return lock_row
+
+
 def _nkr_session_open_asset_count(chain_id: int, vault: str, sid: int) -> int:
     raw = _eth_call(int(chain_id), _norm_addr(vault), _core_selector("sessionOf(uint256)") + _uint_to_32(int(sid)))
     words = _core_words(raw)
@@ -40219,6 +40368,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     if status_id != 1:
         # Status 4 = FINALIZED: local/UI must not keep showing RUNNING.
         if status_id == 4:
+            try:
+                _nkr_position_lock_clear(wallet, live_row)
+            except Exception:
+                pass
             try:
                 _nkr_set_local_stop_state(wallet, "FINALIZED", f"CoreVault session #{sid} is FINALIZED on {chain_key}")
             except Exception:
@@ -40497,11 +40650,17 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             return True
 
     actions = []
-    # ENGINE-408: snapshot-level one-position lock. When NKR already owns any
-    # position in this session, no target rebalance may create OPEN/ADD elsewhere.
-    # The only normal mutation while active is an explicit forced CLOSE.
+    # ENGINE-409: combine live snapshot state with the durable cross-worker lock.
+    # LOCKED is set immediately after a confirmed ENTRY and is never cleared merely
+    # because a later RPC/position snapshot temporarily reports zero. EXIT_PENDING
+    # may clear only after an explicit CLOSE and CoreVault openAssetCount==0.
+    nkr_position_lock = _nkr_position_lock_reconcile_exit_pending(wallet, live_row) if engine_name == "NKR" else {}
+    nkr_persistent_position_locked = bool(engine_name == "NKR" and _nkr_position_lock_active(nkr_position_lock))
     nkr_any_open_position = bool(
-        engine_name == "NKR" and any(int((s or {}).get("amount") or 0) > 0 for s in snapshots.values())
+        engine_name == "NKR" and (
+            nkr_persistent_position_locked
+            or any(int((s or {}).get("amount") or 0) > 0 for s in snapshots.values())
+        )
     )
     for sym, snap in snapshots.items():
         # ENGINE-385: position with amount>0 is always closable; value may be 0 on quote fail.
@@ -40588,7 +40747,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     # ENGINE-388: flat session = try every ranked executable candidate in the same
     # decision cycle.  Only one can be submitted because the loop breaks after the
     # first confirmed OPEN and the cross-worker entry guard is authoritative.
-    if not any(int((snap or {}).get("amount") or 0) > 0 for snap in snapshots.values()):
+    if (
+        not any(int((snap or {}).get("amount") or 0) > 0 for snap in snapshots.values())
+        and not (engine_name == "NKR" and nkr_persistent_position_locked)
+    ):
         candidate_actions = []
         scale = 10 ** max(0, min(18, int(_dec)))
         open_usd = min(float(plan.get("investUsd") or 0.0), float(spendable_usd or budget_usd or 0.0))
@@ -40643,6 +40805,12 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 # ENGINE-378: flat after exit → allow re-entry after short cool-down (not 24h).
                 try:
                     if result and (result.get("ok") or result.get("txHash") or result.get("tx_hash") or result.get("executed")):
+                        if engine_name == "NKR":
+                            _nkr_position_lock_exit_pending(wallet, live_row, sym, result)
+                            # Unlock only if this confirmed CLOSE is already reflected
+                            # by CoreVault openAssetCount==0. Otherwise EXIT_PENDING
+                            # remains durable and blocks any duplicate re-entry.
+                            _nkr_position_lock_reconcile_exit_pending(wallet, live_row)
                         # Short cool-down only — unlimited harvest cycles in one session.
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_REENTRY_COOLDOWN_SEC, state="EXIT_CONFIRMED")
                         try:
@@ -40652,6 +40820,17 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 except Exception:
                     pass
             else:
+                # ENGINE-409 final durable barrier: once this session has confirmed an
+                # ENTRY, no OPEN/ADD is allowed until an explicit confirmed CLOSE has
+                # transitioned the persistent lock through EXIT_PENDING to flat.
+                if engine_name == "NKR":
+                    _lock_now = _nkr_position_lock_reconcile_exit_pending(wallet, live_row)
+                    if _nkr_position_lock_active(_lock_now):
+                        return {
+                            "executed": False, "decision": "HOLD", "gate": "POSITION_LOCKED",
+                            "asset": str(_lock_now.get("asset_symbol") or sym),
+                            "detail": f"{chain_key} session #{sid} already has a confirmed NKR position lock; duplicate {action} blocked until confirmed full CLOSE.",
+                        }
                 # Authoritative duplicate-entry barrier shared by every backend process.
                 # Re-read openAssetCount after the mutex is acquired so a stale portfolio
                 # snapshot can never submit a second OPEN/ADD on ETH, BNB or POL.
@@ -40714,7 +40893,13 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         return {"executed": False, "decision": "HOLD", "gate": "TRADER_SLOTS_FULL", "asset": sym,
                                 "detail": f"Trader session #{sid} has all {trader_slot_count} slots filled for {sym}."}
                 result = _nkr_live_trade_route(wallet, live_row, route, settlement, route["token"], int(amount), action=action)
-                # Short duplicate-entry hold only (not 24h). Re-entry after a later exit is free.
+                if engine_name == "NKR":
+                    # Durable before the short TTL guard: all workers immediately know
+                    # that this session owns a position even if RPC positionOf/sessionOf
+                    # is still lagging behind the mined executeTrade.
+                    _nkr_position_lock_entry_confirmed(wallet, live_row, sym, result)
+                # Short duplicate-entry hold only (not 24h). The durable position lock,
+                # not this TTL, now governs re-entry until confirmed full CLOSE.
                 _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_CONFIRMED")
         except Exception as trade_exc:
             err = str(trade_exc)[:240]
