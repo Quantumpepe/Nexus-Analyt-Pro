@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-409-NKR-PERSISTENT-POSITION-LOCK"
+BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-410-NKR-SELL-GATE-HARD-RISK-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15720,17 +15720,24 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     trailing = peak_pct >= max(tp,0.25) and net_positive and drawdown >= {"AGGRESSIVE":1.2,"DYNAMIC":1.4,"TACTICAL":1.6,"DEFENSIVE":1.8}.get(m,1.4)
     take_profit = held >= min_hold and net_positive and net_pct >= tp
     micro_profit = held >= max(60,min_hold//2) and net_positive and net_pct >= 0.02
-    severe_risk = m != "AGGRESSIVE" and (risk >= 70 or bool(q.get("hard_block")))
+    # ENGINE-410: a generic elevated risk score is Strategist context, not a SELL command.
+    # The previous live path mapped risk>=70 to `risk_exceeded`, then treated that
+    # reason as an immediate loss-taking exit. This caused confirmed BUY -> SELL
+    # churn within seconds. Only true hard safety blocks and actual hard-stop loss
+    # conditions may bypass the normal positive-net exit gate.
+    hard_safety_block = bool(q.get("hard_block"))
+    risk_context_exceeded = bool(m != "AGGRESSIVE" and risk >= 70)
     hard_loss = net_pct <= hard_stop
     reason = ""
     if hard_loss: reason="hard_stop"
-    elif severe_risk: reason="risk_exceeded"
+    elif hard_safety_block: reason="hard_safety_block"
     elif recovery_exit: reason="break_even_recovery_exit"
     elif trailing: reason="peak_profit_trailing_protection"
     elif take_profit: reason="shadow_tactical_take_profit"
     elif micro_profit: reason="shadow_micro_profit_harvest"
     decision = "EXIT" if reason else ("RECOVERY" if gross < 0 and (recovery > 0 or momentum > -10) else "HOLD")
     return {"decision":decision,"reason":reason,"quality":quality,"risk":risk,"recovery":recovery,"momentum":momentum,
+            "riskContextExceeded":risk_context_exceeded,"hardSafetyBlock":hard_safety_block,
             "grossUsd":gross,"grossPct":gross_pct,"costsUsd":costs,"netUsd":net,"netPct":net_pct,
             "heldSec":held,"peakNetUsd":peak_net,"peakNetPct":peak_pct,"drawdownPct":drawdown,
             "worstPnlUsd":worst_usd,"worstPnlPct":worst_pct,"signalVector":signals}
@@ -40675,11 +40682,24 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             # Shadow EXIT back into HOLD. Every non-empty forced_exits reason was
             # produced by the shared Shadow decision layer and is therefore closable.
             is_protect = bool(reason)
+            # ENGINE-410: `risk_exceeded` is no longer an automatic exit reason.
+            # It is only context for the Strategist. Immediate loss-taking CLOSE is
+            # reserved for actual hard-stop/max-loss/hard-safety conditions.
+            generic_risk_context = reason == "risk_exceeded" or reason.startswith("risk_exceeded")
             immediate_risk = (
-                reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "risk_exceeded")
+                reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "hard_safety_block", "security_hard_block")
                 or reason.startswith("max_loss") or reason.startswith("hard_stop")
+                or reason.startswith("hard_safety_block") or reason.startswith("security_hard_block")
             )
             metric_now = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
+            if engine_name == "NKR" and generic_risk_context:
+                # High/changed risk by itself never means SELL. Keep the position and
+                # let the Strategist continue evaluating it on later ticks.
+                targets[sym] = current
+                metric_now["riskContextHold"] = True
+                metric_now["exitBlockReason"] = f"risk_context_is_not_sell:{reason}"
+                forced_exits.pop(sym, None)
+                continue
             net_now = _safe_float(metric_now.get("netUsd"), 0.0)
             # ENGINE-406: NKR discretionary CLOSE requires positive net-after-costs.
             # Hard risk is the only automatic loss-taking exception in this portfolio
@@ -40792,9 +40812,17 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 # at the execution boundary. Hard-risk exits are exempt.
                 if engine_name == "NKR":
                     _reason = str((forced_exits or {}).get(sym) or "")
+                    # ENGINE-410 defense-in-depth: even a stale/reordered CLOSE with
+                    # generic `risk_exceeded` must never reach the vault. Elevated risk
+                    # remains analysis context; only hard safety / hard stop may realize
+                    # an automatic loss.
+                    if _reason == "risk_exceeded" or _reason.startswith("risk_exceeded"):
+                        last_skip = f"RISK_CONTEXT_HOLD:{sym}:{action}"
+                        continue
                     _risk_exit = (
-                        _reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "risk_exceeded")
+                        _reason in ("hard_stop_net_loss", "max_loss", "hard_stop", "hard_safety_block", "security_hard_block")
                         or _reason.startswith("max_loss") or _reason.startswith("hard_stop")
+                        or _reason.startswith("hard_safety_block") or _reason.startswith("security_hard_block")
                     )
                     _metric = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
                     _net_now = _safe_float(_metric.get("netUsd"), 0.0)
