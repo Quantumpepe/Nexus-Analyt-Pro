@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.12-ENGINE-412-NO-INSTANT-SELL-REENTRY"
+BACKEND_BUILD_ID = "B-2026.08.13-ENGINE-413-NO-FALSE-POSITION-BEFORE-BUY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1363,9 +1363,11 @@ def _live_engine_health_payload(wallet=""):
                     xo = x.get("openRotation") if isinstance(x.get("openRotation"), dict) else {}
                     xa = str(x.get("positionAsset") or xo.get("asset") or x.get("targetAsset") or x.get("asset") or x.get("symbol") or xm.get("nkr_active_asset") or "").upper()
                     xq = float(x.get("positionQty") or xo.get("quantity") or xm.get("nkr_position_qty") or 0)
-                    xt = str(x.get("txHash") or x.get("tradeTxHash") or xo.get("txHash") or xm.get("nkr_live_buy_tx_hash") or "")
+                    # ENGINE-413: trade hash only — not CreateSession txHash on the session row
+                    xt = str(x.get("tradeTxHash") or xo.get("txHash") or xm.get("nkr_live_buy_tx_hash") or xm.get("nkr_entry_tx_hash") or "")
                     xs = str(x.get("onchainStatus") or xm.get("onchain_status") or "").upper()
-                    return bool(xa and xa not in {"ASSET","WAITING","NONE","NULL"} and (xq > 0 or xt or xs == "CONFIRMED"))
+                    xopen = int(x.get("openAssetCount") or x.get("open_asset_count") or xm.get("open_asset_count") or 0)
+                    return bool(xa and xa not in {"ASSET","WAITING","NONE","NULL"} and (xq > 0 or xopen > 0 or xt or xs == "CONFIRMED"))
 
                 current = next((x for x in active_local if _row_has_live_position(x)), active_local[0] if active_local else {})
                 meta = current.get("meta") if isinstance(current.get("meta"), dict) else {}
@@ -1376,12 +1378,45 @@ def _live_engine_health_payload(wallet=""):
                 position_state = str(current.get("positionState") or meta.get("position_state") or "").upper()
                 onchain_state = str(current.get("onchainStatus") or meta.get("onchain_status") or "").upper()
                 position_qty = float(current.get("positionQty") or open_pos.get("quantity") or meta.get("nkr_position_qty") or 0)
-                tx_hash_hint = str(current.get("txHash") or current.get("tradeTxHash") or open_pos.get("txHash") or meta.get("nkr_live_buy_tx_hash") or live[0].get("tx_hash") or "")
+                # ENGINE-413: only a *trade/buy* hash proves an open position.
+                # live[0].tx_hash is the CreateSession hash — using it made brand-new
+                # sessions look POSITION_ACTIVE / HOLD with Invest=$budget before any buy.
+                tx_hash_hint = str(
+                    current.get("tradeTxHash")
+                    or open_pos.get("txHash")
+                    or meta.get("nkr_live_buy_tx_hash")
+                    or meta.get("nkr_entry_tx_hash")
+                    or current.get("lastTradeTxHash")
+                    or ""
+                )
+                # Session create / finalize hashes must never count as position proof.
+                create_tx = str(live[0].get("tx_hash") or meta.get("create_tx_hash") or current.get("createTxHash") or "").lower()
+                if tx_hash_hint and create_tx and tx_hash_hint.lower() == create_tx:
+                    tx_hash_hint = ""
+                open_asset_hint = int(
+                    current.get("openAssetCount")
+                    or current.get("open_asset_count")
+                    or meta.get("open_asset_count")
+                    or 0
+                )
                 live_session_state = str(live[0].get("status") or "").upper()
                 exit_pending = bool(str(row.get("pending_tx") or "").strip() or live_session_state in {"CLOSING","EXITING"})
-                has_position = bool(asset and (position_state == "OPEN" or onchain_state == "CONFIRMED" or position_qty > 0 or tx_hash_hint) and not (live_session_state in {"FINALIZED","CLOSED","STOPPED"}))
+                # Real position only: qty, openAssetCount, confirmed trade, or explicit OPEN state with qty/open count.
+                has_position = bool(
+                    asset
+                    and not (live_session_state in {"FINALIZED", "CLOSED", "STOPPED"})
+                    and (
+                        position_qty > 0
+                        or open_asset_hint > 0
+                        or onchain_state == "CONFIRMED"
+                        or bool(tx_hash_hint)
+                        or (position_state == "OPEN" and (position_qty > 0 or open_asset_hint > 0))
+                    )
+                )
                 if has_position and not exit_pending:
                     position_state = "OPEN"
+                elif not has_position:
+                    position_state = position_state if position_state in {"WAITING", "SCANNING"} else "WAITING"
                 live_statuses = {str(x.get("status") or "").upper() for x in live}
                 paused = bool(live_statuses and live_statuses <= {"PAUSED"})
                 if paused:
