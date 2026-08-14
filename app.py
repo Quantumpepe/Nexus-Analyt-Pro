@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-423-NO-GHOST-POSITION-FROM-BUY-TX"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-425-POSITION-ONLY-IF-POSITIONOF"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1402,28 +1402,42 @@ def _live_engine_health_payload(wallet=""):
                 # ENGINE-423: real open position ONLY from qty or openAssetCount.
                 # A past buy tx hash / onchainStatus=CONFIRMED must NOT keep POSITION_ACTIVE
                 # after the tokens were sold (user holdings empty, ghost XRP card).
+                # ENGINE-425: position only if positionOf has tokens — not openCount/qty/buy-tx.
+                _real = {"open": False}
                 try:
                     _cid_live = int(live[0].get("chain_id") or 0)
                     _vault_live = _norm_addr(live[0].get("vault_address") or "")
                     _sid_live = int(str(live[0].get("onchain_session_id") or "0") or 0)
                     if _cid_live > 0 and _sid_live > 0 and _looks_like_evm_addr(_vault_live):
-                        _oa_chain = int(_nkr_session_open_asset_count(_cid_live, _vault_live, _sid_live) or 0)
-                        if _oa_chain >= 0:
-                            open_asset_hint = _oa_chain
+                        _real = _nkr_session_has_real_position(_cid_live, _vault_live, _sid_live)
                 except Exception:
-                    pass
-                has_position = bool(
-                    asset
-                    and not (live_session_state in {"FINALIZED", "CLOSED", "STOPPED"})
-                    and (position_qty > 0 or open_asset_hint > 0)
-                )
+                    _real = {"open": False}
+                if bool(_real.get("open")):
+                    has_position = not (live_session_state in {"FINALIZED", "CLOSED", "STOPPED"})
+                    asset = str(_real.get("symbol") or asset or "").upper()
+                    open_asset_hint = 1
+                    if position_qty <= 0:
+                        position_qty = 1.0
+                else:
+                    has_position = False
+                    open_asset_hint = 0
+                    position_qty = 0.0
                 if not has_position:
-                    # Clear ghost fields so UI/worker can re-enter.
                     asset = ""
                     position_qty = 0.0
                     position_value = 0.0
                     tx_hash_hint = ""
                     position_state = "WAITING"
+                    open_asset_hint = 0
+                    try:
+                        _nkr_position_lock_clear(wallet, {
+                            "onchain_session_id": str(live[0].get("onchain_session_id") or ""),
+                            "chain_id": int(live[0].get("chain_id") or 0),
+                            "vault_address": live[0].get("vault_address") or "",
+                            "wallet_address": wallet,
+                        })
+                    except Exception:
+                        pass
                     try:
                         _nkr_stamp_session_flat(wallet, {
                             "onchain_session_id": str(live[0].get("onchain_session_id") or ""),
@@ -15975,53 +15989,24 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 "nkr_exit_reason": "", "open_asset_count": open_count,
             })
         elif open_count > 0:
-            # ENGINE-382: CoreVault reports open assets but route registry could not
-            # resolve the token (missing enabledForLive / quoter lag). Still show OPEN
-            # so the card never lies with "no buy yet / watching".
-            try:
-                dec = 6
-                try:
-                    set_tok = _norm_addr(snap.get("settlementToken") or snap.get("settlement_token") or "")
-                    if set_tok:
-                        dec = int((_v5_read_token_config(chain_id, vault, set_tok) or {}).get("decimals") or 6)
-                except Exception:
-                    dec = 6 if int(chain_id) in (1, 137) else 18
-                scale = float(10 ** max(0, min(18, int(dec))))
-                budget_usd = budget_units / scale if budget_units else 0.0
-                cash_usd = settlement_cash_units / scale if settlement_cash_units else 0.0
-                # ENGINE-384: if 6-dec scale produces trillions, retry as 18-dec
-                if budget_usd > 1_000_000 and budget_units >= 10**15:
-                    scale = 1e18
-                    budget_usd = budget_units / scale
-                    cash_usd = settlement_cash_units / scale
-                invested = max(0.0, budget_usd - cash_usd)
-                if invested <= 0 and budget_usd > 0:
-                    invested = min(budget_usd * 0.95, 100000.0)
-                invested = min(max(0.0, invested), 100000.0)
-            except Exception:
-                invested = 0.0
-            chain_native = {1: "ETH", 56: "BNB", 137: "POL"}.get(int(chain_id), "ASSET")
-            sym = str(out.get("positionAsset") or out.get("targetAsset") or meta.get("nkr_active_asset") or chain_native).upper()
-            if sym in ("", "WAITING", "USDC", "USDT"):
-                sym = chain_native
-            open_rotation = dict(out.get("openRotation") if isinstance(out.get("openRotation"), dict) else {})
-            open_rotation.update({
-                "asset": sym, "symbol": sym, "quantity": open_rotation.get("quantity") or 0,
-                "currentValueUsd": invested, "capitalUsd": invested, "executionMode": "live",
-                "openAssetCount": open_count, "projectedFromOpenCount": True,
-            })
+            # ENGINE-425: openAssetCount alone is NOT a position.
+            # If every positionOf probe returned 0, the counter is stale/ghost after a
+            # full sell. Showing OPEN/XRP here blocked all re-entry for hours.
             out.update({
-                "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
-                "asset": sym, "symbol": sym,
-                "positionValueUsd": invested, "workingCapitalUsd": invested, "investedUsd": invested,
-                "openRotation": open_rotation, "active": status in {"ACTIVE", "PAUSED", "CLOSING"},
-                "exitReason": "", "reason": f"On-chain open assets ({open_count}) — position syncing",
+                "positionState": "WAITING", "positionAsset": "", "targetAsset": "",
+                "asset": "", "symbol": "", "openRotation": None,
+                "positionValueUsd": 0, "investedUsd": 0, "workingCapitalUsd": 0,
+                "positionQty": 0, "openAssetCount": 0, "open_asset_count": 0,
+                "reason": f"openAssetCount={open_count} but positionOf empty — treated flat",
             })
             meta.update({
-                "position_state": "OPEN", "nkr_active_asset": sym,
-                "nkr_position_value_usd": invested, "open_asset_count": open_count,
-                "nkr_exit_reason": "", "position_projected_from_open_count": True,
+                "position_state": "WAITING", "nkr_active_asset": "",
+                "nkr_position_qty": 0, "nkr_position_value_usd": 0,
+                "open_asset_count": 0, "position_projected_from_open_count": False,
+                "ghost_open_asset_count": open_count,
             })
+            for k in ("nkr_position_opened_ts", "position_opened_ts", "entry_ts"):
+                meta.pop(k, None)
         else:
             # ENGINE-422: CoreVault flat — never keep a ghost XRP/OPEN card.
             out.update({
@@ -16043,34 +16028,11 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
         # force a visible OPEN card and preserve a conservative cost/net estimate.
         msg = str(exc)[:240]
         meta["position_projection_error"] = msg
-        if projection_open_count > 0:
-            chain_native = {1: "ETH", 56: "BNB", 137: "POL"}.get(int(projection_chain_id or 0), "ASSET")
-            sym = str(out.get("positionAsset") or out.get("targetAsset") or meta.get("nkr_active_asset") or chain_native).upper()
-            if sym in ("", "WAITING", "USDC", "USDT", "USD", "DAI"):
-                sym = chain_native
-            fallback_value = max(0.0, _safe_float(out.get("positionValueUsd") or out.get("investedUsd") or out.get("workingCapitalUsd") or out.get("budgetUsd") or 0, 0.0))
-            fallback_costs = max(0.0, _safe_float(out.get("costsUsd") or meta.get("nkr_live_costs_usd") or 0, 0.0))
-            if fallback_costs <= 0 and fallback_value > 0:
-                fallback_costs = max(0.02, min(1.50, fallback_value * 0.0035))
-            fallback_gross = _safe_float(out.get("grossProfitUsd") or meta.get("nkr_live_gross_profit_usd") or 0, 0.0)
-            fallback_net = fallback_gross - fallback_costs
-            out.update({
-                "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
-                "asset": sym, "symbol": sym, "openAssetCount": int(projection_open_count),
-                "open_asset_count": int(projection_open_count), "positionValueUsd": fallback_value,
-                "investedUsd": max(fallback_value, _safe_float(out.get("investedUsd"), 0.0)),
-                "grossProfitUsd": fallback_gross, "costsUsd": fallback_costs, "netProfitUsd": fallback_net,
-                "liveGrossProfitUsd": fallback_gross, "liveCostsUsd": fallback_costs, "liveNetProfitUsd": fallback_net,
-                "active": True, "reason": f"On-chain {sym} position detected; market projection recovering",
-            })
-            meta.update({
-                "position_state": "OPEN", "nkr_active_asset": sym,
-                "open_asset_count": int(projection_open_count),
-                "nkr_live_gross_profit_usd": fallback_gross,
-                "nkr_live_costs_usd": fallback_costs,
-                "nkr_live_net_profit_usd": fallback_net,
-                "position_projection_degraded": True,
-            })
+        # ENGINE-425: never invent OPEN from open-count alone on projection errors.
+        out.setdefault("positionState", "WAITING")
+        meta.setdefault("position_state", "WAITING")
+        meta["position_projection_error"] = msg
+        meta["ghost_open_asset_count"] = int(projection_open_count or 0)
         out["meta"] = meta
         return out
 
@@ -40575,6 +40537,49 @@ def _nkr_position_lock_reconcile_exit_pending(wallet: str, live_row: dict) -> di
     return lock_row
 
 
+
+def _nkr_session_has_real_position(chain_id: int, vault: str, sid: int, cfg: dict | None = None) -> dict:
+    """ENGINE-425: single source of truth for 'is a trade still open?'.
+
+    True only if positionOf returns amount>0 for at least one known route token.
+    openAssetCount alone is ignored when all positionOf reads are zero (ghost after sell).
+    """
+    cid = int(chain_id or 0)
+    vault = _norm_addr(vault)
+    sid = int(sid or 0)
+    if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(vault):
+        return {"open": False, "symbol": "", "amount": 0, "openAssetCount": -1}
+    try:
+        oa = int(_nkr_session_open_asset_count(cid, vault, sid))
+    except Exception:
+        oa = -1
+    cfg = dict(cfg or _privy_trading_cfg(cid) or {})
+    cfg["vault"] = vault
+    cfg["chainId"] = cid
+    routes = dict(_nkr_live_route_registry(cfg) or {})
+    # Always probe common BNB recovery tokens so a sold XRP cannot hide as open_count.
+    if cid == 56:
+        for sym, (tok, dec) in {
+            "WBNB": ("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),
+            "XRP": ("0x1D2F0dA169ceB9fC7B3144628dB156F3F6c60dBE", 18),
+            "BTCB": ("0x7130d2A12B9BCbFae4f2634d864A1Ee1Ce3Ead9c", 18),
+        }.items():
+            routes.setdefault(sym, {"symbol": sym, "token": tok, "decimals": dec, "fee": 500, "live": True})
+    for sym, route in routes.items():
+        try:
+            ps = _nkr_position_snapshot(vault, sid, route, cfg)
+            amt = int(ps.get("amount") or 0)
+            if amt > 0:
+                return {
+                    "open": True, "symbol": str(sym).upper(), "amount": amt,
+                    "openAssetCount": oa, "valueUsd": _safe_float(ps.get("valueUsd"), 0.0),
+                    "costBasisUsd": _safe_float(ps.get("costBasisUsd"), 0.0),
+                }
+        except Exception:
+            continue
+    return {"open": False, "symbol": "", "amount": 0, "openAssetCount": oa}
+
+
 def _nkr_session_open_asset_count(chain_id: int, vault: str, sid: int) -> int:
     raw = _eth_call(int(chain_id), _norm_addr(vault), _core_selector("sessionOf(uint256)") + _uint_to_32(int(sid)))
     words = _core_words(raw)
@@ -41082,8 +41087,31 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     # may clear only after an explicit CLOSE and CoreVault openAssetCount==0.
     nkr_position_lock = _nkr_position_lock_reconcile_exit_pending(wallet, live_row) if engine_name == "NKR" else {}
     nkr_persistent_position_locked = bool(engine_name == "NKR" and _nkr_position_lock_active(nkr_position_lock))
+    # ENGINE-425: flat when no positionOf amount — ignore openCount + stale snapshots.
+    try:
+        _real_pos = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
+    except Exception:
+        _real_pos = {"open": False}
+    if not bool(_real_pos.get("open")):
+        for _sk in list(snapshots.keys()):
+            try:
+                snapshots[_sk]["amount"] = 0
+                snapshots[_sk]["valueUsd"] = 0.0
+                snapshots[_sk]["costBasisUsd"] = 0.0
+            except Exception:
+                pass
+        try:
+            _nkr_position_lock_clear(wallet, live_row)
+        except Exception:
+            pass
+        try:
+            _nkr_stamp_session_flat(wallet, live_row)
+        except Exception:
+            pass
+        nkr_persistent_position_locked = False
+        open_assets_now = 0
     nkr_any_open_position = bool(
-        engine_name == "NKR" and (
+        engine_name == "NKR" and bool(_real_pos.get("open")) and (
             nkr_persistent_position_locked
             or any(int((s or {}).get("amount") or 0) > 0 for s in snapshots.values())
         )
@@ -41378,8 +41406,15 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                             "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
                             "asset": sym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
                         }
-                open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
+                # ENGINE-425: concurrent-slot check uses real positionOf, not ghost openCount.
+                try:
+                    _rp = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
+                    open_assets_now = 1 if bool(_rp.get("open")) else 0
+                except Exception:
+                    open_assets_now = 0
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
+                if open_assets_now == 0:
+                    same_asset_amount = 0
                 # ENGINE-419: Trade security for NKR/Trader OPEN.
                 # Native + stables always OK. Live-route registry tokens: GoPlus only
                 # (honeypot/tax/blacklist) — owner_approval is a DEPOSIT gate, not a
