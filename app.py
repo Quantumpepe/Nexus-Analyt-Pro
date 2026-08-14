@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-416-OBS-NO-STUCK-GOPLUS-ENTRY"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-417-ENTRY-INFLIGHT-RELEASE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40237,6 +40237,58 @@ def _nkr_entry_guard_release(wallet: str, live_row: dict) -> None:
         conn.close()
 
 
+def _nkr_entry_guard_force_clear_stale(wallet: str, live_row: dict, max_age_sec: int = 45) -> None:
+    """ENGINE-417: clear stuck ENTRY_INFLIGHT when no position is open.
+
+    Releases local guards past max_age and aborts durable ENTRY ops without tx_hash
+    so the next tick can acquire a fresh lock. NKR + Trader share this path.
+    """
+    key = _nkr_entry_guard_key(wallet, live_row)
+    nowi = int(time.time())
+    age = max(15, int(max_age_sec or 45))
+    if key:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute(
+                    "DELETE FROM nexus_nkr_entry_guards WHERE guard_key=? AND acquired_ts<=?",
+                    (key, nowi - age),
+                )
+                conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE expires_ts<=?", (nowi,))
+                conn.commit()
+        finally:
+            conn.close()
+    # Abort durable ENTRY ops for this session that never broadcast a tx.
+    try:
+        identity = _nkr_session_identity(wallet=wallet, live_row=live_row)
+        if not identity.get("controllable"):
+            return
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute(
+                    "UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, "
+                    "error_text='entry_inflight_force_clear_no_tx' "
+                    "WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? "
+                    "AND lower(vault_address)=? AND onchain_session_id=? "
+                    "AND status IN ('RESERVED','SUBMITTING','RECOVERING') "
+                    "AND (tx_hash IS NULL OR tx_hash='' OR tx_hash='0x') "
+                    "AND reserved_ts<=?",
+                    (
+                        nowi,
+                        str(identity.get("wallet") or "").lower(),
+                        int(identity.get("chainId") or 0),
+                        str(identity.get("vault") or "").lower(),
+                        str(identity.get("onchainSessionId") or ""),
+                        nowi - age,
+                    ),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
 
 # ENGINE-409: durable NKR session-position lock. The old one-position protection was
 # derived from live position snapshots/openAssetCount. Those reads may lag a mined
@@ -41087,12 +41139,25 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     _snap_for_slot = snapshots.get(sym) or {}
                     _slot_state_now = _trader_live_slot_state(_snap_for_slot, budget_usd, trader_slot_count)
                     _slot_cycle = f"trader-slot-{int(_slot_state_now.get('filledSlots') or 0)}"
-                entry_guard = _nkr_entry_guard_acquire(wallet, live_row, cycle_key=_slot_cycle)
+                entry_guard = _nkr_entry_guard_acquire(wallet, live_row, ttl_sec=90, cycle_key=_slot_cycle)
                 if not entry_guard:
-                    return {
-                        "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
-                        "asset": sym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
-                    }
+                    # ENGINE-417: if no open position, force-clear stale ENTRY locks so
+                    # a failed preflight cannot block the session for minutes.
+                    try:
+                        _oa = int(_nkr_session_open_asset_count(chain_id, vault, sid) or 0)
+                    except Exception:
+                        _oa = -1
+                    if _oa == 0:
+                        try:
+                            _nkr_entry_guard_force_clear_stale(wallet, live_row, max_age_sec=45)
+                        except Exception:
+                            pass
+                        entry_guard = _nkr_entry_guard_acquire(wallet, live_row, ttl_sec=90, cycle_key=_slot_cycle)
+                    if not entry_guard:
+                        return {
+                            "executed": False, "decision": "HOLD", "gate": "ENTRY_INFLIGHT",
+                            "asset": sym, "detail": f"{chain_key} session #{sid} already has an entry submission in progress.",
+                        }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
                 # ENGINE-416: GoPlus + vault approval before any new OPEN (NKR + Trader).
@@ -41108,9 +41173,19 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                                 f"OPEN {sym} blocked by security: "
                                 f"{_gp.get('blocked_by') or 'denied'} ({_gp.get('reason') or ''})"
                             )[:240]
+                            try:
+                                _nkr_entry_guard_release(wallet, live_row)
+                            except Exception:
+                                pass
+                            entry_guard = False
                             continue
                     except Exception as _gpx:
                         last_skip = f"OPEN {sym} security check failed: {str(_gpx)[:160]}"
+                        try:
+                            _nkr_entry_guard_release(wallet, live_row)
+                        except Exception:
+                            pass
+                        entry_guard = False
                         continue
                 # A lower settlementCash is authoritative proof that this session already
                 # spent capital. Block another automatic entry even if positionOf/openAssetCount
@@ -41177,6 +41252,9 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 "quote_amount", "quote_min_out", "router_config_decode",
                 "live_trade_preflight_failed", "router_not_enabled",
                 "selector_not_allowed", "invalid_live_trade_addresses",
+                "goplus", "security", "blocked by", "owner_approval",
+                "honeypot", "insufficient", "allowance", "slippage",
+                "deadline", "execution reverted", "call_exception",
             )
             if entry_guard:
                 try:
