@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-422-FLAT-AFTER-SELL-SYNC"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-423-NO-GHOST-POSITION-FROM-BUY-TX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1363,11 +1363,9 @@ def _live_engine_health_payload(wallet=""):
                     xo = x.get("openRotation") if isinstance(x.get("openRotation"), dict) else {}
                     xa = str(x.get("positionAsset") or xo.get("asset") or x.get("targetAsset") or x.get("asset") or x.get("symbol") or xm.get("nkr_active_asset") or "").upper()
                     xq = float(x.get("positionQty") or xo.get("quantity") or xm.get("nkr_position_qty") or 0)
-                    # ENGINE-413: trade hash only — not CreateSession txHash on the session row
-                    xt = str(x.get("tradeTxHash") or xo.get("txHash") or xm.get("nkr_live_buy_tx_hash") or xm.get("nkr_entry_tx_hash") or "")
-                    xs = str(x.get("onchainStatus") or xm.get("onchain_status") or "").upper()
                     xopen = int(x.get("openAssetCount") or x.get("open_asset_count") or xm.get("open_asset_count") or 0)
-                    return bool(xa and xa not in {"ASSET","WAITING","NONE","NULL"} and (xq > 0 or xopen > 0 or xt or xs == "CONFIRMED"))
+                    # ENGINE-423: buy-tx / CONFIRMED alone is not an open position.
+                    return bool(xa and xa not in {"ASSET","WAITING","NONE","NULL"} and (xq > 0 or xopen > 0))
 
                 current = next((x for x in active_local if _row_has_live_position(x)), active_local[0] if active_local else {})
                 meta = current.get("meta") if isinstance(current.get("meta"), dict) else {}
@@ -1401,22 +1399,42 @@ def _live_engine_health_payload(wallet=""):
                 )
                 live_session_state = str(live[0].get("status") or "").upper()
                 exit_pending = bool(str(row.get("pending_tx") or "").strip() or live_session_state in {"CLOSING","EXITING"})
-                # Real position only: qty, openAssetCount, confirmed trade, or explicit OPEN state with qty/open count.
+                # ENGINE-423: real open position ONLY from qty or openAssetCount.
+                # A past buy tx hash / onchainStatus=CONFIRMED must NOT keep POSITION_ACTIVE
+                # after the tokens were sold (user holdings empty, ghost XRP card).
+                try:
+                    _cid_live = int(live[0].get("chain_id") or 0)
+                    _vault_live = _norm_addr(live[0].get("vault_address") or "")
+                    _sid_live = int(str(live[0].get("onchain_session_id") or "0") or 0)
+                    if _cid_live > 0 and _sid_live > 0 and _looks_like_evm_addr(_vault_live):
+                        _oa_chain = int(_nkr_session_open_asset_count(_cid_live, _vault_live, _sid_live) or 0)
+                        if _oa_chain >= 0:
+                            open_asset_hint = _oa_chain
+                except Exception:
+                    pass
                 has_position = bool(
                     asset
                     and not (live_session_state in {"FINALIZED", "CLOSED", "STOPPED"})
-                    and (
-                        position_qty > 0
-                        or open_asset_hint > 0
-                        or onchain_state == "CONFIRMED"
-                        or bool(tx_hash_hint)
-                        or (position_state == "OPEN" and (position_qty > 0 or open_asset_hint > 0))
-                    )
+                    and (position_qty > 0 or open_asset_hint > 0)
                 )
-                if has_position and not exit_pending:
+                if not has_position:
+                    # Clear ghost fields so UI/worker can re-enter.
+                    asset = ""
+                    position_qty = 0.0
+                    position_value = 0.0
+                    tx_hash_hint = ""
+                    position_state = "WAITING"
+                    try:
+                        _nkr_stamp_session_flat(wallet, {
+                            "onchain_session_id": str(live[0].get("onchain_session_id") or ""),
+                            "chain_id": int(live[0].get("chain_id") or 0),
+                            "vault_address": live[0].get("vault_address") or "",
+                            "wallet_address": wallet,
+                        })
+                    except Exception:
+                        pass
+                elif has_position and not exit_pending:
                     position_state = "OPEN"
-                elif not has_position:
-                    position_state = position_state if position_state in {"WAITING", "SCANNING"} else "WAITING"
                 live_statuses = {str(x.get("status") or "").upper() for x in live}
                 paused = bool(live_statuses and live_statuses <= {"PAUSED"})
                 if paused:
