@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.13-ENGINE-413-NO-FALSE-POSITION-BEFORE-BUY"
+BACKEND_BUILD_ID = "B-2026.08.13-ENGINE-414-HARD-MIN-HOLD-ON-BUY-TS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15766,7 +15766,9 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     elif recovery_exit: reason="break_even_recovery_exit"
     elif trailing: reason="peak_profit_trailing_protection"
     elif take_profit: reason="shadow_tactical_take_profit"
-    # micro_profit intentionally omitted (ENGINE-412)
+    # ENGINE-414: discretionary exits require min_hold; only hard_stop/security may fire early.
+    if reason and reason not in ("hard_stop", "security_emergency") and held < min_hold:
+        reason = ""
     decision = "EXIT" if reason else ("RECOVERY" if gross < 0 and (recovery > 0 or momentum > -10) else "HOLD")
     return {"decision":decision,"reason":reason,"quality":quality,"risk":risk,"recovery":recovery,"momentum":momentum,
             "riskContextExceeded":risk_context_exceeded,"securityEmergency":security_emergency,
@@ -37907,13 +37909,18 @@ def _nkr_patch_local_execution(wallet: str, session_id: int, *, symbol: str, amo
                 },
             })
             meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
-            if not int(meta.get("nkr_position_opened_ts") or meta.get("position_opened_ts") or 0):
-                meta["nkr_position_opened_ts"] = int(time.time())
-                meta["position_opened_ts"] = int(time.time())
+            # ENGINE-414: ALWAYS reset hold clock on confirmed BUY.
+            # Stale opened_ts from a prior cycle/false-OPEN made held_sec look
+            # like 15+ minutes and allowed EXIT ~90s after the real buy.
+            _buy_ts = int(time.time())
+            meta["nkr_position_opened_ts"] = _buy_ts
+            meta["position_opened_ts"] = _buy_ts
+            meta["entry_ts"] = _buy_ts
+            meta["nkr_trade_opened_at"] = nowi
             meta.update({
                 "position_state": "OPEN", "nkr_active_asset": symbol,
                 "nkr_entry_price_usd": round(float(price_usd), 10),
-                "nkr_live_buy_tx_hash": tx_hash, "nkr_trade_opened_at": nowi,
+                "nkr_live_buy_tx_hash": tx_hash,
                 "onchain_session_id": str(session_id), "execution_mode": "live",
             })
             row["meta"] = meta
@@ -39412,9 +39419,11 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
         cid = f"{master_id}-{sym}"
         previous = previous_children.get(sym) or {}
         prior_meta = dict(previous.get("meta") if isinstance(previous.get("meta"), dict) else {})
+        # ENGINE-414: do not invent an early opened_ts; prefer buy-confirmed clock.
         if not int(prior_meta.get("nkr_position_opened_ts") or prior_meta.get("position_opened_ts") or 0):
             prior_meta["nkr_position_opened_ts"] = int(time.time())
             prior_meta["position_opened_ts"] = int(time.time())
+            prior_meta["entry_ts"] = int(time.time())
         metric = (plan.get("metrics") or {}).get(sym) or {}
         prior_meta.update({"nkr_session": True, "nkr_asset_session": True, "parent_nkr_session_id": master_id,
                      "onchain_session_id": sid, "core_vault_session_id": sid, "chain": chain_key, "chain_id": chain_id,
@@ -40369,6 +40378,39 @@ def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict,
     return {**base, "decision": decision, "reason": reason, "slotRiskDecision": risk_decision,
             "slotQuality": quality, "signalVector": signals}
 
+
+def _nkr_clear_position_opened_ts(wallet: str, live_row: dict, symbol: str = "") -> None:
+    """ENGINE-414: after a flat exit, drop hold timestamps so the next entry is timed from its own buy."""
+    try:
+        sessions, active_id, _ = _db_get_rotation_sessions(wallet)
+    except Exception:
+        return
+    sid = str((live_row or {}).get("onchain_session_id") or "")
+    chain_id = int((live_row or {}).get("chain_id") or 0)
+    sym_u = str(symbol or "").upper()
+    updated = []
+    changed = False
+    for src in sessions or []:
+        if not isinstance(src, dict):
+            continue
+        row = dict(src)
+        meta = dict(row.get("meta") if isinstance(row.get("meta"), dict) else {})
+        row_sid = str(row.get("onchainSessionId") or row.get("onchain_session_id") or meta.get("onchain_session_id") or "")
+        row_chain = int(row.get("chainId") or row.get("chain_id") or meta.get("chain_id") or 0)
+        row_sym = str(row.get("symbol") or row.get("targetAsset") or meta.get("nkr_active_asset") or "").upper()
+        if sid and row_sid == sid and (not chain_id or row_chain == chain_id) and (not sym_u or row_sym == sym_u or not row_sym):
+            for k in ("nkr_position_opened_ts", "position_opened_ts", "entry_ts", "nkr_trade_opened_at"):
+                if k in meta:
+                    meta.pop(k, None)
+                    changed = True
+            row["meta"] = meta
+        updated.append(row)
+    if changed:
+        try:
+            _db_set_rotation_sessions(wallet, updated, active_session_id=active_id, replace_missing=False)
+        except Exception:
+            pass
+
 def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[dict], settings: dict) -> dict:
     engine_name = _live_row_engine_name(live_row)
     chain_id = int(live_row.get("chain_id") or 1)
@@ -40690,14 +40732,18 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     # ENGINE-378: min hold before discretionary CLOSE (shadow never flipped in 60s).
     # Hard max-loss still closes immediately via forced_exits with reason max_loss if present.
     def _position_held_long_enough(sym_key: str) -> bool:
+        # ENGINE-414: never treat unknown/error as "held long enough".
         try:
             pm = previous_meta.get(str(sym_key or "").upper()) or {}
             opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
             if opened <= 0:
                 return False
-            return (int(time.time()) - opened) >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
+            held = int(time.time()) - opened
+            if held < 0 or held > 30 * 86400:
+                return False
+            return held >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
         except Exception:
-            return True
+            return False
 
     actions = []
     # ENGINE-409: combine live snapshot state with the durable cross-worker lock.
@@ -40901,8 +40947,6 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         if engine_name == "NKR":
                             _nkr_position_lock_exit_pending(wallet, live_row, sym, result)
                             _nkr_position_lock_reconcile_exit_pending(wallet, live_row)
-                            # ENGINE-412: after a confirmed CLOSE, re-read openAssetCount.
-                            # If flat, clear the lock immediately so the next tick can OPEN again.
                             try:
                                 _oa = _nkr_session_open_asset_count(chain_id, vault, sid)
                                 if int(_oa or 0) <= 0:
@@ -40912,6 +40956,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                                     _nkr_position_lock_clear(wallet, live_row)
                                 except Exception:
                                     pass
+                            # ENGINE-414: wipe hold clock after flat so the next BUY starts fresh.
+                            try:
+                                _nkr_clear_position_opened_ts(wallet, live_row, sym)
+                            except Exception:
+                                pass
                         # Short cool-down only — unlimited harvest cycles in one session.
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_REENTRY_COOLDOWN_SEC, state="EXIT_CONFIRMED")
                         try:
