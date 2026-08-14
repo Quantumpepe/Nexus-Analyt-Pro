@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-415-AUTO-LIVE-ROUTES-ALL-CHAINS"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-416-OBS-NO-STUCK-GOPLUS-ENTRY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -38836,7 +38836,13 @@ def _nkr_observation_minutes(value) -> int:
 
 
 def _nkr_session_observation_gate(live_row: dict, settings: dict, starts_at: int = 0) -> dict:
-    """OBSERVING until earliestEntryAt; then SEARCHING. NKR + Trader. Modes cannot bypass."""
+    """OBSERVING until earliestEntryAt; then SEARCHING. NKR + Trader. Modes cannot bypass.
+
+    ENGINE-416: never restart the window by setting starts=now when startsAt is missing.
+    That caused multi-hour sessions to stay OBSERVATION_WINDOW forever. Prefer on-chain
+    startsAt, then registry created_ts; if still unknown after obs_min wall time since
+    live_row.updated_ts, fail-open to SEARCHING.
+    """
     eng = str((live_row or {}).get("engine") or (settings or {}).get("engine") or "NKR").upper()
     if eng == "TRADING":
         eng = "TRADER"
@@ -38847,28 +38853,57 @@ def _nkr_session_observation_gate(live_row: dict, settings: dict, starts_at: int
         or (settings or {}).get("observation_window")
         or (live_row or {}).get("nkrObservationWindow")
         or (live_row or {}).get("observation_window")
-        or "1h"
+        or "15m"
     )
     obs_min = _nkr_observation_minutes(obs_raw)
     nowi = int(time.time())
-    try:
-        starts = int(starts_at or 0)
-    except Exception:
-        starts = 0
-    if starts <= 0:
+
+    def _as_sec(v) -> int:
         try:
-            starts = int((live_row or {}).get("starts_at") or (live_row or {}).get("startsAt") or 0)
+            n = int(float(v or 0))
         except Exception:
-            starts = 0
+            return 0
+        if n > 10_000_000_000:  # ms
+            n = n // 1000
+        if n < 1_000_000_000:  # junk / index
+            return 0
+        return n
+
+    starts = _as_sec(starts_at)
     if starts <= 0:
-        try:
-            starts = int((live_row or {}).get("created_ts") or (live_row or {}).get("createdAt") or 0)
-        except Exception:
-            starts = 0
+        starts = _as_sec((live_row or {}).get("starts_at") or (live_row or {}).get("startsAt"))
     if starts <= 0:
-        starts = nowi
+        starts = _as_sec((live_row or {}).get("created_ts") or (live_row or {}).get("createdAt") or (live_row or {}).get("created_ts_sec"))
+    if starts <= 0:
+        starts = _as_sec((live_row or {}).get("updated_ts") or (live_row or {}).get("updatedAt"))
+    # ENGINE-416: do NOT set starts=nowi — that restarts observation every tick.
+    if starts <= 0:
+        return {
+            "allowed": True,
+            "phase": "SEARCHING_NO_START_TS",
+            "engine": eng,
+            "observationMinutes": obs_min,
+            "startsAt": 0,
+            "earliestEntryAt": nowi,
+            "remainingSec": 0,
+            "gate": "ENTRY_SEARCH_ALLOWED",
+            "detail": f"{eng} observation start unknown — entry search allowed (fail-open).",
+        }
+    if obs_min <= 0:
+        return {
+            "allowed": True,
+            "phase": "SEARCHING_IMMEDIATE",
+            "engine": eng,
+            "observationMinutes": 0,
+            "startsAt": starts,
+            "earliestEntryAt": starts,
+            "remainingSec": 0,
+            "gate": "ENTRY_SEARCH_ALLOWED",
+            "detail": f"{eng} observation set to immediate; entry search allowed.",
+        }
     earliest = int(starts) + int(obs_min) * 60
     remaining = max(0, earliest - nowi)
+    # Hard ceiling: never observe longer than obs_min after known start.
     if remaining > 0:
         return {
             "allowed": False,
@@ -41060,6 +41095,23 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
+                # ENGINE-416: GoPlus + vault approval before any new OPEN (NKR + Trader).
+                # Native assets skip. Fake/scam tokens must not receive executeTrade.
+                if action in {"OPEN", "ADD"} and str(sym or "").upper() not in {
+                    "ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "USDC", "USDT"
+                }:
+                    try:
+                        _tok = _norm_addr((route or {}).get("token") or "")
+                        _gp = _goplus_check_token(int(chain_id), _tok, str(sym))
+                        if not bool(_gp.get("allowed")):
+                            last_skip = (
+                                f"OPEN {sym} blocked by security: "
+                                f"{_gp.get('blocked_by') or 'denied'} ({_gp.get('reason') or ''})"
+                            )[:240]
+                            continue
+                    except Exception as _gpx:
+                        last_skip = f"OPEN {sym} security check failed: {str(_gpx)[:160]}"
+                        continue
                 # A lower settlementCash is authoritative proof that this session already
                 # spent capital. Block another automatic entry even if positionOf/openAssetCount
                 # is temporarily lagging or the route registry has not resolved the token yet.
