@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-418-ENTRY-GUARD-HARD-CLEAR"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-419-TRADE-GOPLUS-NOT-OWNER-GATE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -41153,18 +41153,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         }
                 open_assets_now = _nkr_session_open_asset_count(chain_id, vault, sid)
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
-                # ENGINE-416: GoPlus + vault approval before any new OPEN (NKR + Trader).
-                # Native assets skip. Fake/scam tokens must not receive executeTrade.
+                # ENGINE-419: Trade security for NKR/Trader OPEN.
+                # Native + stables always OK. Live-route registry tokens: GoPlus only
+                # (honeypot/tax/blacklist) — owner_approval is a DEPOSIT gate, not a
+                # trade gate, and must not block configured executable routes.
                 if action in {"OPEN", "ADD"} and str(sym or "").upper() not in {
                     "ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "USDC", "USDT"
                 }:
                     try:
                         _tok = _norm_addr((route or {}).get("token") or "")
-                        _gp = _goplus_check_token(int(chain_id), _tok, str(sym))
-                        if not bool(_gp.get("allowed")):
+                        _sec = _nkr_trade_security_check(int(chain_id), _tok, str(sym), route=route)
+                        if not bool(_sec.get("allowed")):
                             last_skip = (
                                 f"OPEN {sym} blocked by security: "
-                                f"{_gp.get('blocked_by') or 'denied'} ({_gp.get('reason') or ''})"
+                                f"{_sec.get('blocked_by') or 'denied'} ({_sec.get('reason') or ''})"
                             )[:240]
                             try:
                                 _nkr_entry_guard_release(wallet, live_row)
