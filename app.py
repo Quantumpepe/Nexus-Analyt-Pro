@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-419-TRADE-GOPLUS-NOT-OWNER-GATE"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-419b-TRADE-SECURITY-FN-FIXED"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40107,6 +40107,72 @@ def _nkr_live_cycle_number(wallet: str, live_row: dict, op_type: str) -> int:
 # ENGINE-352: cross-worker entry mutex. Gunicorn workers are separate processes, so
 # an in-memory cooldown cannot prevent two workers from submitting the same OPEN
 # before the first receipt/position read is visible. SQLite is the shared authority.
+
+def _nkr_trade_security_check(chain_id: int, token_address: str, symbol: str = "", route: dict | None = None) -> dict:
+    """ENGINE-419: security gate for live NKR/Trader OPEN (all EVMs).
+
+    - Native / USDC / USDT: always allowed
+    - Token on live route registry (token+router present): run GoPlus risk checks only
+    - owner_approval is NOT required for configured trade routes (deposit gate only)
+    - Unknown / no-route tokens: full _goplus_check_token (approval+GoPlus)
+    """
+    sym = str(symbol or "").strip().upper()
+    addr = _norm_addr(token_address)
+    cid = int(chain_id or 0)
+    if sym in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "USDC", "USDT"}:
+        return {"allowed": True, "blocked_by": None, "reason": "native_or_stable", "symbol": sym}
+    try:
+        if _goplus_is_native_asset(cid, symbol=sym, address=addr):
+            return {"allowed": True, "blocked_by": None, "reason": "native_asset", "symbol": sym}
+    except Exception:
+        pass
+
+    route_live = bool(
+        isinstance(route, dict)
+        and route.get("live")
+        and _looks_like_evm_addr(_norm_addr(route.get("token") or addr))
+        and _looks_like_evm_addr(_norm_addr(route.get("router") or ""))
+    )
+    if route_live and _looks_like_evm_addr(addr):
+        try:
+            raw = _goplus_fetch_token_security(cid, addr) or {}
+        except Exception as exc:
+            if str(os.getenv("NEXUS_TRADE_GOPLUS_REQUIRED", "")).strip().lower() in {"1", "true", "yes", "on"}:
+                return {
+                    "allowed": False, "blocked_by": "goplus_unavailable",
+                    "reason": f"goplus_request_failed:{exc}", "symbol": sym,
+                }
+            return {"allowed": True, "blocked_by": None, "reason": "goplus_unavailable_fail_open_route", "symbol": sym}
+        blocked_by = None
+        reason = "route_token_passed_goplus"
+        try:
+            if GOPLUS_BLOCK_HONEYPOT and _goplus_is_truthy(raw.get("is_honeypot")):
+                blocked_by, reason = "honeypot", "blocked by GoPlus honeypot check"
+            elif _goplus_is_truthy(raw.get("is_blacklisted")):
+                blocked_by, reason = "blacklisted", "blocked by GoPlus blacklist signal"
+            elif _goplus_is_truthy(raw.get("cannot_sell_all")):
+                blocked_by, reason = "sell_restriction", "blocked by GoPlus sell restriction"
+            else:
+                sell_tax = _goplus_to_float(raw.get("sell_tax"))
+                if sell_tax is not None and sell_tax > 0.10:
+                    blocked_by, reason = "high_sell_tax", "blocked because sell tax exceeds 10%"
+        except Exception:
+            pass
+        return {
+            "allowed": blocked_by is None,
+            "blocked_by": blocked_by,
+            "reason": reason,
+            "symbol": sym,
+        }
+    try:
+        return _goplus_check_token(cid, addr, sym)
+    except Exception as exc:
+        return {
+            "allowed": False, "blocked_by": "security_error",
+            "reason": str(exc)[:200], "symbol": sym,
+        }
+
+
 def _nkr_entry_guard_key(wallet: str, live_row: dict) -> str:
     # ENGINE-364: key is the canonical session identity (no trailing empties).
     ident = _nkr_session_identity(wallet=wallet, live_row=live_row)
