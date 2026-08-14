@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-417-ENTRY-INFLIGHT-RELEASE"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-418-ENTRY-GUARD-HARD-CLEAR"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40129,7 +40129,7 @@ def _nkr_entry_guard_acquire(wallet: str, live_row: dict, ttl_sec: int = 180, cy
         wallet=wallet,
         live_row=live_row,
         cycle_key=effective_cycle_key,
-        ttl_sec=max(180, int(ttl_sec or 180)),
+        ttl_sec=max(60, int(ttl_sec or 90)),
         meta={"source": "nkr_entry_guard_acquire", "schema": NEXUS_LIVE_OPS_SCHEMA_VERSION},
     )
     if live_op is None:
@@ -40237,51 +40237,44 @@ def _nkr_entry_guard_release(wallet: str, live_row: dict) -> None:
         conn.close()
 
 
-def _nkr_entry_guard_force_clear_stale(wallet: str, live_row: dict, max_age_sec: int = 45) -> None:
-    """ENGINE-417: clear stuck ENTRY_INFLIGHT when no position is open.
+def _nkr_entry_guard_force_clear_stale(wallet: str, live_row: dict, max_age_sec: int = 15) -> None:
+    """ENGINE-418: hard-clear stuck ENTRY_INFLIGHT when no on-chain position is open.
 
-    Releases local guards past max_age and aborts durable ENTRY ops without tx_hash
-    so the next tick can acquire a fresh lock. NKR + Trader share this path.
+    Deletes the local guard immediately and aborts durable ENTRY rows that never
+    got a real tx_hash — including false SUCCEEDED / RECOVERING locks that left
+    the session blocked with Position WAITING forever.
     """
     key = _nkr_entry_guard_key(wallet, live_row)
     nowi = int(time.time())
-    age = max(15, int(max_age_sec or 45))
     if key:
         conn = _db()
         try:
             with DB_WRITE_LOCK:
-                conn.execute(
-                    "DELETE FROM nexus_nkr_entry_guards WHERE guard_key=? AND acquired_ts<=?",
-                    (key, nowi - age),
-                )
+                conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE guard_key=?", (key,))
                 conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE expires_ts<=?", (nowi,))
                 conn.commit()
         finally:
             conn.close()
-    # Abort durable ENTRY ops for this session that never broadcast a tx.
     try:
         identity = _nkr_session_identity(wallet=wallet, live_row=live_row)
         if not identity.get("controllable"):
             return
+        wa = str(identity.get("wallet") or "").lower()
+        cid = int(identity.get("chainId") or 0)
+        vault = str(identity.get("vault") or "").lower()
+        sid = str(identity.get("onchainSessionId") or "")
         conn = _db()
         try:
             with DB_WRITE_LOCK:
+                # Any ENTRY without a real broadcast tx is safe to abort when flat.
                 conn.execute(
                     "UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, "
-                    "error_text='entry_inflight_force_clear_no_tx' "
+                    "error_text='entry_guard_hard_clear_flat_session' "
                     "WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? "
                     "AND lower(vault_address)=? AND onchain_session_id=? "
-                    "AND status IN ('RESERVED','SUBMITTING','RECOVERING') "
-                    "AND (tx_hash IS NULL OR tx_hash='' OR tx_hash='0x') "
-                    "AND reserved_ts<=?",
-                    (
-                        nowi,
-                        str(identity.get("wallet") or "").lower(),
-                        int(identity.get("chainId") or 0),
-                        str(identity.get("vault") or "").lower(),
-                        str(identity.get("onchainSessionId") or ""),
-                        nowi - age,
-                    ),
+                    "AND (tx_hash IS NULL OR tx_hash='' OR tx_hash='0x' OR length(tx_hash)<10) "
+                    "AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING','SUCCEEDED')",
+                    (nowi, wa, cid, vault, sid),
                 )
                 conn.commit()
         finally:
@@ -41149,7 +41142,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         _oa = -1
                     if _oa == 0:
                         try:
-                            _nkr_entry_guard_force_clear_stale(wallet, live_row, max_age_sec=45)
+                            _nkr_entry_guard_force_clear_stale(wallet, live_row, max_age_sec=0)
                         except Exception:
                             pass
                         entry_guard = _nkr_entry_guard_acquire(wallet, live_row, ttl_sec=90, cycle_key=_slot_cycle)
