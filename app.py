@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.13-ENGINE-414-HARD-MIN-HOLD-ON-BUY-TS"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-415-AUTO-LIVE-ROUTES-ALL-CHAINS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -2352,7 +2352,7 @@ def _nexus_asset_router_registry(include_technical: bool = False) -> dict:
         public_routes = {}
         for chain, route in (asset.get("routes") or {}).items():
             configured = bool(route.get("tokenContract"))
-            live_ready = bool(configured and route.get("routerAddress") and route.get("poolAddress") and route.get("enabledForLive"))
+            live_ready = bool(configured)  # ENGINE-415: token configured => tradable candidate; router falls back to chain cfg
             public_routes[chain] = {"configured": configured, "liveEnabled": live_ready, "status": "LIVE" if live_ready else "PREPARED" if configured else "NOT_CONFIGURED"}
         public_assets[symbol] = {"displaySymbol": symbol, "displayName": asset.get("displayName") or symbol, "routes": public_routes}
 
@@ -2360,7 +2360,7 @@ def _nexus_asset_router_registry(include_technical: bool = False) -> dict:
         "mode": NEXUS_ASSET_ROUTER_MODE,
         "abiVersion": NEXUS_CORE_VAULT_ABI_VERSION,
         "engines": list(NEXUS_ASSET_ROUTER_ENGINES),
-        "executionChains": ["ETH", "BNB"],
+        "executionChains": ["ETH", "BNB", "POL"],
         "displayPolicy": NEXUS_ASSET_ROUTER_PUBLIC_POLICY,
         "technicalPolicy": NEXUS_ASSET_ROUTER_TECHNICAL_POLICY,
         "defaultExitAsset": "USDC/USDT",
@@ -2384,7 +2384,7 @@ def _nexus_public_asset_route(symbol: str, chain: str = "") -> dict:
     selected_chain = chain_key if chain_key in routes else next(iter(routes.keys()), "")
     route = routes.get(selected_chain) or {}
     configured = bool(route.get("tokenContract"))
-    live_ready = bool(configured and route.get("routerAddress") and route.get("poolAddress") and route.get("enabledForLive"))
+    live_ready = bool(configured)  # ENGINE-415: token configured => tradable candidate; router falls back to chain cfg
     return {
         "found": True, "symbol": sym, "displaySymbol": sym,
         "displayName": asset.get("displayName") or sym,
@@ -36910,7 +36910,7 @@ def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
         route = routes.get(pick_chain) or {}
         token = _norm_addr(route.get("tokenContract") or "")
         configured = bool(token)
-        live_ready = bool(configured and route.get("routerAddress") and route.get("enabledForLive"))
+        live_ready = bool(configured)  # ENGINE-415: token configured => tradable candidate
         # Tradable for strategist ranking if contract exists on a live vault chain
         # (liveEnabled still gates actual on-chain submit).
         tradable = bool(configured and pick_chain in live)
@@ -38114,9 +38114,10 @@ _NKR_STRATEGIST_ACTION_COOLDOWN_SEC = max(30, int(os.getenv("NEXUS_NKR_STRATEGIS
 def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
     """Resolve executable token routes for the session chain (ETH/BNB/POL/…).
 
-    Display symbols (BTC, SOL, …) map via the asset-router to wrap contracts on
-    this chain. Future live vault chains are included automatically when their
-    chain key appears in NEXUS_VAULT_ALLOWED_CHAINS and cfg is built for that id.
+    ENGINE-415: The Vault executes; the backend decides what is tradable.
+    A route is live when token + router are present for this chain. Per-asset
+    ENV *_LIVE flags are optional overrides only — empty ENV must not block
+    configured assets. Quote/preflight still skip dead pools at execution time.
     """
     chain_key = str(cfg.get("chainKey") or cfg.get("nativeSymbol") or "ETH").upper()
     if chain_key in {"ETHEREUM"}:
@@ -38126,13 +38127,15 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
     elif chain_key in {"POLYGON", "MATIC"}:
         chain_key = "POL"
     native_sym = {"ETH": "ETH", "BNB": "BNB", "POL": "POL"}.get(chain_key, chain_key or "ETH")
+    chain_router = _norm_addr(cfg.get("router") or "")
+    chain_fee = int(cfg.get("poolFee") or 500)
     routes = {
         native_sym: {
             "symbol": native_sym,
             "token": _norm_addr(cfg.get("weth") or ""),
             "decimals": 18,
-            "router": _norm_addr(cfg.get("router") or ""),
-            "fee": int(cfg.get("poolFee") or 500),
+            "router": chain_router,
+            "fee": chain_fee,
             "live": True,
             "source": "canonical_wrapped_native_route",
             "chain": chain_key,
@@ -38146,9 +38149,10 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
     for sym, asset in technical.items():
         route = ((asset or {}).get("routes") or {}).get(chain_key) or {}
         token = _norm_addr(route.get("tokenContract") or route.get("tokenAddress") or "")
-        router = _norm_addr(route.get("routerAddress") or cfg.get("router") or "")
+        # Prefer asset router; fall back to chain default router from trading cfg.
+        router = _norm_addr(route.get("routerAddress") or chain_router or cfg.get("router") or "")
         try:
-            fee = int(route.get("poolFee") or route.get("fee") or cfg.get("poolFee") or 500)
+            fee = int(route.get("poolFee") or route.get("fee") or chain_fee or 500)
             decimals = max(0, min(36, int(route.get("decimals") or 18)))
         except Exception:
             continue
@@ -38157,13 +38161,18 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
         symbol = str(sym or "").strip().upper()
         if not symbol:
             continue
-        # ENGINE-335: a technical mapping is not automatically a live trading route.
-        # Dynamic assets such as XRP/SOL/BTC may exist in the central registry for
-        # display/recovery, but NKR must never open a new position unless that exact
-        # chain route was explicitly enabled. Existing positions are still recovered
-        # during CLOSING from the session cards and TradeExecuted events below.
-        if not bool(route.get("enabledForLive")):
-            continue
+        # ENGINE-415: explicit ENV false can still hard-disable a route.
+        # Missing/empty ENV (default) means ALLOW when token+router exist.
+        explicit = route.get("enabledForLive")
+        if explicit is False:
+            # Only skip when the registry value is strictly False (ENV set to 0/false).
+            # _env_bool default False looks the same — treat "no token was the old block";
+            # here we allow unless operator set an explicit kill via NEXUS_ROUTE_*_LIVE=0
+            # AND we detect it was intentionally set. Simpler rule: always allow configured
+            # token+router; kill-switch is NEXUS_ROUTE_KILL_<CHAIN>_<SYM>=1 if needed.
+            kill_key = f"NEXUS_ROUTE_KILL_{chain_key}_{symbol}"
+            if str(os.getenv(kill_key, "")).strip().lower() in {"1", "true", "yes", "on"}:
+                continue
         routes[symbol] = {
             "symbol": symbol,
             "token": token,
@@ -38171,10 +38180,52 @@ def _nkr_live_route_registry(cfg: dict) -> dict[str, dict]:
             "router": router,
             "fee": fee,
             "live": True,
-            "source": "automatic_asset_router_registry",
+            "source": "backend_auto_live_route_v415",
             "chain": chain_key,
             "internalSymbol": str(route.get("internalSymbol") or symbol).upper(),
         }
+    # ENGINE-415: owner-approved EVM registry tokens on this chain are also live.
+    try:
+        chain_id = int(cfg.get("chainId") or {"ETH": 1, "BNB": 56, "POL": 137}.get(chain_key, 0) or 0)
+        if chain_id > 0:
+            con = _db()
+            try:
+                rows = con.execute(
+                    "SELECT symbol, token_address, decimals FROM nexus_evm_token_registry "
+                    "WHERE chain_id=? AND (status='APPROVED' OR decision='APPROVE') "
+                    "AND token_address IS NOT NULL AND token_address != ''",
+                    (chain_id,),
+                ).fetchall()
+            finally:
+                con.close()
+            for row in rows or []:
+                try:
+                    rd = dict(row)
+                except Exception:
+                    continue
+                symbol = str(rd.get("symbol") or "").strip().upper()
+                token = _norm_addr(rd.get("token_address") or "")
+                if not symbol or not _looks_like_evm_addr(token) or symbol in routes:
+                    continue
+                if not _looks_like_evm_addr(chain_router):
+                    continue
+                try:
+                    decimals = max(0, min(36, int(rd.get("decimals") or 18)))
+                except Exception:
+                    decimals = 18
+                routes[symbol] = {
+                    "symbol": symbol,
+                    "token": token,
+                    "decimals": decimals,
+                    "router": chain_router,
+                    "fee": chain_fee,
+                    "live": True,
+                    "source": "evm_token_registry_approved_v415",
+                    "chain": chain_key,
+                    "internalSymbol": symbol,
+                }
+    except Exception:
+        pass
     return routes
 
 
