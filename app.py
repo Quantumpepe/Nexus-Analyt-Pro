@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-419b-TRADE-SECURITY-FN-FIXED"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-420-PREFLIGHT-SKIP-NEXT-CANDIDATE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -41325,8 +41325,17 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_RESULT_UNCERTAIN")
                 except Exception:
                     pass
-            # Skip dead routes (e.g. WBTC quoter_failed) and try next ranked target.
-            if any(x in err.lower() for x in ("quoter_failed", "quoter_not_configured", "quoter_returned", "quote_amount", "quote_min_out", "router_config_decode")):
+            # ENGINE-420: any pre-submit / quote / preflight failure skips to the next
+            # ranked candidate (DOGE, BNB, …) instead of hard-stopping the whole tick.
+            skip_next = (
+                "quoter_failed", "quoter_not_configured", "quoter_returned",
+                "quote_amount", "quote_min_out", "router_config_decode",
+                "live_trade_preflight_failed", "router_not_enabled",
+                "selector_not_allowed", "invalid_live_trade_addresses",
+                "goplus", "security", "blocked by", "owner_approval",
+                "honeypot", "execution reverted", "call_exception",
+            )
+            if any(x in err.lower() for x in skip_next):
                 last_skip = f"{action} {sym} skipped on {chain_key}: {err}"
                 continue
             return {
