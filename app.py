@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-425-POSITION-ONLY-IF-POSITIONOF"
+BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-425b-WORKER-SAFE-POSITION-CHECK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1423,30 +1423,13 @@ def _live_engine_health_payload(wallet=""):
                     open_asset_hint = 0
                     position_qty = 0.0
                 if not has_position:
+                    # Display only — worker owns lock/DB flat stamp (avoid status-poll DB storms).
                     asset = ""
                     position_qty = 0.0
                     position_value = 0.0
                     tx_hash_hint = ""
                     position_state = "WAITING"
                     open_asset_hint = 0
-                    try:
-                        _nkr_position_lock_clear(wallet, {
-                            "onchain_session_id": str(live[0].get("onchain_session_id") or ""),
-                            "chain_id": int(live[0].get("chain_id") or 0),
-                            "vault_address": live[0].get("vault_address") or "",
-                            "wallet_address": wallet,
-                        })
-                    except Exception:
-                        pass
-                    try:
-                        _nkr_stamp_session_flat(wallet, {
-                            "onchain_session_id": str(live[0].get("onchain_session_id") or ""),
-                            "chain_id": int(live[0].get("chain_id") or 0),
-                            "vault_address": live[0].get("vault_address") or "",
-                            "wallet_address": wallet,
-                        })
-                    except Exception:
-                        pass
                 elif has_position and not exit_pending:
                     position_state = "OPEN"
                 live_statuses = {str(x.get("status") or "").upper() for x in live}
@@ -40538,46 +40521,69 @@ def _nkr_position_lock_reconcile_exit_pending(wallet: str, live_row: dict) -> di
 
 
 
-def _nkr_session_has_real_position(chain_id: int, vault: str, sid: int, cfg: dict | None = None) -> dict:
-    """ENGINE-425: single source of truth for 'is a trade still open?'.
+def _nkr_session_has_real_position(chain_id: int, vault: str, sid: int, cfg=None) -> dict:
+    """ENGINE-425b: is a trade still open? Worker-safe (fast path + limited probes).
 
-    True only if positionOf returns amount>0 for at least one known route token.
-    openAssetCount alone is ignored when all positionOf reads are zero (ghost after sell).
+    True only if positionOf amount>0 for a known token. openAssetCount alone is not enough.
     """
-    cid = int(chain_id or 0)
-    vault = _norm_addr(vault)
-    sid = int(sid or 0)
-    if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(vault):
-        return {"open": False, "symbol": "", "amount": 0, "openAssetCount": -1}
     try:
-        oa = int(_nkr_session_open_asset_count(cid, vault, sid))
-    except Exception:
-        oa = -1
-    cfg = dict(cfg or _privy_trading_cfg(cid) or {})
-    cfg["vault"] = vault
-    cfg["chainId"] = cid
-    routes = dict(_nkr_live_route_registry(cfg) or {})
-    # Always probe common BNB recovery tokens so a sold XRP cannot hide as open_count.
-    if cid == 56:
-        for sym, (tok, dec) in {
-            "WBNB": ("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),
-            "XRP": ("0x1D2F0dA169ceB9fC7B3144628dB156F3F6c60dBE", 18),
-            "BTCB": ("0x7130d2A12B9BCbFae4f2634d864A1Ee1Ce3Ead9c", 18),
-        }.items():
-            routes.setdefault(sym, {"symbol": sym, "token": tok, "decimals": dec, "fee": 500, "live": True})
-    for sym, route in routes.items():
+        cid = int(chain_id or 0)
+        vault_n = _norm_addr(vault)
+        sid_i = int(sid or 0)
+        if cid <= 0 or sid_i <= 0 or not _looks_like_evm_addr(vault_n):
+            return {"open": False, "symbol": "", "amount": 0, "openAssetCount": -1}
         try:
-            ps = _nkr_position_snapshot(vault, sid, route, cfg)
-            amt = int(ps.get("amount") or 0)
-            if amt > 0:
-                return {
-                    "open": True, "symbol": str(sym).upper(), "amount": amt,
-                    "openAssetCount": oa, "valueUsd": _safe_float(ps.get("valueUsd"), 0.0),
-                    "costBasisUsd": _safe_float(ps.get("costBasisUsd"), 0.0),
-                }
+            oa = int(_nkr_session_open_asset_count(cid, vault_n, sid_i))
         except Exception:
-            continue
-    return {"open": False, "symbol": "", "amount": 0, "openAssetCount": oa}
+            oa = -1
+        # Fast path: vault says zero open assets → flat, no token probes.
+        if oa == 0:
+            return {"open": False, "symbol": "", "amount": 0, "openAssetCount": 0}
+        try:
+            cfg_d = dict(cfg or {})
+            if not cfg_d:
+                cfg_d = dict(_privy_trading_cfg(cid) or {})
+        except Exception:
+            cfg_d = {}
+        cfg_d["vault"] = vault_n
+        cfg_d["chainId"] = cid
+        routes = {}
+        try:
+            routes = dict(_nkr_live_route_registry(cfg_d) or {})
+        except Exception:
+            routes = {}
+        if cid == 56:
+            for sym, (tok, dec) in {
+                "WBNB": ("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", 18),
+                "XRP": ("0x1D2F0dA169ceB9fC7B3144628dB156F3F6c60dBE", 18),
+                "BTCB": ("0x7130d2A12B9BCbFae4f2634d864A1Ee1Ce3Ead9c", 18),
+            }.items():
+                routes.setdefault(sym, {"symbol": sym, "token": tok, "decimals": dec, "fee": 500, "live": True})
+        # Cap probes so a large registry cannot stall the worker tick.
+        probed = 0
+        for sym, route in list(routes.items())[:20]:
+            if probed >= 12:
+                break
+            try:
+                tok = _norm_addr((route or {}).get("token") or "")
+                if not _looks_like_evm_addr(tok):
+                    continue
+                probed += 1
+                # Lightweight positionOf only (no quoter) to avoid RPC storms.
+                raw = _eth_call(cid, vault_n, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(sid_i) + _addr_to_32(tok))
+                words = _abi_hex_words(raw)
+                amt = int(words[0], 16) if words else 0
+                if amt > 0:
+                    return {
+                        "open": True, "symbol": str(sym or "").upper(), "amount": amt,
+                        "openAssetCount": oa,
+                    }
+            except Exception:
+                continue
+        # openCount>0 but no token found → ghost after sell → treat flat
+        return {"open": False, "symbol": "", "amount": 0, "openAssetCount": oa, "ghostOpenCount": True}
+    except Exception as exc:
+        return {"open": False, "symbol": "", "amount": 0, "openAssetCount": -1, "error": str(exc)[:120]}
 
 
 def _nkr_session_open_asset_count(chain_id: int, vault: str, sid: int) -> int:
