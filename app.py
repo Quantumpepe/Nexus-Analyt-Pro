@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-446-TRADER-LIFECYCLE-STATE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-447-TRADER-EXACT-CONTROL-STATUS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19316,6 +19316,107 @@ def api_nexus_core_vault_accounting():
     return jsonify({"status": "ok", "accounting": accounting, **accounting, "ts": now_ts()})
 
 
+
+def _trader_resolve_exact_core_session(wallet: str, target_id: str, target_chain: str) -> dict:
+    """Resolve one exact TRADER CoreVault session from chain + on-chain session id."""
+    wa = _norm_addr(wallet)
+    sid_txt = str(target_id or "").strip().split("-")[-1]
+    chain_key = str(target_chain or "").strip().upper()
+    chain_key = {"POLYGON":"POL","MATIC":"POL","ETHEREUM":"ETH","BSC":"BNB","BNB CHAIN":"BNB"}.get(chain_key, chain_key)
+    chain_id = int(_nkr_chain_id_from_key(chain_key) or 0)
+    if not sid_txt.isdigit() or int(sid_txt) <= 0 or chain_id <= 0:
+        raise RuntimeError("exact chain and positive on-chain Trader session id required")
+    sid = int(sid_txt)
+    vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+    if not _looks_like_evm_addr(vault):
+        raise RuntimeError(f"vault not configured for chain {chain_id}")
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    if len(words) < 4:
+        raise RuntimeError("sessionOf returned incomplete data")
+    owner = "0x" + words[0].to_bytes(32, "big")[-20:].hex()
+    system_id = int(words[2])
+    status_id = int(words[3])
+    if _norm_addr(owner) != wa:
+        raise RuntimeError("session owner does not match connected wallet")
+    if system_id != int(_CORE_SYSTEM_ID.get("TRADER", 1)):
+        raise RuntimeError("session is not a TRADER session")
+    wallet_id = str(_privy_wallet_id_for_user(wa) or "")
+    if not wallet_id:
+        raise RuntimeError("Privy wallet id not found")
+    return {
+        "wallet_address": wa, "engine": "TRADER", "chain_id": chain_id,
+        "chain": chain_key, "vault_address": vault, "privy_wallet_id": wallet_id,
+        "onchain_session_id": str(sid), "status_id": status_id,
+        "status": {1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(status_id,"UNKNOWN"),
+    }
+
+
+def _trader_control_exact_core_session(wallet: str, target_id: str, target_chain: str, paused: bool) -> dict:
+    """Pause/resume one exact Trader session on-chain; does not depend on execution_queue."""
+    row = _trader_resolve_exact_core_session(wallet, target_id, target_chain)
+    sid = int(row["onchain_session_id"]); chain_id = int(row["chain_id"])
+    vault = row["vault_address"]; wallet_id = row["privy_wallet_id"]
+    expected = 2 if paused else 1
+    current = int(row.get("status_id") or -1)
+    if current == 4:
+        raise RuntimeError("session already finalized")
+    txh = ""
+    if current != expected:
+        data = _core_selector("setSessionPaused(uint256,bool)") + _uint_to_32(sid) + _uint_to_32(1 if paused else 0)
+        sent = _privy_send_delegated_transaction(
+            wallet_id,
+            {"from": _norm_addr(wallet), "to": vault, "data": data, "value": "0x0"},
+            f"nexus-trader-exact-{'pause' if paused else 'resume'}-{chain_id}-{sid}-{int(time.time())}",
+            chain_id=chain_id,
+        )
+        txh = str(sent.get("hash") or "")
+        if not txh:
+            raise RuntimeError("Privy returned no transaction hash")
+        _privy_wait_receipt(txh, timeout_sec=120, chain_id=chain_id)
+        confirmed = False
+        for _ in range(12):
+            chk = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            ww = _core_words(chk)
+            actual = int(ww[3]) if len(ww) > 3 else -1
+            if actual == expected:
+                confirmed = True
+                break
+            time.sleep(1.5)
+        if not confirmed:
+            raise RuntimeError(f"on-chain Trader status not confirmed; expected {expected}")
+    try:
+        _reconcile_live_registry_from_corevault(_norm_addr(wallet), "TRADER")
+    except Exception:
+        pass
+    return {"sessionId": sid, "chainId": chain_id, "chain": row.get("chain"), "status": "PAUSED" if paused else "ACTIVE", "statusId": expected, "txHash": txh, "confirmed": True}
+
+
+@app.route("/api/nexus/trading/session-status", methods=["GET"])
+def api_nexus_trading_session_status():
+    """Exact on-chain Trader lifecycle status; used by the UI before removing a card."""
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    chain_raw = request.args.get("chain") or request.args.get("chainKey") or request.args.get("chainId") or ""
+    sid_raw = str(request.args.get("sessionId") or request.args.get("onchainSessionId") or "").strip()
+    try:
+        if str(chain_raw).isdigit():
+            chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
+        else:
+            chain = str(chain_raw or "").strip().upper()
+            chain = {"POLYGON":"POL","MATIC":"POL","ETHEREUM":"ETH","BSC":"BNB","BNB CHAIN":"BNB"}.get(chain, chain)
+        row = _trader_resolve_exact_core_session(wa, sid_raw, chain)
+    except Exception as exc:
+        return jsonify({"status":"error","error":"trader_session_status_failed","message":str(exc)[:300]}), 400
+    return jsonify({
+        "status":"ok", "engine":"TRADER", "chain":row.get("chain"),
+        "chainId":row.get("chain_id"), "sessionId":int(row.get("onchain_session_id") or 0),
+        "statusId":int(row.get("status_id") or 0), "statusLabel":str(row.get("status") or "UNKNOWN"),
+        "finalized":int(row.get("status_id") or 0) == 4, "ts":now_ts(),
+    })
+
+
 @app.route("/api/nexus/trading/control", methods=["POST"])
 def api_nexus_trading_control():
     """Trader session control.
@@ -19353,6 +19454,23 @@ def api_nexus_trading_control():
         conn.close()
 
     core_vault_finalize = []
+    core_vault_control = []
+    if action in ("pause", "resume") and onchain_sid:
+        try:
+            if str(chain_raw).isdigit():
+                pause_chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
+            else:
+                pause_chain = str(chain_raw or "").strip().upper()
+                pause_chain = {"BSC":"BNB","BNB CHAIN":"BNB","ETHEREUM":"ETH","POLYGON":"POL","MATIC":"POL"}.get(pause_chain, pause_chain)
+            exact = _trader_control_exact_core_session(wa, onchain_sid, pause_chain, paused=(action == "pause"))
+            core_vault_control = [exact]
+        except Exception as control_exc:
+            return jsonify({
+                "status":"error", "error":"trader_live_control_failed",
+                "message":str(control_exc)[:400], "session_id":session_id,
+                "onchainSessionId":onchain_sid, "chain":chain_raw,
+                "affected_queue_rows":affected,
+            }), 500
     if action == "stop":
         # Prefer explicit on-chain id; else parse from TRD-... local ids; else all TRADER rows.
         target_id = onchain_sid
@@ -19434,7 +19552,7 @@ def api_nexus_trading_control():
         "status": "ok", "wallet": wa, "action": action,
         "session_id": session_id, "runtime_status": status_map[action],
         "affected_queue_rows": affected, "execution": execution,
-        "coreVaultFinalize": core_vault_finalize,
+        "coreVaultFinalize": core_vault_finalize, "coreVaultControl": core_vault_control,
         "backend_is_state_master": True, "ts": now_ts(),
     })
 
