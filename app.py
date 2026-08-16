@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-438-EXACT-ORPHAN-SESSION-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-439-ETH-GHOST-POSITION-AUDIT-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15764,6 +15764,23 @@ def _nkr_recover_open_route_from_events(chain_id: int, vault: str, sid: int, cfg
             continue
         if int(ps.get("amount") or 0) > 0:
             return sym, route, ps
+    # ENGINE-439: if eth_getLogs alone did not resolve the position, reconstruct
+    # TradeExecuted from persisted operation receipts and probe every touched token.
+    try:
+        audit=_nkr_exhaustive_session_token_audit(int(chain_id),vault,int(sid),cfg)
+        for p in audit.get("positivePositions") or []:
+            tok=_norm_addr(p.get("address") or "")
+            if not _looks_like_evm_addr(tok): continue
+            sym=str(p.get("symbol") or _symbol_for_chain_token(int(chain_id),tok) or "ASSET").upper()
+            known=next((dict(r) for r in (routes or {}).values() if _norm_addr((r or {}).get("token") or "").lower()==tok.lower()),None)
+            router=""
+            for rr in p.get("routers") or []:
+                if _looks_like_evm_addr(rr): router=_norm_addr(rr); break
+            route=known or {"symbol":sym,"token":tok,"decimals":18,"router":router or _norm_addr(cfg.get("router") or ""),"fee":int(cfg.get("poolFee") or 500),"live":True,"source":"ENGINE439_exhaustive_audit"}
+            ps=_nkr_position_snapshot(vault,int(sid),route,cfg)
+            if int(ps.get("amount") or 0)>0: return sym,route,ps
+    except Exception:
+        pass
     return None
 
 
@@ -33772,8 +33789,158 @@ def _nkr_session_trade_events(chain_id: int, vault: str, session_id: int) -> lis
             f"closing_trade_event_scan_failed:chain={cid}:session={sid}:"
             f"range={start_block}-{latest}:errors={' | '.join(request_errors)[:900]}"
         )
+    # ENGINE-439: a partial log scan is not sufficient evidence for declaring a
+    # ghost open-asset counter. Fail closed so the receipt-backed audit can still
+    # recover known transactions without falsely calling the token universe complete.
+    if request_errors:
+        raise RuntimeError(
+            f"closing_trade_event_scan_partial:chain={cid}:session={sid}:"
+            f"range={start_block}-{latest}:errors={' | '.join(request_errors)[:900]}"
+        )
     out.sort(key=lambda x: int(x.get("blockNumber") or 0))
     return out
+
+
+def _nkr_exhaustive_session_token_audit(chain_id: int, vault: str, session_id: int, cfg: dict | None = None) -> dict:
+    """ENGINE-439: reconstruct every token touched by one CoreVault session.
+
+    Sources are deliberately redundant:
+      1. bounded authoritative TradeExecuted eth_getLogs scan,
+      2. receipts of every persisted live operation for the exact session,
+      3. current configured/technical token inventory.
+
+    positionOf(sessionId, token) remains the authority.  We only declare a
+    contract ghost open-count when the TradeExecuted scan completed, every
+    candidate positionOf read succeeded, no candidate has a positive balance,
+    and sessionOf still reports openAssetCount > 0.
+    """
+    cid = int(chain_id or 0); sid = int(session_id or 0); va = _norm_addr(vault)
+    result = {
+        "chainId": cid, "vault": va, "sessionId": sid, "openAssetCount": 0,
+        "logsComplete": False, "eventCount": 0, "operationReceiptCount": 0,
+        "tokens": [], "positivePositions": [], "positionReadErrors": [],
+        "ghostOpenCountConfirmed": False, "proof": "INCOMPLETE",
+    }
+    if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(va):
+        result["error"] = "invalid_session_identity"; return result
+    cfg = dict(cfg or _privy_trading_cfg(cid) or {}); cfg["vault"] = va
+    settlement = ""
+    try:
+        raw = _eth_call(cid, va, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+        words = _core_words(raw)
+        if len(words) < 13: raise RuntimeError("session_decode_failed")
+        settlement = _norm_addr(_word_addr(words[1])); result["openAssetCount"] = int(words[12])
+        result["statusId"] = int(words[3])
+    except Exception as exc:
+        result["error"] = f"session_read_failed:{str(exc)[:240]}"; return result
+
+    events=[]; event_keys=set(); scan_error=""
+    try:
+        events = list(_nkr_session_trade_events(cid, va, sid) or [])
+        result["logsComplete"] = True
+    except Exception as exc:
+        scan_error = str(exc)[:500]
+        result["tradeLogScanError"] = scan_error
+
+    # Supplement the log scan with receipts from every persisted operation for the exact session.
+    try:
+        _live_ops_init(); con=_db()
+        try:
+            rows=con.execute(
+                "SELECT op_type,tx_hash,status FROM nexus_live_operations WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=? AND tx_hash IS NOT NULL AND length(tx_hash)>=10 ORDER BY updated_ts ASC",
+                (cid, va.lower(), str(sid)),
+            ).fetchall()
+            rows=[dict(r) for r in rows]
+        finally: con.close()
+        for op in rows:
+            txh=str(op.get("tx_hash") or "").strip()
+            if not txh: continue
+            try: receipt=_rpc_call(cid,"eth_getTransactionReceipt",[txh]) or {}
+            except Exception: continue
+            if not receipt: continue
+            result["operationReceiptCount"] += 1
+            for log in list(receipt.get("logs") or []):
+                if _norm_addr((log or {}).get("address") or "").lower() != va.lower(): continue
+                topics=list((log or {}).get("topics") or [])
+                if len(topics)<4 or str(topics[0]).lower()!=_NKR_TRADE_EXECUTED_TOPIC.lower(): continue
+                try:
+                    log_sid=int(str(topics[1]),16)
+                except Exception: continue
+                if log_sid != sid: continue
+                data=str((log or {}).get("data") or "0x").removeprefix("0x")
+                if len(data)<192: continue
+                ev={
+                    "router":_nkr_addr_from_abi_word(topics[2]),
+                    "tokenIn":_nkr_addr_from_abi_word(topics[3]),
+                    "tokenOut":_nkr_addr_from_abi_word("0x"+data[:64]),
+                    "amountIn":int(data[64:128],16), "amountOut":int(data[128:192],16),
+                    "blockNumber":int(str((log or {}).get("blockNumber") or receipt.get("blockNumber") or "0x0"),16),
+                    "transactionHash":str((log or {}).get("transactionHash") or txh),
+                    "source":"operation_receipt",
+                }
+                key=(ev["transactionHash"].lower(),ev["tokenIn"].lower(),ev["tokenOut"].lower())
+                if key not in event_keys:
+                    event_keys.add(key); events.append(ev)
+    except Exception as exc:
+        result["operationReceiptError"] = str(exc)[:400]
+
+    # Deduplicate and order all reconstructed events.
+    merged=[]; seen=set()
+    for ev in events:
+        key=(str(ev.get("transactionHash") or "").lower(), _norm_addr(ev.get("tokenIn") or "").lower(), _norm_addr(ev.get("tokenOut") or "").lower())
+        if key in seen: continue
+        seen.add(key); merged.append(dict(ev))
+    merged.sort(key=lambda x:int(x.get("blockNumber") or 0)); events=merged
+    result["eventCount"] = len(events)
+    result["events"] = events[-100:]
+
+    token_meta={}
+    def add_token(token, source, router=""):
+        tok=_norm_addr(token or "")
+        if not _looks_like_evm_addr(tok) or (settlement and tok.lower()==settlement.lower()): return
+        m=token_meta.setdefault(tok.lower(), {"address":tok,"sources":set(),"routers":set(),"eventNetUnits":0,"eventTouches":0})
+        m["sources"].add(str(source or "unknown"))
+        rr=_norm_addr(router or "")
+        if _looks_like_evm_addr(rr): m["routers"].add(rr)
+    for ev in events:
+        tin=_norm_addr(ev.get("tokenIn") or ""); tout=_norm_addr(ev.get("tokenOut") or ""); router=ev.get("router")
+        add_token(tin,"TradeExecuted",router); add_token(tout,"TradeExecuted",router)
+        if tin.lower() in token_meta:
+            token_meta[tin.lower()]["eventNetUnits"] -= int(ev.get("amountIn") or 0); token_meta[tin.lower()]["eventTouches"] += 1
+        if tout.lower() in token_meta:
+            token_meta[tout.lower()]["eventNetUnits"] += int(ev.get("amountOut") or 0); token_meta[tout.lower()]["eventTouches"] += 1
+    try:
+        for sym,r in dict(_nkr_live_route_registry(cfg) or {}).items(): add_token((r or {}).get("token"),f"live_route:{sym}",(r or {}).get("router"))
+    except Exception: pass
+    try:
+        technical=(_nexus_asset_router_registry(include_technical=True).get("technicalRoutes") or {}); ck=_nkr_chain_key_from_id(cid)
+        for sym,a in technical.items():
+            rr=((a or {}).get("routes") or {}).get(ck) or {}; add_token(rr.get("tokenContract") or rr.get("tokenAddress"),f"technical_route:{sym}",rr.get("routerAddress"))
+    except Exception: pass
+    # Native wrapped token is always a valid historical candidate.
+    add_token(cfg.get("weth"),"wrapped_native",cfg.get("router"))
+
+    read_errors=[]; positives=[]; token_rows=[]
+    for m in token_meta.values():
+        tok=m["address"]; amount=None; err=""
+        try: amount=int(_position_amount(va,sid,tok,chain_id=cid))
+        except Exception as exc: err=str(exc)[:240]; read_errors.append({"address":tok,"error":err})
+        sym=str(_symbol_for_chain_token(cid,tok) or f"TOKEN_{tok[-6:].upper()}").upper()
+        row={"symbol":sym,"address":tok,"amountUnits":str(amount) if amount is not None else None,
+             "eventNetUnits":str(int(m.get("eventNetUnits") or 0)),"eventTouches":int(m.get("eventTouches") or 0),
+             "sources":sorted(m["sources"]),"routers":sorted(m["routers"]),"readError":err}
+        token_rows.append(row)
+        if amount is not None and amount>0: positives.append(row)
+    token_rows.sort(key=lambda x:(0 if int(x.get("amountUnits") or 0)>0 else 1, x.get("symbol") or "", x.get("address") or ""))
+    result["tokens"] = token_rows; result["positivePositions"] = positives; result["positionReadErrors"] = read_errors
+    # A completed eth_getLogs scan proves the historical token universe for TradeExecuted.
+    # Configured candidates are supplemental; any failed positionOf read keeps proof incomplete.
+    complete = bool(result.get("logsComplete")) and not read_errors
+    ghost = bool(int(result.get("openAssetCount") or 0)>0 and complete and not positives)
+    result["ghostOpenCountConfirmed"] = ghost
+    result["proof"] = "CONTRACT_GHOST_OPEN_COUNT_CONFIRMED" if ghost else ("REAL_POSITION_FOUND" if positives else "INCOMPLETE")
+    result["settlementToken"] = settlement
+    return result
 
 def _privy_job_write(job_id, wallet, wallet_id, system, amount, status, stage, error="", txs=None):
     _privy_trading_db_init(); now = now_ts()
@@ -40268,6 +40435,38 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
                 }
                 route_by_token[token.lower()] = (symbol, routes[symbol])
 
+    # ENGINE-439: exhaustive receipt-backed reconstruction before any further exit.
+    # This catches historical tokens missed by the route registry/log provider and,
+    # conversely, proves a true contract ghost counter when all touched tokens are flat.
+    exhaustive_audit = None
+    if expected_open_assets > 0 and len(known_positive_tokens) < expected_open_assets:
+        try:
+            exhaustive_audit = _nkr_exhaustive_session_token_audit(chain_id, vault, int(session_id), cfg)
+            route_tokens={_norm_addr((r or {}).get("token") or "").lower() for r in routes.values()}
+            for p in exhaustive_audit.get("positivePositions") or []:
+                tok=_norm_addr(p.get("address") or "")
+                if not _looks_like_evm_addr(tok) or tok.lower()==settlement.lower() or tok.lower() in route_tokens: continue
+                sym=str(p.get("symbol") or f"TOKEN_{tok[-6:].upper()}").upper(); router=""
+                for rr in p.get("routers") or []:
+                    if _looks_like_evm_addr(rr): router=_norm_addr(rr); break
+                routes[sym]={"symbol":sym,"token":tok,"decimals":18,"router":router or _norm_addr(cfg.get("router") or ""),
+                             "fee":int(cfg.get("poolFee") or 500),"feeCandidates":[100,500,2500,3000,10000],"live":True,
+                             "source":"ENGINE439_exhaustive_receipt_recovery","chain":_nkr_chain_key_from_id(chain_id),"closingRecoveryOnly":True}
+                route_tokens.add(tok.lower())
+            if exhaustive_audit.get("ghostOpenCountConfirmed"):
+                _live_engine_mark(runtime_engine,status="closing",decision="GHOST_OPEN_COUNT_CONFIRMED",gate_status="CONTRACT_BOOKKEEPING_BLOCKED",
+                    reason=f"Session #{session_id}: openAssetCount={expected_open_assets}, but every reconstructed TradeExecuted token has positionOf=0",
+                    pending_tx="",last_error="contract_ghost_open_count_confirmed; no further executeTrade retries")
+                raise RuntimeError(
+                    f"contract_ghost_open_count_confirmed:chain={chain_id}:session={session_id}:openAssetCount={expected_open_assets}:"
+                    f"events={exhaustive_audit.get('eventCount',0)}:tokens={len(exhaustive_audit.get('tokens') or [])}"
+                )
+        except RuntimeError as audit_exc:
+            if "contract_ghost_open_count_confirmed" in str(audit_exc): raise
+            _live_engine_mark(runtime_engine,last_error=f"exhaustive token audit warning: {str(audit_exc)[:300]}")
+        except Exception as audit_exc:
+            _live_engine_mark(runtime_engine,last_error=f"exhaustive token audit warning: {str(audit_exc)[:300]}")
+
     executed = []
     discovered = []
     for sym, route in routes.items():
@@ -40422,6 +40621,14 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     open_assets = int(words[12])
     if open_assets != 0:
         mapped = ",".join(f"{x['asset']}:{x['token']}:{x['amount']}" for x in discovered) or "none"
+        if exhaustive_audit is None:
+            try: exhaustive_audit=_nkr_exhaustive_session_token_audit(chain_id,vault,int(session_id),cfg)
+            except Exception: exhaustive_audit=None
+        if exhaustive_audit and exhaustive_audit.get("ghostOpenCountConfirmed"):
+            raise RuntimeError(
+                f"contract_ghost_open_count_confirmed:chain={chain_id}:session={session_id}:openAssetCount={open_assets}:"
+                f"events={exhaustive_audit.get('eventCount',0)}:tokens={len(exhaustive_audit.get('tokens') or [])}"
+            )
         raise RuntimeError(
             f"closing_open_assets_unmapped:chain={chain_id}:session={session_id}:"
             f"openAssetCount={open_assets}:mappedPositions={mapped}:tradeEvents={len(event_history)}"
@@ -46237,8 +46444,24 @@ def api_nexus_system_info_evm_diagnostics():
                         seen.add(token.lower())
             target_token = discovered[0] if discovered else None
             found_ok = len(discovered) >= int(session.get("openAssetCount") or 0)
-            add_check("openPositionResolution", found_ok, "READY" if found_ok else "UNRESOLVED", {"expectedCount":session.get("openAssetCount"),"positions":discovered}, blocker="open_position_unresolved")
-            trace("POSITION", "Resolve open on-chain positions", found_ok, contract=vault, function="positionOf/TradeExecuted", detail={"positions":discovered})
+            audit_detail=None
+            if not found_ok:
+                try:
+                    audit_detail=_nkr_exhaustive_session_token_audit(chain_id,vault,session_id,cfg)
+                    # If receipt-backed reconstruction found a real position, surface it immediately.
+                    for p in audit_detail.get("positivePositions") or []:
+                        if all(str(x.get("address") or "").lower()!=str(p.get("address") or "").lower() for x in discovered):
+                            discovered.append({"symbol":p.get("symbol") or "DYNAMIC","address":p.get("address"),"amountUnits":p.get("amountUnits"),"source":"ENGINE439_exhaustive_audit"})
+                    found_ok = len(discovered) >= int(session.get("openAssetCount") or 0)
+                except Exception as audit_exc:
+                    audit_detail={"proof":"INCOMPLETE","error":str(audit_exc)[:500]}
+            detail={"expectedCount":session.get("openAssetCount"),"positions":discovered,"exhaustiveAudit":audit_detail}
+            if audit_detail and audit_detail.get("ghostOpenCountConfirmed"):
+                add_check("openPositionResolution", False, "CONTRACT_GHOST_OPEN_COUNT", detail, blocker="contract_ghost_open_count")
+                trace("POSITION", "Resolve open on-chain positions", False, contract=vault, function="positionOf/TradeExecuted+operationReceipts", detail=detail)
+            else:
+                add_check("openPositionResolution", found_ok, "READY" if found_ok else "UNRESOLVED", detail, blocker="open_position_unresolved")
+                trace("POSITION", "Resolve open on-chain positions", found_ok, contract=vault, function="positionOf/TradeExecuted+operationReceipts", detail=detail)
         except Exception as exc:
             msg=str(exc)
             add_check("openPositionResolution", False, "FAILED", {"error":msg}, blocker="open_position_resolution_failed")
@@ -46259,6 +46482,7 @@ def api_nexus_system_info_evm_diagnostics():
         mapping={
             "rpc_unreachable":("RPC","Chain RPC unavailable","Configure a working provider-neutral RPC_URL for the chain."),
             "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
+            "contract_ghost_open_count":("POSITION","CoreVault openAssetCount is inconsistent","All reconstructed TradeExecuted tokens have positionOf=0 while sessionOf still reports an open asset. This requires a CoreVault bookkeeping/dust repair; do not retry executeTrade."),
             "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
             "open_position_resolution_failed":("POSITION","Position discovery failed","Check RPC eth_getLogs support and the session creation block."),
             "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
