@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-439-ETH-GHOST-POSITION-AUDIT-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-440-RECEIPT-FIRST-GHOST-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33817,8 +33817,8 @@ def _nkr_exhaustive_session_token_audit(chain_id: int, vault: str, session_id: i
     cid = int(chain_id or 0); sid = int(session_id or 0); va = _norm_addr(vault)
     result = {
         "chainId": cid, "vault": va, "sessionId": sid, "openAssetCount": 0,
-        "logsComplete": False, "eventCount": 0, "operationReceiptCount": 0,
-        "tokens": [], "positivePositions": [], "positionReadErrors": [],
+        "logsComplete": False, "eventCount": 0, "operationTxCount": 0, "operationReceiptCount": 0,
+        "operationReceiptFailures": [], "tokens": [], "positivePositions": [], "positionReadErrors": [],
         "ghostOpenCountConfirmed": False, "proof": "INCOMPLETE",
     }
     if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(va):
@@ -33852,12 +33852,18 @@ def _nkr_exhaustive_session_token_audit(chain_id: int, vault: str, session_id: i
             ).fetchall()
             rows=[dict(r) for r in rows]
         finally: con.close()
+        result["operationTxCount"] = len(rows)
         for op in rows:
             txh=str(op.get("tx_hash") or "").strip()
             if not txh: continue
-            try: receipt=_rpc_call(cid,"eth_getTransactionReceipt",[txh]) or {}
-            except Exception: continue
-            if not receipt: continue
+            try:
+                receipt=_rpc_call(cid,"eth_getTransactionReceipt",[txh]) or {}
+            except Exception as receipt_exc:
+                result["operationReceiptFailures"].append({"txHash":txh,"error":str(receipt_exc)[:240]})
+                continue
+            if not receipt:
+                result["operationReceiptFailures"].append({"txHash":txh,"error":"receipt_not_found"})
+                continue
             result["operationReceiptCount"] += 1
             for log in list(receipt.get("logs") or []):
                 if _norm_addr((log or {}).get("address") or "").lower() != va.lower(): continue
@@ -33936,9 +33942,24 @@ def _nkr_exhaustive_session_token_audit(chain_id: int, vault: str, session_id: i
     # A completed eth_getLogs scan proves the historical token universe for TradeExecuted.
     # Configured candidates are supplemental; any failed positionOf read keeps proof incomplete.
     complete = bool(result.get("logsComplete")) and not read_errors
+    receipt_coverage = bool(
+        int(result.get("operationTxCount") or 0) > 0
+        and int(result.get("operationReceiptCount") or 0) == int(result.get("operationTxCount") or 0)
+        and not (result.get("operationReceiptFailures") or [])
+    )
+    result["receiptCoverageComplete"] = receipt_coverage
     ghost = bool(int(result.get("openAssetCount") or 0)>0 and complete and not positives)
     result["ghostOpenCountConfirmed"] = ghost
-    result["proof"] = "CONTRACT_GHOST_OPEN_COUNT_CONFIRMED" if ghost else ("REAL_POSITION_FOUND" if positives else "INCOMPLETE")
+    if ghost:
+        result["proof"] = "CONTRACT_GHOST_OPEN_COUNT_CONFIRMED"
+    elif positives:
+        result["proof"] = "REAL_POSITION_FOUND_RECEIPT_BACKED" if not result.get("logsComplete") else "REAL_POSITION_FOUND"
+    elif receipt_coverage and not read_errors:
+        # Strong recovery evidence but not sufficient to call a contract ghost: a
+        # historical trade could predate the durable operation table. Keep fail-closed.
+        result["proof"] = "RECEIPTS_COMPLETE_NO_POSITION_LOGS_UNAVAILABLE"
+    else:
+        result["proof"] = "INCOMPLETE"
     result["settlementToken"] = settlement
     return result
 
@@ -40411,8 +40432,23 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     # represented by the canonical routes/cards. Normal WETH/WBNB/WPOL closes now
     # proceed immediately and do not depend on historical log scanning.
     event_history = []
+    event_scan_error = ""
     if len(known_positive_tokens) < expected_open_assets:
-        event_history = _nkr_session_trade_events(chain_id, vault, int(session_id))
+        # ENGINE-440: archive-capable eth_getLogs is optional for recovery. Public RPCs
+        # may reject historical ranges (for example HTTP 403 archive requests). Do not
+        # abort the closing lifecycle before the receipt-backed audit gets a chance to
+        # reconstruct the exact tokens from persisted ENTRY/EXIT operations.
+        try:
+            event_history = _nkr_session_trade_events(chain_id, vault, int(session_id)) or []
+        except Exception as event_exc:
+            event_scan_error = str(event_exc)[:900]
+            event_history = []
+            _live_engine_mark(
+                runtime_engine, status="closing", decision="RECEIPT_POSITION_RECOVERY",
+                gate_status="EXIT_PENDING",
+                reason=f"Session #{session_id}: historical eth_getLogs unavailable; reconstructing positions from stored transaction receipts",
+                pending_tx="", last_error=f"trade log scan unavailable; receipt recovery active: {event_scan_error[:300]}",
+            )
         route_by_token = {
             _norm_addr((r or {}).get("token") or "").lower(): (sym, r)
             for sym, r in routes.items()
@@ -46431,8 +46467,16 @@ def api_nexus_system_info_evm_diagnostics():
                 amount = _position_amount(vault, session_id, token, chain_id)
                 if amount > 0:
                     discovered.append({"symbol":symbol,"address":token,"amountUnits":str(amount),"source":"positionOf_known_token"})
+            event_scan_error = ""
             if len(discovered) < int(session.get("openAssetCount") or 0):
-                events = _nkr_session_trade_events(chain_id, vault, session_id)
+                # ENGINE-440: diagnostics must not fail just because a public RPC does
+                # not provide archive eth_getLogs. Continue with operation receipts and
+                # direct positionOf checks; logs remain supplemental evidence.
+                try:
+                    events = _nkr_session_trade_events(chain_id, vault, session_id) or []
+                except Exception as event_exc:
+                    event_scan_error = str(event_exc)[:900]
+                    events = []
                 seen=set(x["address"].lower() for x in discovered)
                 for ev in reversed(events):
                     token=_norm_addr(ev.get("tokenOut") or "")
@@ -46456,6 +46500,9 @@ def api_nexus_system_info_evm_diagnostics():
                 except Exception as audit_exc:
                     audit_detail={"proof":"INCOMPLETE","error":str(audit_exc)[:500]}
             detail={"expectedCount":session.get("openAssetCount"),"positions":discovered,"exhaustiveAudit":audit_detail}
+            if event_scan_error:
+                detail["tradeLogScanWarning"] = event_scan_error
+                detail["recoverySource"] = "OPERATION_RECEIPTS_PLUS_POSITION_OF"
             if audit_detail and audit_detail.get("ghostOpenCountConfirmed"):
                 add_check("openPositionResolution", False, "CONTRACT_GHOST_OPEN_COUNT", detail, blocker="contract_ghost_open_count")
                 trace("POSITION", "Resolve open on-chain positions", False, contract=vault, function="positionOf/TradeExecuted+operationReceipts", detail=detail)
@@ -46484,7 +46531,7 @@ def api_nexus_system_info_evm_diagnostics():
             "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
             "contract_ghost_open_count":("POSITION","CoreVault openAssetCount is inconsistent","All reconstructed TradeExecuted tokens have positionOf=0 while sessionOf still reports an open asset. This requires a CoreVault bookkeeping/dust repair; do not retry executeTrade."),
             "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
-            "open_position_resolution_failed":("POSITION","Position discovery failed","Check RPC eth_getLogs support and the session creation block."),
+            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD440."),
             "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
             "router_selector_blocked":("ROUTER","Router selector blocked","Allow exactInputSingle selector on-chain."),
         }
