@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-448-TRADER-PAUSE-STOP-RESOLVE"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-449-TRADER-STOP-SYNC-ONCHAIN"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1231,7 +1231,7 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
     try:
         for row in rows:
             try:
-                results.append(_finalize_one_live_session(wallet, engine, row, allow_early_nkr_stop=(str(engine).upper() in ("NKR", "TRADER", "GRID"))))
+                results.append(_finalize_one_live_session(wallet, engine, row, allow_early_nkr_stop=True))
             except Exception as exc:
                 msg = str(exc)[:1000]
                 conn = _db()
@@ -19497,12 +19497,10 @@ def api_nexus_trading_control():
                 "affected_queue_rows":affected,
             }), 500
     if action == "stop":
-        # Prefer explicit on-chain id; else parse from TRD-... local ids; else all TRADER rows.
-        target_id = onchain_sid
-        if not target_id:
-            # ENGINE-446: never infer a CoreVault id from a local TRD-* identifier.
-            # Local ids contain timestamps/random numeric components and are not on-chain ids.
-            target_id = ""
+        # ENGINE-449: Trader Stop must END the CoreVault session on-chain (sync).
+        # Do not depend on registry rows alone — UI may show an on-chain session
+        # that was never registered locally.
+        target_id = str(onchain_sid or "").strip()
         target_chain = ""
         try:
             if str(chain_raw).isdigit():
@@ -19518,12 +19516,7 @@ def api_nexus_trading_control():
                 _reconcile_live_registry_from_corevault(wa, "TRADER")
             except Exception:
                 pass
-
-            # ENGINE-446: the browser's local TRD-* id is not the CoreVault session id.
-            # Resolve the exact live TRADER row from the authoritative registry when
-            # onchainSessionId was not supplied.  The previous parser could extract a
-            # timestamp/random numeric tail and therefore target a non-existent session.
-            if not onchain_sid:
+            if not target_id:
                 try:
                     rows = _live_active_sessions(wa, "TRADER")
                     if target_chain:
@@ -19534,35 +19527,53 @@ def api_nexus_trading_control():
                     if len(live_rows) == 1:
                         target_id = str(live_rows[0].get("onchain_session_id") or "").strip()
                     elif target_chain and live_rows:
-                        # Same-chain most recent row is deterministic; never cross-stop another chain.
                         live_rows.sort(key=lambda r: int((r or {}).get("created_ts") or 0), reverse=True)
                         target_id = str(live_rows[0].get("onchain_session_id") or "").strip()
                 except Exception:
                     pass
 
-            core_vault_finalize = _live_finalize_engine_sessions(
-                wa, "TRADER", target_id or None, target_chain or None
-            )
-            _need_fallback = (
-                not core_vault_finalize
-                or any(str((r or {}).get("status") or "") == "not_found" for r in core_vault_finalize)
-            )
-            if _need_fallback:
-                # Fail safely inside TRADER and the selected chain only.  Never touch NKR.
-                core_vault_finalize = _live_finalize_engine_sessions(
-                    wa, "TRADER", None, target_chain or None
+            if not target_id or not target_chain:
+                return jsonify({
+                    "status": "error",
+                    "error": "trader_stop_requires_onchain_session",
+                    "message": "Stop needs exact CoreVault session id + chain. Refresh on-chain sessions and retry.",
+                    "session_id": session_id,
+                    "chain": target_chain,
+                    "affected_queue_rows": affected,
+                }), 400
+
+            # Build authoritative row from on-chain sessionOf (works even if registry empty).
+            exact_row = _trader_resolve_exact_core_session(wa, target_id, target_chain)
+            if int(exact_row.get("status_id") or 0) == 4:
+                core_vault_finalize = [{
+                    "sessionId": int(target_id), "status": "already_finalized",
+                    "chain": target_chain, "txHash": "",
+                }]
+            else:
+                # SYNCHRONOUS finalize — request returns only after Start Closing + Finalize
+                # (or a real error). Async worker alone left sessions ACTIVE with no txs.
+                fin = _finalize_one_live_session(
+                    wa, "TRADER", exact_row, allow_early_nkr_stop=True
                 )
+                core_vault_finalize = [fin if isinstance(fin, dict) else {
+                    "sessionId": int(target_id), "status": "FINALIZED", "chain": target_chain,
+                    "result": str(fin)[:200],
+                }]
+                # Keep registry in sync
+                try:
+                    _reconcile_live_registry_from_corevault(wa, "TRADER")
+                except Exception:
+                    pass
         except Exception as stop_exc:
             return jsonify({
                 "status": "error",
                 "error": "trader_live_stop_failed",
-                "message": str(stop_exc)[:400],
+                "message": str(stop_exc)[:500],
                 "session_id": session_id,
                 "onchainSessionId": target_id,
                 "chain": target_chain,
                 "affected_queue_rows": affected,
             }), 500
-        # Also stop shadow/runtime rows so Strategist does not keep ticking.
         try:
             with DB_WRITE_LOCK:
                 conn = _db()
