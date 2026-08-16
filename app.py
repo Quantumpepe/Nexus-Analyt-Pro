@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-430-NET-PROFIT-EXIT-ORPHAN-TRADER-STOP"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-431-NKR-TRADER-SESSION-SPLIT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19230,10 +19230,14 @@ def api_nexus_trading_control():
         except Exception:
             target_chain = str(chain_raw or "").upper()
         try:
+            try:
+                _reconcile_live_registry_from_corevault(wa, "TRADER")
+            except Exception:
+                pass
             core_vault_finalize = _live_finalize_engine_sessions(
                 wa, "TRADER", target_id or None, target_chain or None
             )
-            # ENGINE-429: if UI session_id did not map to registry, still stop every
+            # ENGINE-429/431: if UI session_id did not map to registry, still stop every
             # ACTIVE/PAUSED/ERROR TRADER CoreVault row (optionally filtered by chain).
             _need_fallback = (
                 not core_vault_finalize
@@ -19297,7 +19301,20 @@ def api_trader_stop_all_live():
     except Exception:
         target_chain = str(chain_raw or "").upper()
     try:
+        # Rebuild registry from CoreVault so orphan Create Session rows are visible.
+        try:
+            _reconcile_live_registry_from_corevault(wa, "TRADER")
+        except Exception:
+            pass
         results = _live_finalize_engine_sessions(wa, "TRADER", None, target_chain or None)
+        # If still empty, also try NKR-labeled rows on that chain that are system TRADER
+        # (mis-registered) — finalizer filters by engine column, so re-register as TRADER.
+        if not results:
+            try:
+                _reconcile_live_registry_from_corevault(wa, "TRADER")
+                results = _live_finalize_engine_sessions(wa, "TRADER", None, target_chain or None)
+            except Exception:
+                pass
     except Exception as exc:
         return jsonify({"status": "error", "error": "trader_stop_all_failed", "message": str(exc)[:400]}), 500
     return jsonify({
@@ -19306,6 +19323,7 @@ def api_trader_stop_all_live():
         "action": "stop_all_live",
         "chain": target_chain or "ALL",
         "coreVaultFinalize": results,
+        "message": "If results empty, no ACTIVE TRADER CoreVault session was found for this wallet/chain.",
         "ts": now_ts(),
     })
 
@@ -42487,10 +42505,11 @@ def _nkr_live_worker_cycle() -> None:
             if any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
                 # Refresh runnable set so the new session can trade in a later tick (or same if registered).
                 try:
-                    # ENGINE-368: refresh NKR + Trader runnable set after strategist open.
+                    # ENGINE-431: NKR worker must NEVER consume TRADER sessions (and vice versa).
+                    # Mixing POL Trader #13 into NKR made System Info show "ETH + POL" under NKR
+                    # and blocked clean Trader-only stop/finalize.
                     nkr_rows = list(_live_active_sessions(wallet, "NKR") or [])
-                    trader_rows = list(_live_active_sessions(wallet, "TRADER") or [])
-                    wallet_rows = nkr_rows + trader_rows or wallet_rows
+                    wallet_rows = nkr_rows
                     runnable_rows = [
                         r for r in wallet_rows
                         if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
