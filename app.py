@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-441-TOKEN-SYMBOL-RESOLVER-GHOST-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-442-CLOSING-RESIDUAL-EXIT-CYCLE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -39870,10 +39870,44 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     live_op_row = None
     live_op_id = str((live_row or {}).get("_live_operation_id") or "") if isinstance(live_row, dict) else ""
     if is_exit:
-        # One EXIT for each confirmed ENTRY round. A prior successful exit must not
-        # block later cycles in the same long-running session.
+        # ENGINE-442: ACTIVE trading still uses one EXIT per confirmed ENTRY round.
+        # CLOSING recovery is different: a previously SUCCEEDED EXIT is not proof that
+        # the position is flat. Partial fills / residual token units can leave
+        # positionOf(session, token) > 0. In that case a new, durable EXIT business
+        # operation is legitimate. Key the CLOSING recovery round by the number of
+        # already confirmed EXITs for this exact session+token. Multiple Gunicorn
+        # workers compute the same next key, so _live_op_reserve remains the atomic
+        # exactly-once barrier. positionOf above is authoritative and prevents a new
+        # recovery EXIT once the token is actually flat.
         exit_cycle_no = _nkr_live_cycle_number(wallet, live_row, "ENTRY")
-        exit_cycle_key = f"exit-{max(1, exit_cycle_no)}"
+        if int(session_status) == 3:
+            _ident = _nkr_session_identity(
+                wallet=wallet, chain_id=int(chain_id), vault=vault,
+                onchain_session_id=str(sid), live_row=live_row if isinstance(live_row, dict) else None
+            )
+            _succeeded_exit_count = 0
+            try:
+                _conn = _db()
+                try:
+                    _r = _conn.execute(
+                        "SELECT COUNT(*) AS n FROM nexus_live_operations "
+                        "WHERE op_type='EXIT' AND wallet_address=? AND chain_id=? "
+                        "AND vault_address=? AND onchain_session_id=? AND token_address=? "
+                        "AND status='SUCCEEDED'",
+                        (
+                            _ident.get("walletAddress") or _norm_addr(wallet), int(chain_id),
+                            _ident.get("vaultAddress") or vault, str(sid),
+                            _norm_addr(target_for_key or ""),
+                        ),
+                    ).fetchone()
+                    _succeeded_exit_count = int((_r["n"] if _r else 0) or 0)
+                finally:
+                    _conn.close()
+            except Exception:
+                _succeeded_exit_count = 0
+            exit_cycle_key = f"closing-exit-{max(1, _succeeded_exit_count + 1)}"
+        else:
+            exit_cycle_key = f"exit-{max(1, exit_cycle_no)}"
         live_op_row = _live_op_reserve(
             "EXIT",
             wallet=wallet,
@@ -46602,7 +46636,7 @@ def api_nexus_system_info_evm_diagnostics():
             "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
             "contract_ghost_open_count":("POSITION","CoreVault openAssetCount is inconsistent","All reconstructed TradeExecuted tokens have positionOf=0 while sessionOf still reports an open asset. This requires a CoreVault bookkeeping/dust repair; do not retry executeTrade."),
             "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
-            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD441."),
+            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD442."),
             "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
             "router_selector_blocked":("ROUTER","Router selector blocked","Allow exactInputSingle selector on-chain."),
         }
