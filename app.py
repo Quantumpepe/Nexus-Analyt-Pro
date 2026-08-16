@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-436-ENGINE-ISOLATION-FINALIZE-UNIFY"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-438-EXACT-ORPHAN-SESSION-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1075,30 +1075,11 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 open_assets = int(words[12])
         except Exception:
             pass
-    # ENGINE-435: After Start Closing (status 3), ALWAYS proceed to finalize.
-    # openAssetCount alone is not trusted (ghost TON dust / exit_already_succeeded).
-    # One exit attempt above is enough; remaining counter must not block capital release.
-    if int(status_id) == 3:
-        open_assets = 0
-    elif open_assets != 0:
-        try:
-            cfg = dict(_privy_trading_cfg(chain_id) or {})
-            cfg["vault"] = vault
-            # Prefer last known asset if present on row
-            try:
-                meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-                cfg["probeSymbol"] = str(meta.get("nkr_active_asset") or meta.get("active_asset") or "TON").upper()
-            except Exception:
-                pass
-            real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
-            if not bool(real.get("open")) or bool(real.get("ghostOpenCount")):
-                open_assets = 0
-        except Exception:
-            pass
-        if open_assets != 0 and "exit_already_succeeded" in (_prior_err + str(exit_result.get("error") or "")):
-            open_assets = 0
+    # ENGINE-437: sessionOf().openAssetCount is authoritative for finalizeSession.
+    # Never coerce it to zero in backend state.
     if open_assets != 0:
-        raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
+        exit_err = str(exit_result.get("error") or "")
+        raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}:{exit_err[:500]}")
 
     finalize_tx = ""
     finalize_op_id = ""
@@ -1330,6 +1311,11 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, targe
                 _nkr_set_exact_local_session_state(wallet, int(row.get("chain_id") or 0), str(row.get("onchain_session_id") or ""), "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
         elif not target_sid:
             _nkr_set_local_stop_state(wallet, "STOPPING", "Stop & Exit requested: open positions will be sold before finalization")
+    # ENGINE-437: Stop/finalize is independent of ENTRY locks.
+    for _stop_row in (rows or []):
+        try: _live_clear_entry_blockers_for_session(wallet, _stop_row, reason="stop_requested_entry_blocker_cleared")
+        except Exception: pass
+
     # Keep every paused/open session visible and mark the live registry as closing
     # before the asynchronous worker starts. This prevents the UI from falling
     # back to PAUSED or hiding the session while an exit is pending.
@@ -19335,6 +19321,85 @@ def api_nexus_trading_control():
         "coreVaultFinalize": core_vault_finalize,
         "backend_is_state_master": True, "ts": now_ts(),
     })
+
+
+@app.route("/api/live/stop-orphan-session", methods=["POST"])
+def api_live_stop_orphan_session():
+    """ENGINE-438: stop/finalize exactly one orphan NKR or Trader CoreVault session.
+
+    This is intentionally session-scoped.  It exists for the case where the normal
+    frontend card has already disappeared while the authoritative CoreVault session
+    is still ACTIVE/PAUSED/CLOSING and therefore still reserves capital.
+    """
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    body = request.get_json(silent=True) or {}
+    engine = str(body.get("engine") or "").strip().upper().replace("TRADING", "TRADER")
+    if engine not in ("NKR", "TRADER"):
+        return err("engine must be NKR or TRADER", 400)
+    sid_raw = str(
+        body.get("sessionId") or body.get("session_id")
+        or body.get("onchainSessionId") or body.get("onchain_session_id") or ""
+    ).strip()
+    if not sid_raw.isdigit() or int(sid_raw) <= 0:
+        return err("positive on-chain sessionId required", 400)
+    sid = str(int(sid_raw))
+    chain_raw = body.get("chain") or body.get("chainKey") or body.get("chain_id") or body.get("chainId") or ""
+    try:
+        if str(chain_raw).isdigit():
+            target_chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
+        else:
+            target_chain = str(chain_raw or "").strip().upper()
+            target_chain = {
+                "BSC": "BNB", "BNB CHAIN": "BNB", "ETHEREUM": "ETH",
+                "POLYGON": "POL", "MATIC": "POL",
+            }.get(target_chain, target_chain)
+    except Exception:
+        target_chain = str(chain_raw or "").strip().upper()
+    if target_chain not in ("ETH", "BNB", "POL"):
+        return err("chain must be ETH, BNB or POL", 400)
+
+    # Reconcile only this engine from the authoritative CoreVault first.  This may
+    # recreate the durable registry row when the normal UI card was already lost.
+    try:
+        _reconcile_live_registry_from_corevault(wa, engine)
+    except Exception as exc:
+        return jsonify({
+            "status": "error", "error": "onchain_registry_reconcile_failed",
+            "message": str(exc)[:400], "engine": engine, "chain": target_chain,
+            "sessionId": int(sid),
+        }), 502
+
+    # ENTRY_INFLIGHT must never prevent an explicit user stop.  Remove only guards
+    # for this exact wallet + chain + session; never clear another live session.
+    try:
+        cid = int(_nkr_chain_id_from_key(target_chain) or 0)
+        rows = _live_exact_registry_rows_fast(wa, engine, sid, target_chain) if target_chain == "ETH" else _live_active_sessions(wa, engine)
+        exact_rows = [
+            r for r in (rows or [])
+            if int((r or {}).get("chain_id") or 0) == cid
+            and str((r or {}).get("onchain_session_id") or "") == sid
+        ]
+        for row in exact_rows:
+            _nkr_entry_guard_release(wa, row)
+    except Exception:
+        pass
+
+    result = _live_finalize_engine_sessions(wa, engine, sid, target_chain)
+    if not result or any(str((x or {}).get("status") or "") == "not_found" for x in (result or [])):
+        return jsonify({
+            "status": "error", "error": "target_onchain_session_not_found",
+            "engine": engine, "chain": target_chain, "sessionId": int(sid),
+            "coreVaultFinalize": result or [],
+        }), 404
+    return jsonify({
+        "status": "ok", "action": "STOP_ORPHAN_EXACT",
+        "wallet": wa, "engine": engine, "chain": target_chain,
+        "sessionId": int(sid), "coreVaultFinalize": result,
+        "message": "Exact on-chain session queued for startClosing/exit/finalize recovery.",
+        "ts": now_ts(),
+    }), 202
 
 
 @app.route("/api/live/stop-all-orphans", methods=["POST"])
@@ -39401,6 +39466,8 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         raise RuntimeError(f"closing_wallet_mapping_missing:chain={chain_id}:session={sid}:wallet={_norm_addr(wallet)}")
     vault = _norm_addr(live_row.get("vault_address") or "")
     mode = str(action or "ENTRY").strip().upper()
+    runtime_engine = _live_row_engine_name(live_row) if "_live_row_engine_name" in globals() else str((live_row or {}).get("engine") or "NKR").upper()
+    if runtime_engine not in {"NKR", "TRADER"}: runtime_engine = "NKR"
     if mode not in {"ENTRY", "BUY", "OPEN", "EXIT", "SELL", "CLOSE", "REDUCE"}:
         raise RuntimeError(f"unsupported_live_trade_action:{mode}")
     is_exit = mode in {"EXIT", "SELL", "CLOSE", "REDUCE"}
@@ -39597,7 +39664,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     # synchronous helper.
     if is_exit:
         _live_engine_mark(
-            "NKR", status="closing", decision="EXIT_SUBMITTING",
+            runtime_engine, status="closing", decision="EXIT_SUBMITTING",
             gate_status="EXIT_PENDING", active_asset=str((route or {}).get("symbol") or ""),
             position_state="EXITING", tx_hash="", pending_tx="submitting", last_error="",
             reason=f"Submitting exit executeTrade for session #{sid} on {_nkr_chain_key_from_id(chain_id)}",
@@ -39629,7 +39696,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
                 f"exit_privy_broadcast_missing_hash:chain={chain_id}:session={sid}:response={str(submitted)[:700]}"
             )
         _live_engine_mark(
-            "NKR", status="closing", decision="EXIT_CONFIRMING",
+            runtime_engine, status="closing", decision="EXIT_CONFIRMING",
             gate_status="EXIT_PENDING", active_asset=str((route or {}).get("symbol") or ""),
             position_state="EXITING", tx_hash=txh, pending_tx="confirmation", last_error="",
             reason=f"Exit executeTrade broadcast for session #{sid}; waiting for receipt",
@@ -39996,6 +40063,8 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     may finalize only after sessionOf().openAssetCount is zero.
     """
     chain_id = int((row or {}).get("chain_id") or 1)
+    runtime_engine = _live_row_engine_name(row) if "_live_row_engine_name" in globals() else str((row or {}).get("engine") or "NKR").upper()
+    if runtime_engine not in {"NKR", "TRADER"}: runtime_engine = "NKR"
     cfg = _privy_trading_cfg(chain_id)
     vault = _norm_addr((row or {}).get("vault_address") or cfg.get("vault") or "")
     if not _looks_like_evm_addr(vault):
@@ -40036,7 +40105,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
                 "closingRecoveryOnly": True,
             })
     except Exception as exc:
-        _live_engine_mark("NKR", last_error=f"closing technical route inventory warning: {str(exc)[:220]}")
+        _live_engine_mark(runtime_engine, last_error=f"closing technical route inventory warning: {str(exc)[:220]}")
 
     # ENGINE-344: deterministic BNB recovery inventory.
     # The affected legacy session was opened with a Binance-peg asset before the
@@ -40214,7 +40283,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
         discovered.append({"asset": sym, "token": token, "amount": amount})
 
         _live_engine_mark(
-            "NKR", status="closing", decision="EXIT_SUBMITTING",
+            runtime_engine, status="closing", decision="EXIT_SUBMITTING",
             gate_status="ORDERLY_EXIT",
             reason=f"CLOSING session #{session_id}: selling {sym} back to settlement",
             active_asset=sym, position_state="EXITING", pending_tx="submitting", last_error="",
@@ -40225,6 +40294,14 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
         if int((route or {}).get("fee") or 0) > 0:
             fee_candidates.insert(0, int((route or {}).get("fee")))
         fee_candidates = list(dict.fromkeys([int(x) for x in fee_candidates if int(x or 0) > 0])) or [500, 2500, 3000, 10000, 100]
+        try: _dust_max_units = max(0, int(os.getenv("NEXUS_CLOSING_DUST_MAX_SETTLEMENT_UNITS", "1")))
+        except Exception: _dust_max_units = 1
+        _dust_quotes=[]
+        for _df in fee_candidates:
+            try: _dust_quotes.append(int(_privy_quote(cfg, token, settlement, int(amount), fee=int(_df))))
+            except Exception: pass
+        if _dust_quotes and max(_dust_quotes) <= _dust_max_units:
+            raise RuntimeError(f"closing_dust_requires_contract_writeoff:chain={chain_id}:session={session_id}:asset={sym}:token={token}:amount={amount}:maxQuoteOutUnits={max(_dust_quotes)}:thresholdUnits={_dust_max_units}")
         for exit_fee in fee_candidates:
             try:
                 exit_route = dict(route or {})
@@ -40579,6 +40656,32 @@ def _nkr_entry_guard_release(wallet: str, live_row: dict) -> None:
     finally:
         conn.close()
 
+
+def _nkr_entry_guard_fail(wallet: str, live_row: dict, error_text: str = "entry_failed") -> None:
+    key = _nkr_entry_guard_key(wallet, live_row)
+    op_id = str((live_row or {}).get("_live_operation_id") or "") if isinstance(live_row, dict) else ""
+    if op_id:
+        try: _live_op_update(op_id, "FAILED", error_text=str(error_text or "entry_failed")[:900])
+        except Exception: pass
+        if isinstance(live_row, dict):
+            live_row.pop("_live_operation_id", None); live_row.pop("_live_operation_type", None)
+    if key:
+        conn=_db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE guard_key=?", (key,)); conn.commit()
+        finally: conn.close()
+
+def _live_clear_entry_blockers_for_session(wallet: str, row: dict, reason: str = "stop_or_reverted_entry") -> None:
+    ident=_nkr_session_identity(wallet=wallet, live_row=row)
+    if not ident.get("controllable"): return
+    nowi=int(time.time()); conn=_db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE guard_key=?", (str(ident.get("identityKey") or ""),))
+            conn.execute("UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, completed_ts=?, error_text=? WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING')", (nowi,nowi,str(reason)[:900],str(ident.get("walletAddress") or "").lower(),int(ident.get("chainId") or 0),str(ident.get("vaultAddress") or "").lower(),str(ident.get("onchainSessionId") or "")))
+            conn.commit()
+    finally: conn.close()
 
 def _nkr_entry_guard_force_clear_stale(wallet: str, live_row: dict, max_age_sec: int = 15) -> None:
     """ENGINE-418: hard-clear stuck ENTRY_INFLIGHT when no on-chain position is open.
@@ -41809,7 +41912,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             )
             if entry_guard:
                 try:
-                    if any(marker in err.lower() for marker in pre_submit_markers):
+                    _err_l = err.lower()
+                    if any(marker in _err_l for marker in ("transaction_reverted", "execution reverted", "privy_broadcast_failure", "broadcast_reverted", "receipt status 0", "receipt_status_0")):
+                        _nkr_entry_guard_fail(wallet, live_row, err)
+                    elif any(marker in _err_l for marker in pre_submit_markers):
                         _nkr_entry_guard_release(wallet, live_row)
                     else:
                         _nkr_entry_guard_hold(wallet, live_row, hold_sec=_NKR_LIVE_ENTRY_DUP_HOLD_SEC, state="ENTRY_RESULT_UNCERTAIN")
@@ -42014,6 +42120,9 @@ def _core_finalize_closing_session_async(wallet: str, row: dict) -> bool:
         eng = "TRADER"
     if eng not in {"NKR", "TRADER"}:
         return False
+    if "closing_dust_requires_contract_writeoff" in str((row or {}).get("last_error") or ""):
+        _live_engine_mark(eng, status="closing", decision="DUST_BLOCKED", gate_status="CONTRACT_DUST_WRITE_OFF_REQUIRED", reason=f"CoreVault session {(row or {}).get('onchain_session_id')} is blocked by contract dust; no retry transaction submitted", pending_tx="", last_error=str((row or {}).get("last_error") or "")[:1000])
+        return True
     key = _nkr_closing_finalize_key(row)
     if key[0] <= 0 or not key[1] or not key[2]:
         return False
@@ -42068,12 +42177,10 @@ def _core_finalize_closing_session_async(wallet: str, row: dict) -> bool:
                     conn.commit()
             finally:
                 conn.close()
-            _live_engine_mark(
-                eng, status="closing", decision="FINALIZE_PENDING",
-                gate_status="EXIT_PENDING",
-                reason=f"{eng} session {key[2]} remains CLOSING; shared finalize path will retry",
-                tx_hash="", pending_tx="", last_error=msg,
-            )
+            if "closing_dust_requires_contract_writeoff" in msg:
+                _live_engine_mark(eng, status="closing", decision="DUST_BLOCKED", gate_status="CONTRACT_DUST_WRITE_OFF_REQUIRED", reason=f"{eng} session {key[2]} contains contract dust; automatic retry transactions are suppressed", tx_hash="", pending_tx="", last_error=msg)
+            else:
+                _live_engine_mark(eng, status="closing", decision="FINALIZE_PENDING", gate_status="EXIT_PENDING", reason=f"{eng} session {key[2]} remains CLOSING; shared finalize path will retry", tx_hash="", pending_tx="", last_error=msg)
         finally:
             with _NKR_CLOSING_FINALIZE_LOCK:
                 _NKR_CLOSING_FINALIZE_INFLIGHT.discard(inflight_key)
@@ -42154,6 +42261,8 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
                         oid, "FAILED", tx_hash=txh,
                         error_text=f"broadcast_not_found_after_recovery:{txh}:age={age_sec}s",
                     )
+                    if str(row.get("op_type") or "").upper() == "ENTRY":
+                        _live_clear_entry_blockers_for_session(row.get("wallet_address") or "", row, reason="entry_broadcast_not_found")
                     out["failed"] += 1
                 except Exception as exc:
                     out["errors"].append(f"{oid}:mark_missing_failed:{str(exc)[:80]}")
@@ -42188,6 +42297,8 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
         else:
             try:
                 _live_op_update(oid, "FAILED", tx_hash=txh, error_text=f"transaction_reverted:{txh}")
+                if str(row.get("op_type") or "").upper() == "ENTRY":
+                    _live_clear_entry_blockers_for_session(row.get("wallet_address") or "", row, reason=f"entry_transaction_reverted:{txh}")
                 out["failed"] += 1
             except Exception as exc:
                 out["errors"].append(f"{oid}:mark_fail:{str(exc)[:80]}")
