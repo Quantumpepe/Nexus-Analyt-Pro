@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-435-CLOSING-ALWAYS-FINALIZE"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-436-ENGINE-ISOLATION-FINALIZE-UNIFY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -41999,64 +41999,61 @@ def _nkr_closing_finalize_key(row: dict) -> tuple:
     )
 
 
-def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
-    """Finalize one authoritative on-chain CLOSING NKR session exactly once.
+def _core_finalize_closing_session_async(wallet: str, row: dict) -> bool:
+    """ENGINE-436: finalize one CLOSING NKR/TRADER session in an engine-isolated thread.
 
-    Stop & Exit already submitted startClosing.  The live worker must not rank or
-    trade that row again.  When openAssetCount is zero this helper submits the
-    missing finalizeSession transaction, waits for confirmation, and verifies
-    FINALIZED directly from sessionOf().
+    BUILD435 made _finalize_one_live_session() the authoritative stop/finalize path,
+    including ghost-openAssetCount handling. The old NKR async helper duplicated the
+    exit first and aborted before finalize when that duplicate exit raised
+    exit_already_succeeded / route errors. This wrapper delegates the whole lifecycle
+    exactly once to the shared authoritative function and keeps runtime health scoped
+    to the row's engine.
     """
+    eng = _live_row_engine_name(row) if "_live_row_engine_name" in globals() else str((row or {}).get("engine") or "NKR").upper()
+    if eng == "TRADING":
+        eng = "TRADER"
+    if eng not in {"NKR", "TRADER"}:
+        return False
     key = _nkr_closing_finalize_key(row)
     if key[0] <= 0 or not key[1] or not key[2]:
         return False
+    inflight_key = (eng,) + tuple(key)
     with _NKR_CLOSING_FINALIZE_LOCK:
-        if key in _NKR_CLOSING_FINALIZE_INFLIGHT:
+        if inflight_key in _NKR_CLOSING_FINALIZE_INFLIGHT:
             return True
-        _NKR_CLOSING_FINALIZE_INFLIGHT.add(key)
+        _NKR_CLOSING_FINALIZE_INFLIGHT.add(inflight_key)
 
     def _runner():
-        stage = "EXIT"
         try:
-            _nkr_set_exact_local_session_state(
-                wallet, key[0], key[2], "CLOSING",
-                "CoreVault closing confirmed; finalizing session"
-            )
+            if eng == "NKR":
+                _nkr_set_exact_local_session_state(
+                    wallet, key[0], key[2], "CLOSING",
+                    "CoreVault closing confirmed; finalizing session"
+                )
             _live_engine_mark(
-                "NKR", status="closing", decision="EXITING",
+                eng, status="closing", decision="EXITING",
                 gate_status="EXIT_PENDING",
-                reason=f"CoreVault session {key[2]} is CLOSING; closing all open positions first",
+                reason=f"{eng} CoreVault session {key[2]} is CLOSING; completing exit/finalize",
                 pending_tx="submitting", last_error="",
             )
-            # ENGINE333: CLOSING with openAssetCount > 0 must execute exits before
-            # finalizeSession. ENGINE330 defined the chain-aware exit helper but did
-            # not invoke it here, so the worker repeatedly attempted finalization
-            # while the contract correctly remained CLOSING.
-            exit_result = _nkr_exit_all_open_positions(wallet, dict(row), int(key[2]))
-            stage = "FINALIZE"
-            _live_engine_mark(
-                "NKR", status="closing", decision="FINALIZING",
-                gate_status="EXIT_PENDING",
-                reason=f"CoreVault session {key[2]} positions closed; submitting finalizeSession",
-                pending_tx="submitting", last_error="",
-            )
-            result = _finalize_one_live_session(wallet, "NKR", dict(row))
-            _nkr_set_exact_local_session_state(
-                wallet, key[0], key[2], "FINALIZED",
-                "CoreVault session finalized and capital released"
-            )
-            remaining = _live_active_sessions(wallet, "NKR")
+            result = _finalize_one_live_session(wallet, eng, dict(row))
+            if eng == "NKR":
+                _nkr_set_exact_local_session_state(
+                    wallet, key[0], key[2], "FINALIZED",
+                    "CoreVault session finalized and capital released"
+                )
+            remaining = _live_active_sessions(wallet, eng)
             if remaining:
                 _live_engine_mark(
-                    "NKR", status="running", decision="SESSION_FINALIZED",
-                    gate_status="", reason=f"Session {key[2]} finalized; other sessions remain",
-                    pending_tx="", last_error="",
+                    eng, status="running", decision="SESSION_FINALIZED",
+                    gate_status="", reason=f"Session {key[2]} finalized; other {eng} sessions remain",
+                    pending_tx=str((result or {}).get("finalizeTxHash") or ""), last_error="",
                 )
             else:
                 _live_engine_mark(
-                    "NKR", status="stopped", decision="FINALIZED",
+                    eng, status="stopped", decision="FINALIZED",
                     gate_status="", reason=f"CoreVault session {key[2]} finalized",
-                    pending_tx="", last_error="",
+                    pending_tx=str((result or {}).get("finalizeTxHash") or ""), last_error="",
                 )
         except Exception as exc:
             msg = str(exc)[:1200]
@@ -42064,36 +42061,34 @@ def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
             try:
                 with DB_WRITE_LOCK:
                     conn.execute(
-                        "UPDATE nexus_live_core_vault_sessions "
-                        "SET status='CLOSING', updated_ts=?, last_error=? "
-                        "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
-                        (int(time.time()), msg, key[0], key[1].lower(), key[2]),
+                        "UPDATE nexus_live_core_vault_sessions SET status='CLOSING', updated_ts=?, last_error=? "
+                        "WHERE engine=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                        (int(time.time()), msg, eng, key[0], key[1].lower(), key[2]),
                     )
                     conn.commit()
             finally:
                 conn.close()
-            failed_decision = "EXIT_FAILED" if stage == "EXIT" else "FINALIZE_FAILED"
-            failed_reason = (
-                f"Session {key[2]} remains CLOSING; exit executeTrade failed before the position was closed"
-                if stage == "EXIT" else
-                f"Session {key[2]} positions are closed, but finalizeSession failed"
-            )
             _live_engine_mark(
-                "NKR", status="closing", decision=failed_decision,
+                eng, status="closing", decision="FINALIZE_PENDING",
                 gate_status="EXIT_PENDING",
-                reason=failed_reason,
+                reason=f"{eng} session {key[2]} remains CLOSING; shared finalize path will retry",
                 tx_hash="", pending_tx="", last_error=msg,
             )
         finally:
             with _NKR_CLOSING_FINALIZE_LOCK:
-                _NKR_CLOSING_FINALIZE_INFLIGHT.discard(key)
+                _NKR_CLOSING_FINALIZE_INFLIGHT.discard(inflight_key)
 
     threading.Thread(
         target=_runner,
-        name=f"nkr-finalize-{key[0]}-{key[2]}",
+        name=f"core-finalize-{eng.lower()}-{key[0]}-{key[2]}",
         daemon=True,
     ).start()
     return True
+
+
+def _nkr_finalize_closing_session_async(wallet: str, row: dict) -> bool:
+    """Compatibility alias; ENGINE-436 uses the shared engine-isolated finalizer."""
+    return _core_finalize_closing_session_async(wallet, row)
 
 
 
@@ -42224,25 +42219,13 @@ def _live_sessions_reconcile_closing(limit: int = 20) -> dict:
             out["skipped"] += 1
             continue
         try:
-            # Prefer async path so the worker cycle is not blocked for minutes.
-            if eng == "NKR" and "_nkr_finalize_closing_session_async" in globals():
-                ok = _nkr_finalize_closing_session_async(wa, row)
-                if ok:
-                    out["continued"] += 1
-                else:
-                    out["skipped"] += 1
-            else:
-                res = _finalize_one_live_session(wa, eng, row)
+            # ENGINE-436: NKR and TRADER use the same non-blocking authoritative
+            # CLOSING lifecycle. No engine-specific duplicate exit path.
+            ok = _core_finalize_closing_session_async(wa, row)
+            if ok:
                 out["continued"] += 1
-                try:
-                    _live_engine_mark(
-                        eng, status="idle", decision="RECONCILE_FINALIZED",
-                        reason=f"Reconciler finalized session #{row.get('onchain_session_id')} after CLOSING recovery",
-                        pending_tx=str((res or {}).get("finalizeTxHash") or (res or {}).get("startClosingTxHash") or ""),
-                        last_error="",
-                    )
-                except Exception:
-                    pass
+            else:
+                out["skipped"] += 1
         except Exception as exc:
             out["errors"].append(f"{eng}:{row.get('onchain_session_id')}:{str(exc)[:120]}")
             try:
@@ -42328,13 +42311,17 @@ def _nkr_live_worker_cycle() -> None:
     if not live_rows:
         return
 
-    by_wallet = {}
+    # ENGINE-436: hard engine isolation starts before any lifecycle, strategy,
+    # execution or diagnostics work. A wallet may have NKR on ETH and TRADER on POL
+    # simultaneously; those rows must never share runnable_rows/working_rows.
+    by_wallet_engine = {}
     for row in live_rows:
         wallet = _norm_addr(row.get("wallet_address"))
-        if wallet:
-            by_wallet.setdefault(wallet, []).append(row)
+        eng = _live_row_engine_name(row)
+        if wallet and eng in {"NKR", "TRADER"}:
+            by_wallet_engine.setdefault((wallet, eng), []).append(row)
 
-    for wallet, wallet_rows in by_wallet.items():
+    for (wallet, worker_engine), wallet_rows in by_wallet_engine.items():
         # CLOSING is terminal orchestration, never a tradable worker row.  Re-read
         # sessionOf() so a stale local ACTIVE/PAUSED projection cannot hide an
         # already confirmed on-chain startClosing transaction.
@@ -42365,23 +42352,25 @@ def _nkr_live_worker_cycle() -> None:
                             conn.commit()
                     finally:
                         conn.close()
-                    _nkr_set_exact_local_session_state(wallet, _cid, str(_sid), "FINALIZED", "On-chain session finalized")
+                    if worker_engine == "NKR":
+                        _nkr_set_exact_local_session_state(wallet, _cid, str(_sid), "FINALIZED", "On-chain session finalized")
             except Exception:
                 if str((_row or {}).get("status") or "").upper() == "CLOSING":
                     closing_rows.append(dict(_row))
 
         closing_keys = {_nkr_closing_finalize_key(r) for r in closing_rows}
         for _closing in closing_rows:
-            _nkr_finalize_closing_session_async(wallet, _closing)
+            _core_finalize_closing_session_async(wallet, _closing)
 
         runnable_rows = [
             r for r in wallet_rows
             if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR"}
             and _nkr_closing_finalize_key(r) not in closing_keys
         ]
-        # Extra guard: presentation-layer user pause (even if registry lag)
+        # Extra guard: NKR presentation-layer user pause (even if registry lag).
+        # TRADER pause/state is owned by its own queue + exact CoreVault row.
         try:
-            _psess, _, _ = _db_get_rotation_sessions(wallet)
+            _psess, _, _ = _db_get_rotation_sessions(wallet) if worker_engine == "NKR" else ([], None, None)
             paused_keys = set()
             for _sx in (_psess or []):
                 if not isinstance(_sx, dict):
@@ -42407,12 +42396,12 @@ def _nkr_live_worker_cycle() -> None:
             # worker tick, hiding the real stage and any failure from System Info.
             with _NKR_CLOSING_FINALIZE_LOCK:
                 wallet_inflight = any(
-                    key in _NKR_CLOSING_FINALIZE_INFLIGHT
+                    (worker_engine,) + tuple(key) in _NKR_CLOSING_FINALIZE_INFLIGHT
                     for key in closing_keys
                 )
             if closing_rows or wallet_inflight:
                 _live_engine_mark(
-                    "NKR", tick=True, status="closing",
+                    worker_engine, tick=True, status="closing",
                     decision="EXITING", gate_status="EXIT_PENDING",
                     reason="CLOSING session recovery is running",
                     decision_detail=", ".join(
@@ -42448,15 +42437,15 @@ def _nkr_live_worker_cycle() -> None:
             ]
             all_paused = bool(open_rows) and len(paused_rows) == len(open_rows)
             _live_engine_mark(
-                "NKR", tick=True,
+                worker_engine, tick=True,
                 status="paused" if all_paused else "idle",
                 decision="PAUSED" if all_paused else "NO_RUNNABLE_SESSION",
                 gate_status="ALL_SESSIONS_PAUSED" if all_paused else "NO_RUNNABLE_SESSION",
-                reason="all NKR sessions paused" if all_paused else "no runnable NKR session",
+                reason=f"all {worker_engine} sessions paused" if all_paused else f"no runnable {worker_engine} session",
                 decision_detail=(
                     "Paused sessions: " + ", ".join(
                         f"{x.get('chain') or x.get('chainId')} #{x.get('sessionId')}" for x in session_states
-                    ) if session_states else "No runnable NKR session."
+                    ) if session_states else f"No runnable {worker_engine} session."
                 ),
                 assets_scanned=0, tradable_assets=0,
                 best_candidate="", candidate_score=0.0,
@@ -42470,13 +42459,14 @@ def _nkr_live_worker_cycle() -> None:
             continue
 
         try:
-            for row in runnable_rows:
-                _nkr_ensure_local_live_session(wallet, row)
+            if worker_engine == "NKR":
+                for row in runnable_rows:
+                    _nkr_ensure_local_live_session(wallet, row)
 
             sessions, active_id, _ = _db_get_rotation_sessions(wallet)
             nkr_sessions = [
                 x for x in sessions
-                if isinstance(x, dict) and _nkr_is_session(x)
+                if worker_engine == "NKR" and isinstance(x, dict) and _nkr_is_session(x)
                 and str(x.get("status") or "").upper() not in {"PAUSED","STOPPED","FINALIZED","CLOSED"}
             ]
             market_rows = _nkr_live_market_rows(wallet)
@@ -42507,7 +42497,7 @@ def _nkr_live_worker_cycle() -> None:
                 market_rows = emergency
             if not market_rows:
                 _live_engine_mark(
-                    "NKR", tick=True, status="running",
+                    worker_engine, tick=True, status="running",
                     assets_scanned=0, tradable_assets=0,
                     best_candidate="", candidate_score=0.0,
                     decision="WAIT", gate_status="NO_MARKET_DATA",
@@ -42567,7 +42557,7 @@ def _nkr_live_worker_cycle() -> None:
             # immutable config keyed by wallet + chainId + on-chain sessionId.
             session_plans = []
             strategist_actions = []
-            for _plan_row in (runnable_rows or []):
+            for _plan_row in ((runnable_rows or []) if worker_engine == "NKR" else []):
                 try:
                     _exact_settings = _nkr_settings_for_exact_live_session(wallet, _plan_row, settings)
                     if not _exact_settings.get("session_config_locked"):
@@ -42600,7 +42590,7 @@ def _nkr_live_worker_cycle() -> None:
                 "sessionPlans": session_plans,
                 "tip": next((str(p.get("tip") or "") for p in session_plans if p.get("tip")), ""),
             }
-            if any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
+            if worker_engine == "NKR" and any(a.get("ok") and a.get("action") == "OPEN_SESSION" for a in strategist_actions):
                 # Refresh runnable set so the new session can trade in a later tick (or same if registered).
                 try:
                     # ENGINE-431: NKR worker must NEVER consume TRADER sessions (and vice versa).
@@ -42652,11 +42642,20 @@ def _nkr_live_worker_cycle() -> None:
                     _diag_settings = _nkr_settings_for_exact_live_session(wallet, working_rows[0], settings)
                 except Exception:
                     _diag_settings = settings
-            diag = _nkr_runtime_decision_diagnostics(
-                processed, market_rows, _diag_settings, summary,
-                session_chain_id=primary_chain_id or None,
-                tradable_symbols=tradable_syms,
-            )
+            if worker_engine == "NKR":
+                diag = _nkr_runtime_decision_diagnostics(
+                    processed, market_rows, _diag_settings, summary,
+                    session_chain_id=primary_chain_id or None,
+                    tradable_symbols=tradable_syms,
+                )
+            else:
+                diag = {
+                    "decision": "WAIT", "gate_status": "WAITING_ENTRY",
+                    "decision_detail": "Trader session worker is engine-isolated and active.",
+                    "best_candidate": "", "candidate_score": 0.0,
+                    "candidate_momentum_24h": 0.0, "candidate_price": 0.0,
+                    "session_chain": _nkr_chain_key_from_id(primary_chain_id) if primary_chain_id else "",
+                }
             diag["sessionMode"] = _diag_settings.get("nkrCapitalMode")
             diag["sessionConfigKey"] = _diag_settings.get("session_config_key")
             diag["sessionConfigLocked"] = bool(_diag_settings.get("session_config_locked"))
@@ -42729,7 +42728,7 @@ def _nkr_live_worker_cycle() -> None:
             # succeeds, so the UI can never show CLOSED while the CoreVault is still open.
             executions = []
             for live_row in runnable_rows:
-                decision_session = _nkr_processed_session_for_live_row(processed, live_row)
+                decision_session = _nkr_processed_session_for_live_row(processed, live_row) if worker_engine == "NKR" else {}
                 try:
                     with _NKR_LIVE_TRADE_LOCK:
                         sess_settings = dict(settings or {})
@@ -42765,7 +42764,8 @@ def _nkr_live_worker_cycle() -> None:
                         execution = _nkr_live_execute_portfolio(
                             wallet, live_row, market_rows, sess_settings
                         )
-                    _nkr_confirm_processed_live_exit(processed, live_row, execution)
+                    if worker_engine == "NKR":
+                        _nkr_confirm_processed_live_exit(processed, live_row, execution)
                 except Exception as exec_exc:
                     # One chain/session failure must not kill the whole wallet tick.
                     chain_hint = _nkr_chain_key_from_id(live_row.get("chain_id") or 1)
@@ -42949,9 +42949,17 @@ def _nkr_live_worker_cycle() -> None:
                     best_overall_score=(diag.get("best_overall_score") or 0) if _eng_name == "NKR" and has_w else 0,
                     best_overall_chain=(diag.get("best_overall_chain") or "") if _eng_name == "NKR" and has_w else "",
                     session_chain=(diag.get("session_chain") or (_nkr_chain_key_from_id(primary_chain_id) if primary_chain_id else "")) if _eng_name == "NKR" else (_nkr_chain_key_from_id((eng_all[0] or {}).get("chain_id") or 0) if eng_all else ""),
-                    working_chains=(diag.get("working_chains") or []) if _eng_name == "NKR" else [],
-                    paused_chains=(diag.get("paused_chains") or []) if _eng_name == "NKR" else [],
-                    session_states=(diag.get("session_states") or []) if _eng_name == "NKR" else [],
+                    working_chains=(diag.get("working_chains") or [_nkr_chain_key_from_id(cid) for cid in working_chain_ids]),
+                    paused_chains=(diag.get("paused_chains") or [_nkr_chain_key_from_id(cid) for cid in paused_chain_ids]),
+                    session_states=(diag.get("session_states") or [
+                        {
+                            "chain": _nkr_chain_key_from_id(_worker_chain_id(r)),
+                            "chainId": _worker_chain_id(r),
+                            "sessionId": str((r or {}).get("onchain_session_id") or ""),
+                            "status": str((r or {}).get("status") or "UNKNOWN").upper(),
+                        }
+                        for r in open_rows
+                    ]),
                     active_asset=e_asset if has_w else "",
                     position_state=(eng_exec.get("positionState") or "") if has_w else "",
                     position_value_usd=(eng_exec.get("positionValueUsd") or 0) if has_w else 0,
