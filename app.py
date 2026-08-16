@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-428-TRADER-STOP-ONCHAIN-FINALIZE"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-430-NET-PROFIT-EXIT-ORPHAN-TRADER-STOP"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1258,6 +1258,9 @@ def _live_finalize_engine_sessions(wallet, engine, target_session_id=None, targe
     # perform all authoritative on-chain validation.
     rows = _live_exact_registry_rows_fast(wallet, engine, target_sid, target_chain_key) if (target_sid and target_chain_key in {"ETH","ETHEREUM","1"}) else _live_active_sessions(wallet, engine)
     target_chain_id = int(_nkr_chain_id_from_key(target_chain_key) or 0) if target_chain_key else 0
+    # ENGINE-429: when stopping all sessions on one chain, filter active rows by chain.
+    if (not target_sid) and target_chain_id > 0:
+        rows = [x for x in rows if int(x.get("chain_id") or 0) == target_chain_id]
     if target_sid:
         matched = []
         tail = target_sid.split("-")[-1] if "-" in target_sid else target_sid
@@ -15765,7 +15768,9 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     peak_pct = max(_safe_float(prior_meta.get("nkr_peak_net_profit_pct"), net_pct), net_pct)
     drawdown = max(0.0, peak_pct - net_pct)
     m = str(mode or "DYNAMIC").upper()
-    min_hold = {"AGGRESSIVE": 900, "DYNAMIC": 1200, "TACTICAL": 1500, "DEFENSIVE": 1800}.get(m, 1200)
+    # ENGINE-430: no long fixed hold for profit exits. Strategist sells when net after
+    # costs is real edge. Only a short floor avoids same-block flip; profit gate is net.
+    min_hold = {"AGGRESSIVE": 45, "DYNAMIC": 60, "TACTICAL": 90, "DEFENSIVE": 120}.get(m, 60)
     tp = {"AGGRESSIVE": 0.45, "DYNAMIC": 0.55, "TACTICAL": 0.70, "DEFENSIVE": 0.90}.get(m, 0.55)
     hard_stop = {"AGGRESSIVE": -15.0, "DYNAMIC": -10.0, "TACTICAL": -7.0, "DEFENSIVE": -5.0}.get(m, -10.0)
     # Real net edge after estimated exit costs (not 0.02% dust).
@@ -15957,13 +15962,26 @@ def _nkr_enrich_session_from_onchain_position(wallet: str, sess: dict, live_row:
                 "capitalUsd": cost_basis, "currentGrossUsd": gross,
                 "currentCostsUsd": costs, "currentNetUsd": net, "executionMode": "live",
             })
+            # ENGINE-429: never show -100% ghost PnL from bad decimals/quotes.
+            if cost_basis > 0 and abs(gross) > cost_basis * 2.5:
+                gross = max(-cost_basis, min(cost_basis * 0.5, value - cost_basis if value > 0 else 0.0))
+                net = gross - costs
+            if value > 0 and cost_basis <= 0:
+                cost_basis = value
+                invested = value
+            else:
+                invested = cost_basis
+            if value <= 0 and cost_basis > 0:
+                value = cost_basis
+                gross = 0.0
+                net = -costs
             out.update({
                 "positionState": "OPEN", "positionAsset": sym, "targetAsset": sym,
                 "asset": sym, "symbol": sym, "positionQty": qty, "positionAmount": qty,
                 "entryPriceUsd": entry_price, "currentPriceUsd": current_price,
                 "positionValueUsd": value, "workingCapitalUsd": cost_basis,
-                "investedUsd": cost_basis, "grossProfitUsd": gross,
-                "costsUsd": costs, "netProfitUsd": net,
+                "investedUsd": invested if cost_basis > 0 else cost_basis,
+                "grossProfitUsd": gross, "costsUsd": costs, "netProfitUsd": net,
                 "liveGrossProfitUsd": gross, "liveCostsUsd": costs, "liveNetProfitUsd": net,
                 "openRotation": open_rotation, "active": status in {"ACTIVE", "PAUSED", "CLOSING"},
                 "exitReason": "", "reason": f"Open {sym} position on-chain",
@@ -19215,6 +19233,16 @@ def api_nexus_trading_control():
             core_vault_finalize = _live_finalize_engine_sessions(
                 wa, "TRADER", target_id or None, target_chain or None
             )
+            # ENGINE-429: if UI session_id did not map to registry, still stop every
+            # ACTIVE/PAUSED/ERROR TRADER CoreVault row (optionally filtered by chain).
+            _need_fallback = (
+                not core_vault_finalize
+                or any(str((r or {}).get("status") or "") == "not_found" for r in core_vault_finalize)
+            )
+            if _need_fallback:
+                core_vault_finalize = _live_finalize_engine_sessions(
+                    wa, "TRADER", None, target_chain or None
+                )
         except Exception as stop_exc:
             return jsonify({
                 "status": "error",
@@ -19242,6 +19270,43 @@ def api_nexus_trading_control():
         "affected_queue_rows": affected, "execution": execution,
         "coreVaultFinalize": core_vault_finalize,
         "backend_is_state_master": True, "ts": now_ts(),
+    })
+
+
+@app.route("/api/trader/stop-all-live", methods=["POST"])
+def api_trader_stop_all_live():
+    """ENGINE-430: finalize every ACTIVE/PAUSED/ERROR TRADER CoreVault session.
+
+    Use when the Trading session card is gone but capital stays reserved on-chain
+    (orphan Create Session without Start Closing / Finalize).
+    Optional body: { "chain": "POL" | "ETH" | "BNB" } to limit to one chain.
+    """
+    wa, error_resp = _nexus_wallet_from_request()
+    if error_resp:
+        return error_resp
+    body = request.get_json(silent=True) or {}
+    chain_raw = body.get("chain") or body.get("chainKey") or body.get("chain_id") or body.get("chainId") or ""
+    target_chain = ""
+    try:
+        if str(chain_raw).isdigit():
+            target_chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
+        else:
+            target_chain = str(chain_raw or "").upper()
+            aliases = {"BSC": "BNB", "BNB CHAIN": "BNB", "ETHEREUM": "ETH", "POLYGON": "POL", "MATIC": "POL"}
+            target_chain = aliases.get(target_chain, target_chain)
+    except Exception:
+        target_chain = str(chain_raw or "").upper()
+    try:
+        results = _live_finalize_engine_sessions(wa, "TRADER", None, target_chain or None)
+    except Exception as exc:
+        return jsonify({"status": "error", "error": "trader_stop_all_failed", "message": str(exc)[:400]}), 500
+    return jsonify({
+        "status": "ok",
+        "wallet": wa,
+        "action": "stop_all_live",
+        "chain": target_chain or "ALL",
+        "coreVaultFinalize": results,
+        "ts": now_ts(),
     })
 
 
@@ -38185,7 +38250,7 @@ _NKR_LIVE_PORTFOLIO_TRADE_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_A
 # ENGINE-378: shadow-like behaviour — never lock re-entry for a whole day.
 # After a flat exit the next OPEN may happen after a short cool-down only.
 _NKR_LIVE_ENTRY_DUP_HOLD_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_ENTRY_DUP_HOLD_SEC", "45")))
-_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(900, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "900")))  # ENGINE-412: 15 min minimum before discretionary CLOSE
+_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC = max(45, int(os.getenv("NEXUS_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC", "45")))  # ENGINE-430: short anti-race only; profit gate is net-after-costs
 _NKR_LIVE_REENTRY_COOLDOWN_SEC = max(15, int(os.getenv("NEXUS_NKR_LIVE_REENTRY_COOLDOWN_SEC", "45")))  # ENGINE-380: fast re-entry after harvest
 
 # Small live sessions (e.g. $1–$5 test budgets) must still be able to open.
@@ -41369,6 +41434,29 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         entry_guard = False
         try:
             if action in {"CLOSE", "REDUCE"}:
+                # ENGINE-430: NO fixed strategy hold time. User rule = sell only with real
+                # net profit after costs (enforced below). Only a 45s anti-race floor so
+                # the same tick cannot buy+sell before opened_ts is durable.
+                try:
+                    _pm_hold = previous_meta.get(str(sym or "").upper()) or {}
+                    _opened_h = int(
+                        _pm_hold.get("nkr_position_opened_ts")
+                        or _pm_hold.get("position_opened_ts")
+                        or _pm_hold.get("entry_ts")
+                        or 0
+                    )
+                    _held_h = (int(time.time()) - _opened_h) if _opened_h > 1_000_000_000 else 0
+                    _reason_h = str((forced_exits or {}).get(sym) or "")
+                    _sec_h = (
+                        _reason_h in ("security_emergency", "security_hard_block")
+                        or _reason_h.startswith("security_emergency")
+                        or _reason_h.startswith("security_hard_block")
+                    )
+                    if action == "CLOSE" and not _sec_h and _opened_h > 0 and _held_h < 45:
+                        last_skip = f"ANTI_RACE_HOLD:{sym}:held={_held_h}s"
+                        continue
+                except Exception:
+                    pass
                 # ENGINE-408 final defense-in-depth: NKR never performs a generic
                 # portfolio REDUCE. Forced strategist/risk exits are full CLOSEs.
                 if engine_name == "NKR" and action == "REDUCE":
