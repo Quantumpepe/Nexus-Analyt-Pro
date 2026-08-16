@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-447-TRADER-EXACT-CONTROL-STATUS"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-448-TRADER-PAUSE-STOP-RESOLVE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19455,14 +19455,39 @@ def api_nexus_trading_control():
 
     core_vault_finalize = []
     core_vault_control = []
-    if action in ("pause", "resume") and onchain_sid:
+    if action in ("pause", "resume"):
+        # ENGINE-448: resolve exact CoreVault session when UI only has local TRD-* id.
         try:
             if str(chain_raw).isdigit():
                 pause_chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
             else:
                 pause_chain = str(chain_raw or "").strip().upper()
                 pause_chain = {"BSC":"BNB","BNB CHAIN":"BNB","ETHEREUM":"ETH","POLYGON":"POL","MATIC":"POL"}.get(pause_chain, pause_chain)
-            exact = _trader_control_exact_core_session(wa, onchain_sid, pause_chain, paused=(action == "pause"))
+            resolved_sid = str(onchain_sid or "").strip()
+            if not resolved_sid:
+                try:
+                    _reconcile_live_registry_from_corevault(wa, "TRADER")
+                except Exception:
+                    pass
+                rows = list(_live_active_sessions(wa, "TRADER") or [])
+                if pause_chain:
+                    tcid = int(_nkr_chain_id_from_key(pause_chain) or 0)
+                    if tcid > 0:
+                        rows = [r for r in rows if int((r or {}).get("chain_id") or 0) == tcid]
+                live_rows = [r for r in rows if str((r or {}).get("status") or "").upper() in {"ACTIVE","PAUSED","STOPPING","CLOSING","ERROR"}]
+                if len(live_rows) == 1:
+                    resolved_sid = str(live_rows[0].get("onchain_session_id") or "").strip()
+                elif live_rows:
+                    live_rows.sort(key=lambda r: int((r or {}).get("created_ts") or 0), reverse=True)
+                    resolved_sid = str(live_rows[0].get("onchain_session_id") or "").strip()
+            if not resolved_sid:
+                return jsonify({
+                    "status":"error", "error":"trader_onchain_session_required",
+                    "message":"Pause/Resume needs the exact CoreVault session id. Refresh on-chain sessions and retry.",
+                    "session_id":session_id, "chain":pause_chain or chain_raw,
+                    "affected_queue_rows":affected,
+                }), 400
+            exact = _trader_control_exact_core_session(wa, resolved_sid, pause_chain, paused=(action == "pause"))
             core_vault_control = [exact]
         except Exception as control_exc:
             return jsonify({
