@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-442-CLOSING-RESIDUAL-EXIT-CYCLE-FIX"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-443-CLOSING-DUST-RESCUE-ROUTER-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -33674,6 +33674,173 @@ def _position_amount(vault, session_id, token, chain_id=1):
     return int(w[0], 16)
 
 
+def _position_state(vault, session_id, token, chain_id=1):
+    """Return the authoritative raw Position(amount,costBasis) from CoreVault.
+
+    ENGINE-443 uses costBasis as a second, settlement-denominated dust proof when
+    every DEX quote rounds to zero or the pool cannot quote the residual amount.
+    """
+    raw = _eth_call(int(chain_id), vault, _PRIVY_POSITION_OF_SELECTOR + _uint_to_32(session_id) + _addr_to_32(token))
+    w = _abi_hex_words(raw)
+    if len(w) < 2:
+        raise RuntimeError("position_decode_failed")
+    return {"amount": int(w[0], 16), "costBasis": int(w[1], 16)}
+
+
+def _closing_dust_router_for_chain(chain_id: int) -> str:
+    cid = int(chain_id or 0)
+    suffix = {1: "ETH", 56: "BNB", 137: "POL", 8453: "BASE", 42161: "ARB"}.get(cid, str(cid))
+    value = os.getenv(f"NEXUS_DUST_EXIT_ROUTER_{suffix}", "") or os.getenv("NEXUS_DUST_EXIT_ROUTER", "")
+    value = _norm_addr(value or "")
+    return value if _looks_like_evm_addr(value) else ""
+
+
+_DUST_RESCUE_SELECTOR = "0x" + _keccak256(b"rescueDust(address,address,uint256,uint256)")[:4].hex()
+
+def _encode_dust_rescue_call(token_in: str, token_out: str, amount_in: int, amount_out: int = 1) -> str:
+    return _DUST_RESCUE_SELECTOR + _addr_to_32(token_in) + _addr_to_32(token_out) + _uint_to_32(amount_in) + _uint_to_32(amount_out)
+
+
+def _closing_dust_viability(cfg: dict, vault: str, session_id: int, token: str, settlement: str, amount: int, fee_candidates: list[int], chain_id: int) -> dict:
+    """Read-only proof that a residual position is below settlement precision.
+
+    A position is classified as dust only when at least one positive quote exists and
+    every usable final settlement quote is <= threshold, OR no route can quote and the
+    CoreVault's remaining costBasis itself is <= threshold. This avoids classifying a
+    temporary RPC/router outage as dust. The bridge path is quoted as target->wrapped
+    native->settlement before declaring direct-route quote failure.
+    """
+    try:
+        threshold = max(1, int(os.getenv("NEXUS_CLOSING_DUST_MAX_SETTLEMENT_UNITS", "1")))
+    except Exception:
+        threshold = 1
+    state = _position_state(vault, session_id, token, chain_id=chain_id)
+    direct_quotes = []
+    direct_errors = []
+    for f in fee_candidates:
+        try:
+            q = int(_privy_quote(cfg, token, settlement, int(amount), fee=int(f)))
+            if q >= 0:
+                direct_quotes.append(q)
+        except Exception as exc:
+            direct_errors.append(f"fee={f}:{str(exc)[:140]}")
+    bridge_quotes = []
+    bridge_errors = []
+    intermediate = _norm_addr(cfg.get("weth") or "")
+    if _looks_like_evm_addr(intermediate) and intermediate.lower() not in {token.lower(), settlement.lower()}:
+        for f1 in fee_candidates:
+            try:
+                q1 = int(_privy_quote(cfg, token, intermediate, int(amount), fee=int(f1)))
+            except Exception as exc:
+                bridge_errors.append(f"leg1={f1}:{str(exc)[:100]}")
+                continue
+            if q1 <= 0:
+                bridge_quotes.append(0)
+                continue
+            for f2 in [100, 500, 2500, 3000, 10000]:
+                try:
+                    q2 = int(_privy_quote(cfg, intermediate, settlement, int(q1), fee=int(f2)))
+                    bridge_quotes.append(q2)
+                except Exception as exc:
+                    bridge_errors.append(f"leg2={f2}:{str(exc)[:100]}")
+    positive_final = [q for q in (direct_quotes + bridge_quotes) if q > 0]
+    quoted_dust = bool(positive_final and max(positive_final) <= threshold)
+    zero_only_quotes = bool((direct_quotes or bridge_quotes) and not positive_final)
+    cost_basis_dust = bool(int(state.get("costBasis") or 0) <= threshold)
+    no_positive_route = not positive_final
+    is_dust = bool(quoted_dust or ((zero_only_quotes or no_positive_route) and cost_basis_dust))
+    return {
+        "isDust": is_dust, "thresholdUnits": threshold,
+        "amountUnits": int(state.get("amount") or amount), "costBasisUnits": int(state.get("costBasis") or 0),
+        "directQuotes": direct_quotes, "bridgeFinalQuotes": bridge_quotes,
+        "maxFinalQuoteUnits": max(positive_final) if positive_final else 0,
+        "directErrors": direct_errors[:8], "bridgeErrors": bridge_errors[:8],
+        "proof": "QUOTE_BELOW_SETTLEMENT_PRECISION" if quoted_dust else ("COST_BASIS_BELOW_SETTLEMENT_PRECISION" if is_dust else "NOT_DUST"),
+    }
+
+
+def _nkr_live_dust_exit_route(wallet: str, live_row: dict, token_in: str, settlement: str, amount_in: int, *, symbol: str = "") -> dict:
+    """Close an untradeable residual through the owner-funded dust rescue router.
+
+    This is only valid for an already-CLOSING CoreVault session. The external router
+    burns/transfers the complete dust token amount away from the Vault and returns
+    exactly one settlement base unit, allowing CoreVault._recordClose() to reduce
+    openAssetCount normally. The CoreVault remains the accounting authority.
+    """
+    chain_id = int((live_row or {}).get("chain_id") or 1)
+    vault = _norm_addr((live_row or {}).get("vault_address") or "")
+    sid = int(str((live_row or {}).get("onchain_session_id") or "0"))
+    wallet_id = str((live_row or {}).get("privy_wallet_id") or "").strip() or str(_privy_wallet_id_for_user(_norm_addr(wallet)) or "").strip()
+    router = _closing_dust_router_for_chain(chain_id)
+    if sid <= 0 or not wallet_id or not _looks_like_evm_addr(vault) or not _looks_like_evm_addr(router):
+        raise RuntimeError(f"dust_rescue_router_not_configured:chain={chain_id}:session={sid}")
+    raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+    words = _core_words(raw)
+    if len(words) < 13 or int(words[3]) != 3:
+        raise RuntimeError(f"dust_rescue_requires_closing_session:chain={chain_id}:session={sid}:status={int(words[3]) if len(words)>3 else -1}")
+    if _nkr_addr_from_abi_word(words[1]).lower() != _norm_addr(settlement).lower():
+        raise RuntimeError(f"dust_rescue_settlement_mismatch:chain={chain_id}:session={sid}")
+    position = _position_amount(vault, sid, token_in, chain_id=chain_id)
+    if position <= 0:
+        return {"executed": False, "alreadyFlat": True, "txHash": ""}
+    amount_in = min(int(amount_in), int(position))
+    rc = _read_router_config(vault, router, chain_id) or {}
+    if not rc.get("enabled"):
+        raise RuntimeError(f"dust_rescue_router_disabled:chain={chain_id}:router={router}")
+    if not bool(_read_router_selector_allowed(vault, router, _DUST_RESCUE_SELECTOR, chain_id)):
+        raise RuntimeError(f"dust_rescue_selector_not_allowed:chain={chain_id}:router={router}:selector={_DUST_RESCUE_SELECTOR}")
+    router_data = _encode_dust_rescue_call(token_in, settlement, amount_in, 1)
+    call = _encode_execute_trade(sid, router, token_in, settlement, amount_in, 1, now_ts() + 300, router_data)
+    _eth_call_from(chain_id, wallet, vault, call)
+    ident = _nkr_session_identity(wallet=wallet, chain_id=chain_id, vault=vault, onchain_session_id=str(sid), live_row=live_row)
+    try:
+        con = _db()
+        try:
+            r = con.execute(
+                "SELECT COUNT(*) AS n FROM nexus_live_operations WHERE op_type='EXIT' AND wallet_address=? AND chain_id=? AND vault_address=? AND onchain_session_id=? AND token_address=? AND status='SUCCEEDED'",
+                (ident.get("walletAddress") or _norm_addr(wallet), chain_id, ident.get("vaultAddress") or vault, str(sid), _norm_addr(token_in)),
+            ).fetchone()
+            n = int((r["n"] if r else 0) or 0)
+        finally:
+            con.close()
+    except Exception:
+        n = 0
+    cycle_key = f"closing-dust-{max(1, n + 1)}"
+    op = _live_op_reserve("EXIT", wallet=wallet, chain_id=chain_id, vault=vault, onchain_session_id=str(sid), live_row=live_row, token=token_in, cycle_key=cycle_key, ttl_sec=300, meta={"source":"ENGINE443_DUST_RESCUE","symbol":symbol,"router":router})
+    if op is None:
+        existing = _live_op_find_active("EXIT", ident, token=token_in, cycle_key=cycle_key)
+        raise RuntimeError(f"dust_rescue_exit_op_inflight:chain={chain_id}:session={sid}:status={(existing or {}).get('status') or 'ACTIVE'}")
+    op_id = str(op.get("operation_id") or "")
+    body_hash = hashlib.sha256(call.encode("utf-8")).hexdigest()[:24]
+    ref = _live_op_privy_key(op_id, body_hash, attempt=int(op.get("attempt") or 1))
+    runtime_engine = _live_row_engine_name(live_row) if "_live_row_engine_name" in globals() else str((live_row or {}).get("engine") or "NKR").upper()
+    _live_engine_mark(runtime_engine, status="closing", decision="DUST_EXIT_SUBMITTING", gate_status="DUST_RESCUE", active_asset=symbol or "DUST", position_state="EXITING", pending_tx="submitting", last_error="", reason=f"CLOSING session #{sid}: clearing non-tradeable residual through approved dust rescue router")
+    txh = ""
+    try:
+        _live_op_update(op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref, expires_ts=int(time.time()) + 300)
+        sent = _privy_send_delegated_transaction(wallet_id, {"from":_norm_addr(wallet),"to":vault,"data":call,"value":"0x0"}, ref, chain_id=chain_id)
+        txh = str((sent or {}).get("hash") or (sent or {}).get("txHash") or "")
+        if not txh.startswith("0x"):
+            raise RuntimeError("dust_rescue_missing_tx_hash")
+        _live_op_update(op_id, "CONFIRMING", tx_hash=txh, expires_ts=int(time.time()) + 180)
+        receipt = _privy_wait_receipt(txh, chain_id=chain_id)
+        status_raw = (receipt or {}).get("status") if isinstance(receipt, dict) else None
+        status_int = int(str(status_raw),16) if isinstance(status_raw,str) and str(status_raw).startswith("0x") else int(status_raw)
+        if status_int == 0:
+            raise RuntimeError("dust_rescue_transaction_reverted")
+        remaining = _position_amount(vault, sid, token_in, chain_id=chain_id)
+        if remaining != 0:
+            raise RuntimeError(f"dust_rescue_position_not_zero:{remaining}")
+        _live_op_update(op_id, "SUCCEEDED", tx_hash=txh)
+        return {"executed":True,"txHash":txh,"amountIn":amount_in,"amountOut":1,"routeMode":"DUST_RESCUE_ROUTER","router":router}
+    except Exception as exc:
+        try:
+            _live_op_update(op_id, "FAILED", tx_hash=txh, error_text=str(exc)[:900])
+        except Exception:
+            pass
+        raise
+
+
 def _send_vault_tx(wallet_id, wallet, vault, data, reference, chain_id=1):
     sent = _privy_send_delegated_transaction(wallet_id, {
         "from": _norm_addr(wallet), "to": _norm_addr(vault), "data": data, "value": "0x0"
@@ -40634,14 +40801,46 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
         if int((route or {}).get("fee") or 0) > 0:
             fee_candidates.insert(0, int((route or {}).get("fee")))
         fee_candidates = list(dict.fromkeys([int(x) for x in fee_candidates if int(x or 0) > 0])) or [500, 2500, 3000, 10000, 100]
-        try: _dust_max_units = max(0, int(os.getenv("NEXUS_CLOSING_DUST_MAX_SETTLEMENT_UNITS", "1")))
-        except Exception: _dust_max_units = 1
-        _dust_quotes=[]
-        for _df in fee_candidates:
-            try: _dust_quotes.append(int(_privy_quote(cfg, token, settlement, int(amount), fee=int(_df))))
-            except Exception: pass
-        if _dust_quotes and max(_dust_quotes) <= _dust_max_units:
-            raise RuntimeError(f"closing_dust_requires_contract_writeoff:chain={chain_id}:session={session_id}:asset={sym}:token={token}:amount={amount}:maxQuoteOutUnits={max(_dust_quotes)}:thresholdUnits={_dust_max_units}")
+        # ENGINE-443: prove residual dust before any further normal DEX broadcast.
+        # The old code only classified dust when a direct quote succeeded. If every
+        # quote rounded to zero/failed, it fell through and repeatedly broadcast a
+        # trade that could never return the mandatory >=1 settlement base unit.
+        dust = _closing_dust_viability(cfg, vault, int(session_id), token, settlement, int(amount), fee_candidates, int(chain_id))
+        if dust.get("isDust"):
+            dust_router = _closing_dust_router_for_chain(chain_id)
+            if dust_router:
+                try:
+                    result = _nkr_live_dust_exit_route(wallet, row, token, settlement, amount, symbol=sym)
+                except Exception as dust_exc:
+                    _live_engine_mark(
+                        runtime_engine, status="closing", decision="DUST_RESCUE_BLOCKED",
+                        gate_status="DUST_RESCUE_REQUIRED", active_asset=sym, position_state="EXITING",
+                        pending_tx="", last_error=str(dust_exc)[:900],
+                        reason=f"Session #{session_id}: residual {sym} is below settlement precision; configured dust rescue could not execute",
+                    )
+                    raise RuntimeError(
+                        f"closing_dust_rescue_failed:chain={chain_id}:session={session_id}:asset={sym}:token={token}:"
+                        f"amount={amount}:costBasis={dust.get('costBasisUnits')}:maxFinalQuote={dust.get('maxFinalQuoteUnits')}:"
+                        f"proof={dust.get('proof')}:error={str(dust_exc)[:700]}"
+                    )
+            else:
+                _live_engine_mark(
+                    runtime_engine, status="closing", decision="DUST_RESCUE_REQUIRED",
+                    gate_status="DUST_RESCUE_REQUIRED", active_asset=sym, position_state="EXITING",
+                    pending_tx="", last_error="approved dust rescue router not configured",
+                    reason=f"Session #{session_id}: residual {sym} is below settlement precision and cannot be closed by a normal DEX swap",
+                )
+                raise RuntimeError(
+                    f"closing_dust_rescue_router_required:chain={chain_id}:session={session_id}:asset={sym}:token={token}:"
+                    f"amount={amount}:costBasis={dust.get('costBasisUnits')}:maxFinalQuote={dust.get('maxFinalQuoteUnits')}:"
+                    f"thresholdUnits={dust.get('thresholdUnits')}:proof={dust.get('proof')}"
+                )
+        if result:
+            remaining = _position_amount(vault, session_id, token, chain_id=chain_id)
+            if remaining != 0:
+                raise RuntimeError(f"dust_rescue_position_not_zero_after_success:chain={chain_id}:session={session_id}:asset={sym}:remaining={remaining}")
+            executed.append({"asset": sym, "token": token, **result, "amountIn": amount})
+            continue
         for exit_fee in fee_candidates:
             try:
                 exit_route = dict(route or {})
@@ -46636,7 +46835,7 @@ def api_nexus_system_info_evm_diagnostics():
             "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
             "contract_ghost_open_count":("POSITION","CoreVault openAssetCount is inconsistent","All reconstructed TradeExecuted tokens have positionOf=0 while sessionOf still reports an open asset. This requires a CoreVault bookkeeping/dust repair; do not retry executeTrade."),
             "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
-            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD442."),
+            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD443."),
             "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
             "router_selector_blocked":("ROUTER","Router selector blocked","Allow exactInputSingle selector on-chain."),
         }
