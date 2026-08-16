@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-450-TRADER-FORCE-STOP-ONCHAIN"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-452-FIX-QUEUE-SESSION-ID-COLUMN"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19439,18 +19439,56 @@ def api_nexus_trading_control():
     if not session_id:
         return err("session_id required", 400)
     status_map = {"start": "ACTIVE", "resume": "ACTIVE", "pause": "PAUSED", "stop": "STOPPING"}
+    # ENGINE-452: nexus_execution_queue has NO session_id / trade_session_id columns
+    # (schema: id, slot_id, meta_json, ...). The old UPDATE crashed every stop/pause
+    # with "no such column: session_id" BEFORE any on-chain finalize ran.
+    affected = 0
+    execution = {}
     with DB_WRITE_LOCK:
         conn = _db()
         cur = conn.cursor()
         now = now_ts()
-        cur.execute("""
-            UPDATE nexus_execution_queue
-               SET state=?, updated_ts=?
-             WHERE wallet_address=? AND (session_id=? OR trade_session_id=?)
-        """, (status_map[action], now, wa, session_id, session_id))
-        affected = cur.rowcount
-        conn.commit()
-        execution = _nexus_execution_summary(cur, wa)
+        try:
+            cur.execute(
+                """
+                UPDATE nexus_execution_queue
+                   SET state=?, updated_ts=?
+                 WHERE wallet_address=? AND (
+                    id = ?
+                    OR slot_id = ?
+                    OR instr(lower(COALESCE(meta_json,'')), lower(?)) > 0
+                 )
+                """,
+                (status_map[action], now, wa, session_id, session_id, session_id),
+            )
+            affected = int(cur.rowcount or 0)
+            # Fallback: match by chain when session token is TRADER-LIVE-POL-16 style
+            if affected <= 0 and chain_raw:
+                ch = str(chain_raw or "").upper()
+                aliases = {"BSC": "BNB", "BNB CHAIN": "BNB", "ETHEREUM": "ETH", "POLYGON": "POL", "MATIC": "POL"}
+                ch = aliases.get(ch, ch) if not str(chain_raw).isdigit() else (_nkr_chain_key_from_id(int(chain_raw)) or "")
+                if ch:
+                    cur.execute(
+                        """
+                        UPDATE nexus_execution_queue
+                           SET state=?, updated_ts=?
+                         WHERE wallet_address=? AND upper(COALESCE(chain,'')) = ?
+                        """,
+                        (status_map[action], now, wa, ch),
+                    )
+                    affected = int(cur.rowcount or 0)
+            conn.commit()
+        except Exception as qexc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            # Never block on-chain pause/stop because of queue schema issues.
+            affected = 0
+        try:
+            execution = _nexus_execution_summary(cur, wa)
+        except Exception:
+            execution = {}
         conn.close()
 
     core_vault_finalize = []
@@ -19682,20 +19720,65 @@ def api_live_stop_orphan_session():
     except Exception:
         pass
 
-    result = _live_finalize_engine_sessions(wa, engine, sid, target_chain)
-    if not result or any(str((x or {}).get("status") or "") == "not_found" for x in (result or [])):
+    # ENGINE-451: finalize SYNCHRONOUSLY from on-chain sessionOf.
+    # Registry-only async path left ACTIVE sessions with no Start Closing/Finalize txs.
+    try:
+        if engine == "TRADER":
+            exact_row = _trader_resolve_exact_core_session(wa, sid, target_chain)
+        else:
+            # NKR: build row from sessionOf + vault config
+            chain_id = int(_nkr_chain_id_from_key(target_chain) or 0)
+            vault = _norm_addr((_VAULT_BY_CHAIN or {}).get(chain_id) or "")
+            if not _looks_like_evm_addr(vault):
+                raise RuntimeError(f"vault not configured for {target_chain}")
+            raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(int(sid)))
+            words = _core_words(raw)
+            if len(words) < 4:
+                raise RuntimeError("sessionOf incomplete")
+            owner = "0x" + words[0].to_bytes(32, "big")[-20:].hex()
+            system_id = int(words[2])
+            status_id = int(words[3])
+            if _norm_addr(owner) != _norm_addr(wa):
+                raise RuntimeError("session owner mismatch")
+            if system_id != int(_CORE_SYSTEM_ID.get("NKR", 0)):
+                raise RuntimeError("session is not NKR")
+            wallet_id = str(_privy_wallet_id_for_user(wa) or "")
+            if not wallet_id:
+                raise RuntimeError("Privy wallet id not found")
+            exact_row = {
+                "wallet_address": _norm_addr(wa), "engine": "NKR", "chain_id": chain_id,
+                "chain": target_chain, "vault_address": vault, "privy_wallet_id": wallet_id,
+                "onchain_session_id": str(int(sid)), "status_id": status_id,
+                "status": {1:"ACTIVE",2:"PAUSED",3:"CLOSING",4:"FINALIZED"}.get(status_id,"UNKNOWN"),
+            }
+        try:
+            _live_session_register(
+                wa, engine,
+                str(exact_row.get("privy_wallet_id") or ""),
+                str(exact_row.get("vault_address") or ""),
+                int(sid), "", 0, int(exact_row.get("chain_id") or 0), "CLOSING",
+            )
+        except Exception:
+            pass
+        if int(exact_row.get("status_id") or 0) == 4:
+            result = [{"sessionId": int(sid), "status": "already_finalized", "chain": target_chain}]
+        else:
+            fin = _finalize_one_live_session(wa, engine, exact_row, allow_early_nkr_stop=True)
+            result = [fin if isinstance(fin, dict) else {"sessionId": int(sid), "status": "finalized", "chain": target_chain}]
+    except Exception as exc:
         return jsonify({
-            "status": "error", "error": "target_onchain_session_not_found",
+            "status": "error", "error": "orphan_stop_finalize_failed",
+            "message": str(exc)[:500],
             "engine": engine, "chain": target_chain, "sessionId": int(sid),
-            "coreVaultFinalize": result or [],
-        }), 404
+        }), 500
+
     return jsonify({
         "status": "ok", "action": "STOP_ORPHAN_EXACT",
         "wallet": wa, "engine": engine, "chain": target_chain,
         "sessionId": int(sid), "coreVaultFinalize": result,
-        "message": "Exact on-chain session queued for startClosing/exit/finalize recovery.",
+        "message": "Exact on-chain session finalized (or already finalized).",
         "ts": now_ts(),
-    }), 202
+    }), 200
 
 
 @app.route("/api/live/stop-all-orphans", methods=["POST"])
