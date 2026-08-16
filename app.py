@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-440-RECEIPT-FIRST-GHOST-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-441-TOKEN-SYMBOL-RESOLVER-GHOST-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -9859,6 +9859,77 @@ def _stable_decimals(chain_id: int, symbol: str, token_address: str | None = Non
     if cid in (1, 137):
         return 6
     return _USDT_DECIMALS if sym == "USDT" else _USDC_DECIMALS
+
+
+def _symbol_for_chain_token(chain_id: int, token_address: str) -> str:
+    """Best-effort local symbol resolver for an exact chain+token address.
+
+    ENGINE-441: recovery/diagnostics must never fail merely because a display symbol
+    cannot be resolved.  The token address remains authoritative; this helper only
+    labels it.  No network request is made here.
+    """
+    cid = int(chain_id or 0)
+    tok = _norm_addr(token_address or "")
+    if not _looks_like_evm_addr(tok):
+        return ""
+    low = tok.lower()
+
+    # Wrapped native is deterministic per chain.
+    try:
+        wnative = _norm_addr((_WNATIVE_BY_CHAIN or {}).get(cid) or "")
+        if _looks_like_evm_addr(wnative) and low == wnative.lower():
+            return str((_NATIVE_SYMBOL_BY_CHAIN or {}).get(cid) or "WNATIVE").upper()
+    except Exception:
+        pass
+
+    # Current chain config contains the settlement assets used by the live Vault.
+    try:
+        cfg = _privy_trading_cfg(cid) or {}
+        for key, sym in (("usdc", "USDC"), ("usdt", "USDT"), ("weth", str((_NATIVE_SYMBOL_BY_CHAIN or {}).get(cid) or "WNATIVE"))):
+            addr = _norm_addr(cfg.get(key) or "")
+            if _looks_like_evm_addr(addr) and low == addr.lower():
+                return str(sym or "").upper()
+        # Live route registry is the next strongest local source.
+        try:
+            for rsym, route in dict(_nkr_live_route_registry(cfg) or {}).items():
+                addr = _norm_addr((route or {}).get("token") or "")
+                if _looks_like_evm_addr(addr) and low == addr.lower():
+                    return str((route or {}).get("symbol") or rsym or "").upper()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Durable token registry catches dynamic assets whose live route was later edited.
+    try:
+        con = _db()
+        try:
+            row = con.execute(
+                "SELECT symbol FROM nexus_evm_token_registry WHERE chain_id=? AND lower(token_address)=? ORDER BY rowid DESC LIMIT 1",
+                (cid, low),
+            ).fetchone()
+        finally:
+            con.close()
+        if row:
+            sym = row[0] if not isinstance(row, dict) else row.get("symbol")
+            if str(sym or "").strip():
+                return str(sym).strip().upper()
+    except Exception:
+        pass
+
+    # Technical router registry is local configuration and can recover wrapped/non-EVM labels.
+    try:
+        technical = (_nexus_asset_router_registry(include_technical=True).get("technicalRoutes") or {})
+        ck = _nkr_chain_key_from_id(cid)
+        for display_sym, asset in technical.items():
+            route = ((asset or {}).get("routes") or {}).get(ck) or {}
+            addr = _norm_addr(route.get("tokenContract") or route.get("tokenAddress") or "")
+            if _looks_like_evm_addr(addr) and low == addr.lower():
+                return str(display_sym or route.get("tokenSymbol") or "").upper()
+    except Exception:
+        pass
+
+    return ""
 
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "25")))
 PRICE_STRATEGIST_WEEKLY_USD = float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20"))
@@ -46531,7 +46602,7 @@ def api_nexus_system_info_evm_diagnostics():
             "session_read_failed":("SESSION","Session cannot be read","Verify chain, Vault address and session id."),
             "contract_ghost_open_count":("POSITION","CoreVault openAssetCount is inconsistent","All reconstructed TradeExecuted tokens have positionOf=0 while sessionOf still reports an open asset. This requires a CoreVault bookkeeping/dust repair; do not retry executeTrade."),
             "open_position_unresolved":("POSITION","Open asset cannot be resolved","Inspect TradeExecuted logs and positionOf for the session."),
-            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD440."),
+            "open_position_resolution_failed":("POSITION","Position discovery failed","Receipt-backed recovery also failed. Check stored operation receipts and direct positionOf reads; archive eth_getLogs is optional in BUILD441."),
             "router_disabled":("ROUTER","Router disabled in CoreVault","Enable the configured router on-chain."),
             "router_selector_blocked":("ROUTER","Router selector blocked","Allow exactInputSingle selector on-chain."),
         }
