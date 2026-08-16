@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-445-LIVE-OP-RETRY-IDEMPOTENCY-FIX"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-446-TRADER-LIFECYCLE-STATE-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19357,11 +19357,9 @@ def api_nexus_trading_control():
         # Prefer explicit on-chain id; else parse from TRD-... local ids; else all TRADER rows.
         target_id = onchain_sid
         if not target_id:
-            # Session ids often look like TRD-... or contain the numeric CoreVault id.
-            for part in reversed(str(session_id).replace("::", "-").split("-")):
-                if part.isdigit() and int(part) > 0:
-                    target_id = part
-                    break
+            # ENGINE-446: never infer a CoreVault id from a local TRD-* identifier.
+            # Local ids contain timestamps/random numeric components and are not on-chain ids.
+            target_id = ""
         target_chain = ""
         try:
             if str(chain_raw).isdigit():
@@ -19377,16 +19375,37 @@ def api_nexus_trading_control():
                 _reconcile_live_registry_from_corevault(wa, "TRADER")
             except Exception:
                 pass
+
+            # ENGINE-446: the browser's local TRD-* id is not the CoreVault session id.
+            # Resolve the exact live TRADER row from the authoritative registry when
+            # onchainSessionId was not supplied.  The previous parser could extract a
+            # timestamp/random numeric tail and therefore target a non-existent session.
+            if not onchain_sid:
+                try:
+                    rows = _live_active_sessions(wa, "TRADER")
+                    if target_chain:
+                        tcid = int(_nkr_chain_id_from_key(target_chain) or 0)
+                        if tcid > 0:
+                            rows = [r for r in rows if int((r or {}).get("chain_id") or 0) == tcid]
+                    live_rows = [r for r in rows if str((r or {}).get("status") or "").upper() in {"ACTIVE","PAUSED","STOPPING","CLOSING","ERROR"}]
+                    if len(live_rows) == 1:
+                        target_id = str(live_rows[0].get("onchain_session_id") or "").strip()
+                    elif target_chain and live_rows:
+                        # Same-chain most recent row is deterministic; never cross-stop another chain.
+                        live_rows.sort(key=lambda r: int((r or {}).get("created_ts") or 0), reverse=True)
+                        target_id = str(live_rows[0].get("onchain_session_id") or "").strip()
+                except Exception:
+                    pass
+
             core_vault_finalize = _live_finalize_engine_sessions(
                 wa, "TRADER", target_id or None, target_chain or None
             )
-            # ENGINE-429/431: if UI session_id did not map to registry, still stop every
-            # ACTIVE/PAUSED/ERROR TRADER CoreVault row (optionally filtered by chain).
             _need_fallback = (
                 not core_vault_finalize
                 or any(str((r or {}).get("status") or "") == "not_found" for r in core_vault_finalize)
             )
             if _need_fallback:
+                # Fail safely inside TRADER and the selected chain only.  Never touch NKR.
                 core_vault_finalize = _live_finalize_engine_sessions(
                     wa, "TRADER", None, target_chain or None
                 )
@@ -20753,6 +20772,73 @@ def _nexus_session_expiry_ts_from_queue(queue: list, cfg: dict, now_i: int) -> i
     return None
 
 
+def _trader_corevault_authoritative_expiry(wallet_address: str, cfg: dict) -> int | None:
+    """Return the actual CoreVault endsAt for the selected live TRADER session.
+
+    ENGINE-446: Shadow/slot runtime must not expire a live Trader earlier than the
+    CoreVault session. Local runtime_hours/session_started_ts are presentation/cache
+    values only once an on-chain TRADER session exists.
+    """
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return None
+    cfg = cfg if isinstance(cfg, dict) else {}
+    local_sid_hint = str(cfg.get("session_id") or cfg.get("sessionId") or "").strip().upper()
+    # This Shadow runtime is shared infrastructure; never let a Trader session's
+    # endsAt override an unrelated NKR/other runtime.
+    if not local_sid_hint or not local_sid_hint.startswith(("TRD", "TRADER")):
+        return None
+    chain_key = _normalize_chain_key(cfg.get("chain") or cfg.get("chain_key") or cfg.get("network") or "")
+    chain_id = int(_nkr_chain_id_from_key(chain_key) or 0) if chain_key else 0
+    explicit_sid = str(cfg.get("onchain_session_id") or cfg.get("onchainSessionId") or cfg.get("coreVaultSessionId") or "").strip()
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            sql = ("SELECT * FROM nexus_live_core_vault_sessions WHERE wallet_address=? AND engine='TRADER' "
+                   "AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR')")
+            args = [wa]
+            if chain_id > 0:
+                sql += " AND chain_id=?"
+                args.append(chain_id)
+            if explicit_sid.isdigit() and int(explicit_sid) > 0:
+                sql += " AND onchain_session_id=?"
+                args.append(explicit_sid)
+            sql += " ORDER BY created_ts DESC"
+            rows = [dict(r) for r in conn.execute(sql, tuple(args)).fetchall()]
+        finally:
+            conn.close()
+    except Exception:
+        rows = []
+    if not rows:
+        return None
+    # Without an explicit on-chain id only use an unambiguous same-chain live row.
+    if not explicit_sid and len(rows) > 1:
+        return None
+    row = rows[0]
+    try:
+        cid = int(row.get("chain_id") or 0)
+        vault = _norm_addr(row.get("vault_address") or "")
+        sid = int(str(row.get("onchain_session_id") or "0"))
+        if cid <= 0 or sid <= 0 or not _looks_like_evm_addr(vault):
+            return None
+        raw = _eth_call(cid, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+        words = _core_words(raw)
+        if len(words) < 13:
+            return None
+        owner = _norm_addr(_word_addr(words[0]))
+        system_id = int(words[2])
+        status_id = int(words[3])
+        ends_at = int(words[5])
+        if owner.lower() != wa.lower() or system_id != int(_CORE_SYSTEM_ID.get("TRADER", 1)):
+            return None
+        if status_id not in (1, 2, 3) or ends_at <= 0:
+            return None
+        return ends_at
+    except Exception:
+        return None
+
+
 def _nexus_shadow_expire_selected_session(cur, wallet_address: str, normalized: list, cfg: dict, expires_ts: int, now_i: int) -> list:
     """Pause all slots of the selected expired session and persist the decision.
 
@@ -21215,8 +21301,11 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     if action == "tick" and latest.get("status") == "paused":
         return {"runtime_status": "paused", "events": [{"type": "SHADOW_PAUSED", "message": "Shadow runtime is paused."}], "queue": normalized, "changed": [], "strategist": {"status": "paused"}}
 
-    # ENGINE-427: hard session window — only expire when endsAt is really past.
-    expires_ts = _nexus_session_expiry_ts_from_queue(normalized, cfg, ts)
+    # ENGINE-446: a live TRADER CoreVault session's endsAt is authoritative.
+    # Do not pause slots from stale frontend/local runtime_hours while the on-chain
+    # permission window is still active.
+    corevault_expires_ts = _trader_corevault_authoritative_expiry(wallet_address, cfg)
+    expires_ts = corevault_expires_ts or _nexus_session_expiry_ts_from_queue(normalized, cfg, ts)
     # Clear false SESSION_EXPIRED pauses while time remains.
     if expires_ts and ts < int(expires_ts):
         recovered = []
