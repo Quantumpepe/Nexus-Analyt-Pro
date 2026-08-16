@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.14-ENGINE-426-WORKER-ALIVE-SIMPLE-FLAT"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-428-TRADER-STOP-ONCHAIN-FINALIZE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -19157,12 +19157,21 @@ def api_nexus_core_vault_accounting():
 
 @app.route("/api/nexus/trading/control", methods=["POST"])
 def api_nexus_trading_control():
+    """Trader session control.
+
+    ENGINE-428: stop must also finalize the live CoreVault session on-chain
+    (startClosing → exit if needed → finalizeSession), same as NKR Stop & Exit.
+    Previously only the local execution_queue was updated — Create Session stayed
+    ACTIVE forever on POL/ETH/BNB.
+    """
     wa, error_resp = _nexus_wallet_from_request()
     if error_resp:
         return error_resp
     body = request.get_json(silent=True) or {}
     action = str(body.get("action") or "").lower().strip()
     session_id = str(body.get("session_id") or body.get("sessionId") or "").strip()
+    chain_raw = body.get("chain") or body.get("chainKey") or body.get("chain_id") or body.get("chainId") or ""
+    onchain_sid = str(body.get("onchainSessionId") or body.get("onchain_session_id") or body.get("coreVaultSessionId") or "").strip()
     if action not in ("start", "pause", "resume", "stop"):
         return err("unsupported trader control action", 400)
     if not session_id:
@@ -19181,10 +19190,57 @@ def api_nexus_trading_control():
         conn.commit()
         execution = _nexus_execution_summary(cur, wa)
         conn.close()
+
+    core_vault_finalize = []
+    if action == "stop":
+        # Prefer explicit on-chain id; else parse from TRD-... local ids; else all TRADER rows.
+        target_id = onchain_sid
+        if not target_id:
+            # Session ids often look like TRD-... or contain the numeric CoreVault id.
+            for part in reversed(str(session_id).replace("::", "-").split("-")):
+                if part.isdigit() and int(part) > 0:
+                    target_id = part
+                    break
+        target_chain = ""
+        try:
+            if str(chain_raw).isdigit():
+                target_chain = _nkr_chain_key_from_id(int(chain_raw)) or ""
+            else:
+                target_chain = str(chain_raw or "").upper()
+                aliases = {"BSC": "BNB", "BNB CHAIN": "BNB", "ETHEREUM": "ETH", "POLYGON": "POL", "MATIC": "POL"}
+                target_chain = aliases.get(target_chain, target_chain)
+        except Exception:
+            target_chain = str(chain_raw or "").upper()
+        try:
+            core_vault_finalize = _live_finalize_engine_sessions(
+                wa, "TRADER", target_id or None, target_chain or None
+            )
+        except Exception as stop_exc:
+            return jsonify({
+                "status": "error",
+                "error": "trader_live_stop_failed",
+                "message": str(stop_exc)[:400],
+                "session_id": session_id,
+                "onchainSessionId": target_id,
+                "chain": target_chain,
+                "affected_queue_rows": affected,
+            }), 500
+        # Also stop shadow/runtime rows so Strategist does not keep ticking.
+        try:
+            with DB_WRITE_LOCK:
+                conn = _db()
+                cur = conn.cursor()
+                _nexus_shadow_stop_session(cur, wa, session_id, target_chain)
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
+
     return jsonify({
         "status": "ok", "wallet": wa, "action": action,
         "session_id": session_id, "runtime_status": status_map[action],
         "affected_queue_rows": affected, "execution": execution,
+        "coreVaultFinalize": core_vault_finalize,
         "backend_is_state_master": True, "ts": now_ts(),
     })
 
@@ -20294,17 +20350,17 @@ def _nexus_shadow_stop_session(cur, wallet_address: str, session_id: str, chain:
 
 
 def _nexus_session_expiry_ts_from_queue(queue: list, cfg: dict, now_i: int) -> int | None:
-    """Return the authoritative session expiry timestamp (seconds) for a Shadow session.
+    """Return the authoritative session expiry timestamp (seconds).
+
+    ENGINE-427: never use min(stale slot expires) from previous sessions — that
+    caused ACTIVE sessions with time left to show "runtime expired" / Slot PAUSED.
 
     Priority:
-      1) explicit queue expires_ts / meta session_expires_ts
-      2) config expires_ts / session_expires_ts
-      3) earliest slot/session start + runtime_hours
-
-    This keeps the user-defined runtime as the hard autonomy window.
+      1) cfg endsAt / expires (current session permission window)
+      2) latest start among queue + runtime_hours
+      3) latest explicit expires on slots that is still >= latest start
     """
     cfg = cfg if isinstance(cfg, dict) else {}
-    candidates = []
 
     def _to_sec(v):
         try:
@@ -20313,38 +20369,52 @@ def _nexus_session_expiry_ts_from_queue(queue: list, cfg: dict, now_i: int) -> i
             n = float(v)
             if not math.isfinite(n) or n <= 0:
                 return None
-            # frontend Date.now() values may arrive in ms
             if n > 10_000_000_000:
                 n = n / 1000.0
             return int(n)
         except Exception:
             return None
 
-    for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
+    # 1) Config / on-chain style ends for THIS session only
+    for k in (
+        "endsAt", "ends_at", "endAt", "end_at",
+        "expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs",
+        "expires_at", "valid_until_ts",
+    ):
         vv = _to_sec(cfg.get(k))
         if vv:
-            candidates.append(vv)
+            return vv
 
     starts = []
+    expires_from_slots = []
     for item in queue if isinstance(queue, list) else []:
+        if not isinstance(item, dict):
+            continue
         meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts"):
-            vv = _to_sec(item.get(k) if k in item else meta.get(k))
-            if vv:
-                candidates.append(vv)
         for k in ("session_started_ts", "sessionStartedTs", "started_ts", "created_ts", "createdAt", "startedAt"):
             vv = _to_sec(item.get(k) if k in item else meta.get(k))
             if vv:
                 starts.append(vv)
-
-    if candidates:
-        # All slots in one selected session should share the same expiry. Use the earliest
-        # valid expiry as the safety boundary.
-        return min(candidates)
+        for k in ("expires_ts", "expiresAtTs", "session_expires_ts", "sessionExpiresTs", "expires_at", "valid_until_ts", "endsAt", "ends_at"):
+            vv = _to_sec(item.get(k) if k in item else meta.get(k))
+            if vv:
+                expires_from_slots.append(vv)
 
     runtime_hours = _clamp_float(cfg.get("runtime_hours", cfg.get("runtimeHours", 24)), 24, 1, 168)
-    if starts:
-        return int(min(starts) + runtime_hours * 3600)
+    latest_start = max(starts) if starts else None
+
+    if latest_start:
+        computed = int(latest_start + runtime_hours * 3600)
+        # Keep slot expires only if they belong to the current start window
+        valid_slot_exp = [e for e in expires_from_slots if e >= latest_start]
+        if valid_slot_exp:
+            # Prefer the furthest valid end for the current session (user may extend)
+            return max(max(valid_slot_exp), computed)
+        return computed
+
+    if expires_from_slots:
+        # No start known: use the latest expires (not the earliest stale one)
+        return max(expires_from_slots)
     return None
 
 
@@ -20810,10 +20880,37 @@ def _nexus_shadow_runtime_tick(cur, wallet_address: str, cfg: dict, action: str 
     if action == "tick" and latest.get("status") == "paused":
         return {"runtime_status": "paused", "events": [{"type": "SHADOW_PAUSED", "message": "Shadow runtime is paused."}], "queue": normalized, "changed": [], "strategist": {"status": "paused"}}
 
-    # Hard session-autonomy window: after expiry, the Strategist must not open new
-    # trades, re-enter slots, recycle cycles, or rebalance. It pauses the selected
-    # session visibly instead of deleting it.
+    # ENGINE-427: hard session window — only expire when endsAt is really past.
     expires_ts = _nexus_session_expiry_ts_from_queue(normalized, cfg, ts)
+    # Clear false SESSION_EXPIRED pauses while time remains.
+    if expires_ts and ts < int(expires_ts):
+        recovered = []
+        for item in normalized if isinstance(normalized, list) else []:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            st = str(item.get("status") or item.get("state") or "").upper()
+            if st == "PAUSED" and (
+                bool(item.get("session_expired"))
+                or bool(meta.get("session_expired"))
+                or str(meta.get("pause_reason") or "").upper() == "SESSION_EXPIRED"
+            ):
+                item["status"] = item["state"] = "READY"
+                item["session_expired"] = False
+                item["reason"] = "Session still within runtime window — Strategist resumed."
+                meta["session_status"] = "READY"
+                meta["runtime_status"] = "RUNNING"
+                meta["session_expired"] = False
+                meta["pause_reason"] = ""
+                meta["shadow_runtime_status"] = "running"
+                meta["session_expires_ts"] = int(expires_ts)
+                item["meta"] = meta
+                recovered.append(item.get("slot"))
+        if recovered:
+            try:
+                _nexus_shadow_persist_queue_preview(cur, wallet_address, normalized)
+            except Exception:
+                pass
     if expires_ts and ts >= int(expires_ts) and action not in ("stop", "pause"):
         changed = _nexus_shadow_expire_selected_session(cur, wallet_address, normalized, cfg, int(expires_ts), ts)
         return {
