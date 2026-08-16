@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-433-FORCE-FINALIZE-AFTER-EXIT-SUCCEEDED"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-434-NKR-TRADER-PARITY-FORCE-FINALIZE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1054,43 +1054,42 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 raise
 
     exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
-    # ENGINE-433: if already CLOSING (status 3) and exit already on-chain, skip re-exit.
+    # ENGINE-434: shared NKR+TRADER+GRID stop.
+    # 1) try orderly exit if open_assets > 0
+    # 2) if no real positionOf tokens (ghost openCount) OR status already CLOSING → finalize
     _prior_err = str(row.get("last_error") or "")
-    _exit_already = (
-        "exit_already_succeeded" in _prior_err
-        or "exit_already_succeeded" in str((row.get("meta") or {}))
-    )
-    if open_assets != 0 and not _exit_already:
+    if open_assets != 0:
         if eng not in ("NKR", "TRADER", "GRID"):
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
         try:
             exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
-            if bool(exit_result.get("executed")) or str(exit_result.get("txHash") or "").startswith("0x"):
-                _exit_already = True
         except Exception as exit_exc:
-            msg = str(exit_exc)
-            exit_result = {"executed": False, "txHash": "", "error": msg[:200]}
-            if "exit_already_succeeded" in msg:
-                _exit_already = True
-        raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
-        words = _core_words(raw)
-        if len(words) < 13:
-            raise RuntimeError("session_decode_failed_after_orderly_exit")
-        status_id = int(words[3])
-        open_assets = int(words[12])
-    # ENGINE-433: dust / zero positionOf / exit_already_succeeded → treat flat and finalize.
-    if open_assets != 0 or _exit_already:
+            exit_result = {"executed": False, "txHash": "", "error": str(exit_exc)[:240]}
+            if "exit_already_succeeded" in str(exit_exc):
+                _prior_err = str(exit_exc)
         try:
-            cfg = _privy_trading_cfg(chain_id)
+            raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
+            words = _core_words(raw)
+            if len(words) >= 13:
+                status_id = int(words[3])
+                open_assets = int(words[12])
+        except Exception:
+            pass
+    # Ghost / already-sold check (both engines)
+    if open_assets != 0:
+        try:
+            cfg = dict(_privy_trading_cfg(chain_id) or {})
             cfg["vault"] = vault
             real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
-            if (not bool(real.get("open"))) or _exit_already:
+            if not bool(real.get("open")):
                 open_assets = 0
         except Exception:
-            if _exit_already:
-                open_assets = 0
-    if open_assets != 0 and status_id == 3:
-        # Last resort after Start Closing: do not block finalize on ghost counter.
+            pass
+    if open_assets != 0 and (
+        int(status_id) == 3
+        or "exit_already_succeeded" in _prior_err
+        or "exit_already_succeeded" in str(exit_result.get("error") or "")
+    ):
         open_assets = 0
     if open_assets != 0:
         raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
@@ -1098,6 +1097,24 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
     finalize_tx = ""
     finalize_op_id = ""
     if status_id == 3:
+        # ENGINE-434: stale FINALIZE ops must not block retry (NKR + TRADER).
+        try:
+            _conn = _db()
+            try:
+                with DB_WRITE_LOCK:
+                    _conn.execute(
+                        "UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, "
+                        "error_text='engine434_retry_finalize' "
+                        "WHERE op_type='FINALIZE' AND wallet_address=? AND chain_id=? "
+                        "AND lower(vault_address)=? AND onchain_session_id=? "
+                        "AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING','FAILED')",
+                        (int(time.time()), _norm_addr(wallet), int(chain_id), str(vault).lower(), str(sid)),
+                    )
+                    _conn.commit()
+            finally:
+                _conn.close()
+        except Exception:
+            pass
         fin_op = _live_op_reserve(
             "FINALIZE",
             wallet=wallet, chain_id=chain_id, vault=vault, onchain_session_id=str(sid),
@@ -1218,7 +1235,7 @@ def _live_stop_worker(wallet: str, engine: str, rows: list[dict]):
     try:
         for row in rows:
             try:
-                results.append(_finalize_one_live_session(wallet, engine, row, allow_early_nkr_stop=(str(engine).upper() == "NKR")))
+                results.append(_finalize_one_live_session(wallet, engine, row, allow_early_nkr_stop=(str(engine).upper() in ("NKR", "TRADER", "GRID"))))
             except Exception as exc:
                 msg = str(exc)[:1000]
                 conn = _db()
@@ -1897,6 +1914,20 @@ def api_nexus_live_reservation_recover():
         status_id=int(s.get("statusId") or 0)
         open_assets=int(s.get("openAssetCount") or 0)
         ends_at=int(s.get("endsAt") or 0)
+        # ENGINE-434: CLOSING + ghost openCount (no real positionOf) is recoverable for NKR and TRADER.
+        ghost_flat = False
+        if status_id == 3 and open_assets > 0:
+            try:
+                cfg = dict(_privy_trading_cfg(chain_id) or {})
+                cfg["vault"] = vault_addr
+                real = _nkr_session_has_real_position(chain_id, vault_addr, int(s.get("sessionId") or 0), cfg)
+                if not bool(real.get("open")):
+                    ghost_flat = True
+                    open_assets = 0
+                    s["openAssetCount"] = 0
+                    s["ghostOpenCountCleared"] = True
+            except Exception:
+                pass
         expired_empty = bool(status_id in (1, 2) and open_assets == 0 and ends_at > 0 and ends_at <= nowi)
         closing_empty = bool(status_id == 3 and open_assets == 0)
         s["statusLabel"]=status_labels.get(status_id,f"UNKNOWN_{status_id}")
@@ -1908,7 +1939,9 @@ def api_nexus_live_reservation_recover():
             wallet=wa, chain_id=chain_id, vault=vault_addr, onchain_session_id=str(s.get("sessionId") or ""),
         )
         s["recoverable"]=bool(closing_empty or expired_empty)
-        if closing_empty:
+        if closing_empty and ghost_flat:
+            s["recoveryReason"]="CLOSING_GHOST_OPEN_COUNT"
+        elif closing_empty:
             s["recoveryReason"]="CLOSING_EMPTY"
         elif expired_empty:
             s["recoveryReason"]="EXPIRED_EMPTY"
@@ -33432,7 +33465,15 @@ def _read_router_selector_allowed(vault, router, selector, chain_id=1):
 
 
 def _encode_create_session(cfg, system_name, budget_units, duration_sec=86400, max_slippage_bps=100, max_loss_bps=1500, settlement_token=None):
-    system_id = int(cfg["systemIds"].get(system_name, 1))
+    _sys = str(system_name or "").strip().upper()
+    if _sys in ("TRADING", "TRADE"):
+        _sys = "TRADER"
+        system_name = "TRADER"
+    if _sys not in ("NKR", "TRADER", "GRID"):
+        raise RuntimeError(f"invalid_engine_system:{system_name}")
+    system_id = int(cfg["systemIds"].get(_sys, _CORE_SYSTEM_ID.get(_sys, -1)))
+    if int(system_id) < 0:
+        raise RuntimeError(f"missing_system_id_mapping:{_sys}")
     settlement = _norm_addr(settlement_token or cfg["usdc"])
     tuple_words = [
         _addr_to_32(settlement), _uint_to_32(system_id), _uint_to_32(budget_units),
