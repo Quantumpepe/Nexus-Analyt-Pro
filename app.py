@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-443-CLOSING-DUST-RESCUE-ROUTER-FIX"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-444-FINALIZE-AFTER-DUST-CLEAR-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -42667,9 +42667,12 @@ def _core_finalize_closing_session_async(wallet: str, row: dict) -> bool:
         eng = "TRADER"
     if eng not in {"NKR", "TRADER"}:
         return False
-    if "closing_dust_requires_contract_writeoff" in str((row or {}).get("last_error") or ""):
-        _live_engine_mark(eng, status="closing", decision="DUST_BLOCKED", gate_status="CONTRACT_DUST_WRITE_OFF_REQUIRED", reason=f"CoreVault session {(row or {}).get('onchain_session_id')} is blocked by contract dust; no retry transaction submitted", pending_tx="", last_error=str((row or {}).get("last_error") or "")[:1000])
-        return True
+    # ENGINE-444: never trust a persisted dust error as an authoritative blocker.
+    # A previously submitted residual EXIT can confirm after the local error was stored,
+    # leaving sessionOf().openAssetCount == 0 while last_error still contains the old
+    # dust marker. Short-circuiting here would then prevent finalizeSession forever.
+    # _finalize_one_live_session() always re-reads sessionOf() first and is the sole
+    # authority: openAssetCount==0 -> finalize; openAssetCount>0 -> orderly/dust exit.
     key = _nkr_closing_finalize_key(row)
     if key[0] <= 0 or not key[1] or not key[2]:
         return False
