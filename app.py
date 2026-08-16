@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-432-ORPHAN-STOP-BOTH-ENGINES-FINALIZE"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-433-FORCE-FINALIZE-AFTER-EXIT-SUCCEEDED"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1054,32 +1054,46 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 raise
 
     exit_result = {"executed": False, "txHash": "", "amountIn": 0, "amountOut": 0}
-    if open_assets != 0:
-        # ENGINE-367: GRID stop also exits open positions then finalizes (same as NKR/Trader).
+    # ENGINE-433: if already CLOSING (status 3) and exit already on-chain, skip re-exit.
+    _prior_err = str(row.get("last_error") or "")
+    _exit_already = (
+        "exit_already_succeeded" in _prior_err
+        or "exit_already_succeeded" in str((row.get("meta") or {}))
+    )
+    if open_assets != 0 and not _exit_already:
         if eng not in ("NKR", "TRADER", "GRID"):
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
         try:
             exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
+            if bool(exit_result.get("executed")) or str(exit_result.get("txHash") or "").startswith("0x"):
+                _exit_already = True
         except Exception as exit_exc:
-            exit_result = {"executed": False, "txHash": "", "error": str(exit_exc)[:200]}
+            msg = str(exit_exc)
+            exit_result = {"executed": False, "txHash": "", "error": msg[:200]}
+            if "exit_already_succeeded" in msg:
+                _exit_already = True
         raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
         words = _core_words(raw)
         if len(words) < 13:
             raise RuntimeError("session_decode_failed_after_orderly_exit")
         status_id = int(words[3])
         open_assets = int(words[12])
-        # ENGINE-432: ghost openAssetCount (dust/zero positionOf) must not block finalize forever.
-        if open_assets != 0:
-            try:
-                cfg = _privy_trading_cfg(chain_id)
-                cfg["vault"] = vault
-                real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
-                if not bool(real.get("open")):
-                    open_assets = 0
-            except Exception:
-                pass
-        if open_assets != 0:
-            raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
+    # ENGINE-433: dust / zero positionOf / exit_already_succeeded → treat flat and finalize.
+    if open_assets != 0 or _exit_already:
+        try:
+            cfg = _privy_trading_cfg(chain_id)
+            cfg["vault"] = vault
+            real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
+            if (not bool(real.get("open"))) or _exit_already:
+                open_assets = 0
+        except Exception:
+            if _exit_already:
+                open_assets = 0
+    if open_assets != 0 and status_id == 3:
+        # Last resort after Start Closing: do not block finalize on ghost counter.
+        open_assets = 0
+    if open_assets != 0:
+        raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
 
     finalize_tx = ""
     finalize_op_id = ""
@@ -19326,6 +19340,20 @@ def api_trader_stop_all_live():
             target_chain = aliases.get(target_chain, target_chain)
     except Exception:
         target_chain = str(chain_raw or "").upper()
+    # ENGINE-433: clear stuck ENTRY_INFLIGHT so stop/finalize is not blocked.
+    try:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute(
+                    "DELETE FROM nexus_nkr_entry_guards WHERE wallet_address=?",
+                    (_norm_addr(wa),),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
     all_results = []
     errors = []
     for eng in engines:
