@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-434-NKR-TRADER-PARITY-FORCE-FINALIZE"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-435-CLOSING-ALWAYS-FINALIZE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1075,22 +1075,28 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 open_assets = int(words[12])
         except Exception:
             pass
-    # Ghost / already-sold check (both engines)
-    if open_assets != 0:
+    # ENGINE-435: After Start Closing (status 3), ALWAYS proceed to finalize.
+    # openAssetCount alone is not trusted (ghost TON dust / exit_already_succeeded).
+    # One exit attempt above is enough; remaining counter must not block capital release.
+    if int(status_id) == 3:
+        open_assets = 0
+    elif open_assets != 0:
         try:
             cfg = dict(_privy_trading_cfg(chain_id) or {})
             cfg["vault"] = vault
+            # Prefer last known asset if present on row
+            try:
+                meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+                cfg["probeSymbol"] = str(meta.get("nkr_active_asset") or meta.get("active_asset") or "TON").upper()
+            except Exception:
+                pass
             real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
-            if not bool(real.get("open")):
+            if not bool(real.get("open")) or bool(real.get("ghostOpenCount")):
                 open_assets = 0
         except Exception:
             pass
-    if open_assets != 0 and (
-        int(status_id) == 3
-        or "exit_already_succeeded" in _prior_err
-        or "exit_already_succeeded" in str(exit_result.get("error") or "")
-    ):
-        open_assets = 0
+        if open_assets != 0 and "exit_already_succeeded" in (_prior_err + str(exit_result.get("error") or "")):
+            open_assets = 0
     if open_assets != 0:
         raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
 
@@ -1914,22 +1920,16 @@ def api_nexus_live_reservation_recover():
         status_id=int(s.get("statusId") or 0)
         open_assets=int(s.get("openAssetCount") or 0)
         ends_at=int(s.get("endsAt") or 0)
-        # ENGINE-434: CLOSING + ghost openCount (no real positionOf) is recoverable for NKR and TRADER.
+        # ENGINE-435: CLOSING is always recoverable (finalize releases capital).
         ghost_flat = False
-        if status_id == 3 and open_assets > 0:
-            try:
-                cfg = dict(_privy_trading_cfg(chain_id) or {})
-                cfg["vault"] = vault_addr
-                real = _nkr_session_has_real_position(chain_id, vault_addr, int(s.get("sessionId") or 0), cfg)
-                if not bool(real.get("open")):
-                    ghost_flat = True
-                    open_assets = 0
-                    s["openAssetCount"] = 0
-                    s["ghostOpenCountCleared"] = True
-            except Exception:
-                pass
+        if status_id == 3:
+            if open_assets > 0:
+                ghost_flat = True
+            open_assets = 0
+            s["openAssetCount"] = 0
+            s["ghostOpenCountCleared"] = True
         expired_empty = bool(status_id in (1, 2) and open_assets == 0 and ends_at > 0 and ends_at <= nowi)
-        closing_empty = bool(status_id == 3 and open_assets == 0)
+        closing_empty = bool(status_id == 3)  # always after force-flat above
         s["statusLabel"]=status_labels.get(status_id,f"UNKNOWN_{status_id}")
         s["rawStatusId"]=status_id
         s["engine"]=engine
