@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-449-TRADER-STOP-SYNC-ONCHAIN"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-450-TRADER-FORCE-STOP-ONCHAIN"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1049,7 +1049,7 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 }, ref, chain_id=chain_id)
                 close_tx = str(sent.get("hash") or sent.get("txHash") or "")
                 _live_op_update(close_op_id, "CONFIRMING", tx_hash=close_tx, expires_ts=int(time.time()) + 180)
-                _privy_wait_receipt(close_tx, timeout_sec=90, chain_id=chain_id)
+                _privy_wait_receipt(close_tx, timeout_sec=45, chain_id=chain_id)
                 _live_op_update(close_op_id, "SUCCEEDED", tx_hash=close_tx)
                 status_id = 3
             except Exception as close_exc:
@@ -19542,24 +19542,50 @@ def api_nexus_trading_control():
                     "affected_queue_rows": affected,
                 }), 400
 
-            # Build authoritative row from on-chain sessionOf (works even if registry empty).
+            # ENGINE-450: always resolve on-chain, upsert registry, then finalize in-thread
+            # with a hard surface of errors. Prefer sync path; if it fails, still return the error.
             exact_row = _trader_resolve_exact_core_session(wa, target_id, target_chain)
+            try:
+                # Ensure a durable registry row so diagnostics / worker retries work.
+                _live_session_register(
+                    wa, "TRADER",
+                    str(exact_row.get("privy_wallet_id") or ""),
+                    str(exact_row.get("vault_address") or ""),
+                    int(target_id),
+                    "",
+                    0,
+                    int(exact_row.get("chain_id") or 0),
+                    "CLOSING",
+                )
+            except Exception:
+                pass
             if int(exact_row.get("status_id") or 0) == 4:
                 core_vault_finalize = [{
                     "sessionId": int(target_id), "status": "already_finalized",
                     "chain": target_chain, "txHash": "",
                 }]
             else:
-                # SYNCHRONOUS finalize — request returns only after Start Closing + Finalize
-                # (or a real error). Async worker alone left sessions ACTIVE with no txs.
-                fin = _finalize_one_live_session(
-                    wa, "TRADER", exact_row, allow_early_nkr_stop=True
-                )
-                core_vault_finalize = [fin if isinstance(fin, dict) else {
-                    "sessionId": int(target_id), "status": "FINALIZED", "chain": target_chain,
-                    "result": str(fin)[:200],
-                }]
-                # Keep registry in sync
+                try:
+                    fin = _finalize_one_live_session(
+                        wa, "TRADER", exact_row, allow_early_nkr_stop=True
+                    )
+                    core_vault_finalize = [fin if isinstance(fin, dict) else {
+                        "sessionId": int(target_id),
+                        "status": "FINALIZED",
+                        "chain": target_chain,
+                        "result": str(fin)[:200],
+                    }]
+                except Exception as fin_exc:
+                    # Do not swallow: UI must show the real on-chain stop failure.
+                    return jsonify({
+                        "status": "error",
+                        "error": "trader_finalize_failed",
+                        "message": str(fin_exc)[:500],
+                        "session_id": session_id,
+                        "onchainSessionId": target_id,
+                        "chain": target_chain,
+                        "affected_queue_rows": affected,
+                    }), 500
                 try:
                     _reconcile_live_registry_from_corevault(wa, "TRADER")
                 except Exception:
