@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-431-NKR-TRADER-SESSION-SPLIT"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-432-ORPHAN-STOP-BOTH-ENGINES-FINALIZE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1058,13 +1058,26 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
         # ENGINE-367: GRID stop also exits open positions then finalizes (same as NKR/Trader).
         if eng not in ("NKR", "TRADER", "GRID"):
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
-        exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
+        try:
+            exit_result = _nkr_exit_all_open_positions(wallet, row, sid)
+        except Exception as exit_exc:
+            exit_result = {"executed": False, "txHash": "", "error": str(exit_exc)[:200]}
         raw = _eth_call(chain_id, vault, _core_selector("sessionOf(uint256)") + _uint_to_32(sid))
         words = _core_words(raw)
         if len(words) < 13:
             raise RuntimeError("session_decode_failed_after_orderly_exit")
         status_id = int(words[3])
         open_assets = int(words[12])
+        # ENGINE-432: ghost openAssetCount (dust/zero positionOf) must not block finalize forever.
+        if open_assets != 0:
+            try:
+                cfg = _privy_trading_cfg(chain_id)
+                cfg["vault"] = vault
+                real = _nkr_session_has_real_position(chain_id, vault, sid, cfg)
+                if not bool(real.get("open")):
+                    open_assets = 0
+            except Exception:
+                pass
         if open_assets != 0:
             raise RuntimeError(f"open_assets_require_orderly_exit:{open_assets}")
 
@@ -19277,19 +19290,32 @@ def api_nexus_trading_control():
     })
 
 
+@app.route("/api/live/stop-all-orphans", methods=["POST"])
+def api_live_stop_all_orphans():
+    return api_trader_stop_all_live()
+
+
 @app.route("/api/trader/stop-all-live", methods=["POST"])
 def api_trader_stop_all_live():
-    """ENGINE-430: finalize every ACTIVE/PAUSED/ERROR TRADER CoreVault session.
+    """ENGINE-432: release orphan live CoreVault capital without a session card.
 
-    Use when the Trading session card is gone but capital stays reserved on-chain
-    (orphan Create Session without Start Closing / Finalize).
-    Optional body: { "chain": "POL" | "ETH" | "BNB" } to limit to one chain.
+    Optional body: { "chain": "POL"|"ETH"|"BNB", "engines": ["TRADER","NKR"] }.
+
+    Why both engines: a Polygon Create Session started from Trading UI can still be
+    systemId=NKR on-chain if registration mismatched. Stopping only TRADER then
+    leaves POL #13 ACTIVE forever. We finalize TRADER and NKR on the requested chain.
     """
     wa, error_resp = _nexus_wallet_from_request()
     if error_resp:
         return error_resp
     body = request.get_json(silent=True) or {}
     chain_raw = body.get("chain") or body.get("chainKey") or body.get("chain_id") or body.get("chainId") or ""
+    engines = body.get("engines") or ["TRADER", "NKR"]
+    if isinstance(engines, str):
+        engines = [engines]
+    engines = [str(e).upper().replace("TRADING", "TRADER") for e in engines if str(e).strip()]
+    if not engines:
+        engines = ["TRADER", "NKR"]
     target_chain = ""
     try:
         if str(chain_raw).isdigit():
@@ -19300,30 +19326,33 @@ def api_trader_stop_all_live():
             target_chain = aliases.get(target_chain, target_chain)
     except Exception:
         target_chain = str(chain_raw or "").upper()
-    try:
-        # Rebuild registry from CoreVault so orphan Create Session rows are visible.
+    all_results = []
+    errors = []
+    for eng in engines:
         try:
-            _reconcile_live_registry_from_corevault(wa, "TRADER")
-        except Exception:
-            pass
-        results = _live_finalize_engine_sessions(wa, "TRADER", None, target_chain or None)
-        # If still empty, also try NKR-labeled rows on that chain that are system TRADER
-        # (mis-registered) — finalizer filters by engine column, so re-register as TRADER.
-        if not results:
             try:
-                _reconcile_live_registry_from_corevault(wa, "TRADER")
-                results = _live_finalize_engine_sessions(wa, "TRADER", None, target_chain or None)
+                _reconcile_live_registry_from_corevault(wa, eng)
             except Exception:
                 pass
-    except Exception as exc:
-        return jsonify({"status": "error", "error": "trader_stop_all_failed", "message": str(exc)[:400]}), 500
+            res = _live_finalize_engine_sessions(wa, eng, None, target_chain or None)
+            for r in (res or []):
+                if isinstance(r, dict):
+                    r = dict(r)
+                    r["engine"] = eng
+                    all_results.append(r)
+                else:
+                    all_results.append({"engine": eng, "raw": r})
+        except Exception as exc:
+            errors.append({"engine": eng, "error": str(exc)[:300]})
     return jsonify({
-        "status": "ok",
+        "status": "ok" if not errors else "partial",
         "wallet": wa,
         "action": "stop_all_live",
         "chain": target_chain or "ALL",
-        "coreVaultFinalize": results,
-        "message": "If results empty, no ACTIVE TRADER CoreVault session was found for this wallet/chain.",
+        "engines": engines,
+        "coreVaultFinalize": all_results,
+        "errors": errors,
+        "message": "Queued startClosing+finalize for matching live sessions. Check explorer for Start Closing / Finalize.",
         "ts": now_ts(),
     })
 
