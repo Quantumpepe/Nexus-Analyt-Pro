@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-444-FINALIZE-AFTER-DUST-CLEAR-FIX"
+BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-445-LIVE-OP-RETRY-IDEMPOTENCY-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -902,6 +902,10 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
         "NKR", status="closing", decision="EXIT_SUBMITTING", gate_status="ORDERLY_EXIT",
         reason="Selling open Ethereum position before CoreVault finalize", pending_tx="submitting", last_error=""
     )
+    # ENGINE-445: a re-armed FAILED/ABORTED operation MUST use the durable row's
+    # incremented attempt in the Privy idempotency key. Hard-coding attempt=1 caused
+    # retries to reuse the original Privy key, so a valid retry (including FINALIZE)
+    # could be suppressed/replayed even though the on-chain state had changed.
     # ENGINE-365: no timestamp in Privy key (defeats idempotency). Bind to session+token.
     call_fp = hashlib.sha256(str(call).encode("utf-8")).hexdigest()[:24]
     exit_op = _live_op_reserve(
@@ -920,7 +924,8 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
             return {"executed": True, "txHash": str(existing.get("tx_hash") or ""), "amountIn": amount_in, "amountOut": quote, "deduped": True}
         raise RuntimeError(f"exit_op_inflight:session={session_id}:status={(existing or {}).get('status') or 'ACTIVE'}")
     exit_op_id = str(exit_op.get("operation_id") or "")
-    ref = _live_op_privy_key(exit_op_id, call_fp, attempt=1)
+    exit_attempt = max(1, int(exit_op.get("attempt") or 1))
+    ref = _live_op_privy_key(exit_op_id, call_fp, attempt=exit_attempt)
     try:
         _live_op_update(exit_op_id, "SUBMITTING", request_body_hash=call_fp, privy_idempotency_key=ref)
         sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
@@ -1032,7 +1037,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
             close_op_id = str(close_op.get("operation_id") or "")
             close_data = _core_selector("startClosing(uint256)") + _uint_to_32(sid)
             body_hash = hashlib.sha256(close_data.encode("utf-8")).hexdigest()[:24]
-            ref = _live_op_privy_key(close_op_id, body_hash, attempt=1)
+            close_attempt = max(1, int(close_op.get("attempt") or 1))
+            ref = _live_op_privy_key(close_op_id, body_hash, attempt=close_attempt)
             _live_engine_mark(eng, status="closing", decision="STOPPING", reason="User stop: closing mode entered", pending_tx="submitting")
             try:
                 _live_op_update(close_op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref,
@@ -1102,6 +1108,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
                 _conn.close()
         except Exception:
             pass
+        # ENGINE-445: FINALIZE retry keeps the same business operation but gets a
+        # fresh Privy request key from its incremented durable attempt counter.
         fin_op = _live_op_reserve(
             "FINALIZE",
             wallet=wallet, chain_id=chain_id, vault=vault, onchain_session_id=str(sid),
@@ -1121,7 +1129,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
             finalize_op_id = str(fin_op.get("operation_id") or "")
             fin_data = _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid)
             body_hash = hashlib.sha256(fin_data.encode("utf-8")).hexdigest()[:24]
-            ref = _live_op_privy_key(finalize_op_id, body_hash, attempt=1)
+            finalize_attempt = max(1, int(fin_op.get("attempt") or 1))
+            ref = _live_op_privy_key(finalize_op_id, body_hash, attempt=finalize_attempt)
             try:
                 _live_op_update(finalize_op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref,
                                 expires_ts=int(time.time()) + 300)
