@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.16-ENGINE-452-FIX-QUEUE-SESSION-ID-COLUMN"
+BACKEND_BUILD_ID = "B-2026.08.17-ENGINE-453-DEFAULT-NEW-WALLET-WATCHLIST"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -15127,6 +15127,53 @@ def _db_set_user_app_state(wallet_address: str, payload: dict) -> tuple[dict, in
         conn.close()
 
 
+# ENGINE-453: public/new-wallet onboarding defaults.
+# A missing watchlist row means the wallet has never established its own list.
+# We seed exactly once; a persisted empty list remains authoritative, so users can
+# remove every default coin without them returning on the next login.
+NEXUS_DEFAULT_WATCH_ITEMS = [
+    {"symbol": "ETH", "mode": "market", "id": "ethereum", "coingecko_id": "ethereum", "name": "Ethereum"},
+    {"symbol": "BNB", "mode": "market", "id": "binancecoin", "coingecko_id": "binancecoin", "name": "BNB"},
+    {"symbol": "POL", "mode": "market", "id": "polygon-ecosystem-token", "coingecko_id": "polygon-ecosystem-token", "name": "POL"},
+    {"symbol": "LINK", "mode": "market", "id": "chainlink", "coingecko_id": "chainlink", "name": "Chainlink"},
+    {"symbol": "UNI", "mode": "market", "id": "uniswap", "coingecko_id": "uniswap", "name": "Uniswap"},
+]
+NEXUS_DEFAULT_COMPARE_SYMBOLS = ["ETH", "BNB", "POL", "LINK", "UNI"]
+
+def _ensure_new_wallet_market_defaults(wallet_address: str) -> bool:
+    wa = _norm_addr(wallet_address or "")
+    if not wa:
+        return False
+    conn = _db()
+    nowi = int(time.time() * 1000)
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM user_watchlists WHERE wallet_address=?", (wa,))
+            if cur.fetchone():
+                return False
+
+            clean = _watch_items_normalize(NEXUS_DEFAULT_WATCH_ITEMS)
+            cur.execute(
+                "INSERT INTO user_watchlists(wallet_address, items_json, updated_ts) VALUES(?,?,?)",
+                (wa, json.dumps(clean, separators=(",", ":")), nowi),
+            )
+
+            # Seed Compare only when there is no prior app-state row. Never overwrite
+            # an existing user's personal Compare selection/settings.
+            cur.execute("SELECT 1 FROM user_app_state WHERE wallet_address=?", (wa,))
+            if not cur.fetchone():
+                cur.execute(
+                    "INSERT INTO user_app_state(wallet_address, compare_json, timeframe, index_mode, ai_selected_json, ui_state_json, updated_ts) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (wa, json.dumps(NEXUS_DEFAULT_COMPARE_SYMBOLS, separators=(",", ":")), "90D", 1, "[]", "{}", nowi),
+                )
+            conn.commit()
+            return True
+    finally:
+        conn.close()
+
+
 def _rotation_session_id(sess: dict) -> str:
     if not isinstance(sess, dict):
         return ""
@@ -16508,26 +16555,17 @@ def api_watchlist():
         return out
 
     if wa:
+        _ensure_new_wallet_market_defaults(wa)
         items, updated_ts = _db_get_user_watchlist(wa)
         resp = {"status": "ok", "wallet": wa, "items": items, "updated_ts": updated_ts, "ts": now_ts()}
         out = jsonify(resp)
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return out
 
-    cache_key = "watchlist"
-    try:
-        data = get_watchlist()
-        resp = {"status": "ok", "items": data}
-        out = jsonify(resp)
-        out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return out
-    except Exception as e:
-        cached = _gen_cache_get_any(cache_key)
-        if cached is not None:
-            out = jsonify(cached)
-            out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-            return out
-        return err(str(e), 500)
+    # Public visitor: keep the landing experience populated without creating any wallet state.
+    out = jsonify({"status": "ok", "items": _watch_items_normalize(NEXUS_DEFAULT_WATCH_ITEMS), "public_default": True, "ts": now_ts()})
+    out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return out
 
 
 @app.route("/api/app-state", methods=["GET", "POST"])
@@ -16541,6 +16579,7 @@ def api_app_state():
         out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
         out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return out
+    _ensure_new_wallet_market_defaults(wa)
     state, updated_ts = _db_get_user_app_state(wa)
     out = jsonify({"status": "ok", "wallet": wa, "state": state, "updated_ts": updated_ts, "ts": now_ts()})
     out.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -16705,9 +16744,8 @@ def api_watchlist_snapshot():
             if wa:
                 items, _ = _db_get_user_watchlist(wa)
             else:
-                # Fallback to server-side watchlist for unauthenticated GET
-                wl = get_watchlist()
-                items = wl.get("items", []) if isinstance(wl, dict) else []
+                # Public visitor snapshot uses the same five default assets as the landing UI.
+                items = list(NEXUS_DEFAULT_WATCH_ITEMS)
 
         # ---- Normalize input items ----
         norm_items = []
