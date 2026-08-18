@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.18-ENGINE-454-COINGECKO-NEWS-PROXY"
+BACKEND_BUILD_ID = "B-2026.08.18-ENGINE-454-COINGECKO-TRENDS-MARKET-BRIEF"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -6952,45 +6952,44 @@ def coingecko_global_market():
         return jsonify({"error": "coingecko_global_failed", "detail": str(e)}), 502
 
 
-@app.route("/api/coingecko/news", methods=["GET"])
-def coingecko_news():
-    """Proxy CoinGecko Pro /news for the Strategist dashboard.
-
-    CoinGecko documents /news as a paid-plan endpoint. Keep the Pro key server-side
-    and return only the fields the Nexus UI needs. Generic _cg_get caching protects
-    the CoinGecko credit budget and deduplicates simultaneous browser refreshes.
-    """
-    if not COINGECKO_API_KEY:
-        return jsonify({"status": "error", "error": "coingecko_pro_key_missing", "items": []}), 503
+@app.route("/api/coingecko/trending", methods=["GET"])
+def coingecko_trending():
+    """Basic-plan compatible CoinGecko 24h search trends for Strategist discovery."""
+    url = f"{COINGECKO_BASE}/search/trending"
     try:
-        page = max(1, min(20, int(request.args.get("page", "1") or 1)))
-        per_page = max(1, min(20, int(request.args.get("per_page", "6") or 6)))
-    except Exception:
-        page, per_page = 1, 6
-
-    url = f"{COINGECKO_BASE}/news?page={page}&per_page={per_page}"
-    try:
-        data = _cg_get(url)
-        rows = data if isinstance(data, list) else []
-        items = []
-        for row in rows:
-            if not isinstance(row, dict):
+        data = _cg_get(url) or {}
+        rows = []
+        for entry in (data.get("coins") or []):
+            item = entry.get("item") if isinstance(entry, dict) else None
+            if not isinstance(item, dict):
                 continue
-            title = str(row.get("title") or "").strip()
-            if not title:
-                continue
-            items.append({
-                "title": title,
-                "url": str(row.get("url") or "").strip(),
-                "source_name": str(row.get("source_name") or "CoinGecko").strip(),
-                "author": str(row.get("author") or "").strip(),
-                "posted_at": row.get("posted_at"),
-                "type": str(row.get("type") or "news").strip(),
-                "related_coin_ids": row.get("related_coin_ids") if isinstance(row.get("related_coin_ids"), list) else [],
+            d = item.get("data") if isinstance(item.get("data"), dict) else {}
+            ch_map = d.get("price_change_percentage_24h") if isinstance(d.get("price_change_percentage_24h"), dict) else {}
+            change_24h = ch_map.get("usd")
+            try:
+                change_24h = float(change_24h) if change_24h is not None else None
+            except Exception:
+                change_24h = None
+            rows.append({
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "symbol": str(item.get("symbol") or "").upper(),
+                "marketCapRank": item.get("market_cap_rank"),
+                "score": item.get("score"),
+                "priceUsd": d.get("price"),
+                "change24h": change_24h,
+                "marketCap": d.get("market_cap"),
+                "totalVolume": d.get("total_volume"),
             })
-        return jsonify({"status": "ok", "items": items, "count": len(items), "source": "CoinGecko Pro"})
+        return jsonify({
+            "status": "ok",
+            "source": "coingecko_search_trending",
+            "coins": rows,
+            "count": len(rows),
+            "ts": now_ts(),
+        })
     except Exception as e:
-        return jsonify({"status": "error", "error": "coingecko_news_failed", "detail": str(e), "items": []}), 502
+        return jsonify({"status": "error", "error": "coingecko_trending_failed", "detail": str(e), "coins": []}), 502
 
 
 @app.route("/api/coingecko/token_price/<platform>", methods=["GET"])
