@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.17-ENGINE-453-DEFAULT-NEW-WALLET-WATCHLIST"
+BACKEND_BUILD_ID = "B-2026.08.18-ENGINE-454-COINGECKO-NEWS-PROXY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -6950,6 +6950,47 @@ def coingecko_global_market():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": "coingecko_global_failed", "detail": str(e)}), 502
+
+
+@app.route("/api/coingecko/news", methods=["GET"])
+def coingecko_news():
+    """Proxy CoinGecko Pro /news for the Strategist dashboard.
+
+    CoinGecko documents /news as a paid-plan endpoint. Keep the Pro key server-side
+    and return only the fields the Nexus UI needs. Generic _cg_get caching protects
+    the CoinGecko credit budget and deduplicates simultaneous browser refreshes.
+    """
+    if not COINGECKO_API_KEY:
+        return jsonify({"status": "error", "error": "coingecko_pro_key_missing", "items": []}), 503
+    try:
+        page = max(1, min(20, int(request.args.get("page", "1") or 1)))
+        per_page = max(1, min(20, int(request.args.get("per_page", "6") or 6)))
+    except Exception:
+        page, per_page = 1, 6
+
+    url = f"{COINGECKO_BASE}/news?page={page}&per_page={per_page}"
+    try:
+        data = _cg_get(url)
+        rows = data if isinstance(data, list) else []
+        items = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            if not title:
+                continue
+            items.append({
+                "title": title,
+                "url": str(row.get("url") or "").strip(),
+                "source_name": str(row.get("source_name") or "CoinGecko").strip(),
+                "author": str(row.get("author") or "").strip(),
+                "posted_at": row.get("posted_at"),
+                "type": str(row.get("type") or "news").strip(),
+                "related_coin_ids": row.get("related_coin_ids") if isinstance(row.get("related_coin_ids"), list) else [],
+            })
+        return jsonify({"status": "ok", "items": items, "count": len(items), "source": "CoinGecko Pro"})
+    except Exception as e:
+        return jsonify({"status": "error", "error": "coingecko_news_failed", "detail": str(e), "items": []}), 502
 
 
 @app.route("/api/coingecko/token_price/<platform>", methods=["GET"])
