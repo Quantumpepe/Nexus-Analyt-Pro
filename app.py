@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.18-ENGINE-454-COINGECKO-TRENDS-MARKET-BRIEF"
+BACKEND_BUILD_ID = "B-2026.08.19-ENGINE-455-WORKER-STATUS-RECONCILE"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -670,27 +670,57 @@ def _live_op_find_active(op_type: str, identity: dict, token: str = "", cycle_ke
 def _live_engine_mark(engine: str, **patch):
     """Update process-local and SQLite-backed runtime health.
 
-    SQLite persistence keeps System Info accurate across Gunicorn workers. A Grid
-    worker can tick in one process while the health request is served by another.
+    ENGINE-455: merge the newest persisted runtime before every write. Gunicorn
+    processes do not share Python globals, so a request handled by another process
+    must never overwrite newer NKR / Grid / Trader diagnostics with its stale local
+    copy. SQLite remains the cross-process runtime source of truth.
     """
     eng = str(engine or "").upper()
     if eng == "TRADING":
         eng = "TRADER"
     if eng not in _LIVE_ENGINE_RUNTIME:
         return
-    with _LIVE_ENGINE_RUNTIME_LOCK:
-        row = dict(_LIVE_ENGINE_RUNTIME.get(eng) or {})
-        row.update({k: v for k, v in patch.items() if v is not None})
-        if patch.get("tick"):
-            row["last_tick_ts"] = int(time.time())
-            row["tick_count"] = int(row.get("tick_count") or 0) + 1
-        row.pop("tick", None)
-        _LIVE_ENGINE_RUNTIME[eng] = row
+
     try:
         _live_engine_tables_init()
         conn = _db()
         try:
             with DB_WRITE_LOCK:
+                persisted = {}
+                try:
+                    dbrow = conn.execute(
+                        "SELECT payload_json FROM nexus_live_engine_runtime_health WHERE engine=?",
+                        (eng,),
+                    ).fetchone()
+                    if dbrow and dbrow["payload_json"]:
+                        persisted = json.loads(dbrow["payload_json"] or "{}")
+                        if not isinstance(persisted, dict):
+                            persisted = {}
+                except Exception:
+                    persisted = {}
+
+                with _LIVE_ENGINE_RUNTIME_LOCK:
+                    local = dict(_LIVE_ENGINE_RUNTIME.get(eng) or {})
+                    persisted_rank = (
+                        int(persisted.get("last_tick_ts") or 0),
+                        int(persisted.get("tick_count") or 0),
+                    )
+                    local_rank = (
+                        int(local.get("last_tick_ts") or 0),
+                        int(local.get("tick_count") or 0),
+                    )
+                    row = dict(persisted if persisted_rank >= local_rank else local)
+                    row.update({k: v for k, v in patch.items() if v is not None})
+                    if patch.get("tick"):
+                        row["last_tick_ts"] = int(time.time())
+                        row["tick_count"] = max(
+                            int(row.get("tick_count") or 0),
+                            int(persisted.get("tick_count") or 0),
+                            int(local.get("tick_count") or 0),
+                        ) + 1
+                    row.pop("tick", None)
+                    _LIVE_ENGINE_RUNTIME[eng] = row
+
                 conn.execute(
                     """INSERT INTO nexus_live_engine_runtime_health(engine,payload_json,updated_ts)
                        VALUES(?,?,?)
@@ -702,7 +732,16 @@ def _live_engine_mark(engine: str, **patch):
         finally:
             conn.close()
     except Exception:
-        pass
+        # Runtime health must never break trading execution. Keep the local copy
+        # usable even if SQLite is temporarily unavailable.
+        with _LIVE_ENGINE_RUNTIME_LOCK:
+            row = dict(_LIVE_ENGINE_RUNTIME.get(eng) or {})
+            row.update({k: v for k, v in patch.items() if v is not None})
+            if patch.get("tick"):
+                row["last_tick_ts"] = int(time.time())
+                row["tick_count"] = int(row.get("tick_count") or 0) + 1
+            row.pop("tick", None)
+            _LIVE_ENGINE_RUNTIME[eng] = row
 
 def _live_session_register(wallet, engine, wallet_id, vault, session_id, tx_hash, budget_units, chain_id=1, status="ACTIVE"):
     """Upsert live CoreVault session into local registry.
@@ -1563,20 +1602,35 @@ def _live_engine_health_payload(wallet=""):
 
         if eng == "NKR":
             thread = globals().get("_NKR_LIVE_WORKER_THREAD")
-            heartbeat = int(globals().get("_NKR_LIVE_WORKER_LAST_HEARTBEAT") or 0)
-            cycle_started = int(globals().get("_NKR_LIVE_WORKER_CYCLE_STARTED_TS") or 0)
-            cycle_completed = int(globals().get("_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS") or 0)
-            row["worker_thread_alive"] = bool(thread is not None and thread.is_alive())
-            row["worker_thread_name"] = str(getattr(thread, "name", "") or "")
+            local_alive = bool(thread is not None and thread.is_alive())
+            local_heartbeat = int(globals().get("_NKR_LIVE_WORKER_LAST_HEARTBEAT") or 0)
+            persisted_heartbeat = int(row.get("worker_heartbeat_ts") or 0)
+            heartbeat = max(local_heartbeat, persisted_heartbeat)
+            local_cycle_started = int(globals().get("_NKR_LIVE_WORKER_CYCLE_STARTED_TS") or 0)
+            local_cycle_completed = int(globals().get("_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS") or 0)
+            cycle_started = max(local_cycle_started, int(row.get("worker_cycle_started_ts") or 0))
+            cycle_completed = max(local_cycle_completed, int(row.get("worker_cycle_completed_ts") or 0))
+            fresh_persisted_heartbeat = bool(
+                persisted_heartbeat and nowi - persisted_heartbeat <= max(30, _NKR_LIVE_WORKER_INTERVAL_SEC * 2 + 10)
+            )
+            # Cluster/process-wide liveness: a request can land on another Gunicorn process.
+            # A fresh persisted heartbeat is therefore valid proof even when this process
+            # does not own the daemon thread object.
+            row["worker_thread_alive"] = bool(local_alive or fresh_persisted_heartbeat)
+            row["worker_thread_local"] = local_alive
+            row["worker_thread_name"] = str(getattr(thread, "name", "") or row.get("worker_thread_name") or "nkr-live-worker")
             row["worker_heartbeat_ts"] = heartbeat
             row["worker_heartbeat_age_sec"] = (nowi - heartbeat) if heartbeat else None
             row["worker_cycle_started_ts"] = cycle_started
             row["worker_cycle_started_age_sec"] = (nowi - cycle_started) if cycle_started else None
             row["worker_cycle_completed_ts"] = cycle_completed
             row["worker_cycle_completed_age_sec"] = (nowi - cycle_completed) if cycle_completed else None
-            row["worker_last_stage"] = str(globals().get("_NKR_LIVE_WORKER_LAST_STAGE") or "unknown")
-            row["worker_loop_count"] = int(globals().get("_NKR_LIVE_WORKER_LOOP_COUNT") or 0)
-            row["worker_heartbeat_stalled"] = bool(not heartbeat or nowi - heartbeat > max(5, _NKR_LIVE_WORKER_INTERVAL_SEC + 5))
+            if local_alive:
+                row["worker_last_stage"] = str(globals().get("_NKR_LIVE_WORKER_LAST_STAGE") or row.get("worker_last_stage") or "unknown")
+            else:
+                row["worker_last_stage"] = str(row.get("worker_last_stage") or "unknown")
+            row["worker_loop_count"] = max(int(globals().get("_NKR_LIVE_WORKER_LOOP_COUNT") or 0), int(row.get("worker_loop_count") or 0))
+            row["worker_heartbeat_stalled"] = bool(not heartbeat or nowi - heartbeat > max(30, _NKR_LIVE_WORKER_INTERVAL_SEC * 2 + 10))
             row["session_state_updated_ts"] = max([int(x.get("updated_ts") or 0) for x in live] or [0])
 
         out[eng] = row
@@ -43436,25 +43490,35 @@ def _nkr_live_worker_cycle() -> None:
                 _raw = _eth_call(_cid, _vault, _core_selector("sessionOf(uint256)") + _uint_to_32(_sid))
                 _words = _core_words(_raw)
                 _onchain_status = int(_words[3]) if len(_words) >= 4 else -1
+
+                # ENGINE-455: CoreVault sessionOf() is authoritative for every live worker row.
+                # A stale local CLOSING/PAUSED/ERROR state must never keep a confirmed ACTIVE
+                # session out of the worker or make System Info report the wrong lifecycle.
+                _status_map = {1: "ACTIVE", 2: "PAUSED", 3: "CLOSING", 4: "FINALIZED"}
+                _chain_status = _status_map.get(_onchain_status)
+                if _chain_status:
+                    _local_status = str((_row or {}).get("status") or "").upper()
+                    _row["status"] = _chain_status
+                    if _chain_status != _local_status:
+                        conn = _db()
+                        try:
+                            with DB_WRITE_LOCK:
+                                conn.execute(
+                                    "UPDATE nexus_live_core_vault_sessions SET status=?, updated_ts=?, last_error=NULL "
+                                    "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
+                                    (_chain_status, int(time.time()), _cid, _vault.lower(), str(_sid)),
+                                )
+                                conn.commit()
+                        finally:
+                            conn.close()
+
                 if _onchain_status == 3:
-                    _row = dict(_row)
-                    _row["status"] = "CLOSING"
-                    closing_rows.append(_row)
+                    closing_rows.append(dict(_row))
                 elif _onchain_status == 4:
-                    conn = _db()
-                    try:
-                        with DB_WRITE_LOCK:
-                            conn.execute(
-                                "UPDATE nexus_live_core_vault_sessions SET status='FINALIZED', updated_ts=?, last_error=NULL "
-                                "WHERE chain_id=? AND lower(vault_address)=? AND onchain_session_id=?",
-                                (int(time.time()), _cid, _vault.lower(), str(_sid)),
-                            )
-                            conn.commit()
-                    finally:
-                        conn.close()
                     if worker_engine == "NKR":
                         _nkr_set_exact_local_session_state(wallet, _cid, str(_sid), "FINALIZED", "On-chain session finalized")
             except Exception:
+                # Only trust local CLOSING as fallback when the authoritative RPC read itself failed.
                 if str((_row or {}).get("status") or "").upper() == "CLOSING":
                     closing_rows.append(dict(_row))
 
@@ -43700,7 +43764,7 @@ def _nkr_live_worker_cycle() -> None:
                     wallet_rows = nkr_rows
                     runnable_rows = [
                         r for r in wallet_rows
-                        if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+                        if str(r.get("status") or "").upper() in {"ACTIVE", "ERROR"}
                     ]
                 except Exception:
                     pass
@@ -43721,7 +43785,7 @@ def _nkr_live_worker_cycle() -> None:
             paused_rows = [r for r in open_rows if str((r or {}).get("status") or "").upper() == "PAUSED"]
             working_rows = [
                 r for r in (runnable_rows or [])
-                if str((r or {}).get("status") or "").upper() in {"ACTIVE", "ERROR", "CLOSING"}
+                if str((r or {}).get("status") or "").upper() in {"ACTIVE", "ERROR"}
             ]
             working_chain_ids = sorted({cid for cid in (_worker_chain_id(r) for r in working_rows) if cid > 0})
             paused_chain_ids = sorted({cid for cid in (_worker_chain_id(r) for r in paused_rows) if cid > 0})
@@ -44102,9 +44166,27 @@ def _nkr_live_worker_loop() -> None:
         _NKR_LIVE_WORKER_LOOP_COUNT += 1
         try:
             _NKR_LIVE_WORKER_LAST_STAGE = "cycle_running"
+            _live_engine_mark(
+                "NKR",
+                worker_heartbeat_ts=_NKR_LIVE_WORKER_LAST_HEARTBEAT,
+                worker_thread_name="nkr-live-worker",
+                worker_last_stage=_NKR_LIVE_WORKER_LAST_STAGE,
+                worker_loop_count=_NKR_LIVE_WORKER_LOOP_COUNT,
+                worker_process_pid=os.getpid(),
+            )
             _nkr_live_worker_cycle()
             _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = int(time.time())
             _NKR_LIVE_WORKER_LAST_STAGE = "cycle_completed"
+            _live_engine_mark(
+                "NKR",
+                worker_heartbeat_ts=_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS,
+                worker_cycle_started_ts=_NKR_LIVE_WORKER_CYCLE_STARTED_TS,
+                worker_cycle_completed_ts=_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS,
+                worker_thread_name="nkr-live-worker",
+                worker_last_stage=_NKR_LIVE_WORKER_LAST_STAGE,
+                worker_loop_count=_NKR_LIVE_WORKER_LOOP_COUNT,
+                worker_process_pid=os.getpid(),
+            )
         except Exception as exc:
             _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = int(time.time())
             _NKR_LIVE_WORKER_LAST_STAGE = "cycle_failed"
@@ -44145,6 +44227,17 @@ def _ensure_nkr_live_worker_started() -> None:
         thread.start()
         _NKR_LIVE_WORKER_THREAD = thread
         _NKR_LIVE_WORKER_STARTED = True
+        # ENGINE-455: publish startup immediately. This is diagnostics-only and makes
+        # liveness visible across Gunicorn workers before the first full market cycle ends.
+        try:
+            _now = int(time.time())
+            _live_engine_mark(
+                "NKR", worker_heartbeat_ts=_now, worker_thread_name=thread.name,
+                worker_last_stage="thread_started", worker_loop_count=_NKR_LIVE_WORKER_LOOP_COUNT,
+                worker_process_pid=os.getpid(),
+            )
+        except Exception:
+            pass
 
 
 def _nkr_session_matches_control_target(sess: dict, target_id: str, target_chain: str = "") -> bool:
