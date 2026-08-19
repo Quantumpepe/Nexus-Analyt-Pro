@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.19-ENGINE-455-WORKER-STATUS-RECONCILE"
+BACKEND_BUILD_ID = "B-2026.08.19-ENGINE-456-GRID-AUTORUN-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -13103,6 +13103,13 @@ def _nexus_snapshot_price(symbol: str) -> dict:
 GRID_SESSIONS: Dict[str, Dict[str, Any]] = {}    # key: item_id -> GridState
 GRID_CONFIGS: Dict[str, GridConfig] = {}    # key: item_id -> GridConfig
 GRID_AUTORUN: Dict[str, Dict[str, Any]] = {}  # item_id -> autorun worker state
+# ENGINE-456: Grid autorun survives backend deploy/restart and multiple Gunicorn workers.
+# The session/config state is persisted, but Python thread objects are process-local.
+# A short SQLite lease guarantees that only one process owns a Grid ticker per item.
+_GRID_AUTORUN_OWNER_TOKEN = f"{os.getpid()}:{uuid.uuid4().hex}"
+_GRID_AUTORUN_RESTORE_LOCK = threading.RLock()
+_GRID_AUTORUN_RESTORE_LAST_TS = 0.0
+_GRID_AUTORUN_RESTORE_INTERVAL_SEC = 5.0
 
 # Load persisted grid sessions/configs (best-effort)
 try:
@@ -31823,59 +31830,172 @@ def _get_live_price_for_item(item_id: str) -> Optional[float]:
     return None
 
 
+def _grid_autorun_lease_table_init() -> None:
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS nexus_grid_autorun_leases (
+                    item_id TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    expires_ts INTEGER NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )"""
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _grid_autorun_lease_acquire(item_id: str, interval: float = 10.0) -> bool:
+    """Acquire/refresh the cross-process Grid ticker lease for one item."""
+    item_id = str(item_id or "").strip()
+    if not item_id:
+        return False
+    ttl = max(30, int(max(2.0, float(interval or 10.0)) * 3.0))
+    nowi = int(time.time())
+    _grid_autorun_lease_table_init()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT owner_token, expires_ts FROM nexus_grid_autorun_leases WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            owner = str(row["owner_token"] or "") if row else ""
+            expires = int(row["expires_ts"] or 0) if row else 0
+            if row and owner != _GRID_AUTORUN_OWNER_TOKEN and expires > nowi:
+                conn.rollback()
+                return False
+            conn.execute(
+                """INSERT INTO nexus_grid_autorun_leases(item_id,owner_token,expires_ts,updated_ts)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(item_id) DO UPDATE SET
+                     owner_token=excluded.owner_token, expires_ts=excluded.expires_ts, updated_ts=excluded.updated_ts""",
+                (item_id, _GRID_AUTORUN_OWNER_TOKEN, nowi + ttl, nowi),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        conn.close()
+
+
+def _grid_autorun_lease_release(item_id: str) -> None:
+    try:
+        _grid_autorun_lease_table_init()
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute(
+                    "DELETE FROM nexus_grid_autorun_leases WHERE item_id=? AND owner_token=?",
+                    (str(item_id or ""), _GRID_AUTORUN_OWNER_TOKEN),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _restore_persisted_grid_autoruns() -> None:
+    """Restart persisted running Grid sessions after deploy/restart.
+
+    Called from the request boot hook and throttled per process. The SQLite lease
+    prevents duplicate live Grid workers when Gunicorn has more than one process.
+    """
+    global _GRID_AUTORUN_RESTORE_LAST_TS
+    nowf = time.time()
+    with _GRID_AUTORUN_RESTORE_LOCK:
+        if nowf - float(_GRID_AUTORUN_RESTORE_LAST_TS or 0.0) < _GRID_AUTORUN_RESTORE_INTERVAL_SEC:
+            return
+        _GRID_AUTORUN_RESTORE_LAST_TS = nowf
+    for item_id, sess in list((GRID_SESSIONS or {}).items()):
+        if not isinstance(sess, dict):
+            continue
+        running = bool(sess.get("running", True)) and not bool(sess.get("stopped", False))
+        autorun = bool(sess.get("autorun", True))
+        if not running or not autorun:
+            continue
+        try:
+            interval = max(2.0, float(sess.get("autorun_interval") or 10.0))
+        except Exception:
+            interval = 10.0
+        _ensure_grid_autorun(str(item_id), interval)
+
+
 def _ensure_grid_autorun(item_id: str, interval: float = 10.0) -> None:
-    """Start exactly one process-local Grid ticker for this item."""
+    """Start exactly one live Grid ticker across all Gunicorn processes."""
     item_id = str(item_id or "").strip()
     if not item_id:
         return
+    interval = max(2.0, float(interval or 10.0))
     current = GRID_AUTORUN.get(item_id)
     if current and current.get("thread") and current["thread"].is_alive():
+        _grid_autorun_lease_acquire(item_id, interval)
+        return
+    if not _grid_autorun_lease_acquire(item_id, interval):
         return
     stop_evt = threading.Event()
     th = threading.Thread(
         target=_autorun_loop,
-        args=(item_id, stop_evt, max(2.0, float(interval or 10.0))),
+        args=(item_id, stop_evt, interval),
         daemon=True,
         name=f"grid-live-worker-{item_id}-{int(time.time())}",
     )
-    GRID_AUTORUN[item_id] = {"stop": stop_evt, "thread": th, "interval": max(2.0, float(interval or 10.0))}
+    GRID_AUTORUN[item_id] = {"stop": stop_evt, "thread": th, "interval": interval}
     th.start()
 
 
 def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
     """Background loop: refresh live price, tick Grid, and publish health."""
-    while not stop_evt.is_set():
-        try:
-            session = GRID_SESSIONS.get(item_id)
-            if session and bool(session.get("running", True)) and not bool(session.get("stopped", False)):
-                p = _get_live_price_for_item(item_id)
-                updated = _sim_tick(session, new_price=p)
-                _grid_sessions_set(item_id, _trim_grid_session(updated))
-                try:
-                    _grid_sync_session_orders_to_db(
-                        session.get("wallet_address") or "", item_id,
-                        updated.get("orders") or [], chain=_grid_chain_key(item_id)
-                    )
-                except Exception:
-                    pass
-                _persist_grid_state()
-                open_orders = [o for o in (updated.get("orders") or []) if isinstance(o, dict) and str(o.get("status") or "").upper() == "OPEN"]
-                symbol = _symbol_from_item(item_id)
-                _live_engine_mark(
-                    "GRID", tick=True, status="running", assets_scanned=1,
-                    tradable_assets=(1 if open_orders else 0), best_candidate=symbol,
-                    candidate_price=float(updated.get("price") or p or 0),
-                    decision=("MONITOR" if open_orders else "IDLE"),
-                    reason=(f"Monitoring {len(open_orders)} active Grid order(s) on {_grid_chain_key(item_id)}" if open_orders else "No open Grid orders"),
-                    last_error="", pending_tx="",
-                )
-            else:
-                _live_engine_mark("GRID", status="idle", decision="IDLE", reason="No running Grid session")
+    try:
+        while not stop_evt.is_set():
+            # Renew ownership before every live tick. If another process owns a fresh
+            # lease, this stale process exits instead of double-ticking/executing Grid.
+            if not _grid_autorun_lease_acquire(item_id, interval):
                 break
-        except Exception as exc:
-            _live_engine_mark("GRID", tick=True, status="error", decision="ERROR", reason="Grid worker tick failed", last_error=str(exc)[:1000])
-        stop_evt.wait(interval)
-
+            try:
+                session = GRID_SESSIONS.get(item_id)
+                if session and bool(session.get("running", True)) and not bool(session.get("stopped", False)):
+                    p = _get_live_price_for_item(item_id)
+                    updated = _sim_tick(session, new_price=p)
+                    _grid_sessions_set(item_id, _trim_grid_session(updated))
+                    try:
+                        _grid_sync_session_orders_to_db(
+                            session.get("wallet_address") or "", item_id,
+                            updated.get("orders") or [], chain=_grid_chain_key(item_id)
+                        )
+                    except Exception:
+                        pass
+                    _persist_grid_state()
+                    open_orders = [o for o in (updated.get("orders") or []) if isinstance(o, dict) and str(o.get("status") or "").upper() == "OPEN"]
+                    symbol = _symbol_from_item(item_id)
+                    _live_engine_mark(
+                        "GRID", tick=True, status="running", assets_scanned=1,
+                        tradable_assets=(1 if open_orders else 0), best_candidate=symbol,
+                        candidate_price=float(updated.get("price") or p or 0),
+                        decision=("MONITOR" if open_orders else "IDLE"),
+                        reason=(f"Monitoring {len(open_orders)} active Grid order(s) on {_grid_chain_key(item_id)}" if open_orders else "No open Grid orders"),
+                        last_error="", pending_tx="",
+                    )
+                else:
+                    _live_engine_mark("GRID", status="idle", decision="IDLE", reason="No running Grid session")
+                    break
+            except Exception as exc:
+                _live_engine_mark("GRID", tick=True, status="error", decision="ERROR", reason="Grid worker tick failed", last_error=str(exc)[:1000])
+            stop_evt.wait(interval)
+    finally:
+        _grid_autorun_lease_release(item_id)
+        cur = GRID_AUTORUN.get(item_id)
+        if cur and cur.get("thread") is threading.current_thread():
+            GRID_AUTORUN.pop(item_id, None)
 
 # --- (dedup) removed duplicate route definitions (kept first set) ---
 
@@ -47401,6 +47521,12 @@ def api_nexus_system_info_evm_diagnostics():
 @app.before_request
 def _boot_nkr_live_worker_once():
     _ensure_nkr_live_worker_started()
+    # ENGINE-456: persisted Grid sessions survive deploys, but their Python ticker
+    # threads do not. Recover them lazily and safely on normal backend traffic.
+    try:
+        _restore_persisted_grid_autoruns()
+    except Exception as exc:
+        _live_engine_mark("GRID", status="error", decision="RESTORE_FAILED", reason="Persisted Grid worker recovery failed", last_error=str(exc)[:1000])
     return None
 
 # ENGINE-351: isolated ETH/POL readiness audit with a BNB regression snapshot.
