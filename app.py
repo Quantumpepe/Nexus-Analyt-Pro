@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.19-ENGINE-456-GRID-AUTORUN-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-458-SESSION-SETTINGS-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -8337,7 +8337,7 @@ def _grid_db_delete_order(conn, wallet_address: str, item_id: str, oid: str, cha
 
     return rc
 
-def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: list, chain: str = "") -> None:
+def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: list, chain: str = "", current_price=None) -> None:
     """Mirror in-memory session order statuses into SQLite so /api/grid/orders stays authoritative."""
     wa = _norm_addr(wallet_address or "")
     if not wa or not item_id or not isinstance(orders, list):
@@ -8363,6 +8363,9 @@ def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: l
                     "cancelled_ts": o.get("cancelled_ts"),
                     "usd": o.get("usd"),
                     "source": o.get("source"),
+                    # ENGINE-457: wallet-wide Grid UI must mark each order with the
+                    # price from its own running session, never the currently selected chain.
+                    "current_price": current_price if current_price is not None else o.get("current_price"),
                 }
                 meta_json = json.dumps({k: v for k, v in meta.items() if v is not None}, separators=(",", ":"))
                 cur.execute(
@@ -24569,7 +24572,7 @@ def api_grid_tick():
     _persist_grid_state()
 
     try:
-        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, updated.get("orders") or [], chain=_grid_chain_key(item_id))
+        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, updated.get("orders") or [], chain=_grid_chain_key(item_id), current_price=updated.get("price"))
     except Exception:
         pass
 
@@ -24740,7 +24743,7 @@ def api_grid_stop():
     session["running"] = False
     _grid_sessions_set(item_id, _trim_grid_session(session))
     try:
-        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, session.get("orders") or [], chain=chain_eff or _grid_chain_key(item_id))
+        _grid_sync_session_orders_to_db(session.get("wallet_address") or wa, item_id, session.get("orders") or [], chain=chain_eff or _grid_chain_key(item_id), current_price=session.get("price"))
     except Exception:
         pass
 
@@ -31970,7 +31973,7 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
                     try:
                         _grid_sync_session_orders_to_db(
                             session.get("wallet_address") or "", item_id,
-                            updated.get("orders") or [], chain=_grid_chain_key(item_id)
+                            updated.get("orders") or [], chain=_grid_chain_key(item_id), current_price=updated.get("price")
                         )
                     except Exception:
                         pass
@@ -46303,15 +46306,10 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
     settings = settings if isinstance(settings, dict) else {}
     market_by_sym = _nkr_market_row_map(market_rows)
     nowi = int(time.time() * 1000)
-    # ENGINE-127: normalize every NKR session to the selected NKR Period before
-    # any status or executor decision. Observation windows never expire a run.
-    period_hours = _nkr_normalize_period_hours(settings.get("nkrPeriodHours"), settings.get("nkrPeriodValue"), settings.get("nkrPeriodUnit"), settings.get("nkrPeriodDays") or settings.get("periodDays") or NEXUS_NKR_DEFAULT_PERIOD_DAYS)
-    period_days = period_hours / 24.0
-    sessions, campaign_clock = _nkr_apply_campaign_clock(
-        [dict(x) for x in (sessions or []) if isinstance(x, dict)],
-        period_days, period_hours=period_hours,
-    )
-    campaign_expires = int((campaign_clock or {}).get("expiresAt") or 0)
+    # ENGINE-458: never normalize running sessions from the current UI draft.
+    # Each NKR session owns the immutable start settings captured at creation.
+    sessions = [dict(x) for x in (sessions or []) if isinstance(x, dict)]
+    campaign_clock = {}
     default_mode = _nkr_normalize_performance_mode(settings.get("nkrCapitalMode") or settings.get("mode") or "DYNAMIC")
     min_score_by_mode = {"AGGRESSIVE": 51.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}
     profit_lock_by_mode = {"AGGRESSIVE": 2.8, "DYNAMIC": 2.0, "TACTICAL": 1.7, "DEFENSIVE": 1.2}
@@ -46332,8 +46330,33 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if not isinstance(sess, dict) or not _nkr_is_session(sess):
             active.append(sess)
             continue
+        # ENGINE-458: resolve the exact immutable settings for THIS session before any
+        # lifecycle/strategy decision. Current wallet/UI settings are never authoritative.
+        sess_meta0 = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
+        chain_id0 = int(sess.get("chainId") or sess.get("chain_id") or sess_meta0.get("chain_id") or 0)
+        sid0 = str(sess.get("onchainSessionId") or sess.get("onchain_session_id") or sess.get("coreVaultSessionId") or sess_meta0.get("onchain_session_id") or sess_meta0.get("core_vault_session_id") or "")
+        cfg_row = dict(sess)
+        cfg_row["chain_id"] = chain_id0
+        cfg_row["onchain_session_id"] = sid0
+        # The API wrapper overlays the exact DB snapshot before calling this function;
+        # from here on the row itself is the immutable per-session strategy source.
+        session_mode = _nkr_normalize_performance_mode(
+            sess.get("nkrCapitalMode") or sess.get("performanceMode") or sess.get("capitalMode") or
+            sess_meta0.get("nkr_capital_mode") or sess_meta0.get("performance_mode") or sess_meta0.get("capital_mode") or
+            default_mode
+        )
+        session_period_hours = _nkr_normalize_period_hours(
+            sess.get("nkrPeriodHours") or sess.get("runtimeHours") or sess_meta0.get("nkr_period_hours") or sess_meta0.get("runtime_hours"),
+            sess.get("nkrPeriodValue") if sess.get("nkrPeriodValue") is not None else sess_meta0.get("nkr_period_value"),
+            sess.get("nkrPeriodUnit") or sess_meta0.get("nkr_period_unit"),
+            sess.get("nkrPeriodDays") or sess.get("periodDays") or sess_meta0.get("nkr_period_days") or NEXUS_NKR_DEFAULT_PERIOD_DAYS,
+        )
+        session_started = int(_safe_float(sess.get("campaignStartedAt") or sess.get("startedAt") or sess.get("createdAt") or sess_meta0.get("campaign_started_at") or 0, 0.0))
+        session_expires = int(_safe_float(sess.get("campaignExpiresAt") or sess.get("expiresAt") or sess.get("expires_at") or sess_meta0.get("campaign_expires_at") or 0, 0.0))
+        if session_expires <= 0 and session_started > 0:
+            session_expires = session_started + int(session_period_hours * 3600000)
         status_u = str(sess.get("status") or "").upper()
-        if campaign_expires and nowi >= campaign_expires and status_u not in {"STOPPED", "CLOSED", "CANCELLED", "DELETED", "ARCHIVED"}:
+        if session_expires and nowi >= session_expires and status_u not in {"STOPPED", "CLOSED", "CANCELLED", "DELETED", "ARCHIVED"}:
             expired = dict(sess)
             expired.update({
                 "status": "EXPIRED",
@@ -46360,11 +46383,23 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         elif chain in {"BSC", "56"}: chain = "BNB"
         elif chain in {"POLYGON", "MATIC", "137"}: chain = "POL"
         sess_meta_mode = sess.get("meta") if isinstance(sess.get("meta"), dict) else {}
-        mode = _nkr_normalize_performance_mode(
-            sess.get("nkrCapitalMode") or sess.get("performanceMode") or sess.get("mode") or
-            sess_meta_mode.get("nkr_capital_mode") or sess_meta_mode.get("performance_mode") or
-            sess_meta_mode.get("start_mode") or default_mode
-        )
+        mode = session_mode
+        # Stamp the immutable settings back onto every processed row so later persistence
+        # cannot replace them with the current UI draft.
+        sess["nkrCapitalMode"] = mode
+        sess["capitalMode"] = mode
+        sess["nkrPeriodHours"] = session_period_hours
+        sess["runtimeHours"] = session_period_hours
+        sess["nkrPeriodDays"] = session_period_hours / 24.0
+        sess["periodDays"] = session_period_hours / 24.0
+        sess["campaignExpiresAt"] = session_expires or sess.get("campaignExpiresAt")
+        sess_meta_mode = dict(sess_meta_mode)
+        sess_meta_mode.update({
+            "nkr_capital_mode": mode, "capital_mode": mode, "performance_mode": mode,
+            "nkr_period_hours": session_period_hours, "runtime_hours": session_period_hours,
+            "nkr_period_days": session_period_hours / 24.0, "start_mode_locked": True,
+        })
+        sess["meta"] = sess_meta_mode
         dispatch_min = min_score_by_mode.get(mode, 62.0)
         profit_lock_pct = profit_lock_by_mode.get(mode, 2.0)
         trailing_activation_pct = trailing_activation_by_mode.get(mode, 0.65)
@@ -46623,40 +46658,88 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         if event:
             messages.append(f"{sym}: {action} net ${net:.2f}")
 
-    # ENGINE-102: Dynamic must also rotate capital when a live winner clearly
-    # outranks an aging weak session. Aggressive remains faster; Dynamic is stricter.
-    reallocation_summary = {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": []}
-    if mode in {"AGGRESSIVE", "DYNAMIC"}:
-        active, reallocation_summary = _nkr_mode_reallocation_pass(active, market_by_sym, nowi, dispatch_min, mode=mode)
-        if reallocation_summary.get("changed"):
-            changed = True
-            messages.append(
-                f"{mode}_REALLOCATION released ${_safe_float(reallocation_summary.get('releasedUsd'), 0.0):.2f}"
-            )
+    # ENGINE-458: post-tick allocation/reallocation must also stay session-mode isolated.
+    # Never use the last loop's mode for every running session. Process each immutable
+    # performance group independently; mixed Aggressive/Dynamic/Tactical/Defensive runs
+    # therefore cannot rewrite one another's policy.
+    terminal_states = {"STOPPED", "CLOSED", "CANCELLED", "EXPIRED", "DELETED", "ARCHIVED", "PROTECTED", "REBALANCED_OUT", "WAITING_REALLOCATION", "WATCH_POOL"}
+    static_rows = []
+    groups = {}
+    group_order = []
+    for row in active:
+        if not isinstance(row, dict) or not _nkr_is_session(row) or str(row.get("status") or "").upper() in terminal_states:
+            static_rows.append(row)
+            continue
+        rm = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        row_mode = _nkr_normalize_performance_mode(
+            row.get("nkrCapitalMode") or row.get("performanceMode") or row.get("capitalMode") or
+            rm.get("nkr_capital_mode") or rm.get("performance_mode") or rm.get("capital_mode") or "DYNAMIC"
+        )
+        if row_mode not in groups:
+            groups[row_mode] = []
+            group_order.append(row_mode)
+        groups[row_mode].append(row)
 
-    # ENGINE-088: after weak sessions are released, continue scanning the entire watchlist.
-    # Do not auto-fill to 10, but do promote multiple strong green candidates when
-    # there is available stable capital and market breadth supports it.
-    promotion_summary = {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": []}
-    if mode in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
-        active, promotion_summary = _nkr_watchlist_green_promotion_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings={**settings, "nkrCapitalMode": mode})
-        if promotion_summary.get("changed"):
-            changed = True
-            messages.append(
-                f"WATCHLIST_GREEN_PROMOTION allocated ${_safe_float(promotion_summary.get('allocatedUsd'), 0.0):.2f} to {','.join(promotion_summary.get('promoted') or [])}"
-            )
+    reallocation_summary = {"changed": False, "events": 0, "releasedUsd": 0.0, "targets": [], "byMode": {}}
+    promotion_summary = {"changed": False, "events": 0, "allocatedUsd": 0.0, "promoted": [], "byMode": {}}
+    deploy_summary = {"changed": False, "allocatedUsd": 0.0, "targets": [], "byMode": {}}
+    processed_groups = []
 
-    # ENGINE-090: if stable capital is still idle after reallocation/promotion,
-    # deploy it across the already-active winner sessions. This does NOT auto-fill
-    # session count; it only fixes the capital allocator gap.
-    deploy_summary = {"changed": False, "allocatedUsd": 0.0}
-    if mode in {"AGGRESSIVE", "DYNAMIC", "TACTICAL", "DEFENSIVE"}:
-        active, deploy_summary = _nkr_aggressive_deploy_available_capital_pass(active, market_by_sym, nowi, dispatch_min, total_budget, settings={**settings, "nkrCapitalMode": mode})
-        if deploy_summary.get("changed"):
+    for group_mode in group_order:
+        group_rows = groups.get(group_mode) or []
+        group_dispatch_min = min_score_by_mode.get(group_mode, 62.0)
+        explicit_totals = [
+            _safe_float(x.get("totalNkrBudgetUsd") or (x.get("meta") or {}).get("nkr_total_budget_usd") or 0, 0.0)
+            for x in group_rows if isinstance(x, dict)
+        ]
+        group_budget = max(explicit_totals or [0.0])
+        if group_budget <= 0:
+            group_budget = sum(_safe_float(x.get("workingCapitalUsd") or x.get("budgetUsd") or 0, 0.0) for x in group_rows if isinstance(x, dict))
+
+        group_rows, rsum = _nkr_mode_reallocation_pass(group_rows, market_by_sym, nowi, group_dispatch_min, mode=group_mode)
+        reallocation_summary["byMode"][group_mode] = rsum
+        if rsum.get("changed"):
             changed = True
-            messages.append(
-                f"AVAILABLE_CAPITAL_DEPLOYED ${_safe_float(deploy_summary.get('allocatedUsd'), 0.0):.2f} to {','.join(deploy_summary.get('targets') or [])}"
-            )
+            reallocation_summary["changed"] = True
+            reallocation_summary["events"] += int(rsum.get("events") or 0)
+            reallocation_summary["releasedUsd"] += _safe_float(rsum.get("releasedUsd"), 0.0)
+            reallocation_summary["targets"].extend(rsum.get("targets") or [])
+            messages.append(f"{group_mode}_REALLOCATION released ${_safe_float(rsum.get('releasedUsd'), 0.0):.2f}")
+
+        group_rows, psum = _nkr_watchlist_green_promotion_pass(
+            group_rows, market_by_sym, nowi, group_dispatch_min, group_budget, settings={"nkrCapitalMode": group_mode}
+        )
+        promotion_summary["byMode"][group_mode] = psum
+        if psum.get("changed"):
+            changed = True
+            promotion_summary["changed"] = True
+            promotion_summary["events"] += int(psum.get("events") or 0)
+            promotion_summary["allocatedUsd"] += _safe_float(psum.get("allocatedUsd"), 0.0)
+            promotion_summary["promoted"].extend(psum.get("promoted") or [])
+            messages.append(f"WATCHLIST_GREEN_PROMOTION[{group_mode}] allocated ${_safe_float(psum.get('allocatedUsd'), 0.0):.2f} to {','.join(psum.get('promoted') or [])}")
+
+        group_rows, dsum = _nkr_aggressive_deploy_available_capital_pass(
+            group_rows, market_by_sym, nowi, group_dispatch_min, group_budget, settings={"nkrCapitalMode": group_mode}
+        )
+        deploy_summary["byMode"][group_mode] = dsum
+        if dsum.get("changed"):
+            changed = True
+            deploy_summary["changed"] = True
+            deploy_summary["allocatedUsd"] += _safe_float(dsum.get("allocatedUsd"), 0.0)
+            deploy_summary["targets"].extend(dsum.get("targets") or [])
+            messages.append(f"AVAILABLE_CAPITAL_DEPLOYED[{group_mode}] ${_safe_float(dsum.get('allocatedUsd'), 0.0):.2f} to {','.join(dsum.get('targets') or [])}")
+
+        processed_groups.extend(group_rows)
+
+    active = static_rows + processed_groups
+    active_modes = group_order[:] or [default_mode]
+    mode = active_modes[0] if len(active_modes) == 1 else "MIXED"
+    # Summary clock is informational only; it never drives lifecycle decisions.
+    summary_running = [x for x in active if isinstance(x, dict) and _nkr_is_session(x) and str(x.get("status") or "").upper() not in terminal_states]
+    summary_started = min([int(_safe_float(x.get("campaignStartedAt") or x.get("startedAt") or x.get("createdAt") or 0, 0.0)) for x in summary_running if _safe_float(x.get("campaignStartedAt") or x.get("startedAt") or x.get("createdAt") or 0, 0.0) > 0] or [0])
+    summary_expires = max([int(_safe_float(x.get("campaignExpiresAt") or x.get("expiresAt") or 0, 0.0)) for x in summary_running if _safe_float(x.get("campaignExpiresAt") or x.get("expiresAt") or 0, 0.0) > 0] or [0])
+    summary_period_days = max([_safe_float(x.get("nkrPeriodDays") or x.get("periodDays") or 0, 0.0) for x in summary_running] or [0.0])
+    campaign_clock = {"periodDays": summary_period_days, "startedAt": summary_started, "expiresAt": summary_expires}
 
     # Recalculate allocation percent after any backend change.
     if total_budget <= 0:
@@ -46681,10 +46764,10 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         "campaignStartedAt": int((campaign_clock or {}).get("startedAt") or 0),
         "campaignExpiresAt": int((campaign_clock or {}).get("expiresAt") or 0),
         "runtimeSource": "NKR_PERIOD_DAYS_ONLY",
-        "profitLockPct": profit_lock_pct,
-        "trailingActivationPct": trailing_activation_pct,
-        "trailingDrawdownPct": trailing_drawdown_pct,
-        "costCoverMultiple": cost_cover_multiple,
+        "profitLockPct": (profit_lock_pct if mode != "MIXED" else None),
+        "trailingActivationPct": (trailing_activation_pct if mode != "MIXED" else None),
+        "trailingDrawdownPct": (trailing_drawdown_pct if mode != "MIXED" else None),
+        "costCoverMultiple": (cost_cover_multiple if mode != "MIXED" else None),
         "exitSizingMode": "SCALE_ADAPTIVE_PERCENT_AND_COST_BASED",
         "aggressiveReallocation": reallocation_summary,
         "watchlistGreenPromotion": promotion_summary if 'promotion_summary' in locals() else {"changed": False},
@@ -46709,14 +46792,45 @@ def api_nkr_executor_tick():
     incoming = body.get("sessions") if isinstance(body, dict) else None
     market_rows = body.get("marketRows") or body.get("watchRows") or [] if isinstance(body, dict) else []
     market_rows = _binance_enrich_market_rows(market_rows)
-    settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
-    if not isinstance(incoming, list):
-        incoming, active_id, _ = _db_get_rotation_sessions(wa)
-    else:
-        _, active_id, _ = _db_get_rotation_sessions(wa)
-    nkr_sessions = [x for x in incoming if isinstance(x, dict) and _nkr_is_session(x)]
+    # ENGINE-458: the UI settings object is a next-start draft only. It must never
+    # reconfigure a running session. Prefer persisted backend sessions over client copies.
+    db_sessions, active_id, _ = _db_get_rotation_sessions(wa)
+    source_sessions = db_sessions if isinstance(db_sessions, list) and db_sessions else (incoming if isinstance(incoming, list) else [])
+    nkr_sessions = []
+    for raw in source_sessions:
+        if not isinstance(raw, dict) or not _nkr_is_session(raw):
+            continue
+        row = dict(raw)
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        cid = int(row.get("chainId") or row.get("chain_id") or meta.get("chain_id") or 0)
+        sid = str(row.get("onchainSessionId") or row.get("onchain_session_id") or row.get("coreVaultSessionId") or meta.get("onchain_session_id") or meta.get("core_vault_session_id") or "")
+        cfg_probe = dict(row)
+        cfg_probe["chain_id"] = cid
+        cfg_probe["onchain_session_id"] = sid
+        locked = _nkr_settings_for_exact_live_session(wa, cfg_probe, {})
+        if locked:
+            locked_mode = _nkr_normalize_performance_mode(locked.get("nkrCapitalMode") or row.get("nkrCapitalMode") or "DYNAMIC")
+            row.update({
+                "nkrCapitalMode": locked_mode, "capitalMode": locked_mode, "performanceMode": locked_mode,
+                "nkrObservationWindow": locked.get("nkrObservationWindow") or row.get("nkrObservationWindow") or "1h",
+                "nkrProfitMode": locked.get("nkrProfitMode") or row.get("nkrProfitMode") or "REINVEST",
+                "nkrPeriodHours": locked.get("nkrPeriodHours") or row.get("nkrPeriodHours"),
+                "nkrPeriodDays": locked.get("nkrPeriodDays") or row.get("nkrPeriodDays"),
+                "nkrPeriodUnit": locked.get("nkrPeriodUnit") or row.get("nkrPeriodUnit"),
+                "nkrPeriodValue": locked.get("nkrPeriodValue") if locked.get("nkrPeriodValue") is not None else row.get("nkrPeriodValue"),
+            })
+            m = dict(meta)
+            m.update({
+                "nkr_capital_mode": locked_mode, "capital_mode": locked_mode, "performance_mode": locked_mode,
+                "nkr_observation_window": row.get("nkrObservationWindow"), "nkr_profit_mode": row.get("nkrProfitMode"),
+                "nkr_period_hours": row.get("nkrPeriodHours"), "nkr_period_days": row.get("nkrPeriodDays"),
+                "nkr_period_unit": row.get("nkrPeriodUnit"), "nkr_period_value": row.get("nkrPeriodValue"),
+                "start_mode_locked": True, "session_config_key": locked.get("session_config_key"),
+            })
+            row["meta"] = m
+        nkr_sessions.append(row)
     try:
-        processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings=settings)
+        processed, summary = _nkr_backend_process_executor_tick(nkr_sessions, market_rows=market_rows, settings={})
         best = ""
         if isinstance(summary, dict):
             best = str(summary.get("bestCandidate") or summary.get("best_candidate") or summary.get("topAsset") or "")
