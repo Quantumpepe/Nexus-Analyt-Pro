@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-459-FAST-WORKER-BOOT"
+BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-460-SESSION-SNAPSHOT-FINALIZE-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1129,24 +1129,12 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
     finalize_tx = ""
     finalize_op_id = ""
     if status_id == 3:
-        # ENGINE-434: stale FINALIZE ops must not block retry (NKR + TRADER).
-        try:
-            _conn = _db()
-            try:
-                with DB_WRITE_LOCK:
-                    _conn.execute(
-                        "UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, "
-                        "error_text='engine434_retry_finalize' "
-                        "WHERE op_type='FINALIZE' AND wallet_address=? AND chain_id=? "
-                        "AND lower(vault_address)=? AND onchain_session_id=? "
-                        "AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING','FAILED')",
-                        (int(time.time()), _norm_addr(wallet), int(chain_id), str(vault).lower(), str(sid)),
-                    )
-                    _conn.commit()
-            finally:
-                _conn.close()
-        except Exception:
-            pass
+        # ENGINE-460: NEVER abort an in-flight FINALIZE operation here.
+        # FINALIZE is globally serialized by nexus_live_operations across Gunicorn workers
+        # and recovery paths. Aborting SUBMITTING/CONFIRMING allowed a second process to
+        # reserve the same business key and broadcast a duplicate finalizeSession tx.
+        # _live_op_reserve() already re-arms only FAILED/ABORTED rows safely and keeps
+        # RESERVED/SUBMITTING/CONFIRMING/RECOVERING/SUCCEEDED protected.
         # ENGINE-445: FINALIZE retry keeps the same business operation but gets a
         # fresh Privy request key from its incremented durable attempt counter.
         fin_op = _live_op_reserve(
@@ -1768,12 +1756,41 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
             _recovery_job_write(job_id,start_closing_tx_hash=txh,receipt_status="waiting_start_closing_receipt",step_label="START_CLOSING_WAIT")
             _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
             _recovery_job_write(job_id,receipt_status="start_closing_confirmed",step_label="START_CLOSING_CONFIRMED")
-        _recovery_job_write(job_id, step=4, step_label="FINALIZE_SUBMIT", receipt_status="submitting_finalize")
-        ref=f"nexus-{engine.lower()}-recover-{sid}-{int(time.time())}-finalize"
-        sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":_PRIVY_FINALIZE_SESSION_SELECTOR+_uint_to_32(sid),"value":"0x0"},ref,chain_id=int(chain_id))
-        txh=str(sent.get("hash") or "")
-        _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
-        _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
+        # ENGINE-460: recovery uses the SAME durable FINALIZE business lock as normal
+        # Stop & Exit. This prevents a recovery thread and a normal lifecycle thread from
+        # broadcasting finalizeSession for the same chain+vault+session at the same time.
+        identity = _nkr_session_identity(wallet=wallet, chain_id=int(chain_id), vault=vault_addr, onchain_session_id=str(sid))
+        fin_op = _live_op_reserve(
+            "FINALIZE", wallet=wallet, chain_id=int(chain_id), vault=vault_addr,
+            onchain_session_id=str(sid), cycle_key="finalize", ttl_sec=300,
+            meta={"engine": engine, "source": "recovery_job", "job_id": str(job_id)},
+        )
+        txh = ""
+        if fin_op is None:
+            existing = _live_op_find_active("FINALIZE", identity, cycle_key="finalize")
+            existing_status = str((existing or {}).get("status") or "").upper()
+            txh = str((existing or {}).get("tx_hash") or "")
+            if existing_status != "SUCCEEDED":
+                _recovery_job_write(
+                    job_id, job_status="PENDING", step=4, step_label="FINALIZE_ALREADY_INFLIGHT",
+                    finalize_tx_hash=txh, receipt_status="waiting_existing_finalize", last_error="",
+                )
+                _live_engine_mark(engine,status="closing",decision="FINALIZE_ALREADY_INFLIGHT",gate_status="EXIT_PENDING",reason=f"CoreVault session {sid} finalize already owned by another worker",pending_tx=txh,last_error="")
+                return
+        else:
+            finalize_op_id = str(fin_op.get("operation_id") or "")
+            fin_data = _PRIVY_FINALIZE_SESSION_SELECTOR + _uint_to_32(sid)
+            body_hash = hashlib.sha256(fin_data.encode("utf-8")).hexdigest()[:24]
+            finalize_attempt = max(1, int(fin_op.get("attempt") or 1))
+            ref = _live_op_privy_key(finalize_op_id, body_hash, attempt=finalize_attempt)
+            _recovery_job_write(job_id, step=4, step_label="FINALIZE_SUBMIT", receipt_status="submitting_finalize")
+            _live_op_update(finalize_op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref, expires_ts=int(time.time()) + 300)
+            sent=_privy_send_delegated_transaction(wallet_id,{"from":_norm_addr(wallet),"to":vault_addr,"data":fin_data,"value":"0x0"},ref,chain_id=int(chain_id))
+            txh=str(sent.get("hash") or sent.get("txHash") or "")
+            _live_op_update(finalize_op_id, "CONFIRMING", tx_hash=txh, expires_ts=int(time.time()) + 180)
+            _recovery_job_write(job_id,finalize_tx_hash=txh,receipt_status="waiting_finalize_receipt",step_label="FINALIZE_WAIT")
+            _privy_wait_receipt(txh, timeout_sec=90, chain_id=int(chain_id))
+            _live_op_update(finalize_op_id, "SUCCEEDED", tx_hash=txh)
         # A confirmed finalize receipt can be visible before the RPC used for sessionOf
         # has caught up. Poll the authoritative contract state instead of declaring a
         # false failure while the session is still reported as CLOSING.
@@ -38556,28 +38573,56 @@ def _nkr_ensure_local_live_session(wallet: str, live_row: dict) -> None:
                 state, _ = _db_get_user_app_state(wallet)
                 ui = state.get("ui") if isinstance(state.get("ui"), dict) else {}
                 locked_cfg = _nkr_get_exact_start_config(wallet, chain_id, sid)
-                capital_mode = _nkr_normalize_performance_mode(locked_cfg.get("nkrCapitalMode") or existing.get("nkrCapitalMode") or (existing.get("meta") or {}).get("nkr_capital_mode") or "DYNAMIC")
-                need = not str(existing.get("nkrCapitalMode") or (existing.get("meta") or {}).get("nkr_capital_mode") or "").strip()
-                if need or str(existing.get("nkrCapitalMode") or "").upper() in {"", "UNKNOWN"}:
-                    meta = dict(existing.get("meta") if isinstance(existing.get("meta"), dict) else {})
-                    observation = str(locked_cfg.get("nkrObservationWindow") or existing.get("nkrObservationWindow") or meta.get("nkr_observation_window") or "1h")
-                    profit_mode = str(locked_cfg.get("nkrProfitMode") or existing.get("nkrProfitMode") or meta.get("nkr_profit_mode") or "REINVEST").upper()
-                    days = _nkr_normalize_period_days(locked_cfg.get("nkrPeriodDays") or existing.get("nkrPeriodDays") or existing.get("periodDays") or meta.get("nkr_period_days") or 1)
-                    meta.update({
-                        "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
-                        "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
-                        "nkr_period_days": days,
-                    })
-                    patched = dict(existing)
+                # ENGINE-460: the immutable per-session create snapshot is authoritative
+                # on EVERY hydration, not only when mode is missing. Never repair a running
+                # session from the mutable wallet UI draft.
+                meta = dict(existing.get("meta") if isinstance(existing.get("meta"), dict) else {})
+                capital_mode = _nkr_normalize_performance_mode(locked_cfg.get("nkrCapitalMode") or existing.get("nkrCapitalMode") or meta.get("nkr_capital_mode") or "DYNAMIC")
+                observation = str(locked_cfg.get("nkrObservationWindow") or existing.get("nkrObservationWindow") or meta.get("nkr_observation_window") or "1h")
+                profit_mode = str(locked_cfg.get("nkrProfitMode") or existing.get("nkrProfitMode") or meta.get("nkr_profit_mode") or "REINVEST").upper()
+                period_hours = _nkr_normalize_period_hours(
+                    locked_cfg.get("nkrPeriodHours"), locked_cfg.get("nkrPeriodValue"),
+                    locked_cfg.get("nkrPeriodUnit"), locked_cfg.get("nkrPeriodDays") or existing.get("nkrPeriodDays") or 1,
+                )
+                days = period_hours / 24.0
+                period_unit = str(locked_cfg.get("nkrPeriodUnit") or existing.get("nkrPeriodUnit") or ("hours" if period_hours < 24 else "days")).lower()
+                period_value = locked_cfg.get("nkrPeriodValue")
+                if period_value is None:
+                    period_value = period_hours if period_unit == "hours" else days
+                locked_budget = _safe_float(locked_cfg.get("budgetUsd"), 0.0)
+                budget_value = locked_budget if locked_budget > 0 else _safe_float(existing.get("sessionBudgetUsd") or existing.get("nkrTotalBudgetUsd") or existing.get("budgetUsd"), 0.0)
+                max_active = max(0, int(_safe_float(locked_cfg.get("maxActiveAssets") if locked_cfg.get("maxActiveAssets") is not None else existing.get("maxActiveAssets"), 0)))
+                max_pct = _safe_float(locked_cfg.get("maxCapitalPerAssetPct") or existing.get("maxCapitalPerAssetPct"), NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT)
+                meta.update({
+                    "nkr_capital_mode": capital_mode, "capital_mode": capital_mode,
+                    "nkr_observation_window": observation, "nkr_profit_mode": profit_mode,
+                    "nkr_period_days": days, "nkr_period_hours": period_hours,
+                    "nkr_period_unit": period_unit, "nkr_period_value": period_value,
+                    "runtime_hours": period_hours, "max_active_assets": max_active,
+                    "max_capital_per_asset_pct": max_pct,
+                    "session_budget_usd": budget_value, "nkr_total_budget_usd": budget_value,
+                    "start_mode_locked": bool(locked_cfg), "session_config_locked": bool(locked_cfg),
+                })
+                patched = dict(existing)
+                patched.update({
+                    "nkrCapitalMode": capital_mode, "capitalMode": capital_mode,
+                    "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
+                    "nkrPeriodDays": days, "periodDays": days, "nkrPeriodHours": period_hours,
+                    "runtimeHours": period_hours, "nkrPeriodUnit": period_unit, "nkrPeriodValue": period_value,
+                    "maxActiveAssets": max_active, "maxCapitalPerAssetPct": max_pct,
+                    "meta": meta,
+                })
+                if budget_value > 0:
                     patched.update({
-                        "nkrCapitalMode": capital_mode, "capitalMode": capital_mode,
-                        "nkrObservationWindow": observation, "nkrProfitMode": profit_mode,
-                        "nkrPeriodDays": days, "periodDays": days, "meta": meta,
+                        "budgetUsd": budget_value, "budgetAmount": budget_value,
+                        "sessionBudgetUsd": budget_value, "nkrTotalBudgetUsd": budget_value,
                     })
-                    if not patched.get("budgetUsd") and live_row.get("budget_units"):
-                        pass  # budget already handled on create path
-                    rest = [x for x in sessions if not _same_live_session(x)]
-                    _db_set_rotation_sessions(wallet, rest + [patched], active_session_id=local_id, replace_missing=False)
+                    if _safe_float(patched.get("workingCapitalUsd"), 0.0) <= 0:
+                        patched["workingCapitalUsd"] = budget_value
+                    if _safe_float(patched.get("reservedUsd"), 0.0) <= 0:
+                        patched["reservedUsd"] = budget_value
+                rest = [x for x in sessions if not _same_live_session(x)]
+                _db_set_rotation_sessions(wallet, rest + [patched], active_session_id=local_id, replace_missing=False)
             except Exception:
                 pass
             return
