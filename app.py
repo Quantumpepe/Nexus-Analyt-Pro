@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-458-SESSION-SETTINGS-LOCK"
+BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-459-FAST-WORKER-BOOT"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -13112,7 +13112,7 @@ GRID_AUTORUN: Dict[str, Dict[str, Any]] = {}  # item_id -> autorun worker state
 _GRID_AUTORUN_OWNER_TOKEN = f"{os.getpid()}:{uuid.uuid4().hex}"
 _GRID_AUTORUN_RESTORE_LOCK = threading.RLock()
 _GRID_AUTORUN_RESTORE_LAST_TS = 0.0
-_GRID_AUTORUN_RESTORE_INTERVAL_SEC = 5.0
+_GRID_AUTORUN_RESTORE_INTERVAL_SEC = 1.0
 
 # Load persisted grid sessions/configs (best-effort)
 try:
@@ -31850,6 +31850,34 @@ def _grid_autorun_lease_table_init() -> None:
         conn.close()
 
 
+def _grid_autorun_owner_pid_alive(owner_token: str) -> bool:
+    """Return True only when the lease owner PID is a live process in this container.
+
+    ENGINE-459: after a Render deploy/restart the persisted SQLite lease may still
+    contain the previous process token for up to its TTL.  If that PID no longer
+    exists (or the PID was reused by this new process with a different boot token),
+    the lease is stale and can be reclaimed immediately.
+    """
+    try:
+        pid = int(str(owner_token or "").split(":", 1)[0])
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    # Same PID but a different UUID means PID reuse after process restart.
+    if pid == os.getpid() and str(owner_token or "") != _GRID_AUTORUN_OWNER_TOKEN:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def _grid_autorun_lease_acquire(item_id: str, interval: float = 10.0) -> bool:
     """Acquire/refresh the cross-process Grid ticker lease for one item."""
     item_id = str(item_id or "").strip()
@@ -31869,8 +31897,12 @@ def _grid_autorun_lease_acquire(item_id: str, interval: float = 10.0) -> bool:
             owner = str(row["owner_token"] or "") if row else ""
             expires = int(row["expires_ts"] or 0) if row else 0
             if row and owner != _GRID_AUTORUN_OWNER_TOKEN and expires > nowi:
-                conn.rollback()
-                return False
+                # ENGINE-459: do not wait for an old deploy's lease TTL when its
+                # process is already gone.  A live sibling Gunicorn process still
+                # keeps ownership, so duplicate Grid execution remains blocked.
+                if _grid_autorun_owner_pid_alive(owner):
+                    conn.rollback()
+                    return False
             conn.execute(
                 """INSERT INTO nexus_grid_autorun_leases(item_id,owner_token,expires_ts,updated_ts)
                    VALUES(?,?,?,?)
@@ -31954,6 +31986,18 @@ def _ensure_grid_autorun(item_id: str, interval: float = 10.0) -> None:
     )
     GRID_AUTORUN[item_id] = {"stop": stop_evt, "thread": th, "interval": interval}
     th.start()
+    # ENGINE-459: publish worker liveness immediately; the first market tick may
+    # still be doing network/RPC work, but System Info must not look dead meanwhile.
+    try:
+        _live_engine_mark(
+            "GRID", status="running", decision="WORKER_STARTING",
+            reason=f"Grid worker started for {item_id}; first live tick in progress",
+            worker_heartbeat_ts=int(time.time()), worker_thread_name=th.name,
+            worker_last_stage="cycle_starting", worker_process_pid=os.getpid(),
+            last_error="",
+        )
+    except Exception:
+        pass
 
 
 def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
@@ -38140,6 +38184,8 @@ def api_nexus_nkr_session_audit():
 
 _NKR_LIVE_WORKER_STARTED = False
 _NKR_LIVE_WORKER_THREAD = None
+_NKR_LIVE_WORKER_HEALTH_THREAD = None
+_NKR_LIVE_WORKER_HEALTH_LOCK = threading.RLock()
 _NKR_LIVE_WORKER_LOCK = threading.RLock()
 _NKR_LIVE_CYCLE_LEASE_LOCK = threading.RLock()
 _NKR_LIVE_CYCLE_LEASE_TOKEN = ""
@@ -38152,6 +38198,7 @@ _NKR_LIVE_WORKER_LAST_STAGE = "boot"
 _NKR_LIVE_WORKER_LOOP_COUNT = 0
 _NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "15")))
 _NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "45")))
+_NKR_LIVE_WORKER_HEALTH_INTERVAL_SEC = max(2, int(os.getenv("NEXUS_NKR_WORKER_HEALTH_INTERVAL_SEC", "3")))
 _NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
 
 
@@ -44331,6 +44378,53 @@ def _nkr_live_worker_loop() -> None:
             _NKR_LIVE_WORKER_LAST_HEARTBEAT = int(time.time())
 
 
+def _nkr_live_health_heartbeat_loop() -> None:
+    """Persist shared NKR/Trader worker liveness while a long cycle is running.
+
+    ENGINE-459: the strategy cycle can legitimately spend tens of seconds in market,
+    RPC and Vault reads.  Previously the SQLite heartbeat was only written at cycle
+    start/end, so another Gunicorn process could report STALLED even while execution
+    was healthy.  This thread is diagnostics-only: it never trades and never changes
+    session state.
+    """
+    global _NKR_LIVE_WORKER_LAST_HEARTBEAT
+    while True:
+        try:
+            worker = _NKR_LIVE_WORKER_THREAD
+            if worker is not None and worker.is_alive():
+                nowi = int(time.time())
+                _NKR_LIVE_WORKER_LAST_HEARTBEAT = nowi
+                stage = str(_NKR_LIVE_WORKER_LAST_STAGE or "running")
+                common = dict(
+                    worker_heartbeat_ts=nowi,
+                    worker_thread_name=worker.name,
+                    worker_last_stage=stage,
+                    worker_loop_count=_NKR_LIVE_WORKER_LOOP_COUNT,
+                    worker_process_pid=os.getpid(),
+                )
+                _live_engine_mark("NKR", **common)
+                # Trader shares this backend live worker. Publish only liveness
+                # metadata; its own decision/tick/status fields remain untouched.
+                _live_engine_mark("TRADER", **common)
+        except Exception:
+            pass
+        time.sleep(float(_NKR_LIVE_WORKER_HEALTH_INTERVAL_SEC))
+
+
+def _ensure_nkr_live_health_heartbeat_started() -> None:
+    global _NKR_LIVE_WORKER_HEALTH_THREAD
+    with _NKR_LIVE_WORKER_HEALTH_LOCK:
+        if _NKR_LIVE_WORKER_HEALTH_THREAD is not None and _NKR_LIVE_WORKER_HEALTH_THREAD.is_alive():
+            return
+        hb = threading.Thread(
+            target=_nkr_live_health_heartbeat_loop,
+            daemon=True,
+            name="nkr-trader-health-heartbeat",
+        )
+        hb.start()
+        _NKR_LIVE_WORKER_HEALTH_THREAD = hb
+
+
 def _ensure_nkr_live_worker_started() -> None:
     global _NKR_LIVE_WORKER_STARTED
     global _NKR_LIVE_WORKER_THREAD
@@ -44339,6 +44433,7 @@ def _ensure_nkr_live_worker_started() -> None:
     with _NKR_LIVE_WORKER_LOCK:
         if _NKR_LIVE_WORKER_THREAD is not None and _NKR_LIVE_WORKER_THREAD.is_alive():
             _NKR_LIVE_WORKER_STARTED = True
+            _ensure_nkr_live_health_heartbeat_started()
             return
 
         _NKR_LIVE_WORKER_LAST_STAGE = "thread_starting"
@@ -44350,15 +44445,18 @@ def _ensure_nkr_live_worker_started() -> None:
         thread.start()
         _NKR_LIVE_WORKER_THREAD = thread
         _NKR_LIVE_WORKER_STARTED = True
-        # ENGINE-455: publish startup immediately. This is diagnostics-only and makes
+        _ensure_nkr_live_health_heartbeat_started()
+        # ENGINE-455/459: publish startup immediately. This is diagnostics-only and makes
         # liveness visible across Gunicorn workers before the first full market cycle ends.
         try:
             _now = int(time.time())
-            _live_engine_mark(
-                "NKR", worker_heartbeat_ts=_now, worker_thread_name=thread.name,
+            _startup_meta = dict(
+                worker_heartbeat_ts=_now, worker_thread_name=thread.name,
                 worker_last_stage="thread_started", worker_loop_count=_NKR_LIVE_WORKER_LOOP_COUNT,
                 worker_process_pid=os.getpid(),
             )
+            _live_engine_mark("NKR", **_startup_meta)
+            _live_engine_mark("TRADER", **_startup_meta)
         except Exception:
             pass
 
@@ -47631,7 +47729,7 @@ def api_nexus_system_info_evm_diagnostics():
     }
     return jsonify({"status":"ok","overall":overall,"engine":engine,"reports":[report],"ts":now_ts()})
 
-# ENGINE-194 boot hook: safe under Flask reload/multiple requests; guarded once per process.
+# ENGINE-459 fast boot hook: first backend request starts shared NKR/Trader liveness immediately and reclaims stale Grid leases from dead deploy processes.
 @app.before_request
 def _boot_nkr_live_worker_once():
     _ensure_nkr_live_worker_started()
