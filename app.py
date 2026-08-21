@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-462-GRID-FALSE-FILLED-RECOVERY"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-463-GRID-FREEBASE-SELL-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -25804,15 +25804,22 @@ def _grid_stop_finalize_sessions(wallet: str, chain_id: int = 0, session_id: str
 
 
 def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_price: float) -> dict:
-    """On Grid SELL fill: execute Vault exit to USDC/USDT when a GRID live session exists.
+    """ENGINE-463: Grid SELL at target/max-loss → real Vault sell to USDC/USDT.
 
-    Uses the same CoreVault executeTrade path as NKR/Trader. Without a live GRID
-    session the order is marked FILLED for monitoring and vault_exit is deferred
-    with a clear reason (no silent token payout).
+    Previous builds called NKR exit-all-positions. Grid EXIT_ONLY orders hold the
+    asset in freeBase (or rarely as a session position). freeBase is not a
+    session position, so those sells never executed and the order stayed OPEN /
+    was false-FILLED.
+
+    This path:
+      1) ensures a GRID CoreVault session exists on the order chain
+      2) resolves the order asset route
+      3) sells min(order qty, available) from positionOf if present, else freeBase
+      4) only reports executed=True when a tx hash is returned
     """
     result = {
         "attempted": False, "executed": False, "txHash": "", "payoutAsset": "USDC",
-        "reason": "", "liveSessionId": "",
+        "reason": "", "liveSessionId": "", "soldUnits": "0", "source": "",
     }
     wa = _norm_addr(wallet or (session or {}).get("wallet_address") or "")
     payout = _grid_normalize_payout_asset(
@@ -25820,43 +25827,250 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     )
     result["payoutAsset"] = payout
     item_id = str((session or {}).get("item_id") or (session or {}).get("item") or "")
-    chain_key = ""
     try:
         chain_key = _grid_chain_key(item_id, (session or {}).get("chain") or "")
     except Exception:
         chain_key = str((session or {}).get("chain") or "").upper()
-    chain_id = _grid_chain_id_from_key(chain_key)
-    live_row = _grid_find_live_vault_row(wa, chain_id)
+    chain_id = int(_grid_chain_id_from_key(chain_key) or 0)
+    if chain_id <= 0:
+        result["reason"] = f"grid_chain_unsupported:{chain_key}"
+        return result
+
+    symbol = str(
+        (order or {}).get("original_asset")
+        or _grid_asset_symbol(item_id)
+        or ""
+    ).upper().strip()
+    if not symbol or symbol in NEXUS_GRID_PAYOUT_ASSETS:
+        result["reason"] = f"grid_asset_invalid:{symbol}"
+        return result
+
+    try:
+        qty = float((order or {}).get("qty") or (order or {}).get("amount") or 0.0)
+    except Exception:
+        qty = 0.0
+    if qty <= 0:
+        result["reason"] = "grid_order_qty_zero"
+        return result
+
+    # --- ensure GRID live session row ---
+    live_row = _grid_find_live_vault_row(wa, chain_id) or _grid_find_live_vault_row(wa, 0)
     if not live_row:
-        # Fallback: any GRID session for wallet
-        live_row = _grid_find_live_vault_row(wa, 0)
+        try:
+            live_row = _grid_ensure_corevault_session(
+                wa, chain_id, payout,
+                budget_usd=max(1.0, float(fill_price or 0.0) * float(qty) * 0.02),
+            )
+        except Exception as ensure_exc:
+            result["reason"] = f"no_grid_corevault_session:{str(ensure_exc)[:160]}"
+            _live_engine_mark(
+                "GRID", status="running", decision="VAULT_SELL_NO_SESSION",
+                reason=f"Grid SELL blocked: no GRID session on {chain_key}",
+                last_error=str(ensure_exc)[:400],
+            )
+            return result
     if not live_row:
         result["reason"] = "no_grid_corevault_session"
         return result
+
     sid = str(live_row.get("onchain_session_id") or "")
     result["liveSessionId"] = sid
-    result["attempted"] = True
+    if not sid or not str(sid).isdigit() or int(sid) <= 0:
+        result["reason"] = "grid_session_id_invalid"
+        return result
+
+    # --- funding / token ---
     try:
-        # Prefer chain-aware exit used by NKR stop path.
-        exit_out = _nkr_exit_all_open_positions(wa, dict(live_row), int(sid))
-        result["executed"] = bool((exit_out or {}).get("executed") or (exit_out or {}).get("txHash"))
-        result["txHash"] = str((exit_out or {}).get("txHash") or "")
-        result["reason"] = "vault_exit_submitted" if result["executed"] else "vault_exit_no_position"
+        funding = _v5_engine_funding_state(wa, chain_key, symbol) or {}
+    except Exception as fund_exc:
+        result["reason"] = f"grid_funding_read_failed:{str(fund_exc)[:160]}"
+        return result
+    token = _norm_addr(funding.get("token") or "")
+    decimals = max(0, min(36, int(funding.get("decimals") or 18)))
+    free_units = int(funding.get("freeBaseUnits") or 0)
+    if not _looks_like_evm_addr(token):
+        result["reason"] = f"grid_token_unresolved:{symbol}"
+        return result
+
+    try:
+        order_units = int(round(float(qty) * (10 ** decimals)))
+    except Exception:
+        order_units = 0
+    if order_units <= 0:
+        result["reason"] = "grid_order_units_zero"
+        return result
+
+    vault = _norm_addr(live_row.get("vault_address") or funding.get("vault") or "")
+    try:
+        pos_units = int(_position_amount(vault, int(sid), token, chain_id=chain_id) or 0)
+    except Exception:
+        pos_units = 0
+
+    # Prefer explicit session position; otherwise sell freeBase (EXIT_ONLY Grid).
+    if pos_units > 0:
+        sell_units = min(order_units, pos_units)
+        sell_source = "session_position"
+    elif free_units > 0:
+        sell_units = min(order_units, free_units)
+        sell_source = "free_base"
+    else:
+        result["reason"] = "grid_no_token_balance"
+        result["attempted"] = True
+        _live_engine_mark(
+            "GRID", status="running", decision="VAULT_SELL_NO_BALANCE",
+            reason=f"Grid SELL {symbol}: position=0 freeBase=0 on {chain_key}",
+            last_error="",
+        )
+        return result
+
+    result["source"] = sell_source
+    result["soldUnits"] = str(sell_units)
+    result["attempted"] = True
+
+    # --- settlement token (USDC/USDT) ---
+    try:
+        settle_funding = _v5_engine_funding_state(wa, chain_key, payout) or {}
+        settlement = _norm_addr(settle_funding.get("token") or "")
+    except Exception:
+        settlement = ""
+    if not _looks_like_evm_addr(settlement):
+        try:
+            cfg0 = _privy_trading_cfg(chain_id)
+            settlement = _norm_addr(cfg0.get("usdc") if payout == "USDC" else (cfg0.get("usdt") or cfg0.get("usdc")) or "")
+        except Exception:
+            settlement = ""
+    if not _looks_like_evm_addr(settlement):
+        result["reason"] = f"grid_settlement_unresolved:{payout}"
+        return result
+
+    # --- route ---
+    try:
+        cfg = _privy_trading_cfg(chain_id)
+    except Exception as cfg_exc:
+        result["reason"] = f"grid_chain_cfg_failed:{str(cfg_exc)[:120]}"
+        return result
+    routes = {}
+    try:
+        routes = _nkr_live_route_registry(cfg) or {}
+    except Exception:
+        routes = {}
+    route = None
+    for key, rr in (routes or {}).items():
+        if str(key or "").upper() == symbol:
+            route = dict(rr or {})
+            break
+        if _norm_addr((rr or {}).get("token") or "").lower() == token.lower():
+            route = dict(rr or {})
+            break
+    if not route:
+        route = {
+            "symbol": symbol,
+            "token": token,
+            "decimals": decimals,
+            "router": _norm_addr(cfg.get("router") or ""),
+            "fee": int(cfg.get("poolFee") or 500),
+            "feeCandidates": [100, 500, 2500, 3000, 10000],
+            "live": True,
+            "source": "grid_exit_only",
+            "chain": chain_key,
+        }
+    route["token"] = token
+    route["decimals"] = decimals
+    route["symbol"] = symbol
+
+    # Stamp engine so live ops / marks stay on GRID (not remapped to NKR).
+    live_row = dict(live_row)
+    live_row["engine"] = "GRID"
+    live_row["vault_address"] = vault or live_row.get("vault_address")
+    live_row["_grid_allow_freebase_exit"] = (sell_source == "free_base")
+
+    try:
+        exit_out = _nkr_live_trade_route(
+            wa, live_row, route, token, settlement, int(sell_units), action="EXIT",
+        ) or {}
+        txh = str(exit_out.get("txHash") or exit_out.get("hash") or exit_out.get("tx_hash") or "").strip()
+        result["executed"] = bool(txh) or bool(exit_out.get("executed"))
+        result["txHash"] = txh
         result["detail"] = exit_out
+        result["reason"] = "vault_exit_submitted" if result["executed"] else "vault_exit_no_tx"
         if result["executed"]:
             _live_engine_mark(
                 "GRID", status="running", decision="VAULT_SELL_FILLED",
-                reason=f"Grid SELL filled @ {fill_price}; Vault exit to {payout} for session #{sid}",
-                active_asset=_grid_asset_symbol(item_id), pending_tx=result["txHash"], last_error="",
+                reason=f"Grid SELL {symbol} @ {fill_price} via {sell_source} → {payout} session #{sid}",
+                active_asset=symbol, pending_tx=txh, last_error="",
+            )
+        else:
+            _live_engine_mark(
+                "GRID", status="running", decision="VAULT_SELL_PENDING",
+                reason=f"Grid SELL {symbol}: trade returned without tx ({sell_source})",
+                last_error=str(exit_out)[:300],
             )
     except Exception as exc:
-        result["reason"] = f"vault_exit_failed:{str(exc)[:200]}"
+        msg = str(exc)[:240]
+        result["reason"] = f"vault_exit_failed:{msg}"
+        result["detail"] = {"error": msg}
         _live_engine_mark(
             "GRID", status="running", decision="VAULT_SELL_ERROR",
-            reason=f"Grid SELL fill vault exit failed: {str(exc)[:160]}",
+            reason=f"Grid SELL {symbol} failed: {msg[:160]}",
             last_error=str(exc)[:400],
         )
     return result
+
+
+def _grid_ensure_corevault_session(wallet: str, chain_id: int, settlement_symbol: str = "USDC", budget_usd: float = 1.0) -> dict | None:
+    """Create a minimal GRID CoreVault session when none is active (ENGINE-463).
+
+    Grid EXIT_ONLY needs a live session row for executeTrade identity. Budget is
+    taken from free USDC/USDT and kept small — the sell itself spends the order asset.
+    """
+    wa = _norm_addr(wallet)
+    chain_id = int(chain_id or 0)
+    if not wa or chain_id <= 0:
+        return None
+    existing = _grid_find_live_vault_row(wa, chain_id)
+    if existing:
+        return existing
+
+    chain_key = {1: "ETH", 56: "BNB", 137: "POL"}.get(chain_id, "ETH")
+    payout = _grid_normalize_payout_asset(settlement_symbol or "USDC")
+    cfg = _privy_trading_cfg(chain_id)
+    vault = _norm_addr(cfg.get("vault") or "")
+    wallet_id = str(_privy_wallet_id_for_user(wa) or "").strip()
+    if not wallet_id or not _looks_like_evm_addr(vault):
+        raise RuntimeError("grid_session_create_privy_or_vault_missing")
+
+    funding = _v5_engine_funding_state(wa, chain_key, payout)
+    decimals = max(0, min(36, int(funding.get("decimals") or 6)))
+    free_units = int(funding.get("freeBaseUnits") or 0)
+    # Minimal budget: $1 equivalent, or whatever free USDC remains (at least 1 unit).
+    want = max(1.0, float(budget_usd or 1.0))
+    amount_units = int(round(want * (10 ** decimals)))
+    amount_units = max(1, min(amount_units, free_units))
+    if amount_units <= 0:
+        raise RuntimeError("grid_session_create_no_usdc_freebase")
+
+    settlement_token = _norm_addr(funding.get("token") or "")
+    calldata = _encode_create_session(
+        cfg, "GRID", amount_units,
+        duration_sec=7 * 24 * 3600,
+        max_slippage_bps=int(cfg.get("slippageBps") or 100),
+        max_loss_bps=1500,
+        settlement_token=settlement_token,
+    )
+    reference = f"nexus-grid-session-{wa.lower()}-{int(time.time())}"
+    sent = _send_vault_tx(wallet_id, wa, vault, calldata, reference, chain_id=chain_id)
+    session_id = _session_id_from_receipt(sent.get("receipt") or {}, vault)
+    if session_id is None:
+        raise RuntimeError("grid_session_id_missing_from_receipt")
+    _live_session_register(wa, "GRID", wallet_id, vault, session_id, sent.get("hash"), amount_units, chain_id=chain_id)
+    _live_engine_mark(
+        "GRID", status="running", decision="SESSION_READY",
+        reason=f"GRID V5 session {session_id} created on {chain_key} for exit-only sells",
+        pending_tx=str(sent.get("hash") or ""), last_error="",
+    )
+    return _grid_find_live_vault_row(wa, chain_id)
+
+
 
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
@@ -26136,6 +26350,21 @@ def api_grid_manual_add():
                     best_candidate=_grid_asset_symbol(live_item),
                     candidate_price=price_f, last_error="", pending_tx=""
                 )
+                # ENGINE-463: EXIT_ONLY sells need a GRID CoreVault session identity.
+                try:
+                    _cid = int(_grid_chain_id_from_key(chain) or 0)
+                    if _cid > 0 and not _grid_find_live_vault_row(wa, _cid):
+                        _grid_ensure_corevault_session(
+                            wa, _cid,
+                            _grid_normalize_payout_asset(order.get("payout_asset") or "USDC"),
+                            budget_usd=max(1.0, float(price_f) * float(qty_f) * 0.02),
+                        )
+                except Exception as sess_exc:
+                    _live_engine_mark(
+                        "GRID", status="running", decision="SESSION_ENSURE_WARN",
+                        reason="Grid order accepted; CoreVault session will be created on first sell attempt",
+                        last_error=str(sess_exc)[:400],
+                    )
             except Exception as worker_exc:
                 _live_engine_mark(
                     "GRID", status="error", decision="START_FAILED",
@@ -40835,7 +41064,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     vault = _norm_addr(live_row.get("vault_address") or "")
     mode = str(action or "ENTRY").strip().upper()
     runtime_engine = _live_row_engine_name(live_row) if "_live_row_engine_name" in globals() else str((live_row or {}).get("engine") or "NKR").upper()
-    if runtime_engine not in {"NKR", "TRADER"}: runtime_engine = "NKR"
+    if runtime_engine not in {"NKR", "TRADER", "GRID"}: runtime_engine = "NKR"
     if mode not in {"ENTRY", "BUY", "OPEN", "EXIT", "SELL", "CLOSE", "REDUCE"}:
         raise RuntimeError(f"unsupported_live_trade_action:{mode}")
     is_exit = mode in {"EXIT", "SELL", "CLOSE", "REDUCE"}
@@ -40913,8 +41142,17 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         # positionOf() already returns exact target-token base units. Never rescale.
         onchain_position = _position_amount(vault, sid, token_in, chain_id=chain_id)
         if onchain_position <= 0:
-            raise RuntimeError(f"exit_position_empty:chain={chain_id}:session={sid}:token={token_in}")
-        ai = min(ai, onchain_position)
+            # ENGINE-463: Grid EXIT_ONLY may sell freeBase when the live row opts in.
+            # NKR/Trader never take this branch — they require a real session position.
+            allow_freebase = bool(isinstance(live_row, dict) and live_row.get("_grid_allow_freebase_exit"))
+            eng = str((live_row or {}).get("engine") or "").upper() if isinstance(live_row, dict) else ""
+            if allow_freebase and eng == "GRID" and ai > 0:
+                # Keep ai as requested freeBase units; contract preflight decides.
+                pass
+            else:
+                raise RuntimeError(f"exit_position_empty:chain={chain_id}:session={sid}:token={token_in}")
+        else:
+            ai = min(ai, onchain_position)
     else:
         settlement_decimals = int(settlement_cfg.get("decimals") or 0)
         if settlement_decimals <= 0 or settlement_decimals > 36:
@@ -41466,7 +41704,7 @@ def _nkr_exit_all_open_positions(wallet: str, row: dict, session_id: int) -> dic
     """
     chain_id = int((row or {}).get("chain_id") or 1)
     runtime_engine = _live_row_engine_name(row) if "_live_row_engine_name" in globals() else str((row or {}).get("engine") or "NKR").upper()
-    if runtime_engine not in {"NKR", "TRADER"}: runtime_engine = "NKR"
+    if runtime_engine not in {"NKR", "TRADER", "GRID"}: runtime_engine = "NKR"
     cfg = _privy_trading_cfg(chain_id)
     vault = _norm_addr((row or {}).get("vault_address") or cfg.get("vault") or "")
     if not _looks_like_evm_addr(vault):
