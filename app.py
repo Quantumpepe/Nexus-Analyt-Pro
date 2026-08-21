@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-473-GRID-SWAP-STEP-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-474-PRIVY-WNATIVE-FULL-ADDRESS"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -34345,8 +34345,20 @@ def _privy_policy_rule_target(rule):
     for condition in rule.get("conditions") or []:
         if not isinstance(condition, dict):
             continue
-        if str(condition.get("field_source") or "").lower() == "ethereum_transaction" and str(condition.get("field") or "").lower() == "to":
-            return _norm_addr(condition.get("value") or "")
+        src = str(condition.get("field_source") or "").lower().replace(" ", "_")
+        field = str(condition.get("field") or "").lower().replace(" ", "_")
+        # API uses "to"; Privy Dashboard UI may show "Recipient address"
+        if src in ("ethereum_transaction", "ethereumtransaction") and field in (
+            "to", "recipient", "recipient_address", "recipientaddress"
+        ):
+            raw = str(condition.get("value") or "").strip()
+            # Only accept full 20-byte addresses (0x + 40 hex). Truncated values must not count as present.
+            if not raw.lower().startswith("0x"):
+                raw = "0x" + raw
+            hx = raw[2:]
+            if len(hx) != 40 or any(c not in "0123456789abcdefABCDEF" for c in hx):
+                return ""  # invalid / truncated → treat as missing
+            return _norm_addr(raw)
     return ""
 
 
@@ -34415,10 +34427,27 @@ def _privy_policy_preview(chain_id=56):
     policy = _privy_policy_current()
     existing_rules = policy.get("rules") if isinstance(policy.get("rules"), list) else []
     existing_targets = {_privy_policy_rule_target(r).lower() for r in existing_rules if _privy_policy_rule_target(r)}
-    existing_names = {str(r.get("name") or "").strip().lower() for r in existing_rules if isinstance(r, dict)}
     requested = _privy_policy_rule_targets_for_chain(chain_id)
-    add = [r for r in requested if r["target"].lower() not in existing_targets and r["name"].lower() not in existing_names]
-    present = [r for r in requested if r not in add]
+    # ENGINE-474: match ONLY on full normalized target address.
+    # A rule with the same name but truncated/wrong address must still appear in toAdd
+    # (Privy Dashboard cannot edit — only API add via System Info Confirm).
+    add = []
+    present = []
+    for r in requested:
+        tgt = str(r.get("target") or "").lower()
+        if len(tgt) == 42 and tgt in existing_targets:
+            present.append(r)
+        else:
+            # ensure unique name if a same-named broken rule already exists
+            rule = dict(r)
+            if any(str(x.get("name") or "").strip().lower() == str(r.get("name") or "").strip().lower() for x in existing_rules if isinstance(x, dict)):
+                if "Wrapped" in str(r.get("name") or "") or "wnative" in str(r.get("label") or "").lower():
+                    rule["name"] = (str(r.get("name") or "Allow WNative") + " Full")[:50]
+                elif "Router" in str(r.get("name") or ""):
+                    rule["name"] = (str(r.get("name") or "Allow Router") + " Full")[:50]
+                else:
+                    rule["name"] = (str(r.get("name") or "Allow") + " v2")[:50]
+            add.append(rule)
     digest_source = json.dumps([{k: r[k] for k in ("name", "method", "conditions", "action")} for r in add], sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
     serializer = URLSafeTimedSerializer((os.getenv("SECRET_KEY") or app.secret_key or "nexus-policy-preview"), salt="privy-policy-preview-v1")
