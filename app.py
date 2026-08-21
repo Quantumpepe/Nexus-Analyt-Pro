@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-461-GRID-TARGET-EXECUTION-FIX"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-462-GRID-FALSE-FILLED-RECOVERY"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -8394,6 +8394,10 @@ def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: l
                     "sell_pending_reason": o.get("sell_pending_reason"),
                     "vault_exit": o.get("vault_exit"),
                     "tx_hash": o.get("tx_hash"),
+                    "false_filled_recovered": o.get("false_filled_recovered"),
+                    "false_filled_recovered_ts": o.get("false_filled_recovered_ts"),
+                    "legacy_false_fill_price": o.get("legacy_false_fill_price"),
+                    "legacy_false_filled_ts": o.get("legacy_false_filled_ts"),
                     # ENGINE-457: wallet-wide Grid UI must mark each order with the
                     # price from its own running session, never the currently selected chain.
                     "current_price": current_price if current_price is not None else o.get("current_price"),
@@ -31866,7 +31870,11 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                         if vault_res.get("txHash"):
                             o["tx_hash"] = vault_res.get("txHash")
                         reason = str(vault_res.get("reason") or "")
-                        vault_ok = bool(vault_res.get("executed")) or reason == "vault_exit_no_position"
+                        # ENGINE-462: a logical/no-position result is NOT a successful Grid sell.
+                        # Only a real submitted/confirmed Vault exit with a transaction hash may
+                        # close the order. BUILD461 treated vault_exit_no_position as success and
+                        # could therefore show FILLED while the token was still sitting in freeBase.
+                        vault_ok = bool(vault_res.get("executed")) and bool(vault_res.get("txHash"))
                     except Exception as vault_exc:
                         o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
                         vault_ok = False
@@ -32096,6 +32104,116 @@ def _ensure_grid_autorun(item_id: str, interval: float = 10.0) -> None:
         pass
 
 
+
+def _grid_recover_false_filled_exit_orders(item_id: str, session: dict) -> dict:
+    """ENGINE-462: recover legacy Grid SELL orders that were marked FILLED without an on-chain sell.
+
+    BUILD460/early BUILD461 could persist FILLED before a successful Vault exit.  Recovery is
+    intentionally conservative: only GRID/EXIT_ONLY SELL orders without any tx hash are eligible,
+    and they are reopened only when the ordered asset quantity is still provably present in the
+    wallet's CoreVault freeBase on the same chain.  A genuine on-chain sell is never reopened.
+    """
+    if not isinstance(session, dict):
+        return session
+    wa = _norm_addr(session.get("wallet_address") or "")
+    if not wa:
+        return session
+    orders = session.get("orders") if isinstance(session.get("orders"), list) else []
+    if not orders:
+        return session
+
+    chain_key = _grid_chain_key(item_id, session.get("chain") or "") or str(session.get("chain") or "").upper()
+    symbol = _grid_asset_symbol(item_id)
+    if not chain_key or not symbol:
+        return session
+
+    eligible = []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        if str(o.get("status") or "").upper() != "FILLED" or str(o.get("side") or "").upper() != "SELL":
+            continue
+        source = str(o.get("source") or "").upper()
+        rule_mode = str(o.get("rule_mode") or "").upper()
+        if source != "GRID" and rule_mode != "EXIT_ONLY":
+            continue
+        vault_meta = o.get("vault_exit") if isinstance(o.get("vault_exit"), dict) else {}
+        txh = str(o.get("tx_hash") or o.get("txHash") or vault_meta.get("txHash") or "").strip()
+        # A transaction hash is durable proof that this order already reached the on-chain exit path.
+        if txh:
+            continue
+        try:
+            qty = float(o.get("qty") or o.get("amount") or 0.0)
+        except Exception:
+            qty = 0.0
+        if qty <= 0:
+            continue
+        eligible.append((o, qty))
+    if not eligible:
+        return session
+
+    # Prove the asset is still in Vault freeBase before reopening anything.
+    try:
+        funding = _v5_engine_funding_state(wa, chain_key, symbol) or {}
+        decimals = int(funding.get("decimals") or 18)
+        free_units = int(funding.get("freeBaseUnits") or 0)
+        scale = float(10 ** max(0, min(36, decimals)))
+        free_qty = free_units / scale if scale > 0 else 0.0
+    except Exception as exc:
+        _live_engine_mark(
+            "GRID", status="running", decision="FALSE_FILLED_RECOVERY_WAIT",
+            reason=f"Grid false-FILLED recovery waiting for Vault proof on {chain_key}:{symbol}",
+            last_error=str(exc)[:400],
+        )
+        return session
+
+    changed = False
+    remaining = max(0.0, float(free_qty or 0.0))
+    nowi = int(time.time())
+    for o, qty in eligible:
+        # Tiny decimal tolerance only; never reopen more quantity than is still present.
+        tol = max(1e-12, abs(qty) * 1e-9)
+        if remaining + tol < qty:
+            continue
+        previous_fill_price = o.get("fill_price")
+        previous_filled_ts = o.get("filled_ts")
+        o["status"] = "OPEN"
+        o["sell_pending"] = True
+        o["sell_pending_reason"] = "recovered_false_filled_without_onchain_exit"
+        o["false_filled_recovered"] = True
+        o["false_filled_recovered_ts"] = nowi
+        if previous_fill_price is not None:
+            o["legacy_false_fill_price"] = previous_fill_price
+        if previous_filled_ts is not None:
+            o["legacy_false_filled_ts"] = previous_filled_ts
+        o.pop("fill_price", None)
+        o.pop("filled_ts", None)
+        remaining = max(0.0, remaining - qty)
+        changed = True
+
+    if not changed:
+        return session
+
+    session["orders"] = orders
+    session["running"] = True
+    session["stopped"] = False
+    try:
+        _grid_sync_session_orders_to_db(
+            wa, item_id, orders, chain=chain_key,
+            current_price=session.get("price") or session.get("last_price"),
+        )
+    except Exception as exc:
+        _live_engine_mark("GRID", status="error", decision="FALSE_FILLED_RECOVERY_DB_ERROR", last_error=str(exc)[:500])
+        return session
+
+    _live_engine_mark(
+        "GRID", status="running", decision="FALSE_FILLED_RECOVERED",
+        reason=f"Reopened Grid SELL on {chain_key}:{symbol}: token is still present in Vault and no sell tx exists",
+        tradable_assets=1, best_candidate=symbol, last_error="",
+    )
+    return session
+
+
 def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
     """Background loop: refresh live price, tick Grid, and publish health."""
     try:
@@ -32116,6 +32234,16 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
                             session = _grid_refresh_session_orders_from_db(item_id, wa, _grid_chain_key(item_id)) or session
                         except Exception:
                             pass
+                        # ENGINE-462: repair the exact legacy state seen in production:
+                        # FILLED locally, no sell transaction, asset still in Vault.
+                        try:
+                            session = _grid_recover_false_filled_exit_orders(item_id, session) or session
+                        except Exception as recovery_exc:
+                            _live_engine_mark(
+                                "GRID", status="running", decision="FALSE_FILLED_RECOVERY_ERROR",
+                                reason="Grid false-FILLED recovery could not complete this tick",
+                                last_error=str(recovery_exc)[:500],
+                            )
 
                     # Resolve a fresh backend price. _get_live_price_for_item requires
                     # snapshot metadata; after deploy that metadata may be absent. Fall
