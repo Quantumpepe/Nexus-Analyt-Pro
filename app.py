@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-474-PRIVY-WNATIVE-FULL-ADDRESS"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-476-GRID-WNATIVE-SWAP-FILL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -25995,18 +25995,35 @@ def _grid_freebase_withdraw_swap_deposit(
                 if wallet_wrapped > 0:
                     amount_in = min(amount_in, wallet_wrapped)
 
-    # 3) approve router
+    # 3) approve router (ENGINE-476: skip if allowance already covers amount_in — stops approve spam)
     if not txs.get("approveRouter"):
-        approve_sel = "0x095ea7b3"
-        approve_data = approve_sel + _addr_to_32(router) + _uint_to_32(amount_in)
-        sent_ap = _step_send(
-            "approve",
-            swap_token_in,
-            approve_data,
-            "0x0",
-            f"grid-fb-approve-{symbol}-{int(time.time())}",
-        )
-        txs["approveRouter"] = sent_ap.get("hash") or ""
+        need_approve = True
+        try:
+            # allowance(owner, router)
+            allow_data = "0xdd62ed3e" + _addr_to_32(wa) + _addr_to_32(router)
+            allow_raw = _eth_call(chain_id, swap_token_in, allow_data)
+            hx = str(allow_raw or "0x0").removeprefix("0x") or "0"
+            allowance = int(hx[-64:] or "0", 16) if hx else 0
+            if allowance >= int(amount_in):
+                need_approve = False
+                txs["approveRouter"] = "already_approved"
+        except Exception:
+            need_approve = True
+        if need_approve:
+            approve_sel = "0x095ea7b3"
+            approve_data = approve_sel + _addr_to_32(router) + ("f" * 64)  # max uint256 — one-time approve
+            try:
+                sent_ap = _step_send(
+                    "approve",
+                    swap_token_in,
+                    approve_data,
+                    "0x0",
+                    f"grid-fb-approve-{symbol}-{int(time.time())}",
+                )
+                txs["approveRouter"] = sent_ap.get("hash") or "approve_sent"
+            except Exception as ap_exc:
+                # keep prior wrap/withdraw hashes so next tick can resume
+                raise RuntimeError(f"{ap_exc}|partial_txs={{{','.join(f'{k}:{v}' for k,v in txs.items() if v)}}}") from ap_exc
 
     # 4) swap
     if not txs.get("swap"):
@@ -26030,15 +26047,21 @@ def _grid_freebase_withdraw_swap_deposit(
             raise RuntimeError("STEP=swap_encode:err=grid_freebase_swap_encode_failed")
         if isinstance(swap_data, str) and not swap_data.startswith("0x"):
             swap_data = "0x" + swap_data
-        sent_sw = _step_send(
-            "swap",
-            router,
-            swap_data,
-            "0x0",
-            f"grid-fb-swap-{symbol}-{int(time.time())}",
-        )
-        txs["swap"] = sent_sw.get("hash") or ""
-        txs["swapSelector"] = used_sel
+        try:
+            sent_sw = _step_send(
+                "swap",
+                router,
+                swap_data,
+                "0x0",
+                f"grid-fb-swap-{symbol}-{int(time.time())}",
+            )
+            txs["swap"] = sent_sw.get("hash") or ""
+            txs["swapSelector"] = used_sel
+        except Exception as sw_exc:
+            # ENGINE-476: persist wrap/approve so resume does not re-wrap; surface policy vs other errors
+            raise RuntimeError(
+                f"{sw_exc}|partial_txs={{{','.join(f'{k}:{v}' for k,v in txs.items() if v)}}}"
+            ) from sw_exc
 
     # 5) USDC on wallet — no vault re-deposit (ENGINE-470)
     bal_data = "0x70a08231" + _addr_to_32(wa)
@@ -26380,9 +26403,26 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
                 last_error=str(exit_out)[:300],
             )
     except Exception as exc:
-        msg = str(exc)[:240]
-        result["reason"] = f"vault_exit_failed:{msg}"
-        result["detail"] = {"error": msg}
+        msg = str(exc)[:500]
+        partial = {}
+        try:
+            # ENGINE-476: recover txs from "|partial_txs={k:v,...}" so next tick resumes after wrap
+            if "partial_txs={" in msg:
+                blob = msg.split("partial_txs={", 1)[1]
+                blob = blob.rsplit("}", 1)[0]
+                for part in blob.split(","):
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        k, v = k.strip(), v.strip()
+                        if k and v:
+                            partial[k] = v
+        except Exception:
+            partial = {}
+        result["reason"] = f"vault_exit_failed:{msg[:240]}"
+        result["detail"] = {"error": msg[:400], "txs": partial}
+        result["txs"] = partial
+        if partial:
+            result["vault_exit"] = {"attempted": True, "executed": False, "txs": partial, "reason": result["reason"]}
         _live_engine_mark(
             "GRID", status="running", decision="VAULT_SELL_ERROR",
             reason=f"Grid SELL {symbol} failed: {msg[:160]}",
@@ -32477,11 +32517,23 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                     vault_ok = False
 
                 if not vault_ok:
+                    # ENGINE-476: keep partial txs (wrap/approve) on the order for resume
+                    try:
+                        ve = o.get("vault_exit") if isinstance(o.get("vault_exit"), dict) else {}
+                        det = ve.get("detail") if isinstance(ve.get("detail"), dict) else {}
+                        partial = det.get("txs") or ve.get("txs") or vault_res.get("txs") or {}
+                        if partial:
+                            ve = dict(ve)
+                            ve["txs"] = partial
+                            o["vault_exit"] = ve
+                    except Exception:
+                        pass
                     o["status"] = "OPEN"
                     o["sell_pending"] = True
                     o["sell_pending_reason"] = str((o.get("vault_exit") or {}).get("reason") or "vault_exit_not_confirmed")[:240]
                     continue
 
+                # ENGINE-476: swap done → FILLED, order leaves open grid list
                 o["status"] = "FILLED"
                 o["sell_pending"] = False
                 o.pop("sell_pending_reason", None)
