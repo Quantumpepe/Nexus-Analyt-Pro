@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.20-ENGINE-460-SESSION-SNAPSHOT-FINALIZE-LOCK"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-461-GRID-TARGET-EXECUTION-FIX"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -8380,6 +8380,20 @@ def _grid_sync_session_orders_to_db(wallet_address: str, item_id: str, orders: l
                     "cancelled_ts": o.get("cancelled_ts"),
                     "usd": o.get("usd"),
                     "source": o.get("source"),
+                    # ENGINE-461: execution-critical Grid fields must survive SQLite
+                    # refresh/restart; otherwise max-loss and pending sell retries lose context.
+                    "entry_price": o.get("entry_price"),
+                    "ref_price": o.get("ref_price"),
+                    "max_loss_pct": o.get("max_loss_pct"),
+                    "rule_mode": o.get("rule_mode"),
+                    "payout_asset": o.get("payout_asset") or o.get("payoutAsset"),
+                    "fill_trigger": o.get("fill_trigger"),
+                    "trigger_price": o.get("trigger_price"),
+                    "triggered_ts": o.get("triggered_ts"),
+                    "sell_pending": o.get("sell_pending"),
+                    "sell_pending_reason": o.get("sell_pending_reason"),
+                    "vault_exit": o.get("vault_exit"),
+                    "tx_hash": o.get("tx_hash"),
                     # ENGINE-457: wallet-wide Grid UI must mark each order with the
                     # price from its own running session, never the currently selected chain.
                     "current_price": current_price if current_price is not None else o.get("current_price"),
@@ -25992,6 +26006,11 @@ def api_grid_manual_add():
             "payout_asset": _grid_normalize_payout_asset(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC"),
             "payoutAsset": _grid_normalize_payout_asset(payload.get("payout_asset") or payload.get("payoutAsset") or "USDC"),
             "original_asset": str(payload.get("original_asset") or _grid_asset_symbol(item_id)).upper().strip(),
+            # ENGINE-461: preserve the real Grid entry/reference price separately from
+            # the SELL target. Max-loss must be measured from the price at Grid start,
+            # never from the target price. The UI may send any of these aliases.
+            "entry_price": 0.0,
+            "ref_price": 0.0,
             "max_loss_pct": max(0.0, min(100.0, float(payload.get("max_loss_pct") or payload.get("maxLossPct") or 0.0))),
             "rule_mode": "EXIT_ONLY" if source == "GRID" else "ORDER",
             "vault_exit_policy": NEXUS_DEFAULT_EXIT_POLICY,
@@ -26002,6 +26021,41 @@ def api_grid_manual_add():
             "ts": int(time.time()),
             "level": payload.get("level", None),  # optional
         }
+
+        # ENGINE-461: resolve and lock the entry/reference price at order creation.
+        # This is independent from order["price"], which is the SELL target.
+        if source == "GRID":
+            entry_px = 0.0
+            for raw_entry in (
+                payload.get("entry_price"), payload.get("entryPrice"),
+                payload.get("ref_price"), payload.get("refPrice"),
+                payload.get("current_price"), payload.get("currentPrice"),
+                payload.get("live_price"), payload.get("livePrice"),
+            ):
+                try:
+                    candidate = float(raw_entry or 0.0)
+                except Exception:
+                    candidate = 0.0
+                if candidate > 0:
+                    entry_px = candidate
+                    break
+            if entry_px <= 0:
+                try:
+                    entry_px = float(_get_live_price_for_item(item_id) or 0.0)
+                except Exception:
+                    entry_px = 0.0
+            if entry_px <= 0:
+                try:
+                    sym = _symbol_from_item(item_id)
+                    cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
+                    if cg_id:
+                        live = _cg_market_snapshot(str(cg_id)) or {}
+                        entry_px = float(live.get("price") or live.get("current_price") or 0.0)
+                except Exception:
+                    entry_px = 0.0
+            if entry_px > 0:
+                order["entry_price"] = round(entry_px, 12)
+                order["ref_price"] = round(entry_px, 12)
 
         # Persist to DB (authoritative)
         db_saved = True
@@ -31788,21 +31842,46 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
             except Exception:
                 max_loss_hit = False
             if crossed or price >= op or max_loss_hit:  # target or max-loss
+                trigger = "MAX_LOSS" if max_loss_hit and not (crossed or price >= op) else "TARGET_PRICE"
+                o["fill_trigger"] = trigger
+                o["trigger_price"] = round(float(price), 8)
+                o["triggered_ts"] = int(time.time())
+                o["payout_asset"] = _grid_normalize_payout_asset(o.get("payout_asset") or o.get("payoutAsset") or "USDC")
+
+                # ENGINE-461: for the real Nexus Grid exit-only path, a target hit is
+                # not a FILLED order until the CoreVault position was actually sold.
+                # BUILD460 marked FILLED before the vault exit and therefore could lose
+                # the retry after an RPC/route/session failure. Keep it OPEN and retry
+                # on the next backend tick until the sell succeeds.
+                is_live_grid_exit = str(o.get("source") or "").upper() == "GRID" or str(o.get("rule_mode") or "").upper() == "EXIT_ONLY"
+                vault_res = {}
+                vault_ok = True
+                if is_live_grid_exit:
+                    vault_ok = False
+                    try:
+                        vault_res = _grid_try_vault_sell_on_fill(
+                            str(session.get("wallet_address") or ""), session, o, float(price),
+                        ) or {}
+                        o["vault_exit"] = vault_res
+                        if vault_res.get("txHash"):
+                            o["tx_hash"] = vault_res.get("txHash")
+                        reason = str(vault_res.get("reason") or "")
+                        vault_ok = bool(vault_res.get("executed")) or reason == "vault_exit_no_position"
+                    except Exception as vault_exc:
+                        o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
+                        vault_ok = False
+
+                    if not vault_ok:
+                        o["status"] = "OPEN"
+                        o["sell_pending"] = True
+                        o["sell_pending_reason"] = str((o.get("vault_exit") or {}).get("reason") or "vault_exit_not_confirmed")[:240]
+                        continue
+
                 o["status"] = "FILLED"
+                o["sell_pending"] = False
+                o.pop("sell_pending_reason", None)
                 o["filled_ts"] = int(time.time())
                 o["fill_price"] = round(float(price), 8)
-                o["fill_trigger"] = "MAX_LOSS" if max_loss_hit and not (crossed or price >= op) else "TARGET_PRICE"
-                o["payout_asset"] = _grid_normalize_payout_asset(o.get("payout_asset") or o.get("payoutAsset") or "USDC")
-                # ENGINE-366: attempt CoreVault sell → USDC/USDT when GRID live session exists.
-                try:
-                    vault_res = _grid_try_vault_sell_on_fill(
-                        str(session.get("wallet_address") or ""), session, o, float(price),
-                    )
-                    o["vault_exit"] = vault_res
-                    if vault_res.get("txHash"):
-                        o["tx_hash"] = vault_res.get("txHash")
-                except Exception as vault_exc:
-                    o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
                 fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd", "payout_asset", "fill_trigger", "tx_hash")})
                 filled_now += 1
 
@@ -32028,7 +32107,34 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
             try:
                 session = GRID_SESSIONS.get(item_id)
                 if session and bool(session.get("running", True)) and not bool(session.get("stopped", False)):
+                    # ENGINE-461: SQLite is the authoritative order source. Refresh it
+                    # before every autorun decision so target/max-loss changes and the
+                    # persisted OPEN state cannot be missed by a stale RAM session.
+                    wa = str(session.get("wallet_address") or "")
+                    if wa:
+                        try:
+                            session = _grid_refresh_session_orders_from_db(item_id, wa, _grid_chain_key(item_id)) or session
+                        except Exception:
+                            pass
+
+                    # Resolve a fresh backend price. _get_live_price_for_item requires
+                    # snapshot metadata; after deploy that metadata may be absent. Fall
+                    # back to the same static CoinGecko mapping used by /api/grid/tick.
                     p = _get_live_price_for_item(item_id)
+                    if p is None or not (float(p or 0.0) > 0):
+                        try:
+                            sym = _symbol_from_item(item_id)
+                            cg_id = _STATIC_CG_IDS.get(sym) or COINGECKO_KNOWN.get(sym)
+                            if cg_id:
+                                live = _cg_market_snapshot(str(cg_id)) or {}
+                                p2 = float(live.get("price") or live.get("current_price") or 0.0)
+                                if p2 > 0:
+                                    p = p2
+                                    snap_data = {"ts": now_ts(), "data": {"id": cg_id, "mode": "market", "symbol": sym, "price": p2}}
+                                    for it in _grid_item_variants(item_id):
+                                        SNAPSHOTS[it] = snap_data
+                        except Exception:
+                            p = None
                     updated = _sim_tick(session, new_price=p)
                     _grid_sessions_set(item_id, _trim_grid_session(updated))
                     try:
