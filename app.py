@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-470-GRID-FREEBASE-SWAP-TO-WALLET-USDC"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-471-GRID-FORCE-WALLET-SWAP-RESUME"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -26200,8 +26200,12 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
             wallet_has = 0
         if wallet_has > 0 or prior.get("withdraw"):
             sell_units = min(order_units, wallet_has) if wallet_has > 0 else order_units
-            sell_source = "free_base_wallet_resume"
+            sell_source = "wallet_swap_resume"
+            if not prior.get("withdraw"):
+                prior = dict(prior or {})
+                prior["withdraw"] = "pre_withdrawn_freebase_empty"
             result["_prior_txs"] = prior
+            _live_engine_mark("GRID", status="running", decision="WALLET_SWAP_START", reason=f"Grid wallet swap resume units={sell_units}", last_error="")
         else:
             result["reason"] = "grid_no_token_balance"
             result["attempted"] = True
@@ -26280,7 +26284,7 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     live_row["_grid_native_freebase_exit"] = bool(is_native and str(sell_source).startswith("free_base"))
 
     try:
-        if str(sell_source).startswith("free_base"):
+        if str(sell_source).startswith("free_base") or str(sell_source).startswith("wallet_swap"):
             # ENGINE-467: freeBase cannot use executeTrade EXIT (needs position).
             # Privy-delegated withdraw → swap → deposit — no user confirmation.
             try:
