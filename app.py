@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-464-GRID-SELL-TRIGGER-HARDEN"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-465-GRID-NATIVE-POL-WNATIVE-SELL"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -25888,6 +25888,31 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     token = _norm_addr(funding.get("token") or "")
     decimals = max(0, min(36, int(funding.get("decimals") or 18)))
     free_units = int(funding.get("freeBaseUnits") or 0)
+    # ENGINE-465: native POL/ETH/BNB freeBase uses the zero-address sentinel.
+    # Uniswap executeTrade needs the wrapped native (WMATIC/WETH/WBNB) as tokenIn.
+    is_native = bool(funding.get("native")) or token in ("", "0x", "0x0") or token == _norm_addr(
+        globals().get("NEXUS_NATIVE_TOKEN") or "0x0000000000000000000000000000000000000000"
+    )
+    trade_token = token
+    if is_native or not _looks_like_evm_addr(token):
+        try:
+            cfg_n = _privy_trading_cfg(chain_id)
+            trade_token = _norm_addr(cfg_n.get("weth") or cfg_n.get("wnative") or "")
+        except Exception:
+            trade_token = ""
+        if not _looks_like_evm_addr(trade_token):
+            # Hard fallback for known wrapped natives
+            _wn = {
+                1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+                56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+                137: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",  # WMATIC/WPOL
+            }.get(int(chain_id))
+            trade_token = _norm_addr(_wn or "")
+        if not _looks_like_evm_addr(trade_token):
+            result["reason"] = f"grid_native_wrapper_unresolved:{symbol}:chain={chain_id}"
+            return result
+        # freeBase of native is still under the zero-address account key
+        token = trade_token
     if not _looks_like_evm_addr(token):
         result["reason"] = f"grid_token_unresolved:{symbol}"
         return result
@@ -25905,6 +25930,12 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
         pos_units = int(_position_amount(vault, int(sid), token, chain_id=chain_id) or 0)
     except Exception:
         pos_units = 0
+    # Native assets may also appear as WNATIVE positions after a prior wrap/trade.
+    if pos_units <= 0 and is_native and _looks_like_evm_addr(trade_token):
+        try:
+            pos_units = int(_position_amount(vault, int(sid), trade_token, chain_id=chain_id) or 0)
+        except Exception:
+            pass
 
     # Prefer explicit session position; otherwise sell freeBase (EXIT_ONLY Grid).
     if pos_units > 0:
@@ -25974,9 +26005,13 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
             "source": "grid_exit_only",
             "chain": chain_key,
         }
+    # Always trade the executable contract (WNATIVE for native POL/ETH/BNB).
     route["token"] = token
     route["decimals"] = decimals
     route["symbol"] = symbol
+    if is_native:
+        route["native"] = True
+        route["wrappedToken"] = token
 
     # Stamp engine so live ops / marks stay on GRID (not remapped to NKR).
     live_row = dict(live_row)
