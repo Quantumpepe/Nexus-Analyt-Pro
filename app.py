@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-471-GRID-FORCE-WALLET-SWAP-RESUME"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-472-PRIVY-POLICY-10CHAIN-CATALOG"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -9695,6 +9695,9 @@ _CHAIN_ID_BY_KEY = {
     "ARBITRUM": 42161,
     "OPTIMISM": 10,
     "AVALANCHE": 43114,
+    "LINEA": 59144,
+    "SCROLL": 534352,
+    "ZKSYNC": 324,
 }
 _ENABLED_EVM_CHAINS = _parse_csv_list(os.getenv("NEXUS_ENABLED_EVM_CHAINS", "POL"))
 # Always keep POL enabled by default to match Phase 1 expectations
@@ -9889,7 +9892,10 @@ _VAULT_BY_CHAIN = {
 }
 
 NEXUS_NATIVE_TOKEN = "0x0000000000000000000000000000000000000000"
-_NATIVE_SYMBOL_BY_CHAIN = {1: "ETH", 56: "BNB", 137: "POL"}
+_NATIVE_SYMBOL_BY_CHAIN = {
+    1: "ETH", 56: "BNB", 137: "POL", 8453: "ETH", 42161: "ETH", 10: "ETH",
+    43114: "AVAX", 59144: "ETH", 534352: "ETH", 324: "ETH",
+}
 _NATIVE_DECIMALS_BY_CHAIN = {1: 18, 56: 18, 137: 18}
 
 _NKR_LIQUIDITY_VAULT_BY_CHAIN = {
@@ -9910,17 +9916,32 @@ _ROUTER_BY_CHAIN = {
 }
 
 # Optional: Uniswap V3 Router (used on ETH mainly; can be empty on chains without V3 usage)
+# Uniswap V3 SwapRouter02 defaults (override via ENV). BNB uses Pancake V3 SmartRouter default empty→ENV required historically.
 _ROUTER_V3_BY_CHAIN = {
-    1: (os.getenv("ROUTER_V3_ADDRESS_ETH") or os.getenv("ROUTER_V3_ADDRESS_1") or "").strip(),
-    56: (os.getenv("ROUTER_V3_ADDRESS_BNB") or os.getenv("ROUTER_V3_ADDRESS_56") or "").strip(),
-    137: (os.getenv("ROUTER_V3_ADDRESS_POL") or os.getenv("ROUTER_V3_ADDRESS_POLYGON") or os.getenv("ROUTER_V3_ADDRESS_137") or "").strip(),
+    1: (os.getenv("ROUTER_V3_ADDRESS_ETH") or os.getenv("ROUTER_V3_ADDRESS_1") or "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45").strip(),
+    56: (os.getenv("ROUTER_V3_ADDRESS_BNB") or os.getenv("ROUTER_V3_ADDRESS_56") or "0x13f4EA80D578cB40fF01D616750695d487e60F13").strip(),
+    137: (os.getenv("ROUTER_V3_ADDRESS_POL") or os.getenv("ROUTER_V3_ADDRESS_POLYGON") or os.getenv("ROUTER_V3_ADDRESS_137") or "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45").strip(),
+    8453: (os.getenv("ROUTER_V3_ADDRESS_BASE") or os.getenv("ROUTER_V3_ADDRESS_8453") or "0x2626664c2603336E57B271c5C0b26F421741e481").strip(),
+    42161: (os.getenv("ROUTER_V3_ADDRESS_ARBITRUM") or os.getenv("ROUTER_V3_ADDRESS_42161") or "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45").strip(),
+    10: (os.getenv("ROUTER_V3_ADDRESS_OPTIMISM") or os.getenv("ROUTER_V3_ADDRESS_10") or "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45").strip(),
+    43114: (os.getenv("ROUTER_V3_ADDRESS_AVALANCHE") or os.getenv("ROUTER_V3_ADDRESS_43114") or "0xbb00FF08d01D300023C629E8fFfFcb65A5a040A7").strip(),
+    59144: (os.getenv("ROUTER_V3_ADDRESS_LINEA") or os.getenv("ROUTER_V3_ADDRESS_59144") or "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a").strip(),
+    534352: (os.getenv("ROUTER_V3_ADDRESS_SCROLL") or os.getenv("ROUTER_V3_ADDRESS_534352") or "0xfc30937f96bD69374D5367108753A2e790095BB1").strip(),
+    324: (os.getenv("ROUTER_V3_ADDRESS_ZKSYNC") or os.getenv("ROUTER_V3_ADDRESS_324") or "0x99c56385e44696a7c4b2E38C1217aFc3eF400F5d").strip(),
 }
 
 # Wrapped native token per chain (useful for auto-path building & validation)
 _WNATIVE_BY_CHAIN = {
     1: (os.getenv("WNATIVE_ADDRESS_ETH") or os.getenv("WNATIVE_ADDRESS_1") or "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").strip(),
     56: (os.getenv("WNATIVE_ADDRESS_BNB") or os.getenv("WNATIVE_ADDRESS_56") or "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c").strip(),
-    137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270").strip(),  # WPOL/WMATIC
+    137: (os.getenv("WNATIVE_ADDRESS_POL") or os.getenv("WNATIVE_ADDRESS_POLYGON") or os.getenv("WNATIVE_ADDRESS_137") or "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270").strip(),
+    8453: (os.getenv("WNATIVE_ADDRESS_BASE") or os.getenv("WNATIVE_ADDRESS_8453") or "0x4200000000000000000000000000000000000006").strip(),
+    42161: (os.getenv("WNATIVE_ADDRESS_ARBITRUM") or os.getenv("WNATIVE_ADDRESS_42161") or "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1").strip(),
+    10: (os.getenv("WNATIVE_ADDRESS_OPTIMISM") or os.getenv("WNATIVE_ADDRESS_10") or "0x4200000000000000000000000000000000000006").strip(),
+    43114: (os.getenv("WNATIVE_ADDRESS_AVALANCHE") or os.getenv("WNATIVE_ADDRESS_43114") or "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7").strip(),
+    59144: (os.getenv("WNATIVE_ADDRESS_LINEA") or os.getenv("WNATIVE_ADDRESS_59144") or "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f").strip(),
+    534352: (os.getenv("WNATIVE_ADDRESS_SCROLL") or os.getenv("WNATIVE_ADDRESS_534352") or "0x5300000000000000000000000000000000000004").strip(),
+    324: (os.getenv("WNATIVE_ADDRESS_ZKSYNC") or os.getenv("WNATIVE_ADDRESS_324") or "0x5AEa5775959fBC2557Cc8789bC1bf90A239D9a91").strip(),
 }
 
 # Owner-managed execution routes for non-EVM display assets such as BTC, SOL and XRP.
@@ -33813,7 +33834,7 @@ def _uint_to_32(value):
 
 def _privy_trading_cfg(chain_id=1):
     cid = int(chain_id or 1)
-    if cid not in (1, 56, 137):
+    if cid not in (1, 56, 137, 8453, 42161, 10, 43114, 59144, 534352, 324):
         raise RuntimeError(f"unsupported_live_chain:{cid}")
     native_symbol = _NATIVE_SYMBOL_BY_CHAIN.get(cid, "ETH")
     vault = _norm_addr(_VAULT_BY_CHAIN.get(cid) or "")
@@ -34216,17 +34237,24 @@ def _privy_policy_rule_targets_for_chain(chain_id):
     cfg = _privy_trading_cfg(cid)
     chain_key = str(cfg.get("chainKey") or cid).upper()
 
-    # Policy safety: BNB V5 trading must use PancakeSwap V3 only. Never fall
-    # back to ROUTER_ADDRESS_56 (PancakeSwap V2) for policy generation.
-    policy_router = cfg.get("router")
+    # Policy safety: prefer V3 router map (defaults for top-10 EVMs).
+    # BNB: Pancake V3 only — never fall back to V2 ROUTER_ADDRESS_56.
+    policy_router = _norm_addr(
+        (_ROUTER_V3_BY_CHAIN.get(cid) if isinstance(globals().get("_ROUTER_V3_BY_CHAIN"), dict) else None)
+        or cfg.get("router")
+        or ""
+    )
     if cid == 56:
         policy_router = _norm_addr(
             os.getenv("ROUTER_V3_ADDRESS_BNB") or
             os.getenv("ROUTER_V3_ADDRESS_56") or
-            ""
+            policy_router or
+            "0x13f4EA80D578cB40fF01D616750695d487e60F13"
         )
         if not _looks_like_evm_addr(policy_router) or policy_router == NATIVE_TOKEN_ADDRESS:
             raise RuntimeError("bnb_v3_router_env_missing: set ROUTER_V3_ADDRESS_56")
+    if cid == 137 and (not _looks_like_evm_addr(policy_router) or policy_router == NATIVE_TOKEN_ADDRESS):
+        policy_router = _norm_addr("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
 
     policy_usdt = cfg.get("usdt")
     policy_usdc_native = ""
@@ -34305,6 +34333,67 @@ def _privy_policy_rule_target(rule):
         if str(condition.get("field_source") or "").lower() == "ethereum_transaction" and str(condition.get("field") or "").lower() == "to":
             return _norm_addr(condition.get("value") or "")
     return ""
+
+
+
+def _nexus_privy_policy_chain_catalog() -> list:
+    """Top-10 EVM catalog for System Info Privy policy selection.
+
+    Each chain lists selectable components (vault, router, wnative, usdc, usdt…).
+    Vault may be empty until that chain's CoreVault is deployed — still listed
+    so Base/Arbitrum/etc. can be enabled later without code changes.
+    """
+    catalog = [
+        {"key": "ETH", "chainId": 1, "name": "Ethereum"},
+        {"key": "BNB", "chainId": 56, "name": "BNB Smart Chain"},
+        {"key": "POL", "chainId": 137, "name": "Polygon"},
+        {"key": "BASE", "chainId": 8453, "name": "Base"},
+        {"key": "ARBITRUM", "chainId": 42161, "name": "Arbitrum One"},
+        {"key": "OPTIMISM", "chainId": 10, "name": "Optimism"},
+        {"key": "AVALANCHE", "chainId": 43114, "name": "Avalanche C-Chain"},
+        {"key": "LINEA", "chainId": 59144, "name": "Linea"},
+        {"key": "SCROLL", "chainId": 534352, "name": "Scroll"},
+        {"key": "ZKSYNC", "chainId": 324, "name": "zkSync Era"},
+    ]
+    out = []
+    for row in catalog:
+        cid = int(row["chainId"])
+        try:
+            cfg = _privy_trading_cfg(cid)
+        except Exception as exc:
+            cfg = {"error": str(exc)[:160]}
+        components = []
+        # desired targets if cfg works
+        try:
+            rules = _privy_policy_rule_targets_for_chain(cid)
+        except Exception:
+            rules = []
+        by_label = {str(r.get("label") or ""): r for r in (rules or [])}
+        for label, title in (
+            ("CoreVault", "Vault"),
+            ("Router", "V3 Router"),
+            ("Wrapped native", "Wrapped Native"),
+            ("USDC", "USDC"),
+            ("USDC_NATIVE", "Native USDC"),
+            ("USDT", "USDT"),
+        ):
+            r = by_label.get(label) or {}
+            addr = str(r.get("target") or "")
+            components.append({
+                "id": label,
+                "title": title,
+                "address": addr,
+                "available": bool(addr and addr.startswith("0x") and len(addr) == 42),
+                "defaultSelected": bool(addr and addr.startswith("0x") and len(addr) == 42),
+            })
+        out.append({
+            **row,
+            "nativeSymbol": (_NATIVE_SYMBOL_BY_CHAIN.get(cid) or row["key"]),
+            "vaultConfigured": bool((_VAULT_BY_CHAIN or {}).get(cid)),
+            "components": components,
+            "cfgError": cfg.get("error") if isinstance(cfg, dict) else None,
+        })
+    return out
 
 
 def _privy_policy_preview(chain_id=56):
@@ -34405,6 +34494,21 @@ def nexus_system_info_privy_policy_apply():
         return jsonify({"status": "error", "error": "invalid_confirmation_token", "ts": now_ts()}), 400
     except Exception as exc:
         return jsonify({"status": "error", "error": str(exc), "ts": now_ts()}), 400
+
+
+
+@app.get("/api/nexus/privy-policy-chain-catalog")
+def api_nexus_privy_policy_chain_catalog():
+    """System Info: top-10 EVM chains + selectable policy components."""
+    try:
+        return jsonify({
+            "status": "ok",
+            "chains": _nexus_privy_policy_chain_catalog(),
+            "policyId": str((_privy_trading_cfg(1).get("policyId") if True else "") or os.getenv("PRIVY_TRADING_POLICY_ID") or ""),
+            "ts": now_ts(),
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)[:300], "ts": now_ts()}), 400
 
 
 def _privy_estimate_tx_gas(chain_id: int, transaction: dict) -> int:
