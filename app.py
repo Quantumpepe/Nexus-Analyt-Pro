@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-467-GRID-FREEBASE-WITHDRAW-SWAP-DEPOSIT"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-470-GRID-FREEBASE-SWAP-TO-WALLET-USDC"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -25803,6 +25803,31 @@ def _grid_stop_finalize_sessions(wallet: str, chain_id: int = 0, session_id: str
     return out
 
 
+def _grid_wallet_token_balance(chain_id: int, token: str, wallet: str, *, is_native: bool = False) -> int:
+    """Raw wallet balance (native or ERC20)."""
+    wa = _norm_addr(wallet)
+    chain_id = int(chain_id)
+    if is_native or _norm_addr(token) in (
+        "", "0x0000000000000000000000000000000000000000",
+        _norm_addr(globals().get("NEXUS_NATIVE_TOKEN") or "0x0"),
+    ):
+        try:
+            raw = _rpc_call(chain_id, "eth_getBalance", [wa, "latest"])
+            return int(str(raw or "0x0"), 16)
+        except Exception:
+            return 0
+    token = _norm_addr(token)
+    if not _looks_like_evm_addr(token):
+        return 0
+    try:
+        bal_data = "0x70a08231" + _addr_to_32(wa)
+        bal_raw = _eth_call(chain_id, token, bal_data)
+        hx = str(bal_raw or "0x0").removeprefix("0x") or "0"
+        return int(hx[-64:] or "0", 16) if hx else 0
+    except Exception:
+        return 0
+
+
 def _grid_freebase_withdraw_swap_deposit(
     wallet: str,
     chain_id: int,
@@ -25816,18 +25841,15 @@ def _grid_freebase_withdraw_swap_deposit(
     decimals: int,
     payout_symbol: str,
     symbol: str,
+    prior_txs: dict | None = None,
 ) -> dict:
-    """ENGINE-467: Sell Grid freeBase without user confirmation (Privy delegated).
+    """ENGINE-467/468: Sell Grid freeBase without user confirmation (Privy delegated).
 
-    CoreVault executeTrade EXIT only spends session positions. freeBase cannot be
-    sold that way. This path uses only existing Vault + router calls:
+    Path: withdraw → optional wrap → swap → deposit USDC/USDT.
 
-      1) withdrawNative / withdrawBase  → user wallet
-      2) optional wrap native → WNATIVE
-      3) exactInputSingle WNATIVE/token → USDC/USDT
-      4) deposit USDC/USDT back into Vault freeBase
-
-    Same Privy delegated path as NKR createSession / executeTrade — no UI confirm.
+    ENGINE-468: resume-safe. If withdraw already succeeded (freeBase empty, POL
+    sitting on the wallet), skip withdraw and continue wrap/swap/deposit from
+    the wallet balance so the order does not stick on grid_no_token_balance.
     """
     wa = _norm_addr(wallet)
     chain_id = int(chain_id)
@@ -25846,142 +25868,166 @@ def _grid_freebase_withdraw_swap_deposit(
     if amount_in <= 0:
         raise RuntimeError("grid_freebase_amount_zero")
 
-    txs = {}
-    # --- 1) withdraw from vault freeBase to wallet ---
+    txs = dict(prior_txs or {})
+    native_zero = _norm_addr(globals().get("NEXUS_NATIVE_TOKEN") or "0x0000000000000000000000000000000000000000")
+
+    # --- balances: vault freeBase already withdrawn? use wallet ---
+    wallet_native = _grid_wallet_token_balance(chain_id, native_zero, wa, is_native=True)
+    wallet_wrapped = _grid_wallet_token_balance(chain_id, wrapped, wa, is_native=False) if _looks_like_evm_addr(wrapped) else 0
+    wallet_erc20 = 0
+    if not is_native and _looks_like_evm_addr(asset_token):
+        wallet_erc20 = _grid_wallet_token_balance(chain_id, asset_token, wa, is_native=False)
+
+    # How much can we still process from the wallet (after a prior withdraw)?
     if is_native:
-        wdata = _CORE_VAULT_SELECTORS["withdrawNative"] + _uint_to_32(amount_in) + _addr_to_32(wa)
+        available_wallet = max(wallet_native, wallet_wrapped)
     else:
-        token = _norm_addr(asset_token)
-        if not _looks_like_evm_addr(token):
-            raise RuntimeError("grid_freebase_token_invalid")
-        wdata = (
-            _CORE_VAULT_SELECTORS.get("withdrawBase")
-            or ("0x" + _keccak256(b"withdrawBase(address,uint256,address)")[:4].hex())
-        )
-        if not str(wdata).startswith("0x") or len(str(wdata)) < 10:
-            wdata = "0xad151a50"
-        wdata = wdata + _addr_to_32(token) + _uint_to_32(amount_in) + _addr_to_32(wa)
-    sent_w = _send_vault_tx(wallet_id, wa, vault, wdata, f"grid-fb-withdraw-{symbol}-{int(time.time())}", chain_id=chain_id)
-    txs["withdraw"] = sent_w.get("hash") or ""
+        available_wallet = wallet_erc20
+    # Leave a tiny native gas buffer on the wallet when selling native
+    gas_buffer = 0
+    if is_native:
+        gas_buffer = int(0.02 * (10 ** 18))  # ~0.02 POL/ETH/BNB for gas
+        if wallet_native > gas_buffer:
+            available_from_native = wallet_native - gas_buffer
+        else:
+            available_from_native = 0
+        available_wallet = max(available_from_native, wallet_wrapped)
+
+    need_withdraw = not bool(txs.get("withdraw"))
+    # If wallet already holds enough, skip withdraw (resume after partial run)
+    if available_wallet >= max(1, amount_in // 1000):  # at least dust
+        # Clamp sell size to what is actually on the wallet
+        sell_now = min(amount_in, available_wallet) if available_wallet > 0 else amount_in
+        if sell_now > 0:
+            amount_in = int(sell_now)
+            need_withdraw = False
+            if not txs.get("withdraw"):
+                txs["withdraw"] = txs.get("withdraw") or "skipped_wallet_already_funded"
+
+    # --- 1) withdraw from vault freeBase to wallet ---
+    if need_withdraw:
+        if is_native:
+            wdata = _CORE_VAULT_SELECTORS["withdrawNative"] + _uint_to_32(amount_in) + _addr_to_32(wa)
+        else:
+            token = _norm_addr(asset_token)
+            if not _looks_like_evm_addr(token):
+                raise RuntimeError("grid_freebase_token_invalid")
+            wsel = _CORE_VAULT_SELECTORS.get("withdrawBase") or "0xad151a50"
+            wdata = wsel + _addr_to_32(token) + _uint_to_32(amount_in) + _addr_to_32(wa)
+        sent_w = _send_vault_tx(wallet_id, wa, vault, wdata, f"grid-fb-withdraw-{symbol}-{int(time.time())}", chain_id=chain_id)
+        txs["withdraw"] = sent_w.get("hash") or ""
+        # refresh wallet balances after withdraw
+        wallet_native = _grid_wallet_token_balance(chain_id, native_zero, wa, is_native=True)
+        if is_native and _looks_like_evm_addr(wrapped):
+            wallet_wrapped = _grid_wallet_token_balance(chain_id, wrapped, wa, is_native=False)
+        elif not is_native:
+            wallet_erc20 = _grid_wallet_token_balance(chain_id, asset_token, wa, is_native=False)
 
     # --- 2) wrap native if needed ---
     swap_token_in = wrapped if is_native else _norm_addr(asset_token)
     if is_native:
         if not _looks_like_evm_addr(wrapped):
             raise RuntimeError("grid_freebase_wrapped_missing")
-        # WETH9/WMATIC/WBNB deposit()
-        wrap_data = "0xd0e30db0"
-        sent_wrap = _privy_send_delegated_transaction(
+        # Prefer already-wrapped balance; otherwise wrap from native
+        if wallet_wrapped >= amount_in:
+            pass  # already wrapped
+        else:
+            wrap_amt = min(amount_in, max(0, wallet_native - gas_buffer))
+            if wrap_amt <= 0:
+                raise RuntimeError(
+                    f"grid_freebase_wallet_empty_after_withdraw:native={wallet_native}:wrapped={wallet_wrapped}"
+                )
+            amount_in = int(wrap_amt)
+            if not txs.get("wrap"):
+                wrap_data = "0xd0e30db0"  # deposit()
+                sent_wrap = _privy_send_delegated_transaction(
+                    wallet_id,
+                    {"from": wa, "to": wrapped, "data": wrap_data, "value": hex(amount_in)},
+                    f"grid-fb-wrap-{symbol}-{int(time.time())}",
+                    chain_id=chain_id,
+                )
+                try:
+                    _privy_wait_receipt(sent_wrap.get("hash"), chain_id=chain_id)
+                except Exception:
+                    pass
+                txs["wrap"] = sent_wrap.get("hash") or ""
+                wallet_wrapped = _grid_wallet_token_balance(chain_id, wrapped, wa, is_native=False)
+                if wallet_wrapped > 0:
+                    amount_in = min(amount_in, wallet_wrapped)
+
+    # --- 3) approve router ---
+    if not txs.get("approveRouter"):
+        approve_sel = "0x095ea7b3"
+        approve_data = approve_sel + _addr_to_32(router) + _uint_to_32(amount_in)
+        sent_ap = _privy_send_delegated_transaction(
             wallet_id,
-            {"from": wa, "to": wrapped, "data": wrap_data, "value": hex(amount_in)},
-            f"grid-fb-wrap-{symbol}-{int(time.time())}",
+            {"from": wa, "to": swap_token_in, "data": approve_data, "value": "0x0"},
+            f"grid-fb-approve-{symbol}-{int(time.time())}",
             chain_id=chain_id,
         )
         try:
-            _privy_wait_receipt(sent_wrap.get("hash"), chain_id=chain_id)
+            _privy_wait_receipt(sent_ap.get("hash"), chain_id=chain_id)
         except Exception:
             pass
-        txs["wrap"] = sent_wrap.get("hash") or ""
+        txs["approveRouter"] = sent_ap.get("hash") or ""
 
-    # --- 3) approve router for swap_token_in ---
-    approve_sel = "0x095ea7b3"  # approve(address,uint256)
-    approve_data = approve_sel + _addr_to_32(router) + _uint_to_32(amount_in)
-    sent_ap = _privy_send_delegated_transaction(
-        wallet_id,
-        {"from": wa, "to": swap_token_in, "data": approve_data, "value": "0x0"},
-        f"grid-fb-approve-{symbol}-{int(time.time())}",
-        chain_id=chain_id,
-    )
-    try:
-        _privy_wait_receipt(sent_ap.get("hash"), chain_id=chain_id)
-    except Exception:
-        pass
-    txs["approveRouter"] = sent_ap.get("hash") or ""
-
-    # --- 4) swap to settlement ---
-    fee = int(cfg.get("poolFee") or 500)
-    deadline = int(time.time()) + 600
-    # Prefer SwapRouter02 selector, fall back to legacy
-    swap_data = None
-    for sel in (
-        globals().get("_PRIVY_EXACT_INPUT_SINGLE_SELECTOR") or "0x04e45aaf",
-        globals().get("_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR") or "0x414bf389",
-    ):
+    # --- 4) swap ---
+    if not txs.get("swap"):
+        fee = int(cfg.get("poolFee") or 500)
+        deadline = int(time.time()) + 600
+        swap_data = None
+        for sel in (
+            globals().get("_PRIVY_EXACT_INPUT_SINGLE_SELECTOR") or "0x04e45aaf",
+            globals().get("_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR") or "0x414bf389",
+        ):
+            try:
+                swap_data = _router_exact_input_single_data(
+                    sel, swap_token_in, settlement, wa, amount_in, min_out, fee, deadline,
+                )
+                break
+            except Exception:
+                continue
+        if not swap_data:
+            raise RuntimeError("grid_freebase_swap_encode_failed")
+        if isinstance(swap_data, str) and not swap_data.startswith("0x"):
+            swap_data = "0x" + swap_data
+        sent_sw = _privy_send_delegated_transaction(
+            wallet_id,
+            {"from": wa, "to": router, "data": swap_data, "value": "0x0"},
+            f"grid-fb-swap-{symbol}-{int(time.time())}",
+            chain_id=chain_id,
+        )
         try:
-            swap_data = _router_exact_input_single_data(
-                sel, swap_token_in, settlement, wa, amount_in, min_out, fee, deadline,
-            )
-            break
-        except Exception:
-            continue
-    if not swap_data:
-        raise RuntimeError("grid_freebase_swap_encode_failed")
-    # ensure 0x prefix on data
-    if isinstance(swap_data, str) and not swap_data.startswith("0x"):
-        swap_data = "0x" + swap_data
-    sent_sw = _privy_send_delegated_transaction(
-        wallet_id,
-        {"from": wa, "to": router, "data": swap_data, "value": "0x0"},
-        f"grid-fb-swap-{symbol}-{int(time.time())}",
-        chain_id=chain_id,
-    )
-    try:
-        _privy_wait_receipt(sent_sw.get("hash"), chain_id=chain_id)
-    except Exception:
-        pass
-    txs["swap"] = sent_sw.get("hash") or ""
+            _privy_wait_receipt(sent_sw.get("hash"), chain_id=chain_id)
+        except Exception as sw_exc:
+            txs["swapError"] = str(sw_exc)[:160]
+            raise RuntimeError(f"grid_freebase_swap_failed:{sw_exc}") from sw_exc
+        txs["swap"] = sent_sw.get("hash") or ""
 
-    # --- 5) read USDC balance on wallet and deposit into vault ---
-    # balanceOf(address)
+    # --- 5) ENGINE-470: USDC stays on the wallet — no vault re-deposit ---
+    # Grid: user sets asset + sell target → Grid sells → USDC on wallet.
     bal_data = "0x70a08231" + _addr_to_32(wa)
     try:
         bal_raw = _eth_call(chain_id, settlement, bal_data)
-        bal_words = _core_words(bal_raw) if "_core_words" in globals() else []
-        if not bal_words:
-            # parse raw
-            hx = str(bal_raw or "0x0").removeprefix("0x") or "0"
-            deposit_amt = int(hx[-64:] or "0", 16) if hx else 0
-        else:
-            deposit_amt = int(bal_words[0] or 0)
+        hx = str(bal_raw or "0x0").removeprefix("0x") or "0"
+        usdc_on_wallet = int(hx[-64:] or "0", 16) if hx else 0
     except Exception:
-        # fallback: use min_out as deposit amount estimate
-        deposit_amt = int(min_out)
-    if deposit_amt <= 0:
-        raise RuntimeError(f"grid_freebase_swap_no_usdc_balance:swapTx={txs.get('swap')}")
+        usdc_on_wallet = int(min_out)
+    if usdc_on_wallet <= 0 and not txs.get("swap"):
+        raise RuntimeError(f"grid_freebase_swap_no_usdc_on_wallet:swapTx={txs.get('swap')}")
 
-    # approve vault for USDC deposit
-    ap2 = approve_sel + _addr_to_32(vault) + _uint_to_32(deposit_amt)
-    sent_ap2 = _privy_send_delegated_transaction(
-        wallet_id,
-        {"from": wa, "to": settlement, "data": ap2, "value": "0x0"},
-        f"grid-fb-approve-vault-{symbol}-{int(time.time())}",
-        chain_id=chain_id,
-    )
-    try:
-        _privy_wait_receipt(sent_ap2.get("hash"), chain_id=chain_id)
-    except Exception:
-        pass
-    txs["approveVault"] = sent_ap2.get("hash") or ""
-
-    # deposit(address,uint256) = 0x47e7ef24
-    dep_data = "0x47e7ef24" + _addr_to_32(settlement) + _uint_to_32(deposit_amt)
-    sent_dep = _send_vault_tx(
-        wallet_id, wa, vault, dep_data,
-        f"grid-fb-deposit-{payout_symbol}-{int(time.time())}",
-        chain_id=chain_id,
-    )
-    txs["deposit"] = sent_dep.get("hash") or ""
-
-    primary = txs.get("swap") or txs.get("deposit") or txs.get("withdraw") or ""
+    primary = txs.get("swap") or txs.get("withdraw") or ""
     return {
         "executed": True,
         "txHash": primary,
         "txs": txs,
-        "depositAmount": str(deposit_amt),
+        "walletUsdcUnits": str(usdc_on_wallet),
         "soldUnits": str(amount_in),
         "payoutAsset": str(payout_symbol or "USDC").upper(),
-        "reason": "freebase_withdraw_swap_deposit",
+        "payoutLocation": "WALLET",
+        "reason": "grid_exit_usdc_on_wallet",
         "path": "PRIVY_DELEGATED_NO_USER_CONFIRM",
+        "userVisible": f"Grid sold {symbol} → {payout_symbol} on wallet",
     }
 
 
@@ -26133,14 +26179,38 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
         sell_units = min(order_units, free_units)
         sell_source = "free_base_native" if is_native else "free_base"
     else:
-        result["reason"] = "grid_no_token_balance"
-        result["attempted"] = True
-        _live_engine_mark(
-            "GRID", status="running", decision="VAULT_SELL_NO_BALANCE",
-            reason=f"Grid SELL {symbol}: position=0 freeBase=0 on {chain_key}",
-            last_error="",
-        )
-        return result
+        # ENGINE-468: after a successful withdraw, freeBase is 0 but coins sit on the
+        # wallet. Resume wrap/swap/deposit from wallet balance instead of aborting.
+        prior = {}
+        try:
+            ve = (order or {}).get("vault_exit") if isinstance((order or {}).get("vault_exit"), dict) else {}
+            prior = ve.get("txs") if isinstance(ve.get("txs"), dict) else {}
+        except Exception:
+            prior = {}
+        wallet_has = 0
+        try:
+            if is_native:
+                wallet_has = max(
+                    _grid_wallet_token_balance(chain_id, "0x0000000000000000000000000000000000000000", wa, is_native=True),
+                    _grid_wallet_token_balance(chain_id, wrapped, wa, is_native=False) if _looks_like_evm_addr(wrapped) else 0,
+                )
+            else:
+                wallet_has = _grid_wallet_token_balance(chain_id, token, wa, is_native=False)
+        except Exception:
+            wallet_has = 0
+        if wallet_has > 0 or prior.get("withdraw"):
+            sell_units = min(order_units, wallet_has) if wallet_has > 0 else order_units
+            sell_source = "free_base_wallet_resume"
+            result["_prior_txs"] = prior
+        else:
+            result["reason"] = "grid_no_token_balance"
+            result["attempted"] = True
+            _live_engine_mark(
+                "GRID", status="running", decision="VAULT_SELL_NO_BALANCE",
+                reason=f"Grid SELL {symbol}: position=0 freeBase=0 wallet=0 on {chain_key}",
+                last_error="grid_no_token_balance",
+            )
+            return result
 
     result["source"] = sell_source
     result["soldUnits"] = str(sell_units)
@@ -26227,6 +26297,14 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
             human_qty = float(sell_units) / float(10 ** max(0, decimals))
             est_out = int(max(1.0, human_qty * max(px, 1e-9) * (10 ** settle_dec)))
             min_out = max(1, int(est_out * 95 // 100))  # 5% slippage buffer
+            prior_txs = {}
+            try:
+                prior_txs = result.get("_prior_txs") if isinstance(result.get("_prior_txs"), dict) else {}
+                if not prior_txs:
+                    ve0 = (order or {}).get("vault_exit") if isinstance((order or {}).get("vault_exit"), dict) else {}
+                    prior_txs = ve0.get("txs") if isinstance(ve0.get("txs"), dict) else {}
+            except Exception:
+                prior_txs = {}
             exit_out = _grid_freebase_withdraw_swap_deposit(
                 wa, chain_id,
                 is_native=bool(is_native),
@@ -26238,6 +26316,7 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
                 decimals=decimals,
                 payout_symbol=payout,
                 symbol=symbol,
+                prior_txs=prior_txs,
             ) or {}
         else:
             exit_out = _nkr_live_trade_route(
@@ -26251,7 +26330,7 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
         if result["executed"]:
             _live_engine_mark(
                 "GRID", status="running", decision="VAULT_SELL_FILLED",
-                reason=f"Grid SELL {symbol} @ {fill_price} via {sell_source} → {payout}",
+                reason=f"Grid sold {symbol} @ {fill_price} → {payout} on wallet",
                 active_asset=symbol, pending_tx=txh, last_error="",
             )
         else:
