@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-463-GRID-FREEBASE-SELL-FIX"
+BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-464-GRID-SELL-TRIGGER-HARDEN"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32046,7 +32046,8 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
     for o in session.get("orders") or []:
         if not isinstance(o, dict):
             continue
-        if o.get("status") != "OPEN":
+        # ENGINE-464: status compare must be case-insensitive (DB/UI variants).
+        if str(o.get("status") or "").upper() != "OPEN":
             continue
         try:
             op = float(o.get("price") or 0.0)
@@ -32064,7 +32065,10 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                 filled_now += 1
 
         elif side == "SELL":
-            crossed = (prev_price < op and price >= op) or (prev_price == 0 and price >= op)
+            # ENGINE-464: inclusive target hit with float tolerance (UI 0.0881 vs 0.088).
+            tol = max(1e-12, abs(op) * 1e-9)
+            at_or_above_target = (op > 0 and price + tol >= op)
+            crossed = (prev_price < op and at_or_above_target) or (prev_price == 0 and at_or_above_target)
             # Max-loss path: if order carries max_loss_pct and entry/ref price is known.
             max_loss_hit = False
             try:
@@ -32074,45 +32078,35 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                     max_loss_hit = price <= ref * (1.0 - (mlp / 100.0))
             except Exception:
                 max_loss_hit = False
-            if crossed or price >= op or max_loss_hit:  # target or max-loss
-                trigger = "MAX_LOSS" if max_loss_hit and not (crossed or price >= op) else "TARGET_PRICE"
+            if crossed or at_or_above_target or max_loss_hit:  # target or max-loss
+                trigger = "MAX_LOSS" if max_loss_hit and not (crossed or at_or_above_target) else "TARGET_PRICE"
                 o["fill_trigger"] = trigger
                 o["trigger_price"] = round(float(price), 8)
                 o["triggered_ts"] = int(time.time())
                 o["payout_asset"] = _grid_normalize_payout_asset(o.get("payout_asset") or o.get("payoutAsset") or "USDC")
 
-                # ENGINE-461: for the real Nexus Grid exit-only path, a target hit is
-                # not a FILLED order until the CoreVault position was actually sold.
-                # BUILD460 marked FILLED before the vault exit and therefore could lose
-                # the retry after an RPC/route/session failure. Keep it OPEN and retry
-                # on the next backend tick until the sell succeeds.
-                is_live_grid_exit = str(o.get("source") or "").upper() == "GRID" or str(o.get("rule_mode") or "").upper() == "EXIT_ONLY"
+                # ENGINE-464: EVERY Grid-session SELL requires an on-chain Vault exit.
+                # Do not trust source/rule_mode alone — MANUAL rows from older clients
+                # still hold freeBase and must not mark FILLED without a tx.
                 vault_res = {}
-                vault_ok = True
-                if is_live_grid_exit:
+                vault_ok = False
+                try:
+                    vault_res = _grid_try_vault_sell_on_fill(
+                        str(session.get("wallet_address") or ""), session, o, float(price),
+                    ) or {}
+                    o["vault_exit"] = vault_res
+                    if vault_res.get("txHash"):
+                        o["tx_hash"] = vault_res.get("txHash")
+                    vault_ok = bool(vault_res.get("executed")) and bool(vault_res.get("txHash"))
+                except Exception as vault_exc:
+                    o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
                     vault_ok = False
-                    try:
-                        vault_res = _grid_try_vault_sell_on_fill(
-                            str(session.get("wallet_address") or ""), session, o, float(price),
-                        ) or {}
-                        o["vault_exit"] = vault_res
-                        if vault_res.get("txHash"):
-                            o["tx_hash"] = vault_res.get("txHash")
-                        reason = str(vault_res.get("reason") or "")
-                        # ENGINE-462: a logical/no-position result is NOT a successful Grid sell.
-                        # Only a real submitted/confirmed Vault exit with a transaction hash may
-                        # close the order. BUILD461 treated vault_exit_no_position as success and
-                        # could therefore show FILLED while the token was still sitting in freeBase.
-                        vault_ok = bool(vault_res.get("executed")) and bool(vault_res.get("txHash"))
-                    except Exception as vault_exc:
-                        o["vault_exit"] = {"attempted": True, "executed": False, "reason": str(vault_exc)[:200]}
-                        vault_ok = False
 
-                    if not vault_ok:
-                        o["status"] = "OPEN"
-                        o["sell_pending"] = True
-                        o["sell_pending_reason"] = str((o.get("vault_exit") or {}).get("reason") or "vault_exit_not_confirmed")[:240]
-                        continue
+                if not vault_ok:
+                    o["status"] = "OPEN"
+                    o["sell_pending"] = True
+                    o["sell_pending_reason"] = str((o.get("vault_exit") or {}).get("reason") or "vault_exit_not_confirmed")[:240]
+                    continue
 
                 o["status"] = "FILLED"
                 o["sell_pending"] = False
@@ -32504,13 +32498,56 @@ def _autorun_loop(item_id: str, stop_evt: threading.Event, interval: float):
                     _persist_grid_state()
                     open_orders = [o for o in (updated.get("orders") or []) if isinstance(o, dict) and str(o.get("status") or "").upper() == "OPEN"]
                     symbol = _symbol_from_item(item_id)
+                    pending_sells = [o for o in open_orders if o.get("sell_pending") or (o.get("vault_exit") if isinstance(o.get("vault_exit"), dict) else None)]
+                    filled_now = int(updated.get("filled_now") or 0)
+                    px = float(updated.get("price") or p or 0)
+                    if filled_now > 0:
+                        decision = "VAULT_SELL_FILLED"
+                        reason = f"Grid filled {filled_now} order(s) on {_grid_chain_key(item_id)}"
+                        last_err = ""
+                        pending_tx = ""
+                        for o in (updated.get("orders") or []):
+                            if isinstance(o, dict) and str(o.get("status") or "").upper() == "FILLED" and o.get("tx_hash"):
+                                pending_tx = str(o.get("tx_hash") or "")
+                                break
+                    elif pending_sells:
+                        pr = str((pending_sells[0].get("sell_pending_reason") or (pending_sells[0].get("vault_exit") or {}).get("reason") or "sell_pending"))[:200]
+                        decision = "VAULT_SELL_RETRY"
+                        reason = f"Target hit · Vault sell pending: {pr}"
+                        last_err = pr
+                        pending_tx = ""
+                    elif open_orders:
+                        # Surface whether live price is already at/above any SELL target.
+                        hit_info = []
+                        for o in open_orders:
+                            if str(o.get("side") or "").upper() != "SELL":
+                                continue
+                            try:
+                                top = float(o.get("price") or 0)
+                            except Exception:
+                                top = 0.0
+                            if top > 0 and px + max(1e-12, abs(top) * 1e-9) >= top:
+                                hit_info.append(f"live {px} >= target {top}")
+                        if hit_info:
+                            decision = "SELL_TARGET_HIT_NO_EXIT"
+                            reason = f"Price at target but sell did not execute: {hit_info[0]}"
+                            last_err = hit_info[0]
+                        else:
+                            decision = "MONITOR"
+                            reason = f"Monitoring {len(open_orders)} active Grid order(s) on {_grid_chain_key(item_id)}"
+                            last_err = ""
+                        pending_tx = ""
+                    else:
+                        decision = "IDLE"
+                        reason = "No open Grid orders"
+                        last_err = ""
+                        pending_tx = ""
                     _live_engine_mark(
                         "GRID", tick=True, status="running", assets_scanned=1,
                         tradable_assets=(1 if open_orders else 0), best_candidate=symbol,
-                        candidate_price=float(updated.get("price") or p or 0),
-                        decision=("MONITOR" if open_orders else "IDLE"),
-                        reason=(f"Monitoring {len(open_orders)} active Grid order(s) on {_grid_chain_key(item_id)}" if open_orders else "No open Grid orders"),
-                        last_error="", pending_tx="",
+                        candidate_price=px,
+                        decision=decision, reason=reason,
+                        last_error=last_err, pending_tx=pending_tx,
                     )
                 else:
                     _live_engine_mark("GRID", status="idle", decision="IDLE", reason="No running Grid session")
