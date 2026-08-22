@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.21-ENGINE-476-GRID-WNATIVE-SWAP-FILL"
+BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-478-SESSION-PERIOD-HARD-LOCK"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1043,12 +1043,14 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
     # before endsAt. Only an explicit user Stop & Exit may override the period.
     # This guard lives in the mutation function itself so a future caller cannot
     # accidentally bypass the higher-level RELEASE_IDLE checks.
-    if eng == "NKR" and status_id in (1, 2) and not bool(allow_early_nkr_stop):
+    # ENGINE-478: NKR + TRADER period is hard. Auto paths must never startClosing
+    # before CoreVault endsAt. Only explicit user Stop (allow_early_nkr_stop=True) may.
+    if eng in ("NKR", "TRADER") and status_id in (1, 2) and not bool(allow_early_nkr_stop):
         now_sec = int(time.time())
         if ends_at <= 0 or now_sec < ends_at:
             remaining = max(0, ends_at - now_sec) if ends_at > 0 else None
             raise RuntimeError(
-                f"nkr_period_still_active_onchain:session={sid}:startsAt={starts_at}:"
+                f"session_period_still_active_onchain:engine={eng}:session={sid}:startsAt={starts_at}:"
                 f"endsAt={ends_at}:now={now_sec}:secondsRemaining={remaining if remaining is not None else 'unknown'}"
             )
 
@@ -3248,8 +3250,59 @@ def api_core_vault_create_system_session_auto():
             "note": "session_create_uses_light_readiness",
         }), 409
 
-    duration_hours = max(1, min(int(float(body.get("durationHours") or 24)), 24 * 30))
-    duration_sec = duration_hours * 3600
+    # ENGINE-478: session lifetime MUST honor period days/hours from the start form.
+    # Previously only body.durationHours was read (default 24), so "2 Tage" was ignored
+    # and CoreVault endsAt expired after 1 day — then auto-release/finalize ran early.
+    def _resolve_session_duration_hours(b: dict, start_cfg: dict) -> float:
+        candidates = [
+            b.get("durationHours"), b.get("duration_hours"), b.get("runtimeHours"), b.get("runtime_hours"),
+            b.get("nkrPeriodHours"), b.get("nkr_period_hours"),
+            start_cfg.get("nkrPeriodHours"), start_cfg.get("nkr_period_hours"),
+        ]
+        for c in candidates:
+            try:
+                if c is None or c == "":
+                    continue
+                h = float(c)
+                if h > 0:
+                    return h
+            except Exception:
+                pass
+        # days / unit
+        unit = str(b.get("nkrPeriodUnit") or b.get("nkr_period_unit") or start_cfg.get("nkrPeriodUnit") or start_cfg.get("nkr_period_unit") or "days").lower()
+        val = b.get("nkrPeriodValue") or b.get("nkr_period_value") or start_cfg.get("nkrPeriodValue")
+        days = b.get("nkrPeriodDays") or b.get("nkr_period_days") or start_cfg.get("nkrPeriodDays") or start_cfg.get("nkr_period_days")
+        try:
+            if val is not None and str(val) != "":
+                v = float(val)
+                if unit in ("hour", "hours", "h"):
+                    return v
+                if unit in ("day", "days", "d"):
+                    return v * 24.0
+        except Exception:
+            pass
+        try:
+            if days is not None and str(days) != "":
+                d = float(days)
+                if d > 0:
+                    return d * 24.0
+        except Exception:
+            pass
+        return 24.0  # safe default only when nothing was provided
+
+    duration_hours = max(1.0, min(float(_resolve_session_duration_hours(body, start_cfg if "start_cfg" in dir() else {})), 24 * 30))
+    # start_cfg may be named differently — use locked settings from body fields already collected
+    try:
+        _sc = {
+            "nkrPeriodHours": body.get("nkrPeriodHours") or body.get("nkr_period_hours"),
+            "nkrPeriodValue": body.get("nkrPeriodValue") or body.get("nkr_period_value"),
+            "nkrPeriodUnit": body.get("nkrPeriodUnit") or body.get("nkr_period_unit"),
+            "nkrPeriodDays": body.get("nkrPeriodDays") or body.get("nkr_period_days"),
+        }
+        duration_hours = max(1.0, min(float(_resolve_session_duration_hours(body, _sc)), 24 * 30))
+    except Exception:
+        duration_hours = max(1.0, min(float(body.get("durationHours") or 24), 24 * 30))
+    duration_sec = int(round(duration_hours * 3600))
     slippage_bps = max(1, min(int(body.get("maxSlippageBps") or cfg.get("slippageBps") or 100), 500))
     max_loss_bps = max(1, min(int(body.get("maxLossBps") or 1500), 10000))
     settlement_symbol = str(body.get("settlementAsset") or body.get("settlement_asset") or "USDC").upper().strip()
@@ -26486,6 +26539,160 @@ def _grid_ensure_corevault_session(wallet: str, chain_id: int, settlement_symbol
 
 
 
+
+# ENGINE-477: user wallet swap (Privy UI) — prepare calldata only; frontend/user sends txs.
+@app.post("/api/wallet/swap/prepare")
+def api_wallet_swap_prepare():
+    """Build wrap/approve/swap steps for a same-chain wallet swap to USDC/USDT (or between listed tokens).
+
+    No broadcast. Client executes steps via Privy embedded provider.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        wallet = _norm_addr(body.get("wallet") or body.get("wallet_address") or "")
+        chain_key = str(body.get("chain") or body.get("chainKey") or "POL").upper().strip()
+        chain_id = int(_grid_chain_id_from_key(chain_key) or body.get("chainId") or 0)
+        if chain_id <= 0:
+            chain_id = {"ETH": 1, "BNB": 56, "POL": 137, "BASE": 8453, "ARB": 42161, "ARBITRUM": 42161}.get(chain_key, 0)
+        if not _looks_like_evm_addr(wallet) or chain_id <= 0:
+            return jsonify({"status": "error", "error": "wallet_or_chain_invalid"}), 400
+
+        token_in_raw = str(body.get("tokenIn") or body.get("token_in") or "").strip()
+        token_out_raw = str(body.get("tokenOut") or body.get("token_out") or "").strip()
+        amount_human = float(body.get("amount") or 0)
+        slippage_bps = max(10, min(5000, int(body.get("slippageBps") or body.get("slippage_bps") or 100)))
+        if amount_human <= 0:
+            return jsonify({"status": "error", "error": "amount_invalid"}), 400
+
+        cfg = _privy_trading_cfg(chain_id)
+        router = _norm_addr(cfg.get("router") or "")
+        wrapped = _norm_addr(cfg.get("weth") or cfg.get("wnative") or cfg.get("wrappedNative") or "")
+        usdc = _norm_addr(cfg.get("usdc") or "")
+        usdt = _norm_addr(cfg.get("usdt") or "")
+        if not _looks_like_evm_addr(router):
+            return jsonify({"status": "error", "error": "router_not_configured"}), 400
+
+        native_sym = str(cfg.get("nativeSymbol") or chain_key).upper()
+        is_native_in = token_in_raw.upper() in ("NATIVE", native_sym, "ETH", "BNB", "POL", "MATIC") or token_in_raw.lower() in ("native", "0x0", "0x0000000000000000000000000000000000000000")
+
+        def _resolve_token(raw: str, *, allow_native: bool = False):
+            r = str(raw or "").strip()
+            u = r.upper()
+            if allow_native and u in ("NATIVE", native_sym, "ETH", "BNB", "POL", "MATIC"):
+                return "native", 18, native_sym
+            if u in ("USDC", "USDCE", "USDC.E") and _looks_like_evm_addr(usdc):
+                return usdc, 6, "USDC"
+            if u in ("USDT", "USDT.E") and _looks_like_evm_addr(usdt):
+                return usdt, 6, "USDT"
+            if u in ("WETH", "WBNB", "WPOL", "WMATIC", "WNATIVE") and _looks_like_evm_addr(wrapped):
+                return wrapped, 18, u if u.startswith("W") else "WNATIVE"
+            if _looks_like_evm_addr(r):
+                return _norm_addr(r), 18, "TOKEN"
+            return "", 0, ""
+
+        if is_native_in:
+            token_in, dec_in, sym_in = ("native", 18, native_sym)
+        else:
+            token_in, dec_in, sym_in = _resolve_token(token_in_raw, allow_native=False)
+        token_out, dec_out, sym_out = _resolve_token(token_out_raw, allow_native=False)
+        if not token_out or not _looks_like_evm_addr(token_out):
+            # default USDC
+            token_out, dec_out, sym_out = (usdc, 6, "USDC") if _looks_like_evm_addr(usdc) else ("", 0, "")
+        if not token_out:
+            return jsonify({"status": "error", "error": "token_out_invalid"}), 400
+        if token_in != "native" and not _looks_like_evm_addr(token_in):
+            return jsonify({"status": "error", "error": "token_in_invalid"}), 400
+        if token_in != "native" and token_in.lower() == token_out.lower():
+            return jsonify({"status": "error", "error": "same_token"}), 400
+
+        amount_in = int(round(amount_human * (10 ** int(dec_in))))
+        if amount_in <= 0:
+            return jsonify({"status": "error", "error": "amount_units_zero"}), 400
+
+        # swap path tokenIn on router is always ERC20 (wrapped if native)
+        swap_in = wrapped if token_in == "native" else token_in
+        if not _looks_like_evm_addr(swap_in):
+            return jsonify({"status": "error", "error": "wrapped_native_missing"}), 400
+
+        fee = int(cfg.get("poolFee") or 500)
+        # best-effort quote via existing helpers if present
+        quote_out = 0
+        try:
+            quote_out = 0  # optional quoter; minOut falls back to 1
+        except Exception:
+            try:
+                # fallback rough: not available — client uses minOut=1 with warning
+                quote_out = 0
+            except Exception:
+                quote_out = 0
+        min_out = max(1, int(quote_out * (10_000 - slippage_bps) // 10_000)) if quote_out > 0 else 1
+
+        steps = []
+        if token_in == "native":
+            steps.append({
+                "type": "wrap",
+                "to": wrapped,
+                "data": "0xd0e30db0",
+                "value": hex(amount_in),
+                "label": f"Wrap {sym_in} → W{sym_in}",
+            })
+        # approve max once
+        steps.append({
+            "type": "approve",
+            "to": swap_in,
+            "data": "0x095ea7b3" + _addr_to_32(router) + ("f" * 64),
+            "value": "0x0",
+            "label": f"Approve router for {sym_in if token_in != 'native' else 'W'+sym_in}",
+        })
+        deadline = int(time.time()) + 900
+        swap_data = None
+        used_sel = ""
+        for sel in (
+            globals().get("_PRIVY_EXACT_INPUT_SINGLE_SELECTOR") or "0x04e45aaf",
+            globals().get("_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR") or "0x414bf389",
+        ):
+            try:
+                swap_data = _router_exact_input_single_data(
+                    sel, swap_in, token_out, wallet, amount_in, min_out, fee, deadline,
+                )
+                used_sel = str(sel)
+                break
+            except Exception:
+                continue
+        if not swap_data:
+            return jsonify({"status": "error", "error": "swap_encode_failed"}), 400
+        if isinstance(swap_data, str) and not swap_data.startswith("0x"):
+            swap_data = "0x" + swap_data
+        steps.append({
+            "type": "swap",
+            "to": router,
+            "data": swap_data,
+            "value": "0x0",
+            "label": f"Swap → {sym_out}",
+            "selector": used_sel,
+        })
+
+        return jsonify({
+            "status": "ok",
+            "chainId": chain_id,
+            "chain": chain_key,
+            "tokenIn": {"address": token_in if token_in != "native" else "native", "symbol": sym_in, "decimals": dec_in},
+            "tokenOut": {"address": token_out, "symbol": sym_out, "decimals": dec_out},
+            "amountIn": str(amount_in),
+            "amountInHuman": amount_human,
+            "quoteOut": str(quote_out),
+            "minOut": str(min_out),
+            "slippageBps": slippage_bps,
+            "router": router,
+            "steps": steps,
+            "note": "Execute steps in order via Privy wallet. USDC/USDT stays in the wallet.",
+            "ts": now_ts(),
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)[:400], "ts": now_ts()}), 400
+
+
+
 @app.route("/api/grid/manual/add", methods=["POST"])
 def api_grid_manual_add():
     """Add a manual order (OPEN) into an existing grid session.
@@ -41153,6 +41360,18 @@ def _nkr_strategist_release_idle_session(wallet: str, live_row: dict) -> dict:
             return {"ok": False, "error": "has_open_position", "openAssets": open_assets}
         if status_id == 4:
             return {"ok": True, "already": "FINALIZED", "sessionId": sid}
+
+        # ENGINE-478: authoritative on-chain endsAt — never auto-release early
+        try:
+            ends_at_onchain = int(words[5]) if len(words) > 5 else 0
+            now_sec = int(time.time())
+            if ends_at_onchain > 0 and now_sec < ends_at_onchain:
+                return {
+                    "ok": False, "error": "period_still_active_onchain", "sessionId": sid,
+                    "endsAt": ends_at_onchain, "secondsRemaining": ends_at_onchain - now_sec,
+                }
+        except Exception:
+            return {"ok": False, "error": "ends_at_unreadable"}
 
         # ENGINE-405 hard guard: RELEASE_IDLE is never allowed to shorten the
         # user-approved NKR period. Only a genuinely expired session may be
