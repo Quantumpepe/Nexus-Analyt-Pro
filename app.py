@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-478-SESSION-PERIOD-HARD-LOCK"
+BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-481-NKR-ALLOWED-ASSETS-FILTER"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16200,16 +16200,25 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     risk_context_exceeded = bool(m != "AGGRESSIVE" and risk >= 70)
     # Deep hard-stop only after a short floor hold so a bad quote cannot sell in 60s.
     hard_loss = open_time_known and held >= 60 and net_pct <= hard_stop and gross < -max(0.05, cost * 0.005)
+    # ENGINE-479: never treat a "loss" as real if price is above entry (stale cost/value mismatch).
+    # This blocked false hard-stops when UI/backend showed green % but broken basis showed −$7.
+    entry_px = _safe_float(prior_meta.get("nkr_entry_price_usd") or prior_meta.get("entry_price_usd") or snap.get("entryPriceUsd"), 0.0)
+    if entry_px <= 0:
+        entry_px = _safe_float(snap.get("avgEntryPriceUsd") or snap.get("costPriceUsd"), 0.0)
+    price_above_entry = bool(entry_px > 0 and price > 0 and price >= entry_px * 0.995)
+    if hard_loss and price_above_entry:
+        hard_loss = False
+    # ENGINE-479: discretionary exits only with real net profit after costs — never "exit into red".
     reason = ""
     if security_emergency:
         reason = "security_emergency"
     elif hard_loss:
         reason = "hard_stop"
-    elif recovery_exit:
+    elif recovery_exit and net_positive:
         reason = "break_even_recovery_exit"
-    elif trailing:
+    elif trailing and net_positive:
         reason = "peak_profit_trailing_protection"
-    elif take_profit:
+    elif take_profit and net_positive:
         reason = "shadow_tactical_take_profit"
     # ENGINE-421: discretionary exits ALWAYS need min_hold + known open time.
     # hard_stop needs >=60s (above). security_emergency is the only true early exit.
@@ -39547,6 +39556,114 @@ def _nkr_symbol_home_chain(symbol: str) -> str:
     return ""
 
 
+
+def _nkr_strict_session_chain_key(chain_key: str) -> str:
+    """Normalize session chain to ETH/BNB/POL (no cross aliases)."""
+    ch = str(chain_key or "").strip().upper()
+    if ch in {"ETH", "ETHEREUM", "1"}:
+        return "ETH"
+    if ch in {"BNB", "BSC", "BINANCE", "56"}:
+        return "BNB"
+    if ch in {"POL", "POLYGON", "MATIC", "137"}:
+        return "POL"
+    return ch
+
+
+def _nkr_native_symbols_for_chain(chain_key: str) -> set:
+    ch = _nkr_strict_session_chain_key(chain_key)
+    return {
+        "ETH": {"ETH", "WETH"},
+        "BNB": {"BNB", "WBNB"},
+        "POL": {"POL", "MATIC", "WMATIC", "WPOL"},
+    }.get(ch, set())
+
+
+def _nkr_symbol_allowed_on_session_chain(symbol: str, session_chain: str) -> dict:
+    """ENGINE-480: hard same-chain gate for NKR/Trader entries.
+
+    ETH-USDC session → only assets that execute on Ethereum.
+    BNB session → only BNB-chain assets.
+    POL session → only Polygon assets.
+    Never mix (no POL on ETH, no ETH on BNB, etc.).
+    """
+    sym = str(symbol or "").strip().upper()
+    chain = _nkr_strict_session_chain_key(session_chain)
+    out = {
+        "allowed": False,
+        "symbol": sym,
+        "sessionChain": chain,
+        "reason": "unknown",
+        "resolvedChain": "",
+        "tokenContract": "",
+    }
+    if not sym or not chain:
+        out["reason"] = "missing_symbol_or_chain"
+        return out
+    # Stables always ok on the session chain (settlement)
+    if sym in {"USDC", "USDT", "USDCE", "USDC.E"}:
+        out["allowed"] = True
+        out["reason"] = "settlement_stable"
+        out["resolvedChain"] = chain
+        return out
+    # Native only on home chain
+    if sym in {"ETH", "WETH"}:
+        ok = chain == "ETH"
+        out["allowed"] = ok
+        out["reason"] = "native_eth" if ok else "native_eth_not_on_session_chain"
+        out["resolvedChain"] = "ETH"
+        return out
+    if sym in {"BNB", "WBNB"}:
+        ok = chain == "BNB"
+        out["allowed"] = ok
+        out["reason"] = "native_bnb" if ok else "native_bnb_not_on_session_chain"
+        out["resolvedChain"] = "BNB"
+        return out
+    if sym in {"POL", "MATIC", "WMATIC", "WPOL"}:
+        ok = chain == "POL"
+        out["allowed"] = ok
+        out["reason"] = "native_pol" if ok else "native_pol_not_on_session_chain"
+        out["resolvedChain"] = "POL"
+        return out
+    # Registry / route must be configured ON this exact session chain
+    try:
+        resolved = _nkr_resolve_display_asset(sym, chain)
+    except Exception as exc:
+        out["reason"] = f"resolve_failed:{str(exc)[:80]}"
+        return out
+    if not isinstance(resolved, dict):
+        out["reason"] = "resolve_not_dict"
+        return out
+    rchain = _nkr_strict_session_chain_key(resolved.get("chain") or "")
+    contract = str(resolved.get("tokenContract") or resolved.get("address") or "").strip()
+    configured = bool(resolved.get("configured"))
+    tradable = bool(resolved.get("tradableOnSession"))
+    out["resolvedChain"] = rchain
+    out["tokenContract"] = contract
+    if not configured:
+        out["reason"] = "asset_not_configured_on_chain"
+        return out
+    if rchain and rchain != chain:
+        out["reason"] = f"route_chain_mismatch:{rchain}!={chain}"
+        return out
+    if not tradable and not (configured and rchain == chain and contract):
+        out["reason"] = "not_tradable_on_session"
+        return out
+    # Home-chain foreign natives already blocked above; double-check home
+    try:
+        home = str(_nkr_symbol_home_chain(sym) or "").upper() if "_nkr_symbol_home_chain" in globals() else ""
+        home = _nkr_strict_session_chain_key(home) if home else ""
+        if home and home != chain and sym in ( _nkr_native_symbols_for_chain("ETH")
+            | _nkr_native_symbols_for_chain("BNB")
+            | _nkr_native_symbols_for_chain("POL")):
+            out["reason"] = f"native_home_mismatch:{home}!={chain}"
+            return out
+    except Exception:
+        pass
+    out["allowed"] = True
+    out["reason"] = "same_chain_ok"
+    return out
+
+
 def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
     """Resolve a watchlist/display symbol to the on-chain wrap for a live chain.
 
@@ -39570,12 +39687,21 @@ def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
     if not sym:
         return out
     # Native gas assets
-    if sym in {"ETH", "WETH"} and (not chain or chain == "ETH"):
-        return {**out, "chain": "ETH", "internalSymbol": "WETH", "configured": True, "tradableOnSession": True, "source": "native"}
-    if sym in {"BNB", "WBNB"} and (not chain or chain == "BNB"):
-        return {**out, "chain": "BNB", "internalSymbol": "WBNB", "configured": True, "tradableOnSession": True, "source": "native"}
-    if sym in {"POL", "MATIC", "WMATIC"} and (not chain or chain == "POL"):
-        return {**out, "chain": "POL", "internalSymbol": "WMATIC", "configured": True, "tradableOnSession": True, "source": "native"}
+    if sym in {"ETH", "WETH"}:
+        if chain and chain != "ETH":
+            return {**out, "chain": chain, "internalSymbol": sym, "configured": False, "tradableOnSession": False, "source": "native_wrong_chain"}
+        if not chain or chain == "ETH":
+            return {**out, "chain": "ETH", "internalSymbol": "WETH", "configured": True, "tradableOnSession": True, "source": "native"}
+    if sym in {"BNB", "WBNB"}:
+        if chain and chain != "BNB":
+            return {**out, "chain": chain, "internalSymbol": sym, "configured": False, "tradableOnSession": False, "source": "native_wrong_chain"}
+        if not chain or chain == "BNB":
+            return {**out, "chain": "BNB", "internalSymbol": "WBNB", "configured": True, "tradableOnSession": True, "source": "native"}
+    if sym in {"POL", "MATIC", "WMATIC", "WPOL"}:
+        if chain and chain != "POL":
+            return {**out, "chain": chain, "internalSymbol": sym, "configured": False, "tradableOnSession": False, "source": "native_wrong_chain"}
+        if not chain or chain == "POL":
+            return {**out, "chain": "POL", "internalSymbol": "WMATIC", "configured": True, "tradableOnSession": True, "source": "native"}
     try:
         reg = _nexus_asset_router_registry(include_technical=True)
         asset = (reg.get("technicalRoutes") or {}).get(sym)
@@ -44313,6 +44439,30 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     _snap_for_slot = snapshots.get(sym) or {}
                     _slot_state_now = _trader_live_slot_state(_snap_for_slot, budget_usd, trader_slot_count)
                     _slot_cycle = f"trader-slot-{int(_slot_state_now.get('filledSlots') or 0)}"
+                # ENGINE-480: hard same-chain gate before any ENTRY lock / buy
+                try:
+                    _sess_ch = str(chain_key or _nkr_chain_key_from_id(int(live_row.get("chain_id") or 0)) or "").upper()
+                    _gate = _nkr_symbol_allowed_on_session_chain(str(sym or ""), _sess_ch)
+                    if not _gate.get("allowed"):
+                        return {
+                            "executed": False,
+                            "decision": "SAME_CHAIN_BLOCKED",
+                            "detail": f"{sym} not allowed on {_sess_ch} session ({_gate.get('reason')}). No cross-chain mix.",
+                            "gate": _gate,
+                        }
+                    _allow = _nkr_session_allowed_asset_set(settings, live_row)
+                    if _allow and str(sym or "").upper() not in _allow:
+                        return {
+                            "executed": False,
+                            "decision": "ALLOWED_ASSETS_BLOCKED",
+                            "detail": f"{sym} not in session allowed assets {_allow}",
+                        }
+                except Exception as _gate_exc:
+                    return {
+                        "executed": False,
+                        "decision": "SAME_CHAIN_GATE_ERROR",
+                        "detail": str(_gate_exc)[:200],
+                    }
                 entry_guard = _nkr_entry_guard_acquire(wallet, live_row, ttl_sec=90, cycle_key=_slot_cycle)
                 if not entry_guard:
                     # ENGINE-417: if no open position, force-clear stale ENTRY locks so
@@ -47647,7 +47797,26 @@ def _nkr_is_placeholder_trade_symbol(sym: str) -> bool:
     return False
 
 
-def _nkr_best_candidate_for_session_chain(market_by_sym, chain_key: str, dispatch_min: float, exclude=None):
+
+def _nkr_session_allowed_asset_set(settings=None, live_row=None) -> set:
+    """ENGINE-481: optional user allowlist (like Trader). Empty = any same-chain asset."""
+    srcs = []
+    for obj in (settings, live_row, (live_row or {}).get("meta") if isinstance(live_row, dict) else None,
+                (settings or {}).get("sessionConfig") if isinstance(settings, dict) else None):
+        if not isinstance(obj, dict):
+            continue
+        for k in ("allowedAssets", "nkrAllowedAssets", "allowed_assets", "nkr_allowed_assets"):
+            v = obj.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str):
+                srcs.extend([x.strip().upper() for x in v.split(",") if x.strip()])
+            elif isinstance(v, (list, tuple, set)):
+                srcs.extend([str(x).strip().upper() for x in v if str(x).strip()])
+    return {x for x in srcs if x}
+
+
+def _nkr_best_candidate_for_session_chain(market_by_sym, chain_key: str, dispatch_min: float, exclude=None, allowed=None):
     """Pick the strongest watchlist asset tradable on this session's chain.
 
     Used when a live CoreVault session is still in SCANNING and has no targetAsset yet.
@@ -47688,27 +47857,20 @@ def _nkr_best_candidate_for_session_chain(market_by_sym, chain_key: str, dispatc
                 home = str(_nkr_symbol_home_chain(sym_u) or "").upper()
         except Exception:
             home = home or ""
-        on_chain = False
-        if sym_u in native_ok:
-            on_chain = True
-        if home == chain:
-            on_chain = True
-        resolved = {}
+        # ENGINE-480: strict same-chain only (no POL on ETH, no cross-chain mix)
         try:
-            resolved = _nkr_resolve_display_asset(sym_u, chain) if "_nkr_resolve_display_asset" in globals() else {}
-            if isinstance(resolved, dict) and resolved.get("configured") and str(resolved.get("chain") or "").upper() == chain:
-                on_chain = True
+            gate = _nkr_symbol_allowed_on_session_chain(sym_u, chain)
+            if not gate.get("allowed"):
+                continue
         except Exception:
-            pass
-        try:
-            foreign = str(_nkr_symbol_home_chain(sym_u) or "").upper() if "_nkr_symbol_home_chain" in globals() else ""
-            if foreign and foreign != chain and sym_u not in native_ok:
-                if not (isinstance(resolved, dict) and resolved.get("configured")):
-                    on_chain = False
-        except Exception:
-            pass
-        if not on_chain:
             continue
+        # ENGINE-481: optional user allowlist (ETH only, etc.)
+        try:
+            allow_set = {str(x).upper() for x in (allowed or set()) if str(x).strip()}
+            if allow_set and sym_u not in allow_set:
+                continue
+        except Exception:
+            pass
         ranked.append({"sym": sym_u, "row": row, "score": float(score), "change": float(change), "price": float(price)})
     if not ranked:
         return None
@@ -47827,7 +47989,8 @@ def _nkr_backend_process_executor_tick(sessions, market_rows=None, settings=None
         # Live sessions start as SCANNING with no trade target. Assign the best
         # chain-tradable watchlist asset so entry can actually fire (BNB session → BNB, etc.).
         if (not has_open_trade_early) and _nkr_is_placeholder_trade_symbol(sym):
-            pick = _nkr_best_candidate_for_session_chain(market_by_sym, chain, dispatch_min)
+            _allow = _nkr_session_allowed_asset_set(settings, sess)
+            pick = _nkr_best_candidate_for_session_chain(market_by_sym, chain, dispatch_min, allowed=_allow)
             if pick and pick.get("sym"):
                 sym = str(pick["sym"]).upper()
                 sess = dict(sess)
