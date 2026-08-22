@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-481-NKR-ALLOWED-ASSETS-FILTER"
+BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-482-CG-TTL-SPARK-5H"
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -240,12 +240,12 @@ NEXUS_NKR_MAX_ACTIVE_SESSIONS_LIMIT = 0  # 0 = user-defined, no enforced hard ca
 # refresh faster from the same shared backend snapshot so Trader, NKR and Watchlist
 # read one source of truth without per-card/per-user API calls.
 NEXUS_PRICE_CACHE_MODE = "GLOBAL_MARKET_ACTIVE_HOT_CACHE_V1"
-NEXUS_PRICE_MARKET_TTL_SEC = int(os.getenv("NEXUS_PRICE_MARKET_TTL_SEC", "60"))
-NEXUS_PRICE_ACTIVE_TTL_SEC = int(os.getenv("NEXUS_PRICE_ACTIVE_TTL_SEC", "15"))
-NEXUS_PRICE_HOT_TTL_SEC = int(os.getenv("NEXUS_PRICE_HOT_TTL_SEC", "5"))
+NEXUS_PRICE_MARKET_TTL_SEC = int(os.getenv("NEXUS_PRICE_MARKET_TTL_SEC", "120"))
+NEXUS_PRICE_ACTIVE_TTL_SEC = int(os.getenv("NEXUS_PRICE_ACTIVE_TTL_SEC", "45"))
+NEXUS_PRICE_HOT_TTL_SEC = int(os.getenv("NEXUS_PRICE_HOT_TTL_SEC", "25"))
 NEXUS_PRICE_HOT_IDLE_SEC = int(os.getenv("NEXUS_PRICE_HOT_IDLE_SEC", "180"))
-NEXUS_PRICE_ACTIVE_POLICY = "ACTIVE_TRADER_AND_NKR_SYMBOLS_REFRESH_10_TO_15_SECONDS_FROM_SHARED_BACKEND_CACHE"
-NEXUS_PRICE_HOT_POLICY = "ENTRY_EXIT_REBALANCE_AND_STRONG_MOMENTUM_SYMBOLS_REFRESH_5_SECONDS_TEMPORARILY"
+NEXUS_PRICE_ACTIVE_POLICY = "ACTIVE_TRADER_AND_NKR_SYMBOLS_REFRESH_30_TO_45_SECONDS_FROM_SHARED_BACKEND_CACHE"
+NEXUS_PRICE_HOT_POLICY = "ENTRY_EXIT_REBALANCE_AND_STRONG_MOMENTUM_SYMBOLS_REFRESH_25_SECONDS_TEMPORARILY"
 NEXUS_NKR_MAX_CAPITAL_PER_ASSET_PCT_DEFAULT = 35
 NEXUS_NKR_CAPITAL_MANAGER_MODE = "NKR_CAPITAL_MANAGER_V1"
 NEXUS_NKR_CAPITAL_MANAGER_POLICY = "SINGLE_POSITION_ROTATION_BY_STRATEGIST_SCORE_WITH_SETTLEMENT_RESERVE"
@@ -5575,7 +5575,7 @@ _CG_CACHE: dict[str, tuple[float, dict]] = {}
 # CoinGecko market data must not be fetched per UI refresh. The Strategist can
 # still use recent market data, but expensive endpoints are protected by a
 # backend-wide cache, in-flight request dedupe and rate-limit cooldown.
-_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "900"))  # generic/simple endpoints
+_CG_TTL_SEC = int(os.getenv("COINGECKO_CACHE_TTL_SEC", "1200"))  # ENGINE-482: 20 min generic CG URL cache
 _CG_STALE_TTL_SEC = int(os.getenv("COINGECKO_STALE_TTL_SEC", "604800"))  # 7 days fallback
 _CG_RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("COINGECKO_RATE_LIMIT_COOLDOWN_SEC", "300"))
 _CG_COOLDOWN_UNTIL = 0.0
@@ -13903,7 +13903,7 @@ COINGECKO_KNOWN = {
 
 # Cache TTL in seconds (default 180s). You can set CG_TTL_SEC in env.
 _CG_CACHE = {"by_key": {}, "ts": {}}
-_CG_TTL_SEC = int(os.getenv("CG_TTL_SEC", "180"))
+_CG_TTL_SEC = int(os.getenv("CG_TTL_SEC") or os.getenv("COINGECKO_CACHE_TTL_SEC") or "1200")  # ENGINE-482: 20 min default
 
 def _cg_cache_get(key: str):
     now = time.time()
@@ -13958,7 +13958,9 @@ def _gen_cache_get_fresh(key: str):
 _WATCH_SNAP_CACHE = {"by_key": {}, "ts": {}}
 _WATCH_SNAP_TTL_SEC = int(os.getenv("WATCH_SNAP_TTL_SEC", "120"))  # 1 min default
 _WATCH_SPARK_CACHE = {"by_key": {}, "ts": {}}
-_WATCH_SPARK_TTL_SEC = int(os.getenv("WATCH_SPARK_TTL_SEC", "300"))  # 5 min; live endpoint is appended in frontend
+_WATCH_SPARK_TTL_SEC = int(os.getenv("WATCH_SPARK_TTL_SEC", "18000"))  # ENGINE-482: 5h — 7D charts rarely need live CG
+_CG_CHART_TTL_SEC = int(os.getenv("COINGECKO_CHART_TTL_SEC", "18000"))  # ENGINE-482: 7d+ market_chart cache 5h
+
 
 _COMPARE_CACHE = {"by_key": {}, "ts": {}}
 _COMPARE_TTL_SEC = int(os.getenv("COMPARE_TTL_SEC", "900"))  # 15 min default
@@ -14269,8 +14271,21 @@ def _cg_market_sparklines_7d_batch(coin_ids):
 
 def _cg_market_chart_usd(coin_id: str, days: int):
     key = f"chart|{coin_id}|{days}"
+    # ENGINE-482: 7d+ charts live 5h in cache
+    try:
+        days_i = int(days)
+    except Exception:
+        days_i = 1
+    ttl = int(globals().get("_CG_CHART_TTL_SEC", 18000) or 18000) if days_i >= 7 else int(globals().get("_CG_TTL_SEC", 1200) or 1200)
+    now = time.time()
+    try:
+        ts = _CG_CACHE["ts"].get(key, 0) if isinstance(_CG_CACHE, dict) and "ts" in _CG_CACHE else 0
+        if isinstance(_CG_CACHE, dict) and "by_key" in _CG_CACHE and key in _CG_CACHE["by_key"] and (now - ts) < ttl:
+            return _CG_CACHE["by_key"][key]
+    except Exception:
+        pass
     cached = _cg_cache_get(key)
-    if cached is not None:
+    if cached is not None and days_i < 7:
         return cached
 
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
@@ -14873,7 +14888,30 @@ def coingecko_market_chart_proxy(coin_id: str):
     vs_currency = str(request.args.get("vs_currency") or "usd").strip().lower() or "usd"
     days = str(request.args.get("days") or "30").strip() or "30"
     interval = str(request.args.get("interval") or "daily").strip().lower() or "daily"
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
+    cid = str(coin_id or "").strip()
+    # ENGINE-482: 7d charts cached 5h (same as watchlist sparklines)
+    try:
+        days_i = int(float(days))
+    except Exception:
+        days_i = 30
+    cache_ttl = int(_CG_CHART_TTL_SEC) if days_i <= 7 else int(_CG_TTL_SEC)
+    cache_key = f"mcproxy|{cid}|{vs_currency}|{days}|{interval}"
+    try:
+        cached = _cache_get_fresh(_COMPARE_CACHE if False else _WATCH_SPARK_CACHE, cache_key, cache_ttl)
+    except Exception:
+        cached = None
+    # Prefer dedicated chart cache store
+    try:
+        if not hasattr(coingecko_market_chart_proxy, "_store"):
+            coingecko_market_chart_proxy._store = {"by_key": {}, "ts": {}}
+        store = coingecko_market_chart_proxy._store
+        now = time.time()
+        ts = store["ts"].get(cache_key, 0)
+        if cache_key in store["by_key"] and (now - ts) < cache_ttl:
+            return jsonify(store["by_key"][cache_key] or {})
+    except Exception:
+        store = None
+    url = f"{COINGECKO_BASE}/coins/{cid}/market_chart"
     try:
         r = requests.get(
             url,
@@ -14882,8 +14920,20 @@ def coingecko_market_chart_proxy(coin_id: str):
             timeout=15,
         )
         r.raise_for_status()
-        return jsonify(r.json() or {})
+        data = r.json() or {}
+        try:
+            if store is not None:
+                store["by_key"][cache_key] = data
+                store["ts"][cache_key] = time.time()
+        except Exception:
+            pass
+        return jsonify(data)
     except Exception as e:
+        try:
+            if store is not None and cache_key in store.get("by_key", {}):
+                return jsonify(store["by_key"][cache_key] or {})
+        except Exception:
+            pass
         return jsonify({"error": "coingecko_market_chart_failed", "detail": str(e)}), 502
 
 
