@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.22-ENGINE-482-CG-TTL-SPARK-5H"
+BACKEND_BUILD_ID = "B-2026.08.23-ENGINE-483-FREE-AI-7D-SPLIT";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10788,8 +10788,9 @@ def _access_apply_strategist_meta(base: dict, wallet_address: str | None) -> dic
     base["strategist_access"] = strat
     base["strategist_active"] = bool(strat.get("active"))
     # Demo can try AI under demo limits; Core/Live requires the separate Strategist add-on for Strategist mode.
-    base["can_use_strategist"] = bool(base.get("is_demo")) or bool(strat.get("active")) or bool(base.get("is_permanent"))
-    base["strategist_demo_limited"] = bool(base.get("is_demo")) and not bool(strat.get("active"))
+    # ENGINE-483: free Strategist trial (3/7d) for demo AND live without paid add-on
+    base["can_use_strategist"] = True  # hard block removed; quota in _ai_demo_consume_or_error
+    base["strategist_demo_limited"] = not bool(strat.get("active")) and not bool(base.get("is_permanent"))
     base["strategist_prices"] = {
         "weekly_usd": float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20")),
         "monthly_usd": float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50")),
@@ -10937,66 +10938,93 @@ def _ai_usage_get(wallet_address: str) -> dict:
     }
 
 
-def _ai_demo_consume_or_error(wallet_address: str, access_status: dict | None):
-    """Allow paid/redeem AI unlimited; limit DEMO/EXPIRED to 3 AI requests/day on max 5 days/month."""
+def _ai_demo_consume_or_error(wallet_address: str, access_status: dict | None, kind: str = "ai"):
+    """ENGINE-483: Free quota per feature over a rolling 7 days.
+
+    - kind "insight" → AI Insight (Compare)
+    - kind "strategist" → Nexus Strategist chat
+    - kind "ai" → legacy shared bucket (other /api/ai calls)
+
+    Limits (env-overridable):
+      NEXUS_FREE_AI_INSIGHT_7D_LIMIT=3
+      NEXUS_FREE_AI_STRATEGIST_7D_LIMIT=3
+      NEXUS_FREE_AI_SHARED_7D_LIMIT=3
+
+    Paid Strategist / LIVE with strategist add-on / permanent → unlimited for that feature.
+    LIVE without Strategist add-on still gets the free Strategist 3/7d trial, then paywall at API if desired.
+    """
     st = access_status or {}
-    if bool(st.get("ai_unlimited")) or bool(st.get("is_live")) or bool(st.get("is_permanent")):
+    kind_u = str(kind or "ai").strip().lower()
+    if kind_u in ("insight", "pair", "explain", "ai_insight"):
+        kind_u = "insight"
+    elif kind_u in ("strategist", "run", "chat", "analyst"):
+        kind_u = "strategist"
+    else:
+        kind_u = "ai"
+
+    # Unlimited: permanent, or live with explicit ai_unlimited, or active paid strategist for strategist kind
+    if bool(st.get("ai_unlimited")) or bool(st.get("is_permanent")):
+        return None
+    if kind_u == "strategist" and bool(st.get("strategist_active")):
+        return None
+    # Core/LIVE users: Insight is included (product copy: AI Insight included with Core)
+    if kind_u == "insight" and bool(st.get("is_live")):
         return None
 
     wa = _norm_addr(wallet_address or "")
     if not wa:
-        return err("wallet required for demo AI", 401)
+        return err("wallet required for free AI", 401)
 
-    daily_limit = int(os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))
-    month_days_limit = int(os.getenv("NEXUS_DEMO_AI_MONTH_DAYS_LIMIT", "5"))
-    day_key = _ai_usage_day_key()
-    month_key = _ai_usage_month_key()
+    limit_env = {
+        "insight": "NEXUS_FREE_AI_INSIGHT_7D_LIMIT",
+        "strategist": "NEXUS_FREE_AI_STRATEGIST_7D_LIMIT",
+        "ai": "NEXUS_FREE_AI_SHARED_7D_LIMIT",
+    }[kind_u]
+    limit = max(0, int(os.getenv(limit_env, os.getenv("NEXUS_DEMO_AI_DAILY_LIMIT", "3"))))
+    window_sec = max(3600, int(os.getenv("NEXUS_FREE_AI_WINDOW_SEC", str(7 * 24 * 3600))))
+    nowi = int(time.time())
+    since = nowi - window_sec
+
     with DB_WRITE_LOCK:
         conn = _db()
         cur = conn.cursor()
-        cur.execute("SELECT used_count FROM ai_daily_usage WHERE wallet_address=? AND day_key=?", (wa, day_key))
-        row = cur.fetchone()
-        used = int(row[0]) if row else 0
+        try:
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS ai_feature_usage (
+                    wallet_address TEXT NOT NULL,
+                    feature TEXT NOT NULL,
+                    ts INTEGER NOT NULL,
+                    PRIMARY KEY (wallet_address, feature, ts)
+                )"""
+            )
+        except Exception:
+            pass
         cur.execute(
-            "SELECT COUNT(*) FROM ai_daily_usage WHERE wallet_address=? AND substr(day_key,1,7)=? AND used_count>0",
-            (wa, month_key),
+            "SELECT COUNT(*) FROM ai_feature_usage WHERE wallet_address=? AND feature=? AND ts>=?",
+            (wa, kind_u, since),
         )
-        month_days_used = int((cur.fetchone() or [0])[0] or 0)
-        today_already_counted = bool(row and used > 0)
-
-        if used >= daily_limit:
+        used = int((cur.fetchone() or [0])[0] or 0)
+        if used >= limit:
             conn.close()
             return jsonify({
                 "status": "error",
-                "error": "daily demo AI limit reached",
-                "mode": st.get("mode") or "DEMO",
-                "ai_used_today": used,
-                "ai_daily_limit": daily_limit,
-                "ai_month_days_used": month_days_used,
-                "ai_month_days_limit": month_days_limit,
+                "error": f"free {kind_u} limit reached ({limit} per 7 days)",
+                "feature": kind_u,
+                "used_7d": used,
+                "limit_7d": limit,
+                "window_sec": window_sec,
                 "upgrade_required": True,
+                "mode": st.get("mode") or "DEMO",
                 "ts": now_ts(),
             }), 429
-
-        if (not today_already_counted) and month_days_used >= month_days_limit:
-            conn.close()
-            return jsonify({
-                "status": "error",
-                "error": "monthly demo AI days limit reached",
-                "mode": st.get("mode") or "DEMO",
-                "ai_used_today": used,
-                "ai_daily_limit": daily_limit,
-                "ai_month_days_used": month_days_used,
-                "ai_month_days_limit": month_days_limit,
-                "upgrade_required": True,
-                "ts": now_ts(),
-            }), 429
-
-        new_used = used + 1
         cur.execute(
-            "INSERT INTO ai_daily_usage(wallet_address, day_key, used_count, updated_ts) VALUES (?,?,?,?) "
-            "ON CONFLICT(wallet_address, day_key) DO UPDATE SET used_count=excluded.used_count, updated_ts=excluded.updated_ts",
-            (wa, day_key, new_used, now_ts()),
+            "INSERT INTO ai_feature_usage(wallet_address, feature, ts) VALUES (?,?,?)",
+            (wa, kind_u, nowi),
+        )
+        # prune old rows for this wallet/feature
+        cur.execute(
+            "DELETE FROM ai_feature_usage WHERE wallet_address=? AND feature=? AND ts<?",
+            (wa, kind_u, since - window_sec),
         )
         conn.commit()
         conn.close()
@@ -31259,17 +31287,10 @@ def api_ai_run():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    ai_gate = _ai_demo_consume_or_error(wa, st)
+    # ENGINE-483: free Strategist 3/7d for everyone without paid strategist; no hard 403 on live
+    ai_gate = _ai_demo_consume_or_error(wa, st, kind="strategist")
     if ai_gate:
         return ai_gate
-    if bool(st.get("is_live")) and not bool(st.get("can_use_strategist")):
-        return jsonify({
-            "status": "error",
-            "error": "strategist access required",
-            "upgrade_required": True,
-            "strategist_prices": st.get("strategist_prices"),
-            "ts": now_ts(),
-        }), 403
 
     body = request.get_json(silent=True) or {}
     kind = str(body.get("kind") or "ask")
@@ -31953,7 +31974,7 @@ def api_ai_insight():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    ai_gate = _ai_demo_consume_or_error(wa, st)
+    ai_gate = _ai_demo_consume_or_error(wa, st, kind="insight")
     if ai_gate:
         return ai_gate
 
@@ -32092,7 +32113,7 @@ def api_ai():
     if not wa:
         return err("unauthorized", 401)
     st = _compute_access_status(wa)
-    ai_gate = _ai_demo_consume_or_error(wa, st)
+    ai_gate = _ai_demo_consume_or_error(wa, st, kind="ai")
     if ai_gate:
         return ai_gate
 
