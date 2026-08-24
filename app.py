@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.23-ENGINE-483-FREE-AI-7D-SPLIT";
+BACKEND_BUILD_ID = "B-2026.08.24-ENGINE-485-NKR-PRESALE-BUY-API";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10154,7 +10154,190 @@ NKR_PAYMENT_CHAIN_ID = int(os.getenv("NEXUS_NKR_PAYMENT_CHAIN_ID", "1"))
 NKR_TOKEN_ADDRESS = (os.getenv("NEXUS_NKR_TOKEN_ADDRESS") or "").strip().lower()
 NKR_PAYMENT_ADDRESS = (os.getenv("NEXUS_NKR_PAYMENT_ADDRESS") or "").strip().lower()
 NKR_TOKEN_DECIMALS = int(os.getenv("NEXUS_NKR_TOKEN_DECIMALS", "18"))
+
 NKR_PRICE_USD = float(os.getenv("NEXUS_NKR_PRICE_USD", "0"))
+
+# ENGINE-484: NKR Presale phase (on-chain is source of truth when address set)
+NKR_PRESALE_ADDRESS = (os.getenv("NEXUS_NKR_PRESALE_ADDRESS") or "0x1a7aed3bae9ae4ed850166d52372d438ff62f553").strip().lower()
+NKR_PRESALE_CHAIN_ID = int(os.getenv("NEXUS_NKR_PRESALE_CHAIN_ID", "1"))
+# Soft override only when contract not configured yet (dev): "auto" | "active" | "ended"
+NKR_PRESALE_PHASE_OVERRIDE = (os.getenv("NEXUS_NKR_PRESALE_PHASE") or "auto").strip().lower()
+NKR_PRESALE_PACKAGE_USD = float(os.getenv("NEXUS_NKR_PRESALE_PACKAGE_USD", "20"))
+NKR_PRESALE_BONUS_BPS = int(os.getenv("NEXUS_NKR_PRESALE_BONUS_BPS", "1000"))
+# Default list price $0.0005 — used for quotes if chain read fails
+if NKR_PRICE_USD <= 0:
+    NKR_PRICE_USD = float(os.getenv("NEXUS_NKR_PRESALE_PRICE_USD", "0.0005"))
+
+_NKR_PRESALE_ABI = [
+    {"inputs": [], "name": "presaleActive", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "salePhase", "outputs": [{"internalType": "uint8", "name": "phase", "type": "uint8"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "saleStarted", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "saleEnded", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "quotePackage", "outputs": [
+        {"internalType": "uint256", "name": "ethRequired", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrBase", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrBonus", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrTotal", "type": "uint256"},
+        {"internalType": "bool", "name": "active", "type": "bool"},
+        {"internalType": "uint256", "name": "ethUsdE18", "type": "uint256"},
+    ], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "buyPackage", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"internalType": "uint256", "name": "count", "type": "uint256"}], "name": "buyPackages", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [], "name": "nkrTotalPerPackage", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalPackagesSold", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "hardCapPackages", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+]
+
+_NKR_PRESALE_STATUS_CACHE = {"ts": 0, "payload": None}
+_NKR_PRESALE_STATUS_TTL = max(5, int(os.getenv("NEXUS_NKR_PRESALE_STATUS_TTL_SEC", "20")))
+
+
+def _nkr_presale_configured() -> bool:
+    return bool(_looks_like_evm_addr(NKR_PRESALE_ADDRESS))
+
+
+def _nkr_presale_phase_from_override() -> dict:
+    """Dev/fallback when contract address not set. Does not invent 'active' unless env says so."""
+    ov = NKR_PRESALE_PHASE_OVERRIDE
+    if ov in ("ended", "end", "market", "2"):
+        phase, active = 2, False
+    elif ov in ("active", "live", "1"):
+        phase, active = 1, True
+    else:
+        # auto without contract = treat as market path (safer: no fake presale buys)
+        phase, active = 2, False
+    base_nkr = (NKR_PRESALE_PACKAGE_USD / max(NKR_PRICE_USD, 1e-12))
+    bonus_nkr = base_nkr * (NKR_PRESALE_BONUS_BPS / 10000.0)
+    return {
+        "configured": False,
+        "presale_address": "",
+        "chain_id": NKR_PRESALE_CHAIN_ID,
+        "phase": phase,
+        "phase_label": {0: "configured", 1: "presale_live", 2: "market"}.get(phase, "market"),
+        "presale_active": active,
+        "sale_started": phase >= 1,
+        "sale_ended": phase >= 2,
+        "package_usd": NKR_PRESALE_PACKAGE_USD,
+        "nkr_price_usd": NKR_PRICE_USD,
+        "nkr_base": int(base_nkr),
+        "nkr_bonus": int(bonus_nkr),
+        "nkr_total": int(base_nkr + bonus_nkr),
+        "eth_required_wei": None,
+        "buy_path": "presale_eth" if active else "market",
+        "strategist_nkr_destination": "liquidity_vault",
+        "note": "contract not configured; phase from NEXUS_NKR_PRESALE_PHASE or default market",
+    }
+
+
+def _nkr_presale_status(force: bool = False) -> dict:
+    """Single status object: presale live vs market path. On-chain is truth when configured."""
+    nowi = int(time.time())
+    if (
+        not force
+        and _NKR_PRESALE_STATUS_CACHE.get("payload")
+        and nowi - int(_NKR_PRESALE_STATUS_CACHE.get("ts") or 0) < _NKR_PRESALE_STATUS_TTL
+    ):
+        return dict(_NKR_PRESALE_STATUS_CACHE["payload"])
+
+    if not _nkr_presale_configured():
+        payload = _nkr_presale_phase_from_override()
+        _NKR_PRESALE_STATUS_CACHE["ts"] = nowi
+        _NKR_PRESALE_STATUS_CACHE["payload"] = payload
+        return dict(payload)
+
+    payload = {
+        "configured": True,
+        "presale_address": NKR_PRESALE_ADDRESS,
+        "chain_id": NKR_PRESALE_CHAIN_ID,
+        "phase": 2,
+        "phase_label": "market",
+        "presale_active": False,
+        "sale_started": False,
+        "sale_ended": True,
+        "package_usd": NKR_PRESALE_PACKAGE_USD,
+        "nkr_price_usd": NKR_PRICE_USD,
+        "nkr_base": None,
+        "nkr_bonus": None,
+        "nkr_total": None,
+        "eth_required_wei": None,
+        "buy_path": "market",
+        "strategist_nkr_destination": "liquidity_vault",
+        "total_packages_sold": None,
+        "hard_cap_packages": None,
+        "error": "",
+    }
+    try:
+        w3 = None
+        if "_w3_for_chain" in globals():
+            w3 = _w3_for_chain(NKR_PRESALE_CHAIN_ID)
+        elif "w3" in globals() and NKR_PRESALE_CHAIN_ID in (1, 0):
+            w3 = globals().get("w3")
+        if w3 is None and "_get_web3" in globals():
+            try:
+                w3 = _get_web3(NKR_PRESALE_CHAIN_ID)
+            except Exception:
+                w3 = None
+        if w3 is None:
+            raise RuntimeError("no web3 for presale chain")
+
+        c = w3.eth.contract(address=w3.to_checksum_address(NKR_PRESALE_ADDRESS), abi=_NKR_PRESALE_ABI)
+        try:
+            phase = int(c.functions.salePhase().call())
+        except Exception:
+            ended = bool(c.functions.saleEnded().call())
+            started = bool(c.functions.saleStarted().call())
+            phase = 2 if ended else (1 if started else 0)
+        active = bool(c.functions.presaleActive().call())
+        payload["phase"] = phase
+        payload["phase_label"] = {0: "configured", 1: "presale_live", 2: "market"}.get(phase, "market")
+        payload["presale_active"] = active
+        payload["sale_started"] = phase >= 1
+        payload["sale_ended"] = phase >= 2
+        payload["buy_path"] = "presale_eth" if active else "market"
+        try:
+            q = c.functions.quotePackage().call()
+            eth_req = int(q[0])
+            nkr_base = int(q[1])
+            nkr_bonus = int(q[2])
+            nkr_total = int(q[3])
+            q_active = bool(q[4])
+            eth_usd = int(q[5]) if len(q) > 5 else None
+            payload["eth_required_wei"] = str(eth_req)
+            payload["eth_required_eth"] = float(eth_req) / 1e18
+            payload["nkr_base"] = int(nkr_base // (10 ** 18)) if nkr_base >= 10**18 else int(nkr_base)
+            payload["nkr_bonus"] = int(nkr_bonus // (10 ** 18)) if nkr_bonus >= 10**18 else int(nkr_bonus)
+            payload["nkr_total"] = int(nkr_total // (10 ** 18)) if nkr_total >= 10**18 else int(nkr_total)
+            payload["nkr_base_wei"] = str(nkr_base)
+            payload["nkr_total_wei"] = str(nkr_total)
+            payload["eth_usd"] = (float(eth_usd) / 1e18) if eth_usd is not None else None
+            payload["presale_active"] = bool(q_active) and active
+            payload["buy_path"] = "presale_eth" if payload["presale_active"] else "market"
+            payload["buy_tx"] = {
+                "chain_id": NKR_PRESALE_CHAIN_ID,
+                "to": NKR_PRESALE_ADDRESS,
+                "data": "0x62158099",  # buyPackage()
+                "value_wei": str(eth_req),
+            }
+        except Exception as qe:
+            payload["error"] = f"quote:{qe}"[:200]
+        try:
+            payload["total_packages_sold"] = int(c.functions.totalPackagesSold().call())
+            payload["hard_cap_packages"] = int(c.functions.hardCapPackages().call())
+        except Exception:
+            pass
+    except Exception as exc:
+        payload["error"] = str(exc)[:300]
+        # Fail-safe: do not advertise presale buys if chain read fails
+        payload["presale_active"] = False
+        payload["buy_path"] = "market"
+        payload["phase"] = 2
+        payload["phase_label"] = "market"
+
+    _NKR_PRESALE_STATUS_CACHE["ts"] = nowi
+    _NKR_PRESALE_STATUS_CACHE["payload"] = payload
+    return dict(payload)
+
+
 
 def _subscription_plan_meta(plan: str) -> dict:
     """Plan pricing/expiry metadata for on-chain USDC/USDT payments."""
@@ -11095,6 +11278,7 @@ def api_access_status():
         "ai_used_today": ai_usage.get("used"),
         "ai_daily_limit": ai_usage.get("limit"),
         "ai_remaining_today": ai_usage.get("remaining"),
+        "nkr_presale": (_nkr_presale_status() if "_nkr_presale_status" in globals() else {}),
         "ai_usage_day": ai_usage.get("day"),
         "ai_usage_month": ai_usage.get("month"),
         "ai_month_days_used": ai_usage.get("month_days_used"),
@@ -13456,6 +13640,30 @@ def api_nft_activate():
     # NFTs are disabled for the initial release (UI removed). Keeping the endpoint
     # for future re-enable without breaking old deployments.
     return err("nft access is disabled", 403)
+
+
+
+@app.route("/api/nkr/presale/status", methods=["GET"])
+def api_nkr_presale_status():
+    """ENGINE-484: Presale vs market phase. Safe for UI gating; does not alter trading."""
+    force = str(request.args.get("force") or "").lower() in ("1", "true", "yes")
+    try:
+        st = _nkr_presale_status(force=force)
+        return jsonify({"status": "ok", "presale": st, "ts": int(time.time())})
+    except Exception as exc:
+        return jsonify({
+            "status": "ok",
+            "presale": {
+                "configured": False,
+                "presale_active": False,
+                "phase": 2,
+                "phase_label": "market",
+                "buy_path": "market",
+                "strategist_nkr_destination": "liquidity_vault",
+                "error": str(exc)[:300],
+            },
+            "ts": int(time.time()),
+        })
 
 
 @app.route("/api/access/subscribe/config", methods=["GET"])
