@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-488-PRESALE-RPC-URL-1";
+BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-489-PRESALE-W3-HELPER";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10236,6 +10236,47 @@ def _nkr_presale_phase_from_override() -> dict:
     }
 
 
+
+def _presale_w3():
+    """Build Web3 for NKR presale (Ethereum). Uses RPC_URL_1 via _rpc_url_for_chain."""
+    from web3 import Web3
+    rpc = ""
+    try:
+        if "_rpc_url_for_chain" in globals() and callable(_rpc_url_for_chain):
+            rpc = str(_rpc_url_for_chain(int(NKR_PRESALE_CHAIN_ID)) or "").strip()
+    except Exception:
+        rpc = ""
+    if not rpc:
+        try:
+            if "_rpc_urls_for_chain" in globals() and callable(_rpc_urls_for_chain):
+                urls = _rpc_urls_for_chain(int(NKR_PRESALE_CHAIN_ID)) or []
+                rpc = str((urls[0] if urls else "") or "").strip()
+        except Exception:
+            rpc = ""
+    if not rpc:
+        rpc = (
+            os.getenv("RPC_URL_1")
+            or os.getenv("RPC_URL_ETH")
+            or os.getenv("ETH_RPC_URL")
+            or os.getenv("ETHEREUM_RPC_URL")
+            or os.getenv("NEXUS_ETH_RPC")
+            or ""
+        ).strip()
+    if not rpc:
+        raise RuntimeError("RPC_URL_1 empty for Ethereum")
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 25}))
+    return w3, rpc
+
+
+def _presale_contract(w3=None):
+    if w3 is None:
+        w3, _ = _presale_w3()
+    return w3.eth.contract(
+        address=w3.to_checksum_address(NKR_PRESALE_ADDRESS),
+        abi=_NKR_PRESALE_ABI,
+    )
+
+
 def _nkr_presale_status(force: bool = False) -> dict:
     """Single status object: presale live vs market path. On-chain is truth when configured."""
     nowi = int(time.time())
@@ -10274,40 +10315,8 @@ def _nkr_presale_status(force: bool = False) -> dict:
         "error": "",
     }
     try:
-        w3 = None
-        try:
-            from web3 import Web3
-            _rpc = ""
-            # Prefer project helper that already maps RPC_URL_1 / RPC_URL_ETH
-            if "_rpc_url_for_chain" in globals() and callable(_rpc_url_for_chain):
-                try:
-                    _rpc = str(_rpc_url_for_chain(int(NKR_PRESALE_CHAIN_ID)) or "").strip()
-                except Exception:
-                    _rpc = ""
-            if not _rpc and "_rpc_urls_for_chain" in globals() and callable(_rpc_urls_for_chain):
-                try:
-                    _urls = _rpc_urls_for_chain(int(NKR_PRESALE_CHAIN_ID)) or []
-                    _rpc = str((_urls[0] if _urls else "") or "").strip()
-                except Exception:
-                    _rpc = ""
-            if not _rpc:
-                _rpc = (
-                    os.getenv("RPC_URL_1")
-                    or os.getenv("RPC_URL_ETH")
-                    or os.getenv("ETH_RPC_URL")
-                    or os.getenv("ETHEREUM_RPC_URL")
-                    or os.getenv("NEXUS_ETH_RPC")
-                    or ""
-                ).strip()
-            if not _rpc:
-                raise RuntimeError("no RPC for chain 1 (set RPC_URL_1)")
-            w3 = Web3(Web3.HTTPProvider(_rpc, request_kwargs={"timeout": 25}))
-            if not getattr(w3, "is_connected", lambda: True)():
-                # still try calls; some providers fail is_connected
-                pass
-        except Exception as _w3e:
-            raise RuntimeError(f"web3 init failed: {_w3e}") from _w3e
-
+        w3, _rpc_used = _presale_w3()
+        payload["rpc_used"] = str(_rpc_used)[:60]
         c = w3.eth.contract(address=w3.to_checksum_address(NKR_PRESALE_ADDRESS), abi=_NKR_PRESALE_ABI)
         try:
             phase = int(c.functions.salePhase().call())
@@ -13704,17 +13713,8 @@ def api_nkr_presale_quote():
     if not st.get("presale_active") and not _nkr_presale_configured():
         return jsonify({"status": "ok", "presale": st, "quote": None, "ts": int(time.time())})
     try:
-        w3 = None
-        if "_w3_for_chain" in globals():
-            w3 = _w3_for_chain(NKR_PRESALE_CHAIN_ID)
-        if w3 is None and "_get_web3" in globals():
-            try:
-                w3 = _get_web3(NKR_PRESALE_CHAIN_ID)
-            except Exception:
-                w3 = None
-        if w3 is None:
-            raise RuntimeError("no web3")
-        c = w3.eth.contract(address=w3.to_checksum_address(NKR_PRESALE_ADDRESS), abi=_NKR_PRESALE_ABI)
+        w3, _ = _presale_w3()
+        c = _presale_contract(w3)
         usd_e18 = int(usd * 1e18)
         q = c.functions.quoteUsd(usd_e18).call()
         eth_req = int(q[0])
