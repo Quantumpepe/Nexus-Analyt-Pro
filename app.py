@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.24-ENGINE-485-NKR-PRESALE-BUY-API";
+BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-486-NKR-PRESALE-V3-UI";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10158,7 +10158,7 @@ NKR_TOKEN_DECIMALS = int(os.getenv("NEXUS_NKR_TOKEN_DECIMALS", "18"))
 NKR_PRICE_USD = float(os.getenv("NEXUS_NKR_PRICE_USD", "0"))
 
 # ENGINE-484: NKR Presale phase (on-chain is source of truth when address set)
-NKR_PRESALE_ADDRESS = (os.getenv("NEXUS_NKR_PRESALE_ADDRESS") or "0x1a7aed3bae9ae4ed850166d52372d438ff62f553").strip().lower()
+NKR_PRESALE_ADDRESS = (os.getenv("NEXUS_NKR_PRESALE_ADDRESS") or "0xa9307ce69e4bcc6e2e8b98efb4a132c2496dbc73").strip().lower()
 NKR_PRESALE_CHAIN_ID = int(os.getenv("NEXUS_NKR_PRESALE_CHAIN_ID", "1"))
 # Soft override only when contract not configured yet (dev): "auto" | "active" | "ended"
 NKR_PRESALE_PHASE_OVERRIDE = (os.getenv("NEXUS_NKR_PRESALE_PHASE") or "auto").strip().lower()
@@ -10173,19 +10173,26 @@ _NKR_PRESALE_ABI = [
     {"inputs": [], "name": "salePhase", "outputs": [{"internalType": "uint8", "name": "phase", "type": "uint8"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "saleStarted", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "saleEnded", "outputs": [{"internalType": "bool", "name": "", "type": "bool"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "quotePackage", "outputs": [
+    {"inputs": [], "name": "minUsdE18", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "maxUsdE18", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "nkrPriceUsdE18", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"internalType": "uint256", "name": "usdE18", "type": "uint256"}], "name": "quoteUsd", "outputs": [
         {"internalType": "uint256", "name": "ethRequired", "type": "uint256"},
         {"internalType": "uint256", "name": "nkrBase", "type": "uint256"},
         {"internalType": "uint256", "name": "nkrBonus", "type": "uint256"},
         {"internalType": "uint256", "name": "nkrTotal", "type": "uint256"},
         {"internalType": "bool", "name": "active", "type": "bool"},
-        {"internalType": "uint256", "name": "ethUsdE18", "type": "uint256"},
     ], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "buyPackage", "outputs": [], "stateMutability": "payable", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "count", "type": "uint256"}], "name": "buyPackages", "outputs": [], "stateMutability": "payable", "type": "function"},
-    {"inputs": [], "name": "nkrTotalPerPackage", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "totalPackagesSold", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [], "name": "hardCapPackages", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "quoteBillingPack", "outputs": [
+        {"internalType": "uint256", "name": "ethRequired", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrBase", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrBonus", "type": "uint256"},
+        {"internalType": "uint256", "name": "nkrTotal", "type": "uint256"},
+        {"internalType": "bool", "name": "active", "type": "bool"},
+    ], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "buy", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"internalType": "uint256", "name": "usdE18", "type": "uint256"}], "name": "buyUsd", "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [], "name": "buyBillingPack", "outputs": [], "stateMutability": "payable", "type": "function"},
 ]
 
 _NKR_PRESALE_STATUS_CACHE = {"ts": 0, "payload": None}
@@ -10295,28 +10302,46 @@ def _nkr_presale_status(force: bool = False) -> dict:
         payload["sale_ended"] = phase >= 2
         payload["buy_path"] = "presale_eth" if active else "market"
         try:
-            q = c.functions.quotePackage().call()
-            eth_req = int(q[0])
-            nkr_base = int(q[1])
-            nkr_bonus = int(q[2])
-            nkr_total = int(q[3])
-            q_active = bool(q[4])
-            eth_usd = int(q[5]) if len(q) > 5 else None
+            # V3: normal $20 quote (no bonus) + billing pack (+10%)
+            qn = c.functions.quoteUsd(int(20e18)).call()
+            qb = c.functions.quoteBillingPack().call()
+            def _nkr_human(x):
+                x = int(x)
+                return int(x // (10 ** 18)) if x >= 10**18 else x
+            eth_req = int(qn[0])
             payload["eth_required_wei"] = str(eth_req)
             payload["eth_required_eth"] = float(eth_req) / 1e18
-            payload["nkr_base"] = int(nkr_base // (10 ** 18)) if nkr_base >= 10**18 else int(nkr_base)
-            payload["nkr_bonus"] = int(nkr_bonus // (10 ** 18)) if nkr_bonus >= 10**18 else int(nkr_bonus)
-            payload["nkr_total"] = int(nkr_total // (10 ** 18)) if nkr_total >= 10**18 else int(nkr_total)
-            payload["nkr_base_wei"] = str(nkr_base)
-            payload["nkr_total_wei"] = str(nkr_total)
-            payload["eth_usd"] = (float(eth_usd) / 1e18) if eth_usd is not None else None
-            payload["presale_active"] = bool(q_active) and active
+            payload["nkr_base"] = _nkr_human(qn[1])
+            payload["nkr_bonus"] = _nkr_human(qn[2])  # 0 for normal
+            payload["nkr_total"] = _nkr_human(qn[3])
+            payload["presale_active"] = bool(qn[4]) and active
             payload["buy_path"] = "presale_eth" if payload["presale_active"] else "market"
+            payload["min_usd"] = 5.0
+            payload["max_usd"] = 50000.0
+            payload["nkr_price_usd"] = 0.0005
+            # Billing pack (+10%)
+            payload["billing_pack"] = {
+                "usd": 20.0,
+                "eth_required_wei": str(int(qb[0])),
+                "eth_required_eth": float(int(qb[0])) / 1e18,
+                "nkr_base": _nkr_human(qb[1]),
+                "nkr_bonus": _nkr_human(qb[2]),
+                "nkr_total": _nkr_human(qb[3]),
+                "bonus_pct": 10,
+            }
+            # buyUsd(20e18) selector = keccak first 4 bytes — computed client-side; data filled in FE
             payload["buy_tx"] = {
                 "chain_id": NKR_PRESALE_CHAIN_ID,
                 "to": NKR_PRESALE_ADDRESS,
-                "data": "0x62158099",  # buyPackage()
+                "method": "buyUsd",
                 "value_wei": str(eth_req),
+            }
+            payload["billing_tx"] = {
+                "chain_id": NKR_PRESALE_CHAIN_ID,
+                "to": NKR_PRESALE_ADDRESS,
+                "method": "buyBillingPack",
+                "data": "0x",  # FE encodes buyBillingPack()
+                "value_wei": str(int(qb[0])),
             }
         except Exception as qe:
             payload["error"] = f"quote:{qe}"[:200]
@@ -13641,6 +13666,55 @@ def api_nft_activate():
     # for future re-enable without breaking old deployments.
     return err("nft access is disabled", 403)
 
+
+
+
+@app.route("/api/nkr/presale/quote", methods=["GET"])
+def api_nkr_presale_quote():
+    """V3: quote normal buy for ?usd=5..50000 (no bonus)."""
+    try:
+        usd = float(request.args.get("usd") or 20)
+    except Exception:
+        usd = 20.0
+    usd = max(5.0, min(50000.0, usd))
+    st = _nkr_presale_status(force=False)
+    if not st.get("presale_active") and not _nkr_presale_configured():
+        return jsonify({"status": "ok", "presale": st, "quote": None, "ts": int(time.time())})
+    try:
+        w3 = None
+        if "_w3_for_chain" in globals():
+            w3 = _w3_for_chain(NKR_PRESALE_CHAIN_ID)
+        if w3 is None and "_get_web3" in globals():
+            try:
+                w3 = _get_web3(NKR_PRESALE_CHAIN_ID)
+            except Exception:
+                w3 = None
+        if w3 is None:
+            raise RuntimeError("no web3")
+        c = w3.eth.contract(address=w3.to_checksum_address(NKR_PRESALE_ADDRESS), abi=_NKR_PRESALE_ABI)
+        usd_e18 = int(usd * 1e18)
+        q = c.functions.quoteUsd(usd_e18).call()
+        eth_req = int(q[0])
+        def _h(x):
+            x = int(x)
+            return int(x // 10**18) if x >= 10**18 else x
+        return jsonify({
+            "status": "ok",
+            "quote": {
+                "usd": usd,
+                "eth_required_wei": str(eth_req),
+                "eth_required_eth": eth_req / 1e18,
+                "nkr_base": _h(q[1]),
+                "nkr_bonus": _h(q[2]),
+                "nkr_total": _h(q[3]),
+                "active": bool(q[4]),
+                "bonus": False,
+            },
+            "presale": st,
+            "ts": int(time.time()),
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)[:300], "ts": int(time.time())}), 500
 
 
 @app.route("/api/nkr/presale/status", methods=["GET"])
