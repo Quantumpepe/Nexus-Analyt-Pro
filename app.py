@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-486-NKR-PRESALE-V3-UI";
+BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-487-PRESALE-ACTIVE-FIX";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10275,17 +10275,29 @@ def _nkr_presale_status(force: bool = False) -> dict:
     }
     try:
         w3 = None
-        if "_w3_for_chain" in globals():
-            w3 = _w3_for_chain(NKR_PRESALE_CHAIN_ID)
-        elif "w3" in globals() and NKR_PRESALE_CHAIN_ID in (1, 0):
+        for _name in ("_w3_for_chain", "_get_web3", "get_web3"):
+            _fn = globals().get(_name)
+            if callable(_fn):
+                try:
+                    w3 = _fn(NKR_PRESALE_CHAIN_ID)
+                    if w3 is not None:
+                        break
+                except Exception:
+                    w3 = None
+        if w3 is None and "w3" in globals():
             w3 = globals().get("w3")
-        if w3 is None and "_get_web3" in globals():
+        if w3 is None:
             try:
-                w3 = _get_web3(NKR_PRESALE_CHAIN_ID)
+                from web3 import Web3
+                _rpc = (
+                    (os.getenv("ETH_RPC_URL") or os.getenv("ETHEREUM_RPC_URL") or os.getenv("RPC_URL_1") or os.getenv("NEXUS_ETH_RPC") or "")
+                ).strip()
+                if _rpc:
+                    w3 = Web3(Web3.HTTPProvider(_rpc, request_kwargs={"timeout": 20}))
             except Exception:
                 w3 = None
         if w3 is None:
-            raise RuntimeError("no web3 for presale chain")
+            raise RuntimeError("no web3 for presale chain (set ETH_RPC_URL)")
 
         c = w3.eth.contract(address=w3.to_checksum_address(NKR_PRESALE_ADDRESS), abi=_NKR_PRESALE_ABI)
         try:
@@ -10314,7 +10326,7 @@ def _nkr_presale_status(force: bool = False) -> dict:
             payload["nkr_base"] = _nkr_human(qn[1])
             payload["nkr_bonus"] = _nkr_human(qn[2])  # 0 for normal
             payload["nkr_total"] = _nkr_human(qn[3])
-            payload["presale_active"] = bool(qn[4]) and active
+            payload["presale_active"] = bool(active)  # do not clear via quote flag
             payload["buy_path"] = "presale_eth" if payload["presale_active"] else "market"
             payload["min_usd"] = 5.0
             payload["max_usd"] = 50000.0
@@ -10345,6 +10357,7 @@ def _nkr_presale_status(force: bool = False) -> dict:
             }
         except Exception as qe:
             payload["error"] = f"quote:{qe}"[:200]
+            # keep payload["presale_active"] as already set from presaleActive()
         try:
             payload["total_packages_sold"] = int(c.functions.totalPackagesSold().call())
             payload["hard_cap_packages"] = int(c.functions.hardCapPackages().call())
@@ -10352,11 +10365,12 @@ def _nkr_presale_status(force: bool = False) -> dict:
             pass
     except Exception as exc:
         payload["error"] = str(exc)[:300]
-        # Fail-safe: do not advertise presale buys if chain read fails
-        payload["presale_active"] = False
-        payload["buy_path"] = "market"
-        payload["phase"] = 2
-        payload["phase_label"] = "market"
+        # Only force inactive if we never confirmed on-chain active in this call
+        if not payload.get("presale_active"):
+            payload["presale_active"] = False
+            payload["buy_path"] = "market"
+            payload["phase"] = 2
+            payload["phase_label"] = "market"
 
     _NKR_PRESALE_STATUS_CACHE["ts"] = nowi
     _NKR_PRESALE_STATUS_CACHE["payload"] = payload
