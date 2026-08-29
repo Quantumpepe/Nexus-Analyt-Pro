@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.25-ENGINE-489-PRESALE-W3-HELPER";
+BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-490-WEEKLY-USDC-NKR-PRICE-GATE";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10147,6 +10147,27 @@ def _symbol_for_chain_token(chain_id: int, token_address: str) -> str:
     return ""
 
 PRICE_PRO_USD = float(os.getenv("PRICE_PRO_USD", os.getenv("PRICE_MONTHLY_USD", "25")))
+
+# NKR plan payment is locked until the live market price reaches this USD level.
+NKR_PAY_MIN_PRICE_USD = float(os.getenv("NEXUS_NKR_PAY_MIN_USD", "0.000009") or "0.000009")
+
+def _nkr_spot_usd() -> float:
+    """Best-effort NKR USD spot. 0 if unknown (pool/CG not ready)."""
+    raw = os.getenv("NEXUS_NKR_SPOT_USD") or ""
+    try:
+        if raw.strip():
+            return max(0.0, float(raw))
+    except Exception:
+        pass
+    return 0.0
+
+def _nkr_pay_unlocked() -> bool:
+    """True only when observed NKR price >= 0.000009 USD."""
+    if str(os.getenv("NEXUS_NKR_PAY_FORCE") or "").strip().lower() in ("1", "true", "yes"):
+        return True
+    spot = _nkr_spot_usd()
+    return spot > 0.0 and spot + 1e-18 >= NKR_PAY_MIN_PRICE_USD
+
 PRICE_STRATEGIST_WEEKLY_USD = float(os.getenv("NEXUS_STRATEGIST_WEEKLY_USD", "20"))
 PRICE_STRATEGIST_MONTHLY_USD = float(os.getenv("NEXUS_STRATEGIST_MONTHLY_USD", "50"))
 # NKR is a utility payment asset for Strategist Weekly only.
@@ -10309,11 +10330,21 @@ def _nkr_presale_status(force: bool = False) -> dict:
         "nkr_total": None,
         "eth_required_wei": None,
         "buy_path": "market",
+        "nkr_pay_enabled": False,
+        "nkr_pay_min_usd": float(NKR_PAY_MIN_PRICE_USD) if "NKR_PAY_MIN_PRICE_USD" in dir() else 0.000009,
+        "nkr_spot_usd": 0.0,
         "strategist_nkr_destination": "liquidity_vault",
         "total_packages_sold": None,
         "hard_cap_packages": None,
         "error": "",
     }
+
+        try:
+            payload["nkr_spot_usd"] = float(_nkr_spot_usd())
+            payload["nkr_pay_min_usd"] = float(NKR_PAY_MIN_PRICE_USD)
+            payload["nkr_pay_enabled"] = bool(_nkr_pay_unlocked())
+        except Exception:
+            payload["nkr_pay_enabled"] = False
     try:
         w3, _rpc_used = _presale_w3()
         payload["rpc_used"] = str(_rpc_used)[:60]
@@ -10408,12 +10439,20 @@ def _subscription_plan_meta(plan: str) -> dict:
             "payment_assets": ["USDT", "USDC"],
         }
     if p in ("strategist_weekly", "strategist-weekly", "strategist_7d", "strategist7d"):
+        assets = ["USDT", "USDC"]
+        try:
+            if _nkr_pay_unlocked():
+                assets = ["USDT", "USDC", "NKR"]
+        except Exception:
+            assets = ["USDT", "USDC"]
         return {
             "plan": "strategist_weekly",
             "kind": "strategist",
             "price_usd": float(PRICE_STRATEGIST_WEEKLY_USD),
             "seconds": 60 * 60 * 24 * 7,
-            "payment_assets": ["NKR"],
+            "payment_assets": assets,
+            "nkr_pay_enabled": "NKR" in assets,
+            "nkr_pay_min_usd": float(NKR_PAY_MIN_PRICE_USD),
         }
     if p in ("strategist_monthly", "strategist-monthly", "strategist_30d", "strategist30d", "strategist"):
         return {
