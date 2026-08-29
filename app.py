@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-490-WEEKLY-USDC-NKR-PRICE-GATE";
+BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-491-INDENT-FIX";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -10338,13 +10338,12 @@ def _nkr_presale_status(force: bool = False) -> dict:
         "hard_cap_packages": None,
         "error": "",
     }
-
-        try:
-            payload["nkr_spot_usd"] = float(_nkr_spot_usd())
-            payload["nkr_pay_min_usd"] = float(NKR_PAY_MIN_PRICE_USD)
-            payload["nkr_pay_enabled"] = bool(_nkr_pay_unlocked())
-        except Exception:
-            payload["nkr_pay_enabled"] = False
+    try:
+        payload["nkr_spot_usd"] = float(_nkr_spot_usd())
+        payload["nkr_pay_min_usd"] = float(NKR_PAY_MIN_PRICE_USD)
+        payload["nkr_pay_enabled"] = bool(_nkr_pay_unlocked())
+    except Exception:
+        payload["nkr_pay_enabled"] = False
     try:
         w3, _rpc_used = _presale_w3()
         payload["rpc_used"] = str(_rpc_used)[:60]
