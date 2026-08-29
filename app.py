@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-492-NKR-LP-REFILL";
+BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-493-LP-REFILL-SYNTAX";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -49624,7 +49624,6 @@ def api_nexus_system_info_evm_diagnostics():
     return jsonify({"status":"ok","overall":overall,"engine":engine,"reports":[report],"ts":now_ts()})
 
 # ENGINE-459 fast boot hook: first backend request starts shared NKR/Trader liveness immediately and reclaims stale Grid leases from dead deploy processes.
-@app.before_request
 
 # ---------------------------------------------------------------------------
 # ENGINE-492: NKR LP refill worker (Privy operator).
@@ -49876,6 +49875,7 @@ def api_nkr_lp_refill_status():
     })
     return jsonify(snap)
 
+@app.before_request
 def _boot_nkr_live_worker_once():
     _ensure_nkr_live_worker_started()
     try:
