@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-491-INDENT-FIX";
+BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-492-NKR-LP-REFILL";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -49625,8 +49625,263 @@ def api_nexus_system_info_evm_diagnostics():
 
 # ENGINE-459 fast boot hook: first backend request starts shared NKR/Trader liveness immediately and reclaims stale Grid leases from dead deploy processes.
 @app.before_request
+
+# ---------------------------------------------------------------------------
+# ENGINE-492: NKR LP refill worker (Privy operator).
+# After owner flushes CoreVault 2% into the NKR liquidity vault:
+#   ethSideStable >= $100  -> convertStableToWeth (full amount)
+#   vault WETH + NKR       -> increaseLockedPosition(tokenId 1358686)
+# Never calls buyBackNkr.
+# ---------------------------------------------------------------------------
+_NKR_LP_REFILL_THREAD = None
+_NKR_LP_REFILL_LOCK = threading.Lock()
+_NKR_LP_REFILL_LAST = {
+    "ts": 0,
+    "stage": "idle",
+    "error": "",
+    "lastTx": "",
+    "lastConvertTx": "",
+    "lastIncreaseTx": "",
+    "ethSideUsdc": "0",
+    "ethSideUsdt": "0",
+}
+
+_NKR_LP_SEL_ETH_SIDE = "0x8ada3444"
+_NKR_LP_SEL_CONVERT = "0xfaa309f3"
+_NKR_LP_SEL_INCREASE = "0xb2739f93"
+_NKR_LP_SEL_BALANCE = "0x70a08231"
+_NKR_LP_POSITION_ID_DEFAULT = 1358686
+_NKR_LP_USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+_NKR_LP_USDT = "0xdac17f958d2ee523a2206206994597c13d831ec7"
+_NKR_LP_WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+_NKR_LP_NKR = "0xaa120cfc79c79830b13728a6ebdd379a572880c8"
+
+
+def _nkr_lp_vault_addr() -> str:
+    return _norm_addr(
+        (_NKR_LIQUIDITY_VAULT_BY_CHAIN.get(1) if "_NKR_LIQUIDITY_VAULT_BY_CHAIN" in globals() else "")
+        or "0x99a9D11313fDB43C258eeDf146e02A41361A3491"
+    )
+
+
+def _nkr_lp_enabled() -> bool:
+    raw = str(os.getenv("NKR_LP_REFILL_ENABLED") or "1").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _nkr_lp_interval_sec() -> int:
+    try:
+        return max(120, int(os.getenv("NKR_LP_REFILL_INTERVAL_SEC") or "900"))
+    except Exception:
+        return 900
+
+
+def _nkr_lp_position_id() -> int:
+    try:
+        return int(os.getenv("NKR_LP_POSITION_ID") or _NKR_LP_POSITION_ID_DEFAULT)
+    except Exception:
+        return _NKR_LP_POSITION_ID_DEFAULT
+
+
+def _nkr_lp_pad_addr(addr: str) -> str:
+    return _norm_addr(addr).lower().replace("0x", "").rjust(64, "0")
+
+
+def _nkr_lp_pad_uint(n: int) -> str:
+    if int(n) < 0:
+        n = 0
+    return format(int(n), "x").rjust(64, "0")
+
+
+def _nkr_lp_decode_uint(raw) -> int:
+    s = str(raw or "0x0").strip()
+    if not s or s == "0x":
+        return 0
+    try:
+        return int(s, 16)
+    except Exception:
+        return 0
+
+
+def _nkr_lp_mark(**kwargs):
+    with _NKR_LP_REFILL_LOCK:
+        _NKR_LP_REFILL_LAST.update(kwargs)
+        _NKR_LP_REFILL_LAST["ts"] = int(time.time())
+
+
+def _nkr_lp_operator_wallet_id() -> str:
+    env_id = str(os.getenv("PRIVY_OPERATOR_WALLET_ID") or os.getenv("PRIVY_LP_OPERATOR_WALLET_ID") or "").strip()
+    if env_id:
+        return env_id
+    try:
+        owner = _owner_system_info_wallet()
+        return str(_privy_wallet_id_for_user(owner) or "").strip()
+    except Exception:
+        return ""
+
+
+def _nkr_lp_read_mapping(selector: str, token: str) -> int:
+    vault = _nkr_lp_vault_addr()
+    data = selector + _nkr_lp_pad_addr(token)
+    raw = _eth_call(1, vault, data)
+    return _nkr_lp_decode_uint(raw)
+
+
+def _nkr_lp_erc20_balance(token: str, holder: str) -> int:
+    data = _NKR_LP_SEL_BALANCE + _nkr_lp_pad_addr(holder)
+    raw = _eth_call(1, _norm_addr(token), data)
+    return _nkr_lp_decode_uint(raw)
+
+
+def _nkr_lp_stable_usd_units(token: str, raw_amount: int) -> int:
+    # USDC/USDT 6 decimals -> 1 unit = $1e-6. Threshold in vault is $100 = 100e6 raw.
+    return int(raw_amount or 0)
+
+
+def _nkr_lp_extract_tx_hash(result) -> str:
+    if isinstance(result, str) and result.startswith("0x") and len(result) >= 66:
+        return result
+    if not isinstance(result, dict):
+        return ""
+    for key in ("hash", "transactionHash", "txHash"):
+        val = result.get(key)
+        if isinstance(val, str) and val.startswith("0x"):
+            return val
+    data = result.get("data")
+    if isinstance(data, dict):
+        for key in ("hash", "transaction_hash", "transactionHash"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("0x"):
+                return val
+    return str(result.get("hash") or "")[:80]
+
+
+def _nkr_lp_send(data: str, reference_id: str, gas_limit: int) -> str:
+    wallet_id = _nkr_lp_operator_wallet_id()
+    if not wallet_id:
+        raise RuntimeError("privy_operator_wallet_id_missing")
+    tx = {
+        "to": _nkr_lp_vault_addr(),
+        "value": "0x0",
+        "data": data,
+        "gas_limit": hex(int(gas_limit)),
+    }
+    out = _privy_send_delegated_transaction(wallet_id, tx, reference_id=reference_id, chain_id=1)
+    txh = _nkr_lp_extract_tx_hash(out)
+    if not txh:
+        raise RuntimeError(f"privy_lp_no_hash:{str(out)[:240]}")
+    try:
+        _privy_wait_receipt(txh, timeout_sec=120, chain_id=1)
+    except Exception:
+        pass
+    return txh
+
+
+def _nkr_lp_refill_once() -> dict:
+    if not _nkr_lp_enabled():
+        _nkr_lp_mark(stage="disabled")
+        return dict(_NKR_LP_REFILL_LAST)
+    vault = _nkr_lp_vault_addr()
+    usdc_side = _nkr_lp_read_mapping(_NKR_LP_SEL_ETH_SIDE, _NKR_LP_USDC)
+    usdt_side = _nkr_lp_read_mapping(_NKR_LP_SEL_ETH_SIDE, _NKR_LP_USDT)
+    _nkr_lp_mark(stage="scan", error="", ethSideUsdc=str(usdc_side), ethSideUsdt=str(usdt_side))
+
+    # $100 min = 100 * 10**6 raw for 6-dec stables
+    min_raw = 100 * 10**6
+    pick_token = ""
+    pick_amount = 0
+    if usdc_side >= min_raw and usdc_side >= usdt_side:
+        pick_token, pick_amount = _NKR_LP_USDC, usdc_side
+    elif usdt_side >= min_raw:
+        pick_token, pick_amount = _NKR_LP_USDT, usdt_side
+
+    convert_tx = ""
+    if pick_token:
+        _nkr_lp_mark(stage="convert")
+        deadline = int(time.time()) + 1800
+        data = (
+            _NKR_LP_SEL_CONVERT
+            + _nkr_lp_pad_addr(pick_token)
+            + _nkr_lp_pad_uint(pick_amount)
+            + _nkr_lp_pad_uint(0)
+            + _nkr_lp_pad_uint(deadline)
+        )
+        convert_tx = _nkr_lp_send(data, f"nkr-lp-convert-{int(time.time())}", 450000)
+        _nkr_lp_mark(stage="converted", lastConvertTx=convert_tx, lastTx=convert_tx)
+
+    weth_bal = _nkr_lp_erc20_balance(_NKR_LP_WETH, vault)
+    nkr_bal = _nkr_lp_erc20_balance(_NKR_LP_NKR, vault)
+    # Need both sides. Tiny leftover WETH is ignored.
+    if weth_bal < 10**14 or nkr_bal < 10**18:
+        if not pick_token:
+            _nkr_lp_mark(stage="wait_funds")
+        else:
+            _nkr_lp_mark(stage="wait_pair", lastConvertTx=convert_tx)
+        return dict(_NKR_LP_REFILL_LAST)
+
+    _nkr_lp_mark(stage="increase")
+    deadline = int(time.time()) + 1800
+    token_id = _nkr_lp_position_id()
+    data = (
+        _NKR_LP_SEL_INCREASE
+        + _nkr_lp_pad_uint(token_id)
+        + _nkr_lp_pad_uint(nkr_bal)
+        + _nkr_lp_pad_uint(weth_bal)
+        + _nkr_lp_pad_uint(0)
+        + _nkr_lp_pad_uint(0)
+        + _nkr_lp_pad_uint(deadline)
+    )
+    inc_tx = _nkr_lp_send(data, f"nkr-lp-increase-{token_id}-{int(time.time())}", 900000)
+    _nkr_lp_mark(stage="increased", lastIncreaseTx=inc_tx, lastTx=inc_tx, error="")
+    return dict(_NKR_LP_REFILL_LAST)
+
+
+def _nkr_lp_refill_loop():
+    while True:
+        try:
+            _nkr_lp_refill_once()
+        except Exception as exc:
+            _nkr_lp_mark(stage="error", error=str(exc)[:500])
+        time.sleep(_nkr_lp_interval_sec())
+
+
+def _ensure_nkr_lp_refill_started() -> None:
+    global _NKR_LP_REFILL_THREAD
+    if not _nkr_lp_enabled():
+        return
+    with _NKR_LP_REFILL_LOCK:
+        if _NKR_LP_REFILL_THREAD is not None and _NKR_LP_REFILL_THREAD.is_alive():
+            return
+        th = threading.Thread(target=_nkr_lp_refill_loop, daemon=True, name="nkr-lp-refill")
+        th.start()
+        _NKR_LP_REFILL_THREAD = th
+        _NKR_LP_REFILL_LAST["stage"] = "started"
+
+
+@app.get("/api/nexus/nkr-lp/refill-status")
+def api_nkr_lp_refill_status():
+    try:
+        _ensure_nkr_lp_refill_started()
+    except Exception:
+        pass
+    with _NKR_LP_REFILL_LOCK:
+        snap = dict(_NKR_LP_REFILL_LAST)
+    snap.update({
+        "enabled": _nkr_lp_enabled(),
+        "vault": _nkr_lp_vault_addr(),
+        "positionId": _nkr_lp_position_id(),
+        "operatorWalletIdSet": bool(_nkr_lp_operator_wallet_id()),
+        "intervalSec": _nkr_lp_interval_sec(),
+        "buyback": "disabled",
+    })
+    return jsonify(snap)
+
 def _boot_nkr_live_worker_once():
     _ensure_nkr_live_worker_started()
+    try:
+        _ensure_nkr_lp_refill_started()
+    except Exception:
+        pass
     # ENGINE-456: persisted Grid sessions survive deploys, but their Python ticker
     # threads do not. Recover them lazily and safely on normal backend traffic.
     try:
