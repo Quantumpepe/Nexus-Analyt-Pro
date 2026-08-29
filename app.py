@@ -48877,7 +48877,7 @@ def _engine_history_init():
 
 def _engine_history_normalize_engine(value):
     v = str(value or "").strip().upper()
-    return v if v in ("GRID", "TRADER") else ""
+    return v if v in ("GRID", "NKR", "TRADER") else ""
 
 
 @app.route("/api/nexus/engine-history", methods=["GET"])
@@ -48887,7 +48887,7 @@ def api_nexus_engine_history_get():
         return error_response
     engine = _engine_history_normalize_engine(request.args.get("engine"))
     if not engine:
-        return jsonify({"status":"error","error":"engine must be GRID or TRADER"}), 400
+        return jsonify({"status":"error","error":"engine must be GRID, NKR or TRADER"}), 400
     limit = max(1, min(5000, int(request.args.get("limit") or 1000)))
     _engine_history_init()
     conn = _db()
@@ -48920,7 +48920,7 @@ def api_nexus_engine_history_sync():
     body=request.get_json(silent=True) or {}
     engine=_engine_history_normalize_engine(body.get("engine"))
     if not engine:
-        return jsonify({"status":"error","error":"engine must be GRID or TRADER"}), 400
+        return jsonify({"status":"error","error":"engine must be GRID, NKR or TRADER"}), 400
     incoming=body.get("events") if isinstance(body.get("events"), list) else []
     incoming=incoming[:2000]
     now_i=now_ts()
