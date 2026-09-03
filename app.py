@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.08.29-ENGINE-493-LP-REFILL-SYNTAX";
+BACKEND_BUILD_ID = "B-2026.09.01-ENGINE-495-NKR-SPOT-HOLD";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1625,6 +1625,76 @@ def _live_engine_health_payload(wallet=""):
 
         out[eng] = row
     return out
+
+
+_NKR_SPOT_CACHE = {"price": 0.0, "change24h": 0.0, "liq": 0.0, "vol": 0.0, "mcap": 0.0, "ts": 0, "source": ""}
+_NKR_SPOT_LOCK = threading.Lock()
+_NKR_TOKEN_ADDR = "0xaa120cFc79C79830B13728a6ebdd379a572880C8"
+_NKR_PAIR_ADDR = "0x099d9a4626137572fbc0fa49cd73d78c554558f5"
+
+def _nkr_spot_http_json(url, timeout=8):
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "NexusAnalyt/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        return json.loads(raw)
+    except Exception:
+        return None
+
+def _nkr_spot_from_pair(pair):
+    if not isinstance(pair, dict):
+        return None
+    try:
+        px = float(pair.get("priceUsd") or pair.get("priceNative") or 0)
+    except Exception:
+        px = 0.0
+    if px <= 0:
+        return None
+    ch = pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+    try:
+        change = float(ch.get("h24") if ch.get("h24") is not None else (ch.get("h6") if ch.get("h6") is not None else (ch.get("h1") or 0)))
+    except Exception:
+        change = 0.0
+    liq = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
+    vol = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+    return {
+        "price": px,
+        "change24h": change,
+        "liq": float(liq.get("usd") or 0),
+        "vol": float(vol.get("h24") or 0),
+        "mcap": float(pair.get("fdv") or pair.get("marketCap") or 0),
+        "ts": int(time.time()),
+        "source": "dexscreener",
+    }
+
+def _refresh_nkr_spot():
+    global _NKR_SPOT_CACHE
+    urls = [
+        f"https://api.dexscreener.com/latest/dex/pairs/ethereum/{_NKR_PAIR_ADDR}",
+        f"https://api.dexscreener.com/latest/dex/tokens/{_NKR_TOKEN_ADDR}",
+    ]
+    fresh = None
+    for url in urls:
+        data = _nkr_spot_http_json(url)
+        if not isinstance(data, dict):
+            continue
+        pair = data.get("pair")
+        if not pair and isinstance(data.get("pairs"), list) and data.get("pairs"):
+            pair = data["pairs"][0]
+        fresh = _nkr_spot_from_pair(pair)
+        if fresh:
+            break
+    with _NKR_SPOT_LOCK:
+        if fresh:
+            _NKR_SPOT_CACHE = fresh
+        return dict(_NKR_SPOT_CACHE)
+
+@app.get("/api/nexus/nkr-spot")
+def api_nexus_nkr_spot():
+    snap = _refresh_nkr_spot()
+    ok = float(snap.get("price") or 0) > 0
+    return jsonify({"status": "ok" if ok else "empty", "spot": snap})
 
 @app.get("/api/nexus/engine-runtime/status")
 def api_nexus_engine_runtime_status():
