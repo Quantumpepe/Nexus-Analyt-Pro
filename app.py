@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-499-WORKER-ALWAYS-ON";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-500-NKR-SPOT-HOLD";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1704,6 +1704,48 @@ def _nkr_spot_from_pair(pair):
         "source": "dexscreener",
     }
 
+def _nkr_spot_store_load():
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM nexus_live_engine_runtime_health WHERE engine=?",
+                ("NKR_SPOT",),
+            ).fetchone()
+            if row and row["payload_json"]:
+                data = json.loads(row["payload_json"] or "{}")
+                if isinstance(data, dict) and float(data.get("price") or 0) > 0:
+                    return data
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return None
+
+def _nkr_spot_store_save(snap):
+    if not isinstance(snap, dict) or float(snap.get("price") or 0) <= 0:
+        return
+    try:
+        _live_engine_tables_init()
+        nowi = int(time.time())
+        with DB_WRITE_LOCK:
+            conn = _db()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO nexus_live_engine_runtime_health(engine, payload_json, updated_ts)
+                    VALUES(?,?,?)
+                    ON CONFLICT(engine) DO UPDATE SET payload_json=excluded.payload_json, updated_ts=excluded.updated_ts
+                    """,
+                    ("NKR_SPOT", json.dumps(snap, separators=(",", ":")), nowi),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception:
+        pass
+
 def _refresh_nkr_spot():
     global _NKR_SPOT_CACHE
     urls = [
@@ -1723,7 +1765,13 @@ def _refresh_nkr_spot():
             break
     with _NKR_SPOT_LOCK:
         if fresh:
+            fresh["ts"] = int(time.time())
             _NKR_SPOT_CACHE = fresh
+            _nkr_spot_store_save(fresh)
+        elif float(_NKR_SPOT_CACHE.get("price") or 0) <= 0:
+            stored = _nkr_spot_store_load()
+            if stored:
+                _NKR_SPOT_CACHE = stored
         return dict(_NKR_SPOT_CACHE)
 
 @app.get("/api/nexus/nkr-spot")
@@ -39996,7 +40044,7 @@ _NKR_LIVE_WORKER_CYCLE_COMPLETED_TS = 0
 _NKR_LIVE_WORKER_LAST_STAGE = "boot"
 _NKR_LIVE_WORKER_LOOP_COUNT = 0
 _NKR_LIVE_WORKER_INTERVAL_SEC = max(15, int(os.getenv("NEXUS_NKR_WORKER_INTERVAL_SEC", "15")))
-_NKR_LIVE_WORKER_STALE_SEC = max(30, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "45")))
+_NKR_LIVE_WORKER_STALE_SEC = max(180, int(os.getenv("NEXUS_NKR_WORKER_STALE_SEC", "300")))
 _NKR_LIVE_WORKER_HEALTH_INTERVAL_SEC = max(2, int(os.getenv("NEXUS_NKR_WORKER_HEALTH_INTERVAL_SEC", "3")))
 _NKR_LIVE_CYCLE_LEASE_SEC = max(30, int(os.getenv("NEXUS_NKR_CYCLE_LEASE_SEC", "45")))
 
