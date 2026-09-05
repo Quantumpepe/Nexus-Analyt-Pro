@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-501-EXIT-OPEN-TS";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-502-EXIT-HELD-OK";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -44683,18 +44683,24 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     # ENGINE-378: min hold before discretionary CLOSE (shadow never flipped in 60s).
     # Hard max-loss still closes immediately via forced_exits with reason max_loss if present.
     def _position_held_long_enough(sym_key: str) -> bool:
-        # ENGINE-414: never treat unknown/error as "held long enough".
         try:
             pm = previous_meta.get(str(sym_key or "").upper()) or {}
             opened = int(pm.get("nkr_position_opened_ts") or pm.get("position_opened_ts") or pm.get("entry_ts") or 0)
-            if opened <= 0:
-                return False
+            if opened <= 1_000_000_000:
+                opened = int(pm.get("session_started_ts") or pm.get("created_ts") or pm.get("started_ts") or 0)
+            if opened <= 1_000_000_000:
+                try:
+                    opened = int(live_row.get("created_ts") or live_row.get("started_ts") or 0)
+                except Exception:
+                    opened = 0
+            if opened <= 1_000_000_000:
+                return True
             held = int(time.time()) - opened
             if held < 0 or held > 30 * 86400:
-                return False
+                return True
             return held >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
         except Exception:
-            return False
+            return True
 
     actions = []
     # ENGINE-409: combine live snapshot state with the durable cross-worker lock.
