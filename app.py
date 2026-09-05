@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-498-HEALTH-FROM-SESSIONS";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-499-WORKER-ALWAYS-ON";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1734,9 +1734,7 @@ def api_nexus_nkr_spot():
 
 @app.get("/api/nexus/engine-runtime/status")
 def api_nexus_engine_runtime_status():
-    wa = _require_auth() or _pick_wallet_from_request()
-    if not wa:
-        return err("wallet required", 401)
+    wa = _require_auth() or _pick_wallet_from_request() or ""
 
     # ENGINE-209: restore the proven Build-199 worker start behavior.
     # The status request may ensure that the daemon loop exists, but it never runs
