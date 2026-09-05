@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-496-WORKER-HEALTH-HOLD";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-498-HEALTH-FROM-SESSIONS";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1590,6 +1590,34 @@ def _live_engine_health_payload(wallet=""):
         row["tick_age_sec"] = (nowi - last) if last else None
         row["stalled"] = bool(str(row.get("status") or "").lower() == "running" and (not last or nowi-last > _NKR_LIVE_WORKER_STALE_SEC))
 
+        if wallet and not live and eng in ("NKR", "TRADER"):
+            try:
+                sessions, _, _ = _db_get_rotation_sessions(wallet)
+                extra = []
+                for x in (sessions or []):
+                    if not isinstance(x, dict):
+                        continue
+                    st = str(x.get("status") or x.get("lifecycleState") or "").upper()
+                    if st in {"STOPPED", "FINALIZED", "CLOSED", "EXPIRED", "CANCELLED", "RELEASED", "ARCHIVED"}:
+                        continue
+                    is_nkr = False
+                    try:
+                        is_nkr = bool(_nkr_is_session(x))
+                    except Exception:
+                        sid = str(x.get("id") or x.get("sessionId") or "")
+                        is_nkr = sid.upper().startswith("NKR")
+                    if eng == "NKR" and not is_nkr:
+                        continue
+                    if eng == "TRADER" and is_nkr:
+                        continue
+                    extra.append(x)
+                if extra:
+                    live = extra
+                    row["status"] = "running"
+                    row["reason"] = row.get("reason") or "Active session registry"
+            except Exception:
+                pass
+
         if eng == "NKR":
             thread = globals().get("_NKR_LIVE_WORKER_THREAD")
             local_alive = bool(thread is not None and thread.is_alive())
@@ -1716,6 +1744,16 @@ def api_nexus_engine_runtime_status():
     try:
         if "_ensure_nkr_live_worker_started" in globals():
             _ensure_nkr_live_worker_started()
+        thread = globals().get("_NKR_LIVE_WORKER_THREAD")
+        if thread is not None and thread.is_alive():
+            nowi = int(time.time())
+            _live_engine_mark(
+                "NKR",
+                status="running",
+                worker_heartbeat_ts=nowi,
+                worker_thread_name=getattr(thread, "name", "nkr-live-worker"),
+                worker_last_stage=str(globals().get("_NKR_LIVE_WORKER_LAST_STAGE") or "running"),
+            )
     except Exception as exc:
         _live_engine_mark("NKR", status="error", decision="WORKER_START_FAILED", reason="NKR worker could not be started", last_error=str(exc)[:1000])
 
@@ -45114,6 +45152,23 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
         reason = (plan.get("forcedExits") or {}).get(sym, "portfolio_target_rebalance")
         execution = {"executed": True, "decision": action, "gate": "ONCHAIN_CONFIRMED", "asset": sym,
                      "detail": f"{action} {sym} confirmed for approximately ${delta:.2f} target delta ({reason}).", **result}
+        try:
+            px = 0.0
+            for mr in (market_rows or []):
+                if str((mr or {}).get("symbol") or (mr or {}).get("asset") or "").upper() == str(sym).upper():
+                    px = float((mr or {}).get("priceUsd") or (mr or {}).get("price") or 0) or 0
+                    break
+            ev_type = "ENTRY" if str(action).upper() in {"BUY", "ENTRY", "OPEN"} else ("EXIT" if str(action).upper() in {"SELL", "EXIT", "CLOSE"} else str(action).upper())
+            _engine_history_record(
+                wallet, engine_name or "NKR", ev_type,
+                asset=sym, chain=chain_key, action=action, side=action,
+                priceUsd=px, amountUsd=abs(float(delta or 0)), budgetUsd=abs(float(delta or 0)),
+                reason=reason, detail=execution.get("detail") or "",
+                txHash=(result or {}).get("txHash") or (result or {}).get("tx_hash") or (result or {}).get("hash") or "",
+                sessionId=sid, onchainSessionId=sid,
+            )
+        except Exception:
+            pass
         break
     # Re-read every position after mutation and build one active card per asset.
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
@@ -48951,6 +49006,70 @@ def _engine_history_init():
             conn.commit()
         finally:
             conn.close()
+
+
+
+def _engine_history_record(wallet, engine, event_type, **fields):
+    """Write one GRID/NKR/TRADER history row from the live worker (entry/exit)."""
+    wa = _norm_addr(wallet or "")
+    eng = _engine_history_normalize_engine(engine)
+    if not wa or not eng:
+        return False
+    now_i = int(time.time())
+    event_type = str(event_type or "EVENT").strip().upper()[:80]
+    asset = str(fields.get("asset") or fields.get("symbol") or "").upper()
+    chain = str(fields.get("chain") or "").upper()
+    sid = str(fields.get("sessionId") or fields.get("onchainSessionId") or "")
+    tx = str(fields.get("txHash") or fields.get("tx_hash") or "")
+    event_key = str(fields.get("eventKey") or fields.get("event_key") or "").strip()[:240]
+    if not event_key:
+        event_key = f"{eng}:{chain}:{sid}:{event_type}:{asset}:{tx or now_i}"[:240]
+    payload = {
+        "engine": eng,
+        "eventKey": event_key,
+        "eventType": event_type,
+        "status": event_type,
+        "ts": now_i,
+        "chain": chain,
+        "asset": asset,
+        "symbol": asset,
+        "side": str(fields.get("side") or fields.get("action") or event_type).upper(),
+        "action": str(fields.get("action") or event_type).upper(),
+        "priceUsd": float(fields.get("priceUsd") or fields.get("price") or 0) or 0,
+        "quantity": float(fields.get("quantity") or fields.get("qty") or 0) or 0,
+        "budgetUsd": float(fields.get("budgetUsd") or fields.get("amountUsd") or 0) or 0,
+        "amountUsd": float(fields.get("amountUsd") or fields.get("budgetUsd") or 0) or 0,
+        "grossUsd": float(fields.get("grossUsd") or 0) or 0,
+        "costsUsd": float(fields.get("costsUsd") or 0) or 0,
+        "netUsd": float(fields.get("netUsd") or 0) or 0,
+        "reason": str(fields.get("reason") or fields.get("detail") or "")[:400],
+        "txHash": tx,
+        "sessionId": sid,
+        "date": time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(now_i)),
+    }
+    try:
+        _engine_history_init()
+        with DB_WRITE_LOCK:
+            conn = _db()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO nexus_engine_event_history(wallet_address,engine,event_key,event_type,event_ts,payload_json,created_ts,updated_ts)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(wallet_address,engine,event_key) DO UPDATE SET
+                      event_type=excluded.event_type,
+                      event_ts=excluded.event_ts,
+                      payload_json=excluded.payload_json,
+                      updated_ts=excluded.updated_ts
+                    """,
+                    (wa, eng, event_key, event_type, now_i, json.dumps(payload, separators=(",", ":"), ensure_ascii=False), now_i, now_i),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return True
+    except Exception:
+        return False
 
 
 def _engine_history_normalize_engine(value):
