@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-504-EXIT-PATH-COMPLETE";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-506-SKIP-BLOCKED-CANDIDATE";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -44908,6 +44908,11 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             for idx, cand in enumerate(plan.get("rankedCandidates") or plan.get("selected") or []):
                 csym = str((cand or {}).get("symbol") or "").upper()
                 if csym in routes:
+                    try:
+                        if not _nkr_symbol_allowed_on_session_chain(csym, str(chain_key or "").upper()).get("allowed"):
+                            continue
+                    except Exception:
+                        continue
                     candidate_actions.append((3, open_usd - idx * 1e-9, "OPEN", csym, open_units))
         # Keep CLOSE/REDUCE actions if any reconciliation created them; replace old
         # OPEN targets so failed candidate #1 can fall through to #2/#3.
@@ -45070,12 +45075,8 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     _sess_ch = str(chain_key or _nkr_chain_key_from_id(int(live_row.get("chain_id") or 0)) or "").upper()
                     _gate = _nkr_symbol_allowed_on_session_chain(str(sym or ""), _sess_ch)
                     if not _gate.get("allowed"):
-                        return {
-                            "executed": False,
-                            "decision": "SAME_CHAIN_BLOCKED",
-                            "detail": f"{sym} not allowed on {_sess_ch} session ({_gate.get('reason')}). No cross-chain mix.",
-                            "gate": _gate,
-                        }
+                        last_skip = f"SAME_CHAIN_SKIP:{sym}:{_sess_ch}:{_gate.get('reason')}"
+                        continue
                     _allow = _nkr_session_allowed_asset_set(settings, live_row)
                     if _allow and str(sym or "").upper() not in _allow:
                         return {
