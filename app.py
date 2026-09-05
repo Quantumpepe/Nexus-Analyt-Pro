@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-507-BOOK-COLLECTED-PROFIT";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-508-PROFIT-MODE-AND-DISPLAY";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -44490,6 +44490,36 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     _div = float(10 ** _dec)
     budget_usd = (_bu / _div) if _bu > 0 else 0.0
     spendable_usd = (settlement_cash / _div) if settlement_cash > 0 else 0.0
+    try:
+        _meta_lr = live_row.get("meta") if isinstance(live_row.get("meta"), dict) else {}
+        _base_cap = _safe_float(
+            _meta_lr.get("nkr_base_capital_usd")
+            or live_row.get("baseCapitalUsd")
+            or live_row.get("budgetUsd")
+            or live_row.get("investUsd")
+            or 0.0,
+            0.0,
+        )
+        if _base_cap <= 0:
+            _base_cap = float(budget_usd or 0.0)
+        _pmode = _nkr_normalize_profit_mode(
+            live_row.get("nkrProfitMode")
+            or live_row.get("profitMode")
+            or live_row.get("profit_mode")
+            or _meta_lr.get("nkr_profit_mode")
+            or (settings or {}).get("nkrProfitMode")
+            or (settings or {}).get("profitMode")
+            or NEXUS_NKR_DEFAULT_PROFIT_MODE
+        )
+        live_row.setdefault("meta", _meta_lr)
+        live_row["meta"]["nkr_base_capital_usd"] = _base_cap
+        live_row["meta"]["nkr_profit_mode"] = _pmode
+        # PAYOUT / HOLD: next buy uses original user capital only. Profit stays collected.
+        if _pmode in {"PAYOUT", "PAYOUT_PERCENTAGE", "HOLD_STABLE"} and _base_cap > 0:
+            budget_usd = min(float(budget_usd or 0.0), float(_base_cap))
+            spendable_usd = min(float(spendable_usd or 0.0), float(_base_cap))
+    except Exception:
+        pass
     # Sanity: if /6-dec looks like trillions but /18-dec is a normal session size, use 18.
     if budget_usd > 1_000_000.0 and _bu >= 10 ** 15:
         alt = _bu / 1e18
@@ -45281,7 +45311,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                         continue
                     meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
                     prev = _safe_float(card.get("collectedProfitUsd") or card.get("rotationProfitUsd") or card.get("profitUsd") or meta.get("collectedProfitUsd"), 0.0)
-                    add = max(0.0, float(_net or 0.0))
+                    add = float(_net or 0.0)
                     nxt = round(prev + add, 6)
                     card["collectedProfitUsd"] = nxt
                     card["rotationProfitUsd"] = nxt
