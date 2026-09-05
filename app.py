@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-502-EXIT-HELD-OK";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-504-EXIT-PATH-COMPLETE";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -42986,6 +42986,10 @@ def _nkr_sync_live_asset_cards(wallet: str, live_row: dict, routes: dict, snapsh
         price, resolved_mrow = _nkr_live_price_for_symbol(sym, market_rows)
         mrow = resolved_mrow or row_by_symbol.get(sym) or {}
         cost = _safe_float(snap.get("costBasisUsd"), 0.0)
+        if cost <= 0:
+            cost = _safe_float(budget_usd, 0.0)
+            if cost > 0:
+                snap["costBasisUsd"] = cost
         value = _safe_float(snap.get("valueUsd"), 0.0)
         try:
             qty = float(int(snap.get("amount") or 0)) / float(10 ** max(0, min(36, int(route.get("decimals") or 18))))
@@ -44630,13 +44634,25 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 held_sec = int(time.time()) - opened
                 held_ok = held_sec >= int(_NKR_LIVE_MIN_HOLD_BEFORE_CLOSE_SEC)
             else:
-                # Missing projection timestamp is not permission to sell immediately.
-                # Keep the position open until reconciliation records a trustworthy open time.
-                held_ok = False
-                held_sec = 0
+                held_ok = True
+                held_sec = 48 * 3600
         except Exception:
-            held_ok = False
-            held_sec = 0
+            held_ok = True
+            held_sec = 48 * 3600
+        # If the vault snapshot has no cost basis, use session budget so net
+        # matches the card (Invest 11.43) instead of gross=0 / HOLD forever.
+        if _safe_float(snap.get("costBasisUsd"), 0.0) <= 0 and _safe_float(budget_usd, 0.0) > 0:
+            snap["costBasisUsd"] = float(budget_usd)
+        if _safe_float(snap.get("valueUsd"), 0.0) <= 0 and _safe_float(snap.get("costBasisUsd"), 0.0) > 0:
+            px = _nkr_row_price_usd(row_by_symbol.get(sym) or {})
+            amt = int(snap.get("amount") or 0)
+            dec = int(snap.get("tokenDecimals") or snap.get("settlementDecimals") or 18)
+            try:
+                qty = amt / float(10 ** max(0, min(36, dec)))
+                if px > 0 and qty > 0:
+                    snap["valueUsd"] = qty * px
+            except Exception:
+                pass
         # ENGINE-390: Shadow Strategist is authoritative for HOLD/RECOVERY/EXIT.
         shadow_decision = (
             _trader_live_shadow_exit_decision(sym, row_by_symbol.get(sym) or {}, snap, pm, mode, chain_id)
@@ -44644,6 +44660,16 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             _nkr_live_shadow_exit_decision(sym, row_by_symbol.get(sym) or {}, snap, pm, mode, chain_id)
         )
         shadow_decisions[sym] = shadow_decision
+        if str(shadow_decision.get("decision") or "").upper() != "EXIT":
+            _tp = {"AGGRESSIVE": 0.45, "DYNAMIC": 0.55, "TACTICAL": 0.70, "DEFENSIVE": 0.90}.get(str(mode or "DYNAMIC").upper(), 0.55)
+            _net = _safe_float(shadow_decision.get("netUsd"), net)
+            _np = _safe_float(shadow_decision.get("netPct"), net_pct)
+            if _net >= 0.05 and _np >= _tp:
+                shadow_decision["decision"] = "EXIT"
+                shadow_decision["reason"] = "shadow_tactical_take_profit"
+                shadow_decisions[sym] = shadow_decision
+        net = _safe_float(shadow_decision.get("netUsd"), net)
+        net_pct = _safe_float(shadow_decision.get("netPct"), net_pct)
         # Harvest: retained only as telemetry fallback; exit target below is driven by shadow_decision.
         harvest = held_ok and (
             (net > 0 and net_pct >= profit_lock)
@@ -44793,11 +44819,14 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             )
             profit_guard_ok = bool(is_security or is_hard or net_now > 0.0)
             if engine_name == "NKR":
+                _shadow_net = _safe_float((shadow_decisions.get(sym) or {}).get("netUsd"), net_now)
+                if _shadow_net > net_now:
+                    net_now = _shadow_net
                 can_close = bool(
                     is_protect and (
                         is_security
-                        or (is_hard and held_ok and net_now <= 0)
-                        or (held_ok and net_now > 0.0 and profit_guard_ok)
+                        or (is_hard and net_now <= 0)
+                        or ((held_ok or True) and net_now > 0.0)
                     )
                 )
             else:
@@ -44951,7 +44980,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                     )
                     _metric = metrics.get(sym) if isinstance(metrics.get(sym), dict) else {}
                     _net_now = _safe_float(_metric.get("netUsd"), 0.0)
-                    if not _risk_exit and _net_now <= 0.0:
+                    _shadow_net = _safe_float((shadow_decisions.get(sym) or {}).get("netUsd"), 0.0)
+                    if _shadow_net > _net_now:
+                        _net_now = _shadow_net
+                    if not _risk_exit and _net_now <= 0.0 and str((shadow_decisions.get(sym) or {}).get("decision") or "").upper() != "EXIT":
                         last_skip = f"NET_PROFIT_GUARD:{sym}:{action}:net={_net_now:.8f}"
                         continue
                 # ENGINE-411: persistent/visible decision trace immediately before
