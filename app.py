@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-506-SKIP-BLOCKED-CANDIDATE";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-507-BOOK-COLLECTED-PROFIT";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -45264,6 +45264,61 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 txHash=(result or {}).get("txHash") or (result or {}).get("tx_hash") or (result or {}).get("hash") or "",
                 sessionId=sid, onchainSessionId=sid,
             )
+        except Exception:
+            pass
+        try:
+            if str(action).upper() in {"CLOSE", "SELL", "EXIT"}:
+                _net = _safe_float((metrics.get(sym) or {}).get("netUsd"), 0.0)
+                if _net <= 0:
+                    _net = _safe_float((shadow_decisions.get(sym) or {}).get("netUsd"), 0.0)
+                sessions_now, active_id, _ = _db_get_rotation_sessions(wallet)
+                booked = False
+                for card in sessions_now or []:
+                    if not isinstance(card, dict):
+                        continue
+                    ch = str(card.get("chain") or card.get("chainKey") or "").upper()
+                    if ch and ch != str(chain_key or "").upper():
+                        continue
+                    meta = card.get("meta") if isinstance(card.get("meta"), dict) else {}
+                    prev = _safe_float(card.get("collectedProfitUsd") or card.get("rotationProfitUsd") or card.get("profitUsd") or meta.get("collectedProfitUsd"), 0.0)
+                    add = max(0.0, float(_net or 0.0))
+                    nxt = round(prev + add, 6)
+                    card["collectedProfitUsd"] = nxt
+                    card["rotationProfitUsd"] = nxt
+                    card["profitUsd"] = nxt
+                    card["grossProfitUsd"] = 0.0
+                    card["liveGrossProfitUsd"] = 0.0
+                    card["netProfitUsd"] = 0.0
+                    card["liveNetProfitUsd"] = 0.0
+                    card["costsUsd"] = 0.0
+                    card["locked_target_symbol"] = ""
+                    meta["collectedProfitUsd"] = nxt
+                    meta["nkr_live_gross_profit_usd"] = 0.0
+                    meta["nkr_live_net_profit_usd"] = 0.0
+                    meta["nkr_live_costs_usd"] = 0.0
+                    meta["last_exit_asset"] = str(sym).upper()
+                    meta["last_exit_net_usd"] = add
+                    meta["last_exit_ts"] = int(time.time())
+                    card["meta"] = meta
+                    evs = list(card.get("rotationEvents") or [])
+                    evs.insert(0, {
+                        "status": "CLOSED_PROFIT" if add > 0 else "CLOSED",
+                        "action": "EXIT",
+                        "eventKind": "ON_CHAIN",
+                        "eventType": "EXIT",
+                        "asset": str(sym).upper(),
+                        "targetAsset": str(sym).upper(),
+                        "netUsd": add,
+                        "ts": int(time.time()),
+                        "onChain": True,
+                        "addedToCollectedProfit": add > 0,
+                        "trade_id": str((result or {}).get("txHash") or sid or int(time.time())),
+                        "text": f"EXIT {sym} net {add:.4f} booked to collected profit",
+                    })
+                    card["rotationEvents"] = evs[:80]
+                    booked = True
+                if booked:
+                    _db_set_rotation_sessions(wallet, sessions_now, active_id, replace_missing=True)
         except Exception:
             pass
         break
