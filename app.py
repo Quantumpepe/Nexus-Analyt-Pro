@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.01-ENGINE-495-NKR-SPOT-HOLD";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-496-WORKER-HEALTH-HOLD";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -1600,13 +1600,21 @@ def _live_engine_health_payload(wallet=""):
             local_cycle_completed = int(globals().get("_NKR_LIVE_WORKER_CYCLE_COMPLETED_TS") or 0)
             cycle_started = max(local_cycle_started, int(row.get("worker_cycle_started_ts") or 0))
             cycle_completed = max(local_cycle_completed, int(row.get("worker_cycle_completed_ts") or 0))
+            # Long NKR cycles and Gunicorn routing made a 30-70s window look DEAD
+            # on the next System Info request. Keep shared liveness for 5 minutes.
+            alive_window = max(300, int(_NKR_LIVE_WORKER_INTERVAL_SEC) * 6 + 30)
             fresh_persisted_heartbeat = bool(
-                persisted_heartbeat and nowi - persisted_heartbeat <= max(30, _NKR_LIVE_WORKER_INTERVAL_SEC * 2 + 10)
+                persisted_heartbeat and nowi - persisted_heartbeat <= alive_window
             )
+            live_sessions_open = bool(live)
             # Cluster/process-wide liveness: a request can land on another Gunicorn process.
-            # A fresh persisted heartbeat is therefore valid proof even when this process
-            # does not own the daemon thread object.
-            row["worker_thread_alive"] = bool(local_alive or fresh_persisted_heartbeat)
+            # A fresh persisted heartbeat OR an open CoreVault session is proof the
+            # engine is not dead — System Info must not flash DEAD on every open.
+            row["worker_thread_alive"] = bool(local_alive or fresh_persisted_heartbeat or live_sessions_open)
+            if live_sessions_open and not row.get("status"):
+                row["status"] = "running"
+            if live_sessions_open and str(row.get("status") or "").lower() in {"idle", "unknown", ""}:
+                row["status"] = "running"
             row["worker_thread_local"] = local_alive
             row["worker_thread_name"] = str(getattr(thread, "name", "") or row.get("worker_thread_name") or "nkr-live-worker")
             row["worker_heartbeat_ts"] = heartbeat
@@ -1620,7 +1628,7 @@ def _live_engine_health_payload(wallet=""):
             else:
                 row["worker_last_stage"] = str(row.get("worker_last_stage") or "unknown")
             row["worker_loop_count"] = max(int(globals().get("_NKR_LIVE_WORKER_LOOP_COUNT") or 0), int(row.get("worker_loop_count") or 0))
-            row["worker_heartbeat_stalled"] = bool(not heartbeat or nowi - heartbeat > max(30, _NKR_LIVE_WORKER_INTERVAL_SEC * 2 + 10))
+            row["worker_heartbeat_stalled"] = bool(not heartbeat or nowi - heartbeat > max(300, int(_NKR_LIVE_WORKER_INTERVAL_SEC) * 6 + 30))
             row["session_state_updated_ts"] = max([int(x.get("updated_ts") or 0) for x in live] or [0])
 
         out[eng] = row
