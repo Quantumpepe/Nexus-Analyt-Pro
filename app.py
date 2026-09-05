@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-508-PROFIT-MODE-AND-DISPLAY";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-510-RPC-ALL-FAILOVER";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -6658,13 +6658,16 @@ def _normalize_chain_key(raw: str) -> str:
     return alias.get(s, s)
 
 def _alchemy_url_for_chain(chain_id: int) -> str:
-    """Alchemy is intentionally disabled for Nexus.
-
-    Kept only as a compatibility stub because older call sites may still import
-    this helper. Returning an empty string guarantees that no Alchemy endpoint
-    can enter the server-side RPC candidate list, even when legacy environment
-    variables are still present on Render.
-    """
+    cid = int(chain_id or 0)
+    env_map = {
+        1: ["ALCHEMY_ETH_URL", "ETH_ALCHEMY_URL", "RPC_URL_ETH", "RPC_URL_1"],
+        56: ["ALCHEMY_BNB_URL", "BNB_ALCHEMY_URL", "RPC_URL_BNB", "RPC_URL_56"],
+        137: ["ALCHEMY_POL_URL", "POL_ALCHEMY_URL", "RPC_URL_POL", "RPC_URL_POLYGON", "RPC_URL_137"],
+    }
+    for key in env_map.get(cid, []):
+        value = str(os.getenv(key) or "").strip().rstrip("/")
+        if value.lower().startswith("http"):
+            return value
     return ""
 
 
@@ -10790,8 +10793,6 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         blocked = (
             "rpc.ankr.com",
             "flashbots.net",
-            "alchemy.com",
-            "alchemyapi.io",
         )
         if any(marker in lowered for marker in blocked):
             return
@@ -10800,8 +10801,9 @@ def _rpc_urls_for_chain(chain_id: int) -> list[str]:
         if url not in urls:
             urls.append(url)
 
-    # Primary: explicit provider-neutral RPC_URL_* configuration.
+    # Primary: explicit RPC_URL_* then Alchemy if configured.
     _add(_rpc_url_for_chain(cid))
+    _add(_alchemy_url_for_chain(cid))
 
     # Public no-key fallbacks. Keep these limited to standard EVM JSON-RPC.
     fallback = {
@@ -10844,7 +10846,7 @@ _RPC_LAST_GOOD: dict[int, str] = {}
 _RPC_FAILURE_COOLDOWN_SEC = 45
 _RPC_CONNECT_TIMEOUT_SEC = 2
 _RPC_READ_TIMEOUT_SEC = 4
-_RPC_MAX_ENDPOINTS_PER_CALL = 3
+_RPC_MAX_ENDPOINTS_PER_CALL = 8
 
 
 def _rpc_call(chain_id: int, method: str, params: list):
