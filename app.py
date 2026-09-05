@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-500-NKR-SPOT-HOLD";
+BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-501-EXIT-OPEN-TS";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16741,8 +16741,20 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     net_pct = (net / cost * 100.0) if cost > 0 else 0.0
     now = int(time.time())
     opened = int(prior_meta.get("nkr_position_opened_ts") or prior_meta.get("position_opened_ts") or prior_meta.get("entry_ts") or 0)
+    if opened <= 1_000_000_000:
+        opened = int(
+            prior_meta.get("session_started_ts")
+            or prior_meta.get("created_ts")
+            or prior_meta.get("started_ts")
+            or 0
+        )
     held = max(0, now - opened) if opened > 0 else 0
     open_time_known = opened > 1_000_000_000
+    # Position already open (UI shows 1d/2d): do not block take-profit forever
+    # just because the first buy tick never wrote opened_ts.
+    if (not open_time_known) and value > 0 and cost > 0:
+        open_time_known = True
+        held = max(held, 24 * 3600)
     quality = _safe_float(q.get("quality"), 0.0)
     risk = _safe_float(q.get("risk"), _safe_float(signals.get("risk_score"), 0.0))
     recovery = _safe_float(q.get("recovery_momentum_score"), _safe_float(signals.get("recovery_momentum_score"), 0.0))
