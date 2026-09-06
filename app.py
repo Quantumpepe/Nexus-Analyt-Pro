@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.06-ENGINE-513-STAKE-TP-TIERS";
+BACKEND_BUILD_ID = "B-2026.09.06-ENGINE-514-TP-BAND-RESPECT-SIGNALS";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16822,6 +16822,16 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
         and net_positive and drawdown >= {"AGGRESSIVE": 1.20, "DYNAMIC": 1.40, "TACTICAL": 1.60, "DEFENSIVE": 1.80}.get(m, 1.40)
     )
     take_profit = open_time_known and held >= min_hold and net_positive and net_pct >= tp
+    # Signals still win before the TP ceiling: dead momentum / quality drop = exit if net > 0.
+    signal_fade = (
+        open_time_known and held >= min_hold and net_positive
+        and net_pct < tp
+        and (
+            momentum <= -8
+            or (quality < 45 and momentum < 0)
+            or (recovery < 35 and momentum < 2 and net_pct >= max(0.25, tp * 0.35))
+        )
+    )
     # Only true security emergencies (honeypot / malicious), not generic risk.
     sec_raw = str(q.get("security") or q.get("security_status") or "").upper()
     security_emergency = bool(
@@ -16853,13 +16863,15 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
         reason = "peak_profit_trailing_protection"
     elif take_profit and net_positive:
         reason = "shadow_tactical_take_profit"
+    elif signal_fade:
+        reason = "shadow_signal_fade_exit"
     # ENGINE-421: discretionary exits ALWAYS need min_hold + known open time.
     # hard_stop needs >=60s (above). security_emergency is the only true early exit.
     if reason and reason != "security_emergency":
         if not open_time_known or held < (60 if reason == "hard_stop" else min_hold):
             reason = ""
     # Discretionary profit exits must still be net-positive after costs.
-    if reason in ("break_even_recovery_exit", "peak_profit_trailing_protection", "shadow_tactical_take_profit") and not net_positive:
+    if reason in ("break_even_recovery_exit", "peak_profit_trailing_protection", "shadow_tactical_take_profit", "shadow_signal_fade_exit") and not net_positive:
         reason = ""
     decision = "EXIT" if reason else ("RECOVERY" if gross < 0 and (recovery > 0 or momentum > -10) else "HOLD")
     return {"decision": decision, "reason": reason, "quality": quality, "risk": risk, "recovery": recovery, "momentum": momentum,
