@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.06-ENGINE-511-CG-ROUTE-AUTOFILL";
+BACKEND_BUILD_ID = "B-2026.09.06-ENGINE-513-STAKE-TP-TIERS";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -16709,6 +16709,38 @@ def _nkr_recover_open_route_from_events(chain_id: int, vault: str, sid: int, cfg
     return None
 
 
+
+def _nkr_strategist_take_profit_pct(mode: str, stake_usd: float, quality: dict | None = None) -> float:
+    """Take-profit band by session stake. Strategist picks inside the band."""
+    m = str(mode or "DYNAMIC").strip().upper()
+    tight = {"AGGRESSIVE": 0.45, "DYNAMIC": 0.55, "TACTICAL": 0.70, "DEFENSIVE": 0.90}.get(m, 0.55)
+    stake = _safe_float(stake_usd, 0.0)
+    q = quality if isinstance(quality, dict) else {}
+    score = _safe_float(q.get("score") or q.get("quality") or q.get("q") or 0.0, 0.0)
+    chg = _safe_float(q.get("change24h") or q.get("chg24") or q.get("momentum24") or 0.0, 0.0)
+    rec = _safe_float(q.get("recovery") or q.get("recovery_score") or 0.0, 0.0)
+    strong = score >= 68 or chg >= 4.0 or rec >= 70
+    mid = score >= 55 or chg >= 1.5 or rec >= 50
+    if stake < 500.0:
+        return tight
+    if stake < 1000.0:
+        if strong:
+            return 1.40
+        if mid:
+            return 1.10
+        return 0.85
+    if stake < 5000.0:
+        if strong:
+            return 2.50
+        if mid:
+            return 2.00
+        return 1.50
+    if strong:
+        return 5.00
+    if mid:
+        return 3.50
+    return 2.50
+
 def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, prior_meta: dict, mode: str, chain_id: int) -> dict:
     """Use the Shadow Strategist signal/exit model for a live open NKR position.
 
@@ -16771,7 +16803,11 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     # ENGINE-430: no long fixed hold for profit exits. Strategist sells when net after
     # costs is real edge. Only a short floor avoids same-block flip; profit gate is net.
     min_hold = {"AGGRESSIVE": 45, "DYNAMIC": 60, "TACTICAL": 90, "DEFENSIVE": 120}.get(m, 60)
-    tp = {"AGGRESSIVE": 0.45, "DYNAMIC": 0.55, "TACTICAL": 0.70, "DEFENSIVE": 0.90}.get(m, 0.55)
+    _stake = max(
+        _safe_float(cost, 0.0),
+        _safe_float(snap.get("budgetUsd") or snap.get("budget_usd") or prior_meta.get("budget_usd") or prior_meta.get("nkr_base_capital_usd"), 0.0),
+    )
+    tp = _nkr_strategist_take_profit_pct(m, _stake, q)
     hard_stop = {"AGGRESSIVE": -15.0, "DYNAMIC": -10.0, "TACTICAL": -7.0, "DEFENSIVE": -5.0}.get(m, -10.0)
     # Real net edge after estimated exit costs (not 0.02% dust).
     net_positive = net >= max(0.05, min(2.0, cost * 0.001))
