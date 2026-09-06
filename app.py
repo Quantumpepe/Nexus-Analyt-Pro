@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.09.05-ENGINE-510-RPC-ALL-FAILOVER";
+BACKEND_BUILD_ID = "B-2026.09.06-ENGINE-511-CG-ROUTE-AUTOFILL";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -40254,6 +40254,43 @@ def _nkr_symbol_allowed_on_session_chain(symbol: str, session_chain: str) -> dic
     return out
 
 
+
+def _nkr_cg_token_contract_on_chain(symbol: str, chain_key: str) -> str:
+    """CoinGecko contract for one symbol on one live chain (ETH/BNB/POL)."""
+    sym = str(symbol or "").strip().upper()
+    chain = str(chain_key or "").strip().upper()
+    if chain in {"ETHEREUM"}:
+        chain = "ETH"
+    if chain in {"BSC", "BNB CHAIN"}:
+        chain = "BNB"
+    if chain in {"POLYGON", "MATIC"}:
+        chain = "POL"
+    if not sym or chain not in {"ETH", "BNB", "POL"}:
+        return ""
+    platform = {"ETH": "ethereum", "BNB": "binance-smart-chain", "POL": "polygon-pos"}[chain]
+    cache_key = f"route:{sym}:{chain}"
+    now = time.time()
+    hit = _CG_CONTRACT_CACHE.get(cache_key)
+    if hit and (now - hit[0]) < _CG_CONTRACT_TTL_SEC:
+        return str(hit[1] or "")
+    addr = ""
+    try:
+        coins = _coin_list_with_platforms()
+        for c in coins if isinstance(coins, list) else []:
+            if str((c or {}).get("symbol") or "").strip().upper() != sym:
+                continue
+            platforms = (c or {}).get("platforms") or {}
+            if not isinstance(platforms, dict):
+                continue
+            cand = _norm_addr(platforms.get(platform) or "")
+            if cand and len(cand) >= 42:
+                addr = cand
+                break
+    except Exception:
+        addr = ""
+    _CG_CONTRACT_CACHE[cache_key] = (now, addr)
+    return addr
+
 def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
     """Resolve a watchlist/display symbol to the on-chain wrap for a live chain.
 
@@ -40306,6 +40343,18 @@ def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
                     out["displaySymbol"] = alt
         routes = (asset or {}).get("routes") if isinstance(asset, dict) else {}
         if not isinstance(routes, dict) or not routes:
+            cg_addr = _nkr_cg_token_contract_on_chain(sym, chain)
+            if cg_addr and chain:
+                return {
+                    **out,
+                    "chain": chain,
+                    "internalSymbol": sym,
+                    "tokenContract": cg_addr,
+                    "configured": True,
+                    "liveEnabled": True,
+                    "tradableOnSession": True,
+                    "source": "coingecko_platforms",
+                }
             return out
         # Prefer requested chain if it has a route; else first live configured chain.
         pick_chain = chain if chain in routes else ""
@@ -40318,6 +40367,8 @@ def _nkr_resolve_display_asset(symbol: str, chain_key: str = "") -> dict:
             pick_chain = next(iter(routes.keys()), "")
         route = routes.get(pick_chain) or {}
         token = _norm_addr(route.get("tokenContract") or "")
+        if not token and chain:
+            token = _norm_addr(_nkr_cg_token_contract_on_chain(sym, chain or pick_chain))
         configured = bool(token)
         live_ready = bool(configured)  # ENGINE-415: token configured => tradable candidate
         # Tradable for strategist ranking if contract exists on a live vault chain
