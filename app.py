@@ -185,7 +185,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.02-ENGINE-520-HELP-GPT-GUIDED";
+BACKEND_BUILD_ID = "B-2026.11.02-ENGINE-521-HELP-AI-INSIGHT-GUIDE";
 FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -32847,7 +32847,7 @@ def api_nexus_ai_support_guide():
     for item in incoming:
         if not isinstance(item,dict): continue
         guide_id=str(item.get('guide_id') or '')
-        if not re.fullmatch(r'(?:manual:[0-9]{2}:[0-9]{1,3}|compare-pair-row|compare-row-(?:name|rsi|delta|spread|score|correlation)|compare|watchlist|grid|nkr|trading|ai_analyst|wallet|overview)',guide_id):
+        if not re.fullmatch(r'(?:manual:[0-9]{2}:[0-9]{1,3}|ai-insight-walkthrough|compare-pair-row|compare-row-(?:name|rsi|delta|spread|score|correlation)|compare|watchlist|grid|nkr|trading|ai_analyst|wallet|overview)',guide_id):
             continue
         if guide_id in known_ids: continue
         title=str(item.get('title') or '')[:100]
@@ -32875,6 +32875,8 @@ def api_nexus_ai_support_guide():
       'A broad question such as "What is Compare?" or "Was ist Compare genau?" means the user wants to '
       'SEE an actual coin PAIR ROW in the Compare list, then learn what the pair, two RSIs, delta, spread, '
       'score and correlation mean. Choose compare-pair-row when available; never just point to a timeframe button. '
+      'For AI Insight, Standard vs Extreme and its analysis result cards, choose ai-insight-walkthrough when available. '
+      'It opens only a Compare pair explanation panel. It never requests an AI analysis, changes the mode or starts any transaction itself. '
       'For a specific setting, choose its matching field guide, not a generic tour. '
       'Set show_tour=true when seeing the interface would help the user understand the requested feature; '
       'else false. Never click controls, trade, change settings, access balances or request secrets. '
@@ -32916,8 +32918,11 @@ def api_nexus_ai_support_guide():
         q=re.sub(r'\s+',' ',question.strip().lower())
         if 'compare-pair-row' in known_ids and re.search(r'\b(compare|vergleich|paarliste|pair list|comparison pair)\b',q) and not re.search(r'\b(index|rsi|weight|gewicht|score|spread|correlation|korrelation|extreme|insight|grid)\b',q):
             guide_id='compare-pair-row'
+        # Allow only the registered AI Insight guide, never a model-produced selector.
+        if 'ai-insight-walkthrough' in known_ids and re.search(r'\b(ai[ -]?insight|ki[ -]?analyse|ki[ -]?einschatzung|extreme on|extreme mode|extreme modus)\b', q):
+            guide_id='ai-insight-walkthrough'
         return jsonify({'status':'ok','answer':answer,'guide_id':guide_id,
-          'show_tour':bool(model_answer.get('show_tour')) and bool(guide_id),
+          'show_tour':bool(guide_id) and (bool(model_answer.get('show_tour')) or guide_id=='ai-insight-walkthrough'),
           'source':'gpt','topic':topic})
     except requests.exceptions.RequestException:
         return jsonify({'status':'error','error':'support_provider_unavailable'}),502
