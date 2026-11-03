@@ -7,6 +7,7 @@ from datetime import datetime
 import os
 import time
 import threading
+import queue as _nexus_queue
 import json
 import re
 import hashlib
@@ -185,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-523-SIGNAL-SAFETY-TRACE";
+BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-525-GLOBAL-NKR-AUDIT";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD562-SIGNAL-SAFETY-TRACE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -37941,6 +37942,105 @@ def api_nexus_system_info_owner_panel():
 
 
 
+
+# ENGINE-524: GLOBAL owner monitoring. Registry and engine health are shared among
+# all wallets on this Nexus database.  Counts are NOT verified on-chain totals.
+_NEXUS_ACTIVE_SESSION_STATES = ("ACTIVE", "PAUSED", "STOPPING", "CLOSING", "ERROR")
+
+def _nexus_platform_session_summary():
+    result = {
+        "scope": "all_wallets_in_shared_database", "proofLevel": "recorded_session_registry",
+        "activeSessions": 0, "pausedSessions": 0, "closingSessions": 0,
+        "errorSessions": 0, "affectedWallets": 0, "chains": [],
+        "perEngine": {eng: {"activeSessions": 0, "pausedSessions": 0,
+                            "closingSessions": 0, "errorSessions": 0,
+                            "wallets": 0, "chains": [], "lastUpdatedTs": None}
+                      for eng in ("NKR", "GRID", "TRADER")},
+        "lastUpdatedTs": None, "status": "ok",
+    }
+    try:
+        _live_engine_tables_init()
+        conn = _db()
+        try:
+            marks = ','.join('?' for _ in _NEXUS_ACTIVE_SESSION_STATES)
+            rows = conn.execute(
+                "SELECT upper(engine) AS engine, chain_id, upper(status) AS status, "
+                "COUNT(*) AS cnt, COUNT(DISTINCT lower(wallet_address)) AS wallets, "
+                "MAX(updated_ts) AS latest FROM nexus_live_core_vault_sessions "
+                f"WHERE upper(status) IN ({marks}) GROUP BY upper(engine), chain_id, upper(status)",
+                _NEXUS_ACTIVE_SESSION_STATES,
+            ).fetchall()
+            users = conn.execute(
+                "SELECT COUNT(DISTINCT lower(wallet_address)) AS wallets FROM nexus_live_core_vault_sessions "
+                f"WHERE upper(status) IN ({marks})", _NEXUS_ACTIVE_SESSION_STATES,
+            ).fetchone()
+            result["affectedWallets"] = int(users["wallets"] or 0)
+            for row in rows:
+                eng = str(row["engine"] or "").upper()
+                if eng == "TRADING": eng = "TRADER"
+                if eng not in result["perEngine"]:continue
+                status = str(row["status"] or "").upper()
+                field = ("pausedSessions" if status == "PAUSED" else
+                         "closingSessions" if status in ("STOPPING", "CLOSING") else
+                         "errorSessions" if status == "ERROR" else "activeSessions")
+                count = int(row["cnt"] or 0)
+                result[field] += count
+                entry = result["perEngine"][eng]
+                entry[field] += count
+                cid = int(row["chain_id"] or 0)
+                if cid > 0:
+                    if cid not in entry["chains"]:entry["chains"].append(cid)
+                    if cid not in result["chains"]:result["chains"].append(cid)
+                latest = int(row["latest"] or 0)
+                if latest:
+                    entry["lastUpdatedTs"] = max(entry["lastUpdatedTs"] or 0, latest)
+                    result["lastUpdatedTs"] = max(result["lastUpdatedTs"] or 0, latest)
+            for eng in result["perEngine"]:
+                entry = result["perEngine"][eng]
+                unique = conn.execute(
+                    "SELECT COUNT(DISTINCT lower(wallet_address)) AS wallets "
+                    "FROM nexus_live_core_vault_sessions "
+                    f"WHERE upper(engine)=? AND upper(status) IN ({marks})",
+                    (eng, *_NEXUS_ACTIVE_SESSION_STATES),
+                ).fetchone()
+                entry["wallets"] = int(unique["wallets"] or 0)
+                entry["chains"].sort()
+            result["chains"].sort()
+        finally:
+            conn.close()
+    except Exception as exc:
+        # An unknown state must never be shown as zero active platform sessions.
+        result["status"] = "unavailable"
+        result["error"] = type(exc).__name__
+        for key in ("activeSessions", "pausedSessions", "closingSessions", "errorSessions", "affectedWallets"):
+            result[key] = None
+    return result
+
+
+@app.get("/api/nexus/system-info/global-overview")
+def api_nexus_system_info_global_overview():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    summary = _nexus_platform_session_summary()
+    try:
+        engines = _live_engine_health_payload("")  # No single-wallet session lookup.
+    except Exception:
+        engines = {}
+    for name in ("NKR", "GRID", "TRADER"):
+        entry = engines.setdefault(name, {"status": "unknown"})
+        if isinstance(entry, dict):
+            entry.pop("core_vault_sessions", None)
+            # Worker RUNNING denotes worker liveness, never an active user trade.
+            entry["registeredSessions"] = summary["perEngine"].get(name, {})
+            entry["working_chains"] = summary["perEngine"].get(name, {}).get("chains", [])
+            entry["session_states"] = []  # Avoid personal session identifiers.
+    return jsonify({"status": "ok" if summary["status"] == "ok" else "partial",
+                    "scope": "platform_global", "wallet": None,
+                    "engines": engines, "sessionCounts": summary, "ts": int(time.time()),
+                    "limitations": "Counts cover registered sessions in the shared Nexus DB, not a chain-wide contract scan. Worker RUNNING does not mean an open trade. Separate data-source cache samples may remain worker-local."})
+
+
 # ENGINE-522: Owner-only, read-only data quality observability.
 # This endpoint reads process-local caches. It NEVER calls an upstream API,
 # executes a trade, mutates a vault, or pretends an unobserved signal is fresh.
@@ -38107,6 +38207,11 @@ def api_nexus_system_info_signal_data_quality():
     except Exception:
         last_by_stage, recent_events = {}, []
 
+    global_last, global_recent, global_ok = _nexus_signal_audit_shared_read()
+    if global_ok:
+        last_by_stage = global_last
+        recent_events = global_recent
+
     def pipeline_stage(label, stage, note):
         item = last_by_stage.get(stage) or {}
         observed = int(item.get("ts") or 0)
@@ -38119,7 +38224,8 @@ def api_nexus_system_info_signal_data_quality():
 
     return jsonify({
         "status": "ok", "readOnly": True, "observedAt": now_sec,
-        "scope": "process_local_cache_only", "ownerOnly": True,
+        "scope": "shared_signal_trace_with_local_price_cache", "ownerOnly": True,
+        "traceScope": "shared_db_all_workers" if global_ok else "local_only_unavailable_shared_db",
         "sources": sources, "priceSummary": {"observed": len(prices), **counts},
         "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
         "signalPipeline": [
@@ -38131,10 +38237,11 @@ def api_nexus_system_info_signal_data_quality():
                            "Trader-Exit/Risikobewertung erfasst; kein On-chain-Ausführungsnachweis."),
         ],
         "signalTrace": recent_events,
+        "platformSessions": _nexus_platform_session_summary(),
         "goPlusLivePolicy": "FAIL_CLOSED_FOR_UNVERIFIED_ERC20_OPEN_ADD",
         "whaleCacheTtlSec": BITQUERY_WHALE_CACHE_TTL_SEC,
         "warnings": warnings[:12],
-        "explanation": "Ein leerer Prozess-Cache beweist keinen API-Ausfall. Keine aktiven Provider-Anfragen durch diesen Test."
+        "explanation": "Signalspuren aus der gemeinsamen Datenbank werden für alle Worker zusammengeführt (wenn verfügbar). Quellen- und Preis-Caches sind weiterhin nur lokale Stichproben, keine vollständige plattformweite Provider-Messung. Keine aktiven Provider-Anfragen durch diesen Test."
     })
 
 # ENGINE-216: CoreVault V5 Native Final budget/session bridge for NKR, Trader and Grid.
@@ -40410,166 +40517,134 @@ def api_nexus_system_info_onchain_sessions():
     })
 
 
+# ENGINE-525: Global owner-only NKR/Strategist audit.
+# A wallet is used ONLY by the existing owner authorization.  All aggregate
+# session and signal evidence comes from the shared Nexus DB (all wallets).
+# This read-only endpoint must NOT touch contracts, providers or live sessions.
 @app.get("/api/nexus/system-info/nkr-session-audit")
 def api_nexus_nkr_session_audit():
-    """Fast owner-only audit of immutable NKR session rules and Strategist runtime.
-
-    ENGINE-350: this endpoint is intentionally local-only.  The previous audit called
-    _live_active_sessions() (which reconciles every configured CoreVault over RPC) and
-    _nkr_live_market_rows() (which can request market data for the whole watchlist).
-    That made a read-only audit time out while a live session was trading.  The audit
-    now reads the already persisted session registry, immutable start configuration,
-    and persisted NKR worker health.  It performs no RPC, quote, log scan, market API
-    call, transaction, or Vault mutation.
-    """
     owner, denied = _require_owner_system_info()
     if denied:
         return denied
-    wallet = _norm_addr(request.args.get("wallet") or request.args.get("wallet_address") or owner)
-    if not wallet or wallet.lower() != _norm_addr(owner).lower():
-        return jsonify({"status": "error", "error": "wallet_mismatch"}), 403
 
-    # Local registry only: do not call _live_active_sessions(), because that helper
-    # deliberately performs an on-chain reconciliation and can be slow on public RPCs.
-    rows = []
+    platform = _nexus_platform_session_summary()
+    if platform.get("status") != "ok":
+        return jsonify({"status": "unavailable", "scope": "global_shared_db",
+                        "error": "platform_registry_unavailable", "readonly": True}), 503
+
+    nkr = dict(platform.get("perEngine", {}).get("NKR") or {})
+    per_chain = []
+    operation_summary = {"succeededWithTxHash": 0, "byType": {},
+                         "lastRecordedTs": None, "source": "shared_nexus_live_operations",
+                         "proof": "successful_operation_records_with_tx_hash_not_independent_chain_verification"}
+    nowi = int(time.time())
     try:
-        _live_engine_tables_init()
         conn = _db()
         try:
-            db_rows = conn.execute(
-                "SELECT * FROM nexus_live_core_vault_sessions "
-                "WHERE wallet_address=? AND engine='NKR' "
-                "AND status IN ('ACTIVE','PAUSED','STOPPING','CLOSING','ERROR') "
-                "ORDER BY created_ts DESC",
-                (wallet,),
+            # GROUP BY prevents exposing wallets, session identifiers or amounts.
+            statuses = _NEXUS_ACTIVE_SESSION_STATES
+            marks = ",".join("?" for _ in statuses)
+            rows = conn.execute(
+                "SELECT chain_id, upper(status) AS state, COUNT(*) AS n "
+                "FROM nexus_live_core_vault_sessions WHERE upper(engine)='NKR' "
+                f"AND upper(status) IN ({marks}) "
+                "GROUP BY chain_id, upper(status)", statuses,
             ).fetchall()
-            rows = [dict(r) for r in db_rows]
+            groups = {}
+            for r in rows:
+                cid = int(r["chain_id"] or 0)
+                entry = groups.setdefault(cid, {"chainId": cid, "chain": {
+                    1: "ETH", 56: "BNB", 137: "POL", 8453: "BASE",
+                    42161: "ARBITRUM"}.get(cid, str(cid)),
+                    "active": 0, "paused": 0, "closing": 0, "error": 0})
+                state = str(r["state"] or "")
+                field = ("paused" if state == "PAUSED" else
+                         "closing" if state in ("STOPPING", "CLOSING") else
+                         "error" if state == "ERROR" else "active")
+                entry[field] += int(r["n"] or 0)
+            per_chain = [groups[cid] for cid in sorted(groups)]
+
+            # Successful NKR operations whose transaction hash was recorded.
+            # They are not equivalent to total trades or independently verified
+            # on-chain receipts.  Identity join avoids counting Trader operations.
+            op_rows = conn.execute(
+                "SELECT o.op_type, COUNT(DISTINCT lower(o.tx_hash)) AS n, "
+                "MAX(o.completed_ts) AS latest "
+                "FROM nexus_live_operations o "
+                "JOIN nexus_live_core_vault_sessions s "
+                "ON lower(s.wallet_address)=lower(o.wallet_address) "
+                "AND s.chain_id=o.chain_id "
+                "AND lower(s.vault_address)=lower(o.vault_address) "
+                "AND s.onchain_session_id=o.onchain_session_id "
+                "WHERE upper(s.engine)='NKR' AND upper(o.status)='SUCCEEDED' "
+                "AND length(o.tx_hash)=66 AND lower(substr(o.tx_hash,1,2))='0x' "
+                "GROUP BY o.op_type"
+            ).fetchall()
+            for r in op_rows:
+                typ = str(r["op_type"] or "UNKNOWN").upper()[:24]
+                n = int(r["n"] or 0)
+                operation_summary["byType"][typ] = n
+                operation_summary["succeededWithTxHash"] += n
+                ts = int(r["latest"] or 0)
+                if ts:
+                    operation_summary["lastRecordedTs"] = max(operation_summary["lastRecordedTs"] or 0, ts)
         finally:
             conn.close()
     except Exception as exc:
-        return jsonify({"status": "error", "error": "local_session_registry_read_failed", "detail": str(exc)[:240]}), 500
+        return jsonify({"status": "unavailable", "scope": "global_shared_db",
+                        "error": "global_nkr_audit_query_failed",
+                        "detail": type(exc).__name__, "readonly": True}), 503
 
-    # Persisted runtime only.  This is the same cross-worker health record used by
-    # System Info and proves that the backend worker is actually receiving candidates.
-    runtime = {}
-    runtime_updated_ts = 0
-    try:
-        conn = _db()
-        try:
-            r = conn.execute(
-                "SELECT payload_json,updated_ts FROM nexus_live_engine_runtime_health WHERE engine='NKR'"
-            ).fetchone()
-            if r:
-                runtime = json.loads(r["payload_json"] or "{}") if r["payload_json"] else {}
-                runtime_updated_ts = int(r["updated_ts"] or 0)
-        finally:
-            conn.close()
-    except Exception:
-        runtime = {}
-    if not isinstance(runtime, dict):
-        runtime = {}
+    # Global signal observations are shared across Gunicorn workers. A trace
+    # proves a signal evaluation happened, NOT a linked trade or that every
+    # signal field was fresh or complete.
+    latest, recent, trace_available = _nexus_signal_audit_shared_read()
+    observed = []
+    for stage, label in (("MARKET_STRATEGIST", "Markt → Strategist"),
+                         ("STRATEGIST_NKR", "Strategist → NKR")):
+        sample = latest.get(stage) or {}
+        ts = int(sample.get("ts") or 0)
+        age = max(0, nowi - ts) if ts else None
+        observed.append({"stage": stage, "label": label,
+                         "status": "RECENT" if age is not None and age <= 3600 else
+                                   "OLD" if age is not None else "NOT_OBSERVED",
+                         "lastTs": ts or None, "ageSec": age,
+                         "observations": 1 if ts else 0,
+                         "signalCount": int(sample.get("signalCount") or 0) if ts else None,
+                         "symbol": str(sample.get("symbol") or "")[:18] if ts else None})
 
-    session_audits = []
-    modes = []
-    for row in rows:
-        sid_raw = str(row.get("onchain_session_id") or "")
-        if not sid_raw.isdigit() or int(sid_raw) <= 0:
-            continue
-        cfg = _nkr_settings_for_exact_live_session(wallet, row, {})
-        cid = int(row.get("chain_id") or 0)
-        sid = sid_raw
-        mode = _nkr_normalize_performance_mode(cfg.get("nkrCapitalMode") or "DYNAMIC")
-        modes.append((f"{cid}:{sid}", mode))
-        session_audits.append({
-            "sessionConfigKey": cfg.get("session_config_key"),
-            "chainId": cid,
-            "chain": _nkr_chain_key_from_id(cid),
-            "sessionId": sid,
-            "status": str(row.get("status") or "").upper(),
-            "locked": bool(cfg.get("session_config_locked")),
-            "mode": mode,
-            "observationWindow": cfg.get("nkrObservationWindow"),
-            "profitMode": cfg.get("nkrProfitMode"),
-            "periodDays": cfg.get("nkrPeriodDays"),
-            "maxActiveAssets": cfg.get("maxActiveAssets"),
-            "maxCapitalPerAssetPct": cfg.get("maxCapitalPerAssetPct"),
-            "payoutAsset": cfg.get("payoutAsset"),
-            "budgetUsd": cfg.get("budgetUsd"),
-            "modeThreshold": {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0),
-        })
-
-    duplicate_keys = len({k for k, _ in modes}) != len(modes)
-    all_locked = all(x.get("locked") for x in session_audits) if session_audits else True
-    tick_count = int(runtime.get("tick_count") or 0)
-    last_tick_ts = int(runtime.get("last_tick_ts") or 0)
-    assets_scanned = int(runtime.get("assets_scanned") or 0)
-    tradable_assets = int(runtime.get("tradable_assets") or 0)
-    worker_status = str(runtime.get("status") or "").lower()
-    nowi = int(time.time())
-    tick_age = (nowi - last_tick_ts) if last_tick_ts else None
-    worker_fresh = bool(last_tick_ts and tick_age is not None and tick_age <= max(180, _NKR_LIVE_WORKER_STALE_SEC * 3))
-    runtime_evidence = bool(tick_count > 0 and assets_scanned > 0 and worker_status not in {"error", "failed"})
-
-    # These are the exact signal groups consumed by the ENGINE-348 Strategist path.
-    # configuredComplete proves the code path contract; runtimeEvidence proves that a
-    # live worker cycle has scanned and ranked candidates after the session started.
-    signal_groups = {
-        "price": True,
-        "momentum_24h": True,
-        "volume_and_rvol": True,
-        "score_and_risk_quality": True,
-        "overextension": True,
-        "volume_confirmation": True,
-        "chain_and_router_route": True,
-        "market_regime": True,
-        "recovery_and_opportunity": True,
-    }
-    configured_complete = all(signal_groups.values())
-    signals_complete = bool(configured_complete and runtime_evidence)
-    no_sessions = len(session_audits) == 0
-    status = "no_active_session" if no_sessions else ("ready" if all_locked and not duplicate_keys and signals_complete else "blocked")
-
+    total_sessions = sum(int(nkr.get(k) or 0) for k in
+                         ("activeSessions", "pausedSessions", "closingSessions", "errorSessions"))
+    # Registry enforces (chain, vault, sessionId) uniqueness via SQLite UNIQUE.
+    # It does not prove that every user's exact mode configuration was read.
     return jsonify({
-        "status": status,
-        "readonly": True,
-        "localOnly": True,
-        "rpcCalls": 0,
-        "marketApiCalls": 0,
-        "transactionsSent": 0,
-        "wallet": wallet,
-        "sessionCount": len(session_audits),
-        "sessions": session_audits,
-        "modeIsolation": {
-            "ok": bool(all_locked and not duplicate_keys),
-            "scope": "wallet+chainId+onchainSessionId",
-            "proof": modes,
-            "nextSessionDraftCannotOverrideRunningSession": True,
-        },
-        "strategistSignals": {
-            "complete": signals_complete,
-            "configuredComplete": configured_complete,
-            "configuredGroups": signal_groups,
-            "runtimeEvidence": runtime_evidence,
-            "workerFresh": worker_fresh,
-            "workerStatus": worker_status or "unknown",
-            "runtimeUpdatedTs": runtime_updated_ts,
-            "lastTickTs": last_tick_ts,
-            "tickAgeSec": tick_age,
-            "tickCount": tick_count,
-            "assetsScanned": assets_scanned,
-            "tradableAssets": tradable_assets,
-            "bestCandidate": runtime.get("best_candidate") or "",
-            "candidateScore": runtime.get("candidate_score"),
-            "candidateMomentum24h": runtime.get("candidate_momentum_24h"),
-            "candidatePrice": runtime.get("candidate_price"),
-            "decision": runtime.get("decision") or "",
-            "gateStatus": runtime.get("gate_status") or "",
-        },
-        "entryPipeline": [
-            "exact_session_config", "watchlist_and_chain_route", "price", "momentum_24h",
-            "volume_and_rvol", "score_and_risk_quality", "market_regime", "capital_release",
-            "router_quote", "vault_preflight", "privy_backend_execution", "onchain_position_verify",
-        ],
+        "status": "ok", "readonly": True, "ownerOnly": True,
+        "scope": "global_shared_db_all_wallets", "observedAt": nowi,
+        "wallet": None, "sessions": [],
+        "sessionCount": total_sessions,
+        "sessionStates": {"active": int(nkr.get("activeSessions") or 0),
+                          "paused": int(nkr.get("pausedSessions") or 0),
+                          "closing": int(nkr.get("closingSessions") or 0),
+                          "error": int(nkr.get("errorSessions") or 0)},
+        "walletsWithSessions": int(nkr.get("wallets") or 0),
+        "chains": per_chain,
+        "modeIsolation": {"registryUniqueKey": "chain_id+vault_address+onchain_session_id",
+                          "registryEnforced": True,
+                          "exactPerUserModeChecked": False,
+                          "status": "REGISTRY_ISOLATION_ONLY"},
+        "strategistSignals": {"status": "PARTIALLY_OBSERVED" if any(x["lastTs"] for x in observed)
+                               else "NOT_OBSERVED",
+                               "endToEndVerified": False,
+                               "sharedTraceAvailable": bool(trace_available),
+                               "stages": observed,
+                               "note": "A shared signal trace is evaluation evidence, not proof of a trade or complete signal delivery."},
+        "recordedOperations": operation_summary,
+        "auditTransactionsSent": 0,
+        "entryPipeline": ["market_source", "strategist_enrichment", "nkr_decision", "router_preflight", "privy_execution", "onchain_confirmation"],
+        "limitations": "Sessions counted from shared registered CoreVault DB, not chain-wide. "
+                       "Trace records are best-effort and may be lost on queue saturation. "
+                       "Successful operation hashes are not independently receipt-verified here. "
+                       "No user wallets, session identifiers, budget amounts or private settings are returned."
     })
 
 _NKR_LIVE_WORKER_STARTED = False
@@ -48239,6 +48314,127 @@ def _nkr_live_shadow_quality(row: dict, mode: str = "DYNAMIC") -> dict:
 _NEXUS_SIGNAL_AUDIT_LOCK = threading.RLock()
 _NEXUS_SIGNAL_AUDIT_LAST = {}
 _NEXUS_SIGNAL_AUDIT_EVENTS = []
+_NEXUS_SIGNAL_AUDIT_PERSIST_LAST = {}  # Per-stage write throttle, per process.
+_NEXUS_SIGNAL_AUDIT_DB_READY = False
+_NEXUS_SIGNAL_AUDIT_LAST_CLEANUP = 0
+_NEXUS_SIGNAL_AUDIT_WRITE_QUEUE = _nexus_queue.Queue(maxsize=256)
+_NEXUS_SIGNAL_AUDIT_WRITER_THREAD = None
+
+
+def _nexus_signal_audit_shared_write(event):
+    """Nonblocking trace enqueue: NEVER wait for SQLite from a trading decision."""
+    global _NEXUS_SIGNAL_AUDIT_WRITER_THREAD
+    stage = str(event.get("stage") or "")
+    now = int(event.get("ts") or time.time())
+    try:
+        with _NEXUS_SIGNAL_AUDIT_LOCK:
+            if now - _NEXUS_SIGNAL_AUDIT_PERSIST_LAST.get(stage, 0) < 15:
+                return
+            _NEXUS_SIGNAL_AUDIT_PERSIST_LAST[stage] = now
+            try:
+                _NEXUS_SIGNAL_AUDIT_WRITE_QUEUE.put_nowait(dict(event))
+            except _nexus_queue.Full:
+                return  # Telemetry loss is safer than blocking a trade.
+            if _NEXUS_SIGNAL_AUDIT_WRITER_THREAD is None or not _NEXUS_SIGNAL_AUDIT_WRITER_THREAD.is_alive():
+                thread = threading.Thread(target=_nexus_signal_audit_writer_loop,
+                                          name="nexus-signal-audit-writer", daemon=True)
+                _NEXUS_SIGNAL_AUDIT_WRITER_THREAD = thread
+                thread.start()
+    except Exception:
+        return  # Never modify engine decisions due to observability failures.
+
+
+def _nexus_signal_audit_writer_loop():
+    while True:
+        event = _NEXUS_SIGNAL_AUDIT_WRITE_QUEUE.get()
+        try:
+            _nexus_signal_audit_persist_event(event)
+        except Exception:
+            pass
+        finally:
+            _NEXUS_SIGNAL_AUDIT_WRITE_QUEUE.task_done()
+
+
+def _nexus_signal_audit_persist_event(event):
+    global _NEXUS_SIGNAL_AUDIT_DB_READY, _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP
+    now = int(event.get("ts") or time.time())
+    stage = str(event.get("stage") or "")
+    try:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                if not _NEXUS_SIGNAL_AUDIT_DB_READY:
+                    conn.execute("""CREATE TABLE IF NOT EXISTS nexus_signal_observations (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      observed_ts INTEGER NOT NULL,
+                      stage TEXT NOT NULL,
+                      symbol TEXT NOT NULL,
+                      decision TEXT NOT NULL,
+                      signal_count INTEGER NOT NULL,
+                      signal_fields_json TEXT NOT NULL,
+                      candidate_rows INTEGER NOT NULL,
+                      worker_id TEXT NOT NULL
+                    )""")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_observations_stage_ts ON nexus_signal_observations(stage, observed_ts DESC)")
+                    _NEXUS_SIGNAL_AUDIT_DB_READY = True
+                conn.execute("INSERT INTO nexus_signal_observations "
+                             "(observed_ts,stage,symbol,decision,signal_count,signal_fields_json,candidate_rows,worker_id) "
+                             "VALUES (?,?,?,?,?,?,?,?)",
+                             (now, stage, str(event.get("symbol") or "")[:18],
+                              str(event.get("decision") or "")[:48],
+                              int(event.get("signalCount") or 0),
+                              json.dumps(event.get("signalFields") or []),
+                              int(event.get("rows") or 0),
+                              str(os.getpid())))
+                if now - _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP > 3600:
+                    conn.execute("DELETE FROM nexus_signal_observations WHERE observed_ts < ?", (now - 86400,))
+                    # Hard cap in case a busy platform generates many observations.
+                    conn.execute("DELETE FROM nexus_signal_observations WHERE id NOT IN "
+                                 "(SELECT id FROM nexus_signal_observations ORDER BY id DESC LIMIT 6000)")
+                    _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP = now
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        # Do not retry synchronously: continue live trading without telemetry.
+        _NEXUS_SIGNAL_AUDIT_DB_READY = False
+
+
+def _nexus_signal_audit_shared_read():
+    try:
+        conn = _db()
+        try:
+            # Legacy databases only get this table after first recorded signal.
+            conn.execute("SELECT id FROM nexus_signal_observations LIMIT 1")
+            since = int(time.time()) - 86400
+            rows = conn.execute(
+                "SELECT observed_ts,stage,symbol,decision,signal_count,signal_fields_json,candidate_rows "
+                "FROM nexus_signal_observations WHERE observed_ts>=? ORDER BY id DESC LIMIT 18", (since,)
+            ).fetchall()
+            recent = [{"ts": int(x["observed_ts"]), "stage": x["stage"],
+                       "symbol": x["symbol"], "decision": x["decision"],
+                       "signalCount": int(x["signal_count"]),
+                       "signalFields": json.loads(x["signal_fields_json"] or "[]"),
+                       "rows": int(x["candidate_rows"])} for x in rows]
+            latest = {}
+            for stage in ("MARKET_STRATEGIST", "STRATEGIST_NKR", "STRATEGIST_TRADER"):
+                row = conn.execute(
+                    "SELECT observed_ts,stage,symbol,decision,signal_count,signal_fields_json,candidate_rows "
+                    "FROM nexus_signal_observations WHERE stage=? ORDER BY observed_ts DESC LIMIT 1", (stage,)
+                ).fetchone()
+                if row:
+                    latest[stage] = {"ts": int(row["observed_ts"]), "stage": row["stage"],
+                                     "symbol": row["symbol"], "decision": row["decision"],
+                                     "signalCount": int(row["signal_count"]),
+                                     "signalFields": json.loads(row["signal_fields_json"] or "[]"),
+                                     "rows": int(row["candidate_rows"])}
+            return latest, recent, True
+        finally:
+            conn.close()
+    except Exception:
+        return {}, [], False
+
+
 _NEXUS_SIGNAL_AUDIT_KEYS = (
     "price", "momentum_1m", "momentum_5m", "momentum_15m",
     "momentum_1h", "momentum_4h", "momentum_24h", "momentum_7d",
@@ -48263,6 +48459,7 @@ def _nexus_signal_audit_record(stage: str, symbol: str = "", signals=None, decis
             _NEXUS_SIGNAL_AUDIT_LAST[event["stage"]] = event
             _NEXUS_SIGNAL_AUDIT_EVENTS.append(event)
             del _NEXUS_SIGNAL_AUDIT_EVENTS[:-80]
+        _nexus_signal_audit_shared_write(event)
     except Exception:
         pass  # Audit must NEVER change trading outcome.
 
