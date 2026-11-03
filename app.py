@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-525-GLOBAL-NKR-AUDIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD562-SIGNAL-SAFETY-TRACE"
+BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-526-GLOBAL-OBSERVABILITY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD565-GLOBAL-OBSERVABILITY"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1673,7 +1673,7 @@ def _nkr_spot_http_json(url, timeout=8):
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "NexusAnalyt/1.0", "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _nexus_observed_http("DexScreener", lambda: urllib.request.urlopen(req, timeout=timeout)) as resp:
             raw = resp.read().decode("utf-8", "replace")
         return json.loads(raw)
     except Exception:
@@ -5205,7 +5205,7 @@ def _binance_public_get(path: str, params: dict | None = None):
     if time.time() < _BINANCE_PUBLIC_COOLDOWN_UNTIL:
         raise RuntimeError("binance public feed cooldown")
     url = f"{BINANCE_FUTURES_BASE}{path}"
-    r = requests.get(url, params=params or {}, timeout=BINANCE_PUBLIC_TIMEOUT_SEC, headers={"User-Agent": "Nexus-Analyt/1.0"})
+    r = _nexus_observed_http("Binance Futures", lambda: requests.get(url, params=params or {}, timeout=BINANCE_PUBLIC_TIMEOUT_SEC, headers={"User-Agent": "Nexus-Analyt/1.0"}))
     if r.status_code in (418, 429):
         retry_after = 30
         try:
@@ -5808,7 +5808,7 @@ def _cg_get(url: str) -> dict:
         headers = {"User-Agent": "NexusAnalyt/1.0 (+Render/Flask)"}
         if COINGECKO_API_KEY:
             headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
-        r = requests.get(url, headers=headers, timeout=12)
+        r = _nexus_observed_http("CoinGecko", lambda: requests.get(url, headers=headers, timeout=12))
 
         if r.status_code == 429:
             with _CG_LOCK:
@@ -5890,12 +5890,12 @@ def _bitquery_headers() -> dict:
 def _bitquery_post(query: str, variables: dict) -> dict:
     if not BITQUERY_API_KEY:
         raise RuntimeError("BITQUERY_API_KEY missing")
-    r = requests.post(
+    r = _nexus_observed_http("Bitquery Whale", lambda: requests.post(
         BITQUERY_GRAPHQL_URL,
         headers=_bitquery_headers(),
         json={"query": query, "variables": variables},
         timeout=18,
-    )
+    ))
     try:
         data = r.json()
     except Exception:
@@ -12706,7 +12706,7 @@ def _moralis_get(path: str, params: dict | None = None) -> dict:
         "X-API-Key": MORALIS_API_KEY,
         "User-Agent": "NexusAnalyt/1.0",
     }
-    r = requests.get(url, headers=headers, params=params or {}, timeout=10)
+    r = _nexus_observed_http("Moralis On-chain", lambda: requests.get(url, headers=headers, params=params or {}, timeout=10))
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, dict) else {"result": data}
@@ -14590,7 +14590,7 @@ def _cg_request_json(url: str, params: dict, timeout: int = 20):
     last_exc = None
     for attempt in range(4):
         try:
-            r = requests.get(url, params=params, headers=_cg_headers(), timeout=timeout)
+            r = _nexus_observed_http("CoinGecko", lambda: requests.get(url, params=params, headers=_cg_headers(), timeout=timeout))
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 if ra:
@@ -14621,7 +14621,7 @@ def _resolve_cg_id(symbol: str) -> Optional[str]:
     if isinstance(cached, str) and cached:
         return cached
 
-    r = requests.get(f"{COINGECKO_BASE}/search", params={"query": sym}, timeout=15)
+    r = _nexus_observed_http("CoinGecko", lambda: requests.get(f"{COINGECKO_BASE}/search", params={"query": sym}, timeout=15))
     r.raise_for_status()
     j = r.json() or {}
     coins = j.get("coins") or []
@@ -14966,7 +14966,7 @@ def _cg_search(query: str, limit: int = 25):
 
     url = f"{COINGECKO_BASE}/search"
     try:
-        r = requests.get(url, params={"query": q}, headers=_cg_headers(), timeout=6)
+        r = _nexus_observed_http("CoinGecko", lambda: requests.get(url, params={"query": q}, headers=_cg_headers(), timeout=6))
 
         # throttle handling
         if r.status_code == 429:
@@ -15056,7 +15056,7 @@ def _cg_exchange_intelligence_for_coin(coin_id: str, symbol: str = "") -> dict:
         return cached
     url = f"{COINGECKO_BASE}/coins/{requests.utils.quote(cid)}/tickers"
     try:
-        r = requests.get(url, params={"include_exchange_logo":"false","depth":"false","order":"volume_desc","page":"1"}, headers=_cg_headers(), timeout=8)
+        r = _nexus_observed_http("CoinGecko", lambda: requests.get(url, params={"include_exchange_logo":"false","depth":"false","order":"volume_desc","page":"1"}, headers=_cg_headers(), timeout=8))
         if r.status_code == 429:
             if hit:
                 cached = dict(hit[1] or {})
@@ -15215,7 +15215,7 @@ def _cg_price_series(cg_id: str, days: int = 14):
     Uses /coins/{id}/market_chart.
     """
     url = f"{COINGECKO_BASE}/coins/{cg_id}/market_chart"
-    r = requests.get(url, params={"vs_currency": "usd", "days": str(days)}, headers=_cg_headers(), timeout=15)
+    r = _nexus_observed_http("CoinGecko", lambda: requests.get(url, params={"vs_currency": "usd", "days": str(days)}, headers=_cg_headers(), timeout=15))
     r.raise_for_status()
     data = r.json() or {}
     prices = data.get("prices") or []
@@ -15472,12 +15472,12 @@ def coingecko_market_chart_proxy(coin_id: str):
         store = None
     url = f"{COINGECKO_BASE}/coins/{cid}/market_chart"
     try:
-        r = requests.get(
+        r = _nexus_observed_http("CoinGecko", lambda: requests.get(
             url,
             params={"vs_currency": vs_currency, "days": days, "interval": interval},
             headers=_cg_headers(),
             timeout=15,
-        )
+        ))
         r.raise_for_status()
         data = r.json() or {}
         try:
@@ -33120,7 +33120,7 @@ CRYPTOCOMPARE_KEY = (os.getenv("CRYPTOCOMPARE_API_KEY") or "").strip()
 def _coincap_request_json(path: str, params: dict | None = None, timeout: int = 6):
     url = COINCAP_BASE.rstrip("/") + "/" + path.lstrip("/")
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout)
+        r = _nexus_observed_http("CoinCap", lambda: requests.get(url, params=params or {}, timeout=timeout))
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -33183,7 +33183,7 @@ def _binance_price_for_symbol(symbol: str) -> dict | None:
     for pair in _binance_symbol_candidates(s):
         try:
             url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
-            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3)
+            r = _nexus_observed_http("Binance Spot", lambda: requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3))
             if r.status_code == 400:
                 continue
             r.raise_for_status()
@@ -33219,7 +33219,7 @@ def _cryptocompare_histoday(symbol: str, days: int) -> list:
         headers["authorization"] = f"Apikey {CRYPTOCOMPARE_KEY}"
     try:
         url = CRYPTOCOMPARE_BASE.rstrip("/") + "/data/v2/histoday"
-        r = requests.get(url, params={"fsym": sym, "tsym": "USD", "limit": max(1, min(days_i, 2000))}, headers=headers, timeout=8)
+        r = _nexus_observed_http("CryptoCompare", lambda: requests.get(url, params={"fsym": sym, "tsym": "USD", "limit": max(1, min(days_i, 2000))}, headers=headers, timeout=8))
         if r.status_code in (401, 403):
             return []
         r.raise_for_status()
@@ -33278,7 +33278,7 @@ def _binance_24h_for_symbol(symbol: str) -> dict | None:
     for pair in _binance_symbol_candidates(s):
         try:
             url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/24hr"
-            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=4)
+            r = _nexus_observed_http("Binance Spot", lambda: requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=4))
             if r.status_code == 400:
                 continue
             r.raise_for_status()
@@ -33370,7 +33370,7 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
     for pair in _binance_symbol_candidates(s):
         try:
             url = BINANCE_BASE.rstrip("/") + "/api/v3/ticker/price"
-            r = requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3)
+            r = _nexus_observed_http("Binance Spot", lambda: requests.get(url, params={"symbol": pair}, headers=_cg_headers(), timeout=3))
             if r.status_code == 400:
                 continue
             r.raise_for_status()
@@ -37532,7 +37532,7 @@ def _evm_registry_cg_coin(coin_id: str) -> dict:
         headers = {"Accept":"application/json"}
         if COINGECKO_API_KEY:
             headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
-        r = requests.get(f"{COINGECKO_BASE}/coins/{cid}", params={"localization":"false","tickers":"false","market_data":"true","community_data":"false","developer_data":"false","sparkline":"false"}, headers=headers, timeout=12)
+        r = _nexus_observed_http("CoinGecko", lambda: requests.get(f"{COINGECKO_BASE}/coins/{cid}", params={"localization":"false","tickers":"false","market_data":"true","community_data":"false","developer_data":"false","sparkline":"false"}, headers=headers, timeout=12))
         return r.json() if r.ok and isinstance(r.json(),dict) else {}
     except Exception:
         return {}
@@ -37562,11 +37562,11 @@ def _evm_registry_dex_market_probe(chain_id: int, token_address: str) -> dict:
         "buys24h": 0, "sells24h": 0, "bestPair": "", "error": "",
     }
     try:
-        r = requests.get(
+        r = _nexus_observed_http("DexScreener", lambda: requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
             headers={"Accept": "application/json", "User-Agent": "Nexus/1.0"},
             timeout=12,
-        )
+        ))
         if not r.ok:
             out["error"] = f"dex_market_http_{r.status_code}"
             return out
@@ -38127,7 +38127,7 @@ def api_nexus_system_info_signal_data_quality():
 
     sources = [
         source("CoinGecko", True, cg_last, int(globals().get("_CG_TTL_SEC") or 1200),
-               "Bezahlter Tarif konfiguriert" if globals().get("COINGECKO_API_KEY") else "Public API; kein Pro-Key gesetzt",
+               "API-Key hinterlegt (Tarifstatus nicht live verifiziert)" if globals().get("COINGECKO_API_KEY") else "Public API; kein Pro-Key gesetzt",
                cg_count, float(globals().get("_CG_COOLDOWN_UNTIL") or 0)),
         source("Binance Spot", True, spot_last, int(globals().get("NEXUS_PRICE_MARKET_TTL_SEC") or 120),
                "Zuletzt beobachtete Binance-Preisquelle; nicht zwingend alle Handelspaare", len(snapshots)),
@@ -38226,6 +38226,8 @@ def api_nexus_system_info_signal_data_quality():
         "status": "ok", "readOnly": True, "observedAt": now_sec,
         "scope": "shared_signal_trace_with_local_price_cache", "ownerOnly": True,
         "traceScope": "shared_db_all_workers" if global_ok else "local_only_unavailable_shared_db",
+        "signalRecorder": _nexus_observability_health(),
+        "apiActivity": _nexus_api_activity_snapshot(),
         "sources": sources, "priceSummary": {"observed": len(prices), **counts},
         "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
         "signalPipeline": [
@@ -40636,6 +40638,7 @@ def api_nexus_nkr_session_audit():
                                else "NOT_OBSERVED",
                                "endToEndVerified": False,
                                "sharedTraceAvailable": bool(trace_available),
+                               "recorder": _nexus_observability_health(),
                                "stages": observed,
                                "note": "A shared signal trace is evaluation evidence, not proof of a trade or complete signal delivery."},
         "recordedOperations": operation_summary,
@@ -48316,6 +48319,7 @@ _NEXUS_SIGNAL_AUDIT_LAST = {}
 _NEXUS_SIGNAL_AUDIT_EVENTS = []
 _NEXUS_SIGNAL_AUDIT_PERSIST_LAST = {}  # Per-stage write throttle, per process.
 _NEXUS_SIGNAL_AUDIT_DB_READY = False
+_NEXUS_SIGNAL_AUDIT_LAST_WRITE_ERROR = ""
 _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP = 0
 _NEXUS_SIGNAL_AUDIT_WRITE_QUEUE = _nexus_queue.Queue(maxsize=256)
 _NEXUS_SIGNAL_AUDIT_WRITER_THREAD = None
@@ -48356,7 +48360,7 @@ def _nexus_signal_audit_writer_loop():
 
 
 def _nexus_signal_audit_persist_event(event):
-    global _NEXUS_SIGNAL_AUDIT_DB_READY, _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP
+    global _NEXUS_SIGNAL_AUDIT_DB_READY, _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP, _NEXUS_SIGNAL_AUDIT_LAST_WRITE_ERROR
     now = int(event.get("ts") or time.time())
     stage = str(event.get("stage") or "")
     try:
@@ -48393,11 +48397,13 @@ def _nexus_signal_audit_persist_event(event):
                                  "(SELECT id FROM nexus_signal_observations ORDER BY id DESC LIMIT 6000)")
                     _NEXUS_SIGNAL_AUDIT_LAST_CLEANUP = now
                 conn.commit()
+                _NEXUS_SIGNAL_AUDIT_LAST_WRITE_ERROR = ""
         finally:
             conn.close()
-    except Exception:
+    except Exception as exc:
         # Do not retry synchronously: continue live trading without telemetry.
         _NEXUS_SIGNAL_AUDIT_DB_READY = False
+        _NEXUS_SIGNAL_AUDIT_LAST_WRITE_ERROR = type(exc).__name__
 
 
 def _nexus_signal_audit_shared_read():
@@ -48433,6 +48439,217 @@ def _nexus_signal_audit_shared_read():
             conn.close()
     except Exception:
         return {}, [], False
+
+
+
+# ENGINE-526: shared, privacy-preserving observability.
+# Tables are created at application import / worker startup, not by admin reads.
+# Telemetry is best-effort; it cannot influence an entry, exit or HTTP result.
+_NEXUS_OBSERVABILITY_BOOT_ERROR = ''
+_NEXUS_API_ACTIVITY_QUEUE = _nexus_queue.Queue(maxsize=2048)
+_NEXUS_API_ACTIVITY_THREAD = None
+_NEXUS_API_ACTIVITY_LOCK = threading.Lock()
+_NEXUS_API_ACTIVITY_LOST_LOCAL = 0
+_NEXUS_API_ACTIVITY_PROVIDERS = (
+    'CoinGecko', 'Binance Spot', 'Binance Futures',
+    'DexScreener', 'Bitquery Whale', 'Moralis On-chain',
+    'CoinCap', 'CryptoCompare',
+)
+_NEXUS_API_ACTIVITY_OUTCOMES = ('HTTP_OK', 'HTTP_ERROR', 'RATE_LIMIT', 'NETWORK_ERROR', 'TIMEOUT')
+
+
+def _nexus_observability_bootstrap():
+    """Import-time schema initialization, additive and safe across WSGI workers."""
+    global _NEXUS_SIGNAL_AUDIT_DB_READY, _NEXUS_OBSERVABILITY_BOOT_ERROR
+    try:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute("""CREATE TABLE IF NOT EXISTS nexus_signal_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_ts INTEGER NOT NULL, stage TEXT NOT NULL,
+                    symbol TEXT NOT NULL, decision TEXT NOT NULL,
+                    signal_count INTEGER NOT NULL, signal_fields_json TEXT NOT NULL,
+                    candidate_rows INTEGER NOT NULL, worker_id TEXT NOT NULL
+                )""")
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_signal_observations_stage_ts '
+                             'ON nexus_signal_observations(stage, observed_ts DESC)')
+                conn.execute("""CREATE TABLE IF NOT EXISTS nexus_api_activity_buckets (
+                    bucket_ts INTEGER NOT NULL, provider TEXT NOT NULL,
+                    outcome TEXT NOT NULL, request_count INTEGER NOT NULL,
+                    last_ts INTEGER NOT NULL, last_http_code INTEGER NOT NULL,
+                    PRIMARY KEY(bucket_ts, provider, outcome)
+                )""")
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_api_activity_bucket_ts '
+                             'ON nexus_api_activity_buckets(bucket_ts DESC)')
+                conn.commit()
+                _NEXUS_SIGNAL_AUDIT_DB_READY = True
+                _NEXUS_OBSERVABILITY_BOOT_ERROR = ''
+                return True
+        finally:
+            conn.close()
+    except Exception as exc:
+        _NEXUS_SIGNAL_AUDIT_DB_READY = False
+        _NEXUS_OBSERVABILITY_BOOT_ERROR = type(exc).__name__
+        return False
+
+
+def _nexus_observability_health():
+    """Read-only, cross-worker DB state; READY_EMPTY is not a successful signal."""
+    nowi = int(time.time())
+    try:
+        conn = _db()
+        try:
+            conn.execute('SELECT id FROM nexus_signal_observations LIMIT 1')
+            count_row = conn.execute('SELECT COUNT(*) AS n, MAX(observed_ts) AS last_ts '
+                                     'FROM nexus_signal_observations WHERE observed_ts >= ?',
+                                     (nowi - 86400,)).fetchone()
+            count = int(count_row['n'] or 0)
+            last_ts = int(count_row['last_ts'] or 0) or None
+            writer_error = str(globals().get('_NEXUS_SIGNAL_AUDIT_LAST_WRITE_ERROR') or '')
+            return {'state': 'ERROR' if writer_error else ('OBSERVED' if count else 'READY_EMPTY'),
+                    'observations24h': count, 'lastObservedTs': last_ts,
+                    'scope': 'shared_db_all_workers',
+                    'startupInit': bool(_NEXUS_SIGNAL_AUDIT_DB_READY),
+                    'localWriterErrorType': writer_error or None,
+                    'note': 'Recorded evaluations, not trade execution or guaranteed signal coverage. Writer errors are process-local.'}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {'state': 'ERROR', 'observations24h': None, 'lastObservedTs': None,
+                'scope': 'shared_db_all_workers', 'startupInit': False,
+                'errorType': type(exc).__name__, 'note': 'Shared signal schema cannot be read.'}
+
+
+def _nexus_api_activity_flush(batch):
+    """Async aggregation in shared SQLite DB, no urls, tokens, wallets or payloads."""
+    if not batch:
+        return
+    merged = {}
+    for e in batch:
+        ts = int(e.get('ts') or 0)
+        key = ((ts // 300) * 300, e['provider'], e['outcome'])
+        item = merged.setdefault(key, [0, 0, 0])
+        item[0] += 1
+        if ts >= item[1]:
+            item[1] = ts
+            item[2] = int(e.get('http') or 0)
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            for (bucket, provider, outcome), (cnt, latest, http) in merged.items():
+                conn.execute('INSERT INTO nexus_api_activity_buckets '
+                             '(bucket_ts,provider,outcome,request_count,last_ts,last_http_code) '
+                             'VALUES (?,?,?,?,?,?) ON CONFLICT(bucket_ts,provider,outcome) '
+                             'DO UPDATE SET request_count=request_count+excluded.request_count, '
+                             'last_ts=MAX(last_ts,excluded.last_ts), '
+                             'last_http_code=CASE WHEN excluded.last_ts >= last_ts '
+                             'THEN excluded.last_http_code ELSE last_http_code END',
+                             (bucket, provider, outcome, cnt, latest, http))
+            conn.execute('DELETE FROM nexus_api_activity_buckets WHERE bucket_ts < ?',
+                         (int(time.time()) - 3 * 86400,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nexus_api_activity_writer():
+    global _NEXUS_API_ACTIVITY_LOST_LOCAL
+    while True:
+        try:
+            first = _NEXUS_API_ACTIVITY_QUEUE.get(timeout=60)
+        except _nexus_queue.Empty:
+            continue
+        batch = [first]
+        deadline = time.monotonic() + 1.0
+        while len(batch) < 256:
+            try:
+                batch.append(_NEXUS_API_ACTIVITY_QUEUE.get(timeout=max(0.01, deadline - time.monotonic())))
+            except _nexus_queue.Empty:
+                break
+        try:
+            _nexus_api_activity_flush(batch)
+        except Exception:
+            # Background recovery only. Do not modify provider response or trade logic.
+            _NEXUS_API_ACTIVITY_LOST_LOCAL += len(batch)
+            _nexus_observability_bootstrap()
+        finally:
+            for _ in batch:
+                _NEXUS_API_ACTIVITY_QUEUE.task_done()
+
+
+def _nexus_api_activity_record(provider, outcome, http=0):
+    """Non-blocking, best-effort provider HTTP outcome, no secrets ever stored."""
+    global _NEXUS_API_ACTIVITY_THREAD, _NEXUS_API_ACTIVITY_LOST_LOCAL
+    if provider not in _NEXUS_API_ACTIVITY_PROVIDERS or outcome not in _NEXUS_API_ACTIVITY_OUTCOMES:
+        return
+    try:
+        _NEXUS_API_ACTIVITY_QUEUE.put_nowait({
+            'provider': provider, 'outcome': outcome,
+            'http': max(0, int(http or 0)), 'ts': int(time.time())})
+        with _NEXUS_API_ACTIVITY_LOCK:
+            if _NEXUS_API_ACTIVITY_THREAD is None or not _NEXUS_API_ACTIVITY_THREAD.is_alive():
+                _NEXUS_API_ACTIVITY_THREAD = threading.Thread(
+                    target=_nexus_api_activity_writer, name='nexus-provider-telemetry', daemon=True)
+                _NEXUS_API_ACTIVITY_THREAD.start()
+    except _nexus_queue.Full:
+        _NEXUS_API_ACTIVITY_LOST_LOCAL += 1
+    except Exception:
+        _NEXUS_API_ACTIVITY_LOST_LOCAL += 1
+
+
+def _nexus_observed_http(provider, call):
+    """Transparent response wrapper: records HTTP only, never changes outcome."""
+    try:
+        response = call()
+    except Exception as exc:
+        outcome = 'TIMEOUT' if 'timeout' in type(exc).__name__.lower() else 'NETWORK_ERROR'
+        _nexus_api_activity_record(provider, outcome)
+        raise
+    code = int(getattr(response, 'status_code', None) or getattr(response, 'status', 0) or 0)
+    outcome = ('RATE_LIMIT' if code in (418, 429) else
+               'HTTP_OK' if 200 <= code < 300 else 'HTTP_ERROR')
+    _nexus_api_activity_record(provider, outcome, code)
+    return response
+
+
+def _nexus_api_activity_snapshot():
+    """Last 24h shared HTTP attempts, all workers; covers instrumented provider paths."""
+    since = int(time.time()) - 86400 - 300
+    try:
+        conn = _db()
+        try:
+            conn.execute('SELECT bucket_ts FROM nexus_api_activity_buckets LIMIT 1')
+            rows = conn.execute('SELECT provider,outcome,SUM(request_count) AS cnt, '
+                                'MAX(last_ts) AS last_ts FROM nexus_api_activity_buckets '
+                                'WHERE bucket_ts>=? GROUP BY provider,outcome', (since,)).fetchall()
+            providers = {p: {'name': p, 'attempts': 0, 'httpOk': 0,
+                             'errors': 0, 'rateLimits': 0, 'lastSeenTs': None}
+                         for p in _NEXUS_API_ACTIVITY_PROVIDERS}
+            for row in rows:
+                p = providers.get(str(row['provider'] or ''))
+                if p is None:
+                    continue
+                n = int(row['cnt'] or 0)
+                p['attempts'] += n
+                if row['outcome'] == 'HTTP_OK':
+                    p['httpOk'] += n
+                else:
+                    p['errors'] += n
+                if row['outcome'] == 'RATE_LIMIT':
+                    p['rateLimits'] += n
+                ts = int(row['last_ts'] or 0)
+                p['lastSeenTs'] = max(p['lastSeenTs'] or 0, ts) or None
+            total = sum(p['attempts'] for p in providers.values())
+            return {'state': 'OBSERVED' if total else 'READY_EMPTY',
+                    'scope': 'shared_db_all_workers', 'windowHours': 24,
+                    'attempts': total, 'providers': list(providers.values()),
+                    'limitations': 'Only instrumented upstream HTTP paths. HTTP 2xx does not verify payload content; writes are asynchronous and best-effort.'}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {'state': 'ERROR', 'scope': 'shared_db_all_workers',
+                'attempts': None, 'providers': [], 'errorType': type(exc).__name__}
 
 
 _NEXUS_SIGNAL_AUDIT_KEYS = (
@@ -51288,3 +51505,6 @@ def api_nexus_eth_pol_readiness_audit():
         "nextStep":"Configure or repair only the chain reported as blocked. Do not change shared BNB execution code.",
         "ts":now_ts(),
     })
+
+# ENGINE-526: initialize observability tables once when each WSGI worker imports this module.
+_nexus_observability_bootstrap()
