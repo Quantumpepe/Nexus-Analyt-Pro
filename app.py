@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-522-SIGNAL-DATA-AUDIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD561-SIGNAL-DATA-AUDIT"
+BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-523-SIGNAL-SAFETY-TRACE";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD562-SIGNAL-SAFETY-TRACE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5724,7 +5724,9 @@ BITQUERY_API_KEY = (
     or ""
 ).strip()
 BITQUERY_GRAPHQL_URL = os.getenv("BITQUERY_GRAPHQL_URL", "https://graphql.bitquery.io").strip()
-BITQUERY_WHALE_CACHE_TTL_SEC = int(os.getenv("BITQUERY_WHALE_CACHE_TTL_SEC", "86400"))
+# ENGINE-523: bounded per-token cache, no additional polling; older 24-hour
+# default was incompatible with the 3-hour whale lookback window.
+BITQUERY_WHALE_CACHE_TTL_SEC = max(300, min(1800, int(os.getenv("BITQUERY_WHALE_CACHE_TTL_SEC", "900"))))
 BITQUERY_WHALE_LOOKBACK_MIN = int(os.getenv("BITQUERY_WHALE_LOOKBACK_MIN", "180"))
 BITQUERY_WHALE_MIN_USD = float(os.getenv("BITQUERY_WHALE_MIN_USD", "10000"))
 BITQUERY_WHALE_TRADE_LIMIT = int(os.getenv("BITQUERY_WHALE_TRADE_LIMIT", "40"))
@@ -9127,10 +9129,22 @@ def _goplus_native_symbols_for_chain(chain_id: int) -> set[str]:
 
 def _goplus_is_native_asset(chain_id: int, symbol: str = "", address: str = "") -> bool:
     addr = _norm_addr(address)
-    if addr and addr in ("0x0000000000000000000000000000000000000000", "native"):
+    if addr in ("0x0000000000000000000000000000000000000000", "native"):
         return True
+    # Wrapped ERC20s have a real contract address and must NOT be exempted
+    # merely because their display symbol looks native.
     sym = str(symbol or "").strip().upper()
-    return bool(sym and sym in _goplus_native_symbols_for_chain(int(chain_id)))
+    if _looks_like_evm_addr(addr):
+        # Keep existing canonical wrapped-native deposits working, but never
+        # trust a symbol alone when a real ERC20 contract is supplied.
+        verified_wraps = {
+            1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+            137: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
+        }
+        return bool(sym in _goplus_native_symbols_for_chain(int(chain_id))
+                    and addr == _norm_addr(verified_wraps.get(int(chain_id)) or ""))
+    return bool(not addr and sym and sym in _goplus_native_symbols_for_chain(int(chain_id)))
 
 def _goplus_get_access_token() -> Optional[str]:
     now = int(time.time())
@@ -9184,13 +9198,18 @@ def _goplus_fetch_token_security(chain_id: int, token_address: str) -> dict:
     r.raise_for_status()
     data = r.json() or {}
     result = data.get("result") or {}
+    # ENGINE-523: fail closed when provider returns no data for this EXACT
+    # contract. Never accept the sole result for a different contract.
     token_data = None
     if isinstance(result, dict):
-        token_data = result.get(addr) or result.get(addr.lower()) or result.get(addr.upper())
-        if token_data is None and len(result) == 1:
-            token_data = next(iter(result.values()))
-    if not isinstance(token_data, dict):
-        token_data = {}
+        token_data = next((v for k, v in result.items()
+                           if str(k).lower() == addr.lower()), None)
+    if not isinstance(token_data, dict) or not token_data:
+        raise RuntimeError("goplus_token_security_missing_for_contract")
+    if not any(k in token_data for k in (
+        "is_honeypot", "is_blacklisted", "cannot_sell_all", "sell_tax", "buy_tax",
+    )):
+        raise RuntimeError("goplus_token_security_fields_missing")
     return token_data
 
 def _goplus_to_float(v: Any) -> Optional[float]:
@@ -33334,7 +33353,9 @@ def _price_multi_fresh_shadow(symbol: str) -> dict | None:
             else:
                 px0 = 0.0
             ttl_sec = _nexus_price_cache_ttl_for_symbol(s) if "_nexus_price_cache_ttl_for_symbol" in globals() else 90
-            if math.isfinite(px0) and px0 > 0 and (not ts_snap or now_ts() - ts_snap <= ttl_sec):
+            # ENGINE-523: a snapshot without a reliable timestamp is NOT fresh.
+            # Refresh from the live provider instead of treating unknown age as valid.
+            if math.isfinite(px0) and px0 > 0 and ts_snap > 0 and 0 <= now_ts() - ts_snap <= ttl_sec:
                 try:
                     NEXUS_PRICE_CACHE_STATS["hits"] = int(NEXUS_PRICE_CACHE_STATS.get("hits") or 0) + 1
                 except Exception:
@@ -38033,7 +38054,13 @@ def api_nexus_system_info_signal_data_quality():
         symbols += list(snapshots.keys())
     normalized = []
     for sym in symbols:
-        sym = _price_symbol_key(sym)
+        raw_symbol = str(sym or "").strip().upper()
+        # GRID internal scope keys such as POL:POL/ETH:ETH are not coins.
+        if ":" in raw_symbol or "/" in raw_symbol:
+            continue
+        sym = _price_symbol_key(raw_symbol)
+        if sym in {"POLPOL", "ETHETH", "BNBBNB"}:
+            continue
         if sym and sym not in normalized: normalized.append(sym)
     # Select active/hot first, then up to 50 distinct observed assets.
     normalized = sorted(normalized, key=lambda s: ({"hot": 0, "active": 1, "market": 2}.get(_nexus_price_cache_tier(s), 2), s))[:50]
@@ -38068,23 +38095,44 @@ def api_nexus_system_info_signal_data_quality():
     if not globals().get("MORALIS_API_KEY"): warnings.append("Moralis nicht konfiguriert: On-chain-Transferdaten fehlen.")
     if int(globals().get("BITQUERY_WHALE_CACHE_TTL_SEC") or 0) >= 3600:
         warnings.append("Whale-Cache ist für Intraday-Signale möglicherweise zu langsam eingestellt.")
-    if str(os.getenv("NEXUS_TRADE_GOPLUS_REQUIRED") or "").lower() not in ("true", "1", "yes", "on"):
-        warnings.append("GoPlus Fail-Closed ist nicht aktiviert: bei API-Fehlern kann die Route durchgelassen werden.")
+    # ENGINE-523: live OPEN/ADD always fails closed for non-trusted ERC20s,
+    # independent of the older environment toggle. Keep this fact visible.
+    # A provider outage can block NEW entries; existing exits are not changed.
 
-    # We do not claim Trader / NKR saw every signal without a per-decision trace.
+    # Bounded, read-only recent signal FUNCTION observations in this worker.
+    try:
+        with _NEXUS_SIGNAL_AUDIT_LOCK:
+            last_by_stage = dict(_NEXUS_SIGNAL_AUDIT_LAST)
+            recent_events = list(_NEXUS_SIGNAL_AUDIT_EVENTS[-12:])[::-1]
+    except Exception:
+        last_by_stage, recent_events = {}, []
+
+    def pipeline_stage(label, stage, note):
+        item = last_by_stage.get(stage) or {}
+        observed = int(item.get("ts") or 0)
+        age = max(0, now_sec - observed) if observed else None
+        state = ("OBSERVED" if age is not None and age <= 3600 else
+                 "OBSERVED_OLD" if observed else "CODE_WIRED_NOT_LIVE_PROVEN")
+        return {"stage": label, "state": state, "lastObservedTs": observed or None,
+                "ageSec": age, "sample": item if observed else None,
+                "note": note}
+
     return jsonify({
         "status": "ok", "readOnly": True, "observedAt": now_sec,
         "scope": "process_local_cache_only", "ownerOnly": True,
         "sources": sources, "priceSummary": {"observed": len(prices), **counts},
         "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
         "signalPipeline": [
-            {"stage": "Market → Strategist", "state": "CODE_WIRED_NOT_LIVE_PROVEN",
-             "note": "Anreicherung im Worker vorgesehen; ohne durchgängiges Event-Tracing keine End-to-End-Bestätigung."},
-            {"stage": "Strategist → NKR", "state": "CODE_WIRED_NOT_LIVE_PROVEN",
-             "note": "Gemeinsamer Signalvektor vorhanden; konkrete Signalvollständigkeit je Trade noch nicht gemessen."},
-            {"stage": "Strategist → Trader", "state": "NOT_INSTRUMENTED",
-             "note": "Separate Laufzeitmessung für Trader-Signalübergabe fehlt."},
+            pipeline_stage("Market → Strategist", "MARKET_STRATEGIST",
+                           "Anreicherung im Worker beobachtbar; kein Nachweis eines ausgeführten Trades."),
+            pipeline_stage("Strategist → NKR", "STRATEGIST_NKR",
+                           "Live-Einstiegsbewertung erfasst; eine echte On-chain-Ausführung wird hier nicht behauptet."),
+            pipeline_stage("Strategist → Trader", "STRATEGIST_TRADER",
+                           "Trader-Exit/Risikobewertung erfasst; kein On-chain-Ausführungsnachweis."),
         ],
+        "signalTrace": recent_events,
+        "goPlusLivePolicy": "FAIL_CLOSED_FOR_UNVERIFIED_ERC20_OPEN_ADD",
+        "whaleCacheTtlSec": BITQUERY_WHALE_CACHE_TTL_SEC,
         "warnings": warnings[:12],
         "explanation": "Ein leerer Prozess-Cache beweist keinen API-Ausfall. Keine aktiven Provider-Anfragen durch diesen Test."
     })
@@ -44244,42 +44292,72 @@ def _nkr_live_cycle_number(wallet: str, live_row: dict, op_type: str) -> int:
 def _nkr_trade_security_check(chain_id: int, token_address: str, symbol: str = "", route: dict | None = None) -> dict:
     """ENGINE-419: security gate for live NKR/Trader OPEN (all EVMs).
 
-    - Native / USDC / USDT: always allowed
-    - Token on live route registry (token+router present): run GoPlus risk checks only
+    - Exact native and official settlement / wrapped-native contracts are trusted
+    - Other live registry ERC20s require complete GoPlus data (fail closed)
     - owner_approval is NOT required for configured trade routes (deposit gate only)
-    - Unknown / no-route tokens: full _goplus_check_token (approval+GoPlus)
+    - Unknown / no-route tokens use _goplus_check_token (approval+GoPlus)
     """
     sym = str(symbol or "").strip().upper()
     addr = _norm_addr(token_address)
     cid = int(chain_id or 0)
-    if sym in {"ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "USDC", "USDT"}:
-        return {"allowed": True, "blocked_by": None, "reason": "native_or_stable", "symbol": sym}
-    try:
-        if _goplus_is_native_asset(cid, symbol=sym, address=addr):
-            return {"allowed": True, "blocked_by": None, "reason": "native_asset", "symbol": sym}
-    except Exception:
-        pass
+    if cid not in (1, 56, 137):
+        return {"allowed": False, "blocked_by": "unsupported_chain", "reason": "unsupported_live_chain", "symbol": sym}
 
+    # Only the REAL native sentinel, exactly configured settlement contracts,
+    # or the canonical chain-specific wrapped-native contract bypass GoPlus.
+    # A forged ticker (e.g. USDC on an unrelated contract) cannot bypass it.
+    native_zero = "0x0000000000000000000000000000000000000000"
+    # A configured route must reference the same exact ERC20 being checked.
+    if isinstance(route, dict) and route.get("live"):
+        expected = _norm_addr(route.get("token") or "")
+        if expected != addr:
+            return {"allowed": False, "blocked_by": "route_mismatch", "reason": "route_token_contract_mismatch", "symbol": sym}
+    native_names = _goplus_native_symbols_for_chain(cid)
+    if cid == 137:
+        native_names = native_names | {"WPOL"}
+    if addr in (native_zero, "native") and sym in native_names:
+        return {"allowed": True, "blocked_by": None, "reason": "verified_native", "symbol": sym}
+    stable_addrs = {
+        _norm_addr(_USDC_BY_CHAIN.get(cid) or ""),
+        _norm_addr(_USDT_BY_CHAIN.get(cid) or ""),
+        *[_norm_addr(x) for x in _USDC_ALT_BY_CHAIN.get(cid, [])],
+    }
+    if cid == 137:
+        stable_addrs.update({
+            _norm_addr("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+            _norm_addr("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"),
+        })
+    native_wrap = {
+        1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+        137: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
+    }
+    if sym in {"USDC", "USDT"} and addr in stable_addrs and _looks_like_evm_addr(addr):
+        return {"allowed": True, "blocked_by": None, "reason": "verified_settlement", "symbol": sym}
+    if sym in native_names and addr == _norm_addr(native_wrap.get(cid) or ""):
+        return {"allowed": True, "blocked_by": None, "reason": "verified_wrapped_native", "symbol": sym}
+    if not _looks_like_evm_addr(addr):
+        return {"allowed": False, "blocked_by": "invalid_contract", "reason": "valid_contract_required", "symbol": sym}
+
+    route_token = _norm_addr((route or {}).get("token") or "") if isinstance(route, dict) else ""
     route_live = bool(
         isinstance(route, dict)
         and route.get("live")
-        and _looks_like_evm_addr(_norm_addr(route.get("token") or addr))
+        and route_token == addr
+        and _looks_like_evm_addr(route_token)
         and _looks_like_evm_addr(_norm_addr(route.get("router") or ""))
     )
-    if route_live and _looks_like_evm_addr(addr):
+    if route_live:
         try:
-            raw = _goplus_fetch_token_security(cid, addr) or {}
+            raw = _goplus_fetch_token_security(cid, addr)
         except Exception as exc:
-            if str(os.getenv("NEXUS_TRADE_GOPLUS_REQUIRED", "")).strip().lower() in {"1", "true", "yes", "on"}:
-                return {
-                    "allowed": False, "blocked_by": "goplus_unavailable",
-                    "reason": f"goplus_request_failed:{exc}", "symbol": sym,
-                }
-            return {"allowed": True, "blocked_by": None, "reason": "goplus_unavailable_fail_open_route", "symbol": sym}
+            # Fail CLOSED regardless of ENV; only new OPEN/ADD is blocked.
+            return {"allowed": False, "blocked_by": "goplus_unavailable",
+                    "reason": f"goplus_request_failed:{str(exc)[:150]}", "symbol": sym}
         blocked_by = None
         reason = "route_token_passed_goplus"
         try:
-            if GOPLUS_BLOCK_HONEYPOT and _goplus_is_truthy(raw.get("is_honeypot")):
+            if _goplus_is_truthy(raw.get("is_honeypot")):
                 blocked_by, reason = "honeypot", "blocked by GoPlus honeypot check"
             elif _goplus_is_truthy(raw.get("is_blacklisted")):
                 blocked_by, reason = "blacklisted", "blocked by GoPlus blacklist signal"
@@ -44815,6 +44893,10 @@ def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict,
         decision, reason = "RECOVERY", str(base.get("reason") or "shadow_trader_recovery")
     else:
         decision, reason = "HOLD", "shadow_trader_no_confirmed_exit"
+    try:
+        _nexus_signal_audit_record("STRATEGIST_TRADER", symbol, signals, decision)
+    except Exception:
+        pass
     return {**base, "decision": decision, "reason": reason, "slotRiskDecision": risk_decision,
             "slotQuality": quality, "signalVector": signals}
 
@@ -45680,13 +45762,10 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
                 same_asset_amount = int((snapshots.get(sym) or {}).get("amount") or 0)
                 if open_assets_now <= 0:
                     same_asset_amount = 0
-                # ENGINE-419: Trade security for NKR/Trader OPEN.
-                # Native + stables always OK. Live-route registry tokens: GoPlus only
-                # (honeypot/tax/blacklist) — owner_approval is a DEPOSIT gate, not a
-                # trade gate, and must not block configured executable routes.
-                if action in {"OPEN", "ADD"} and str(sym or "").upper() not in {
-                    "ETH", "WETH", "BNB", "WBNB", "POL", "MATIC", "WMATIC", "USDC", "USDT"
-                }:
+                # ENGINE-523: Every OPEN/ADD passes the exact-contract security
+                # gate. Canonical native / USDC / USDT wrappers are exempted INSIDE
+                # the helper by chain+address, not by an untrusted ticker alone.
+                if action in {"OPEN", "ADD"}:
                     try:
                         _tok = _norm_addr((route or {}).get("token") or "")
                         _sec = _nkr_trade_security_check(int(chain_id), _tok, str(sym), route=route)
@@ -48155,6 +48234,39 @@ def _nkr_live_shadow_quality(row: dict, mode: str = "DYNAMIC") -> dict:
     return quality
 
 
+# ENGINE-523: read-only, bounded process-local signal decision trace.
+# No wallet IDs, tx hashes, API keys or provider requests are stored here.
+_NEXUS_SIGNAL_AUDIT_LOCK = threading.RLock()
+_NEXUS_SIGNAL_AUDIT_LAST = {}
+_NEXUS_SIGNAL_AUDIT_EVENTS = []
+_NEXUS_SIGNAL_AUDIT_KEYS = (
+    "price", "momentum_1m", "momentum_5m", "momentum_15m",
+    "momentum_1h", "momentum_4h", "momentum_24h", "momentum_7d",
+    "relative_volume", "liquidity_score", "liquidity_usd",
+    "market_structure", "risk_score", "confidence", "security",
+    "slippage_pct", "whale_sell_pressure", "exit_risk",
+)
+
+
+def _nexus_signal_audit_record(stage: str, symbol: str = "", signals=None, decision: str = "", rows: int = 0):
+    try:
+        sig = signals if isinstance(signals, dict) else {}
+        present = [k for k in _NEXUS_SIGNAL_AUDIT_KEYS if sig.get(k) is not None]
+        event = {
+            "stage": str(stage or "")[:28],
+            "symbol": re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())[:18],
+            "ts": int(time.time()), "signalCount": len(present),
+            "signalFields": present, "decision": str(decision or "")[:48],
+            "rows": max(0, int(rows or 0)),
+        }
+        with _NEXUS_SIGNAL_AUDIT_LOCK:
+            _NEXUS_SIGNAL_AUDIT_LAST[event["stage"]] = event
+            _NEXUS_SIGNAL_AUDIT_EVENTS.append(event)
+            del _NEXUS_SIGNAL_AUDIT_EVENTS[:-80]
+    except Exception:
+        pass  # Audit must NEVER change trading outcome.
+
+
 def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC") -> dict:
     """Shared full-signal live entry gate; 24h red alone can no longer suppress recovery."""
     q = _nkr_live_shadow_quality(row, mode)
@@ -48170,6 +48282,8 @@ def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC") -> 
         reason = "FULL_SIGNAL_SCORE_BLOCKED"
     elif momentum < -6.0 and recovery < 55.0:
         reason = "FULL_SIGNAL_MOMENTUM_BLOCKED"
+    _nexus_signal_audit_record("STRATEGIST_NKR", row.get("symbol") or row.get("sym") or "",
+                               q.get("signal_vector"), "ALLOW" if allowed else reason)
     return {"allowed": allowed, "reason": reason, "score": score, "quality": q}
 
 
@@ -48272,6 +48386,14 @@ def _nkr_prepare_strategist_signals(rows: list) -> list:
         row["strategist_live_momentum_score"] = shadow_quality.get("momentum_score")
         row["strategist_live_recovery_score"] = shadow_quality.get("recovery_momentum_score")
         out.append(row)
+    # Records data preparation, NOT a confirmed on-chain trade or entry.
+    try:
+        sample = next((x for x in out if isinstance(x, dict) and isinstance(x.get("signals"), dict)), {})
+        if sample:
+            _nexus_signal_audit_record("MARKET_STRATEGIST", sample.get("symbol") or "",
+                                       sample.get("signals"), "ENRICHED", len(out))
+    except Exception:
+        pass
     return out
 
 
