@@ -185,8 +185,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.02-ENGINE-521-HELP-AI-INSIGHT-GUIDE";
-FRONTEND_TARGET_BUILD_ID = "F-2026.08.11-BUILD408-WATCHLIST-CG-7D-SPARKLINE"
+BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-522-SIGNAL-DATA-AUDIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD561-SIGNAL-DATA-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -37918,6 +37918,176 @@ def api_nexus_system_info_owner_panel():
     payload["liveExecutionReadiness"]=rd; payload["liveExecution"]=rd.get("liveExecution"); payload["vault"]={"status":"READY" if rd.get("checks",{}).get("vaultConnected") else "SETUP REQUIRED"}; payload["privateKeys"]="PRIVY WALLET KEY NEVER EXPOSED"; payload["ownerAuthenticated"]=True; payload["ownerWallet"]=owner; payload["evmTokenRegistry"]=_evm_registry_summary()
     return jsonify(payload)
 
+
+
+# ENGINE-522: Owner-only, read-only data quality observability.
+# This endpoint reads process-local caches. It NEVER calls an upstream API,
+# executes a trade, mutates a vault, or pretends an unobserved signal is fresh.
+@app.get("/api/nexus/system-info/signal-data-quality")
+def api_nexus_system_info_signal_data_quality():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    now = time.time()
+    now_sec = int(now)
+
+    def stamp(value):
+        try:
+            v = float(value or 0)
+            if v > 1e12: v /= 1000.0
+            return int(v) if 946684800 <= v <= now + 60 else 0
+        except (ValueError, TypeError, OverflowError):
+            return 0
+
+    def source(name, configured, success_ts=0, ttl_sec=None, detail="", samples=0, cooldown_until=0):
+        last = stamp(success_ts)
+        age = max(0, now_sec - last) if last else None
+        if not configured:
+            status = "DISABLED"
+        elif cooldown_until and cooldown_until > now:
+            status = "COOLDOWN"
+        elif not last:
+            status = "UNVERIFIED"
+        elif ttl_sec is not None and age > ttl_sec:
+            status = "STALE"
+        else:
+            status = "CACHED_DATA"
+        return {"name": name, "configured": bool(configured), "status": status,
+                "lastSuccessTs": last or None, "ageSec": age, "nominalTtlSec": ttl_sec,
+                "sampleCount": samples, "detail": detail}
+
+    # Distinct CoinGecko caches are shared by multiple implementations. The
+    # later simple/price cache uses by_key/ts; inspect shape, never return keys.
+    cg_cache = globals().get("_CG_CACHE") or {}
+    cg_times = []
+    cg_count = 0
+    if isinstance(cg_cache, dict):
+        ts_map = cg_cache.get("ts")
+        if isinstance(ts_map, dict):
+            cg_count = len(ts_map)
+            cg_times = [stamp(x) for x in ts_map.values()]
+        else:
+            cg_count = len(cg_cache)
+            cg_times = [stamp(v[0]) for v in cg_cache.values()
+                        if isinstance(v, (list, tuple)) and len(v) >= 2]
+    cg_last = max(cg_times or [0])
+
+    bins = globals().get("_BINANCE_PUBLIC_SYMBOL_CACHE") or {}
+    future_rows = [v[1] for v in bins.values() if isinstance(v, tuple) and len(v) >= 2
+                   and isinstance(v[1], dict)] if isinstance(bins, dict) else []
+    future_valid = [r for r in future_rows if r.get("available") and not r.get("stale")]
+    future_ok = [r for r in future_valid if stamp(r.get("updatedAt")) and
+                 now_sec - stamp(r.get("updatedAt")) <= int(r.get("cacheTtlSec") or 25)]
+    future_last = max([stamp(r.get("updatedAt")) for r in future_valid] or [0])
+
+    snapshots = globals().get("SNAPSHOTS") or {}
+    spot_last = 0
+    dex_last = 0
+    if isinstance(snapshots, dict):
+        for snap in snapshots.values():
+            if not isinstance(snap, dict): continue
+            data = snap.get("data") if isinstance(snap.get("data"), dict) else snap
+            label = str(data.get("source") or "").lower()
+            ts = stamp(snap.get("ts") or data.get("ts"))
+            if "binance" in label: spot_last = max(spot_last, ts)
+            if "dexscreener" in label: dex_last = max(dex_last, ts)
+
+    whale_cache = globals().get("_WHALE_SIGNAL_CACHE") or {}
+    whales = [v[1] for v in whale_cache.values() if isinstance(v, tuple) and len(v) >= 2
+              and isinstance(v[1], dict)] if isinstance(whale_cache, dict) else []
+    whale_ok = [r for r in whales if str(r.get("status") or "ok").lower() == "ok"]
+    whale_last = max([stamp(r.get("ts")) for r in whale_ok] or [0])
+
+    chain_cache = globals().get("_ONCHAIN_SIGNAL_CACHE") or {}
+    onchain_rows = [v[1] for v in chain_cache.values() if isinstance(v, tuple) and len(v) >= 2
+                    and isinstance(v[1], dict)] if isinstance(chain_cache, dict) else []
+    moralis_rows = [r for r in onchain_rows if str(r.get("source") or "").lower() == "moralis"]
+    moralis_last = max([stamp(r.get("ts")) for r in moralis_rows] or [0])
+
+    sources = [
+        source("CoinGecko", True, cg_last, int(globals().get("_CG_TTL_SEC") or 1200),
+               "Bezahlter Tarif konfiguriert" if globals().get("COINGECKO_API_KEY") else "Public API; kein Pro-Key gesetzt",
+               cg_count, float(globals().get("_CG_COOLDOWN_UNTIL") or 0)),
+        source("Binance Spot", True, spot_last, int(globals().get("NEXUS_PRICE_MARKET_TTL_SEC") or 120),
+               "Zuletzt beobachtete Binance-Preisquelle; nicht zwingend alle Handelspaare", len(snapshots)),
+        source("Binance Futures", bool(globals().get("BINANCE_PUBLIC_ENABLED")), future_last,
+               int(globals().get("BINANCE_PUBLIC_WATCHLIST_TTL_SEC") or 25),
+               f"{len(future_ok)}/{len(future_rows)} Futures-Symbole mit frischen Daten", len(future_rows),
+               float(globals().get("_BINANCE_PUBLIC_COOLDOWN_UNTIL") or 0)),
+        source("DexScreener", True, dex_last, None,
+               "Fallback nach Token-Vertrag; nur beobachtete Cache-Daten", 0),
+        source("Bitquery Whale", bool(globals().get("BITQUERY_API_KEY")), whale_last,
+               int(globals().get("BITQUERY_WHALE_CACHE_TTL_SEC") or 86400),
+               "Optionale On-chain-DEX-Trades; keine Vollabdeckung aller Coins", len(whale_ok)),
+        source("Moralis On-chain", bool(globals().get("MORALIS_API_KEY")), moralis_last,
+               int(globals().get("_ONCHAIN_SIGNAL_TTL_SEC") or 900),
+               "Optionale Token-Transferdaten; keine Vollabdeckung aller Chains", len(moralis_rows)),
+    ]
+
+    tiers = globals().get("NEXUS_PRICE_CACHE_TIERS") or {}
+    symbols = []
+    if isinstance(tiers, dict):
+        symbols += [s for s, rec in tiers.items() if isinstance(rec, dict) and
+                    stamp(rec.get("expires_ts")) >= now_sec]
+    if isinstance(snapshots, dict):
+        symbols += list(snapshots.keys())
+    normalized = []
+    for sym in symbols:
+        sym = _price_symbol_key(sym)
+        if sym and sym not in normalized: normalized.append(sym)
+    # Select active/hot first, then up to 50 distinct observed assets.
+    normalized = sorted(normalized, key=lambda s: ({"hot": 0, "active": 1, "market": 2}.get(_nexus_price_cache_tier(s), 2), s))[:50]
+    prices = []
+    for sym in normalized:
+        try:
+            row = _nexus_snapshot_price(sym)
+            age = row.get("ageSec")
+            ttl = int(row.get("ttlSec") or 0)
+            if not row.get("price"):
+                state = "MISSING"
+            elif age is None:
+                state = "UNKNOWN_AGE"
+            elif age > ttl:
+                state = "STALE"
+            else:
+                state = "FRESH"
+            prices.append({"symbol": sym, "source": str(row.get("source") or "missing"),
+                           "state": state, "ageSec": age, "ttlSec": ttl,
+                           "tier": str(row.get("tier") or "market")})
+        except Exception:
+            prices.append({"symbol": sym, "source": "unknown", "state": "ERROR",
+                           "ageSec": None, "ttlSec": None, "tier": "unknown"})
+    counts = {k: sum(1 for r in prices if r["state"] == k)
+              for k in ("FRESH", "STALE", "MISSING", "UNKNOWN_AGE", "ERROR")}
+    warnings = []
+    if any(s["status"] == "COOLDOWN" for s in sources): warnings.append("Mindestens eine API ist in einem Rate-Limit-Cooldown.")
+    if counts["STALE"]: warnings.append(f"{counts['STALE']} beobachtete Preise sind älter als ihre Cache-Grenze.")
+    if counts["UNKNOWN_AGE"]: warnings.append(f"{counts['UNKNOWN_AGE']} Preise haben keinen verlässlichen Zeitstempel.")
+    if not prices: warnings.append("Keine Preis-Snapshots in diesem Prozess beobachtet; nicht automatisch ein Systemausfall.")
+    if not globals().get("BITQUERY_API_KEY"): warnings.append("Bitquery nicht konfiguriert: keine bestätigten Whale-Signale von Bitquery.")
+    if not globals().get("MORALIS_API_KEY"): warnings.append("Moralis nicht konfiguriert: On-chain-Transferdaten fehlen.")
+    if int(globals().get("BITQUERY_WHALE_CACHE_TTL_SEC") or 0) >= 3600:
+        warnings.append("Whale-Cache ist für Intraday-Signale möglicherweise zu langsam eingestellt.")
+    if str(os.getenv("NEXUS_TRADE_GOPLUS_REQUIRED") or "").lower() not in ("true", "1", "yes", "on"):
+        warnings.append("GoPlus Fail-Closed ist nicht aktiviert: bei API-Fehlern kann die Route durchgelassen werden.")
+
+    # We do not claim Trader / NKR saw every signal without a per-decision trace.
+    return jsonify({
+        "status": "ok", "readOnly": True, "observedAt": now_sec,
+        "scope": "process_local_cache_only", "ownerOnly": True,
+        "sources": sources, "priceSummary": {"observed": len(prices), **counts},
+        "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
+        "signalPipeline": [
+            {"stage": "Market → Strategist", "state": "CODE_WIRED_NOT_LIVE_PROVEN",
+             "note": "Anreicherung im Worker vorgesehen; ohne durchgängiges Event-Tracing keine End-to-End-Bestätigung."},
+            {"stage": "Strategist → NKR", "state": "CODE_WIRED_NOT_LIVE_PROVEN",
+             "note": "Gemeinsamer Signalvektor vorhanden; konkrete Signalvollständigkeit je Trade noch nicht gemessen."},
+            {"stage": "Strategist → Trader", "state": "NOT_INSTRUMENTED",
+             "note": "Separate Laufzeitmessung für Trader-Signalübergabe fehlt."},
+        ],
+        "warnings": warnings[:12],
+        "explanation": "Ein leerer Prozess-Cache beweist keinen API-Ausfall. Keine aktiven Provider-Anfragen durch diesen Test."
+    })
 
 # ENGINE-216: CoreVault V5 Native Final budget/session bridge for NKR, Trader and Grid.
 # V5 sessions contain only settlement token, system, budget and risk limits.
