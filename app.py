@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-529-STRATEGIST-EARLY-SPOT-FIX";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD568-STRATEGIST-EARLY-SPOT-FIX"
+BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-530-STRATEGIST-ADVISORY-DIAGNOSTICS";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD569-STRATEGIST-ADVISORY-DIAGNOSTICS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5667,6 +5667,60 @@ def _nexus_early_shared_recent(limit: int = 25):
     except Exception:
         return None
 
+
+
+def _nexus_early_advisory_for_symbols(symbols: list) -> list[dict]:
+    """Fresh Binance Spot observations for human-facing Strategist analysis ONLY.
+
+    Reads existing DB samples and does no HTTP requests, price-router changes,
+    scorer adjustments or live-order decisions. Unsupported/stale pairs are omitted.
+    """
+    if not isinstance(symbols, (list, tuple)) or not NEXUS_EARLY_ENABLED:
+        return []
+    clean = []
+    for raw in symbols[:40]:
+        symbol = re.sub(r"[^A-Z0-9]", "", str(raw or "").upper())
+        if symbol.endswith("USDT"):
+            symbol = symbol[:-4]
+        symbol = {"WETH": "ETH", "WBTC": "BTC", "WMATIC": "POL"}.get(symbol, symbol)
+        if re.fullmatch(r"[A-Z0-9]{2,16}", symbol) and symbol not in clean:
+            clean.append(symbol)
+    if not clean:
+        return []
+    records = _nexus_early_shared_recent(50)
+    if not isinstance(records, list):
+        return []
+    by_pair = {str(x.get("pair") or ""): x for x in records if isinstance(x, dict)}
+    now = int(time.time())
+    output = []
+    for symbol in clean[:20]:
+        row = by_pair.get(symbol + "USDT")
+        if not row or not row.get("available"):
+            continue
+        closed_ts = int(row.get("lastClosedTs") or 0)
+        cache_age = int(row.get("cacheAgeSec") or 0)
+        # An aged candle is not a live intraday signal.
+        if closed_ts <= 0 or not (0 <= now - closed_ts <= 180) or not (0 <= cache_age <= 120):
+            continue
+        m1 = row.get("momentum1mPct")
+        m5 = row.get("momentum5mPct")
+        m15 = row.get("momentum15mPct")
+        rv = row.get("rvol5m")
+        share = row.get("takerBuyShare5mPct")
+        if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v)
+               for v in (m1, m5, m15, rv, share)):
+            continue
+        direction = ("UP" if m1 > 0 and m5 > 0 and m15 > 0 else
+                     "DOWN" if m1 < 0 and m5 < 0 and m15 < 0 else "MIXED")
+        output.append({
+            "symbol": symbol, "source": "binance_spot_closed_1m_klines",
+            "lastClosedTs": closed_ts, "ageSec": max(0, now - closed_ts),
+            "momentum1mPct": m1, "momentum5mPct": m5, "momentum15mPct": m15,
+            "rvol5m": rv, "takerBuyShare5mPct": share, "direction": direction,
+            "mode": "advisory_only", "executionEvidence": False,
+            "caution": "CEX-Spot-Beobachtung; kein DEX-Preis, keine Trading-Freigabe",
+        })
+    return output
 
 def _nexus_enrich_early_observations(rows: list[dict]) -> list[dict]:
     """Sample candidate coins, rotating over the full watchlist across cycles.
@@ -31287,6 +31341,22 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
     binance_bundle = _binance_public_intelligence(strategist_symbols, default_tier="active") if strategist_symbols else {"symbols": {}}
     binance_by_sym = binance_bundle.get("symbols") if isinstance(binance_bundle, dict) and isinstance(binance_bundle.get("symbols"), dict) else {}
 
+    # Build 530: early data is advisory context for this manual AI analysis.
+    early_symbols = strategist_symbols or [str(s) for s in (ctx.get("analysis_symbols") or [])[:12]]
+    early_advisory = _nexus_early_advisory_for_symbols(early_symbols)
+    early_by_sym = {o["symbol"]: o for o in early_advisory}
+    if early_advisory:
+        try:
+            first = early_advisory[0]
+            _nexus_signal_audit_record("STRATEGIST_CONTEXT", first["symbol"], {
+                "momentum_1m": first["momentum1mPct"],
+                "momentum_5m": first["momentum5mPct"],
+                "momentum_15m": first["momentum15mPct"],
+                "relative_volume": first["rvol5m"],
+            }, "ADVISORY_ONLY", len(early_advisory))
+        except Exception:
+            pass
+
     coin_digest = []
     for c in coins[:12]:
         if not isinstance(c, dict):
@@ -31330,6 +31400,7 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
             "futures_score_adjustment": nf(_fut.get("futuresScoreAdjustment")),
             "futures_signal_quality": _fut.get("futuresSignalQuality") or "",
             "futures_reasons": _fut.get("futuresReasons") or [],
+            "short_term_spot_observation": early_by_sym.get(_sym),
         })
 
     pair_digest = []
@@ -31358,6 +31429,8 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
         "binance_futures_source": "public_usdm_no_api_key",
         "binance_futures_cached": bool(binance_bundle.get("cached")) if isinstance(binance_bundle, dict) else False,
         "binance_futures_stale": bool(binance_bundle.get("stale")) if isinstance(binance_bundle, dict) else False,
+        "short_term_spot_observations": early_advisory,
+        "short_term_spot_mode": "advisory_only_no_trade_score_or_vault_changes",
     }
 
 
@@ -31713,6 +31786,11 @@ NARRATIVE INTELLIGENCE RULES:
 
 INTERNAL DIGEST:
 {json.dumps(strategist_digest, ensure_ascii=False)}
+
+FRESH SHORT-TERM SPOT CONTEXT (when present in digest):
+- Interpret the 1m/5m/15m closed-candle observations as supporting evidence in the Strategist explanation, including direction, volume confirmation, and conflicts with 24h data.
+- Only use fresh observations actually present. Do not invent missing readings or claim Binance CEX liquidity proves DEX execution.
+- These are observational/advisory inputs only, not a changed score, automatic trading permission, order or on-chain verification.
 
 STRATEGIST MEMORY V2:
 {json.dumps(strategist_memory_v2, ensure_ascii=False)}
@@ -38549,6 +38627,8 @@ def api_nexus_system_info_signal_data_quality():
             "samples": early_sample,
         },
         "signalPipeline": [
+            pipeline_stage("Frühsignale → Strategist-Analyse", "STRATEGIST_CONTEXT",
+                           "Nur bei einer tatsächlichen Strategist-Analyse nachgewiesen; Frühdaten sind beratend, ohne Einfluss auf Live-Trades."),
             pipeline_stage("Market → Strategist", "MARKET_STRATEGIST",
                            "Anreicherung im Worker beobachtbar; kein Nachweis eines ausgeführten Trades."),
             pipeline_stage("Strategist → NKR", "STRATEGIST_NKR",
@@ -48747,7 +48827,7 @@ def _nexus_signal_audit_shared_read():
                        "signalFields": json.loads(x["signal_fields_json"] or "[]"),
                        "rows": int(x["candidate_rows"])} for x in rows]
             latest = {}
-            for stage in ("MARKET_STRATEGIST", "STRATEGIST_NKR", "STRATEGIST_TRADER"):
+            for stage in ("MARKET_STRATEGIST", "STRATEGIST_NKR", "STRATEGIST_TRADER", "STRATEGIST_CONTEXT"):
                 row = conn.execute(
                     "SELECT observed_ts,stage,symbol,decision,signal_count,signal_fields_json,candidate_rows "
                     "FROM nexus_signal_observations WHERE stage=? ORDER BY observed_ts DESC LIMIT 1", (stage,)
@@ -48811,6 +48891,12 @@ def _nexus_observability_bootstrap():
                 )""")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_api_activity_bucket_ts '
                              'ON nexus_api_activity_buckets(bucket_ts DESC)')
+                conn.execute("""CREATE TABLE IF NOT EXISTS nexus_binance_400_issues (
+                    bucket_ts INTEGER NOT NULL, provider TEXT NOT NULL,
+                    endpoint TEXT NOT NULL, binance_code INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL, last_ts INTEGER NOT NULL,
+                    PRIMARY KEY(bucket_ts,provider,endpoint,binance_code)
+                )""")
                 conn.commit()
                 _NEXUS_SIGNAL_AUDIT_DB_READY = True
                 _NEXUS_OBSERVABILITY_BOOT_ERROR = ''
@@ -48850,16 +48936,43 @@ def _nexus_observability_health():
                 'errorType': type(exc).__name__, 'note': 'Shared signal schema cannot be read.'}
 
 
+
+def _nexus_binance_error_class(response) -> tuple[str, int]:
+    """Sanitized error classification. No request parameters, secrets or response text."""
+    url = str(getattr(response, "url", "") or "").split("?", 1)[0]
+    classes = (
+        ("/api/v3/ticker/price", "spot_price"),
+        ("/api/v3/ticker/24hr", "spot_24h"),
+        ("/api/v3/klines", "spot_klines"),
+        ("/fapi/v1/premiumIndex", "futures_premium"),
+        ("/fapi/v1/openInterest", "futures_open_interest"),
+        ("/futures/data/globalLongShortAccountRatio", "futures_long_short"),
+    )
+    endpoint = next((v for path, v in classes if url.endswith(path)), "other")
+    try:
+        raw = response.json()
+        code = int(raw.get("code") or 0) if isinstance(raw, dict) else 0
+        code = code if -99999 <= code <= 99999 else 0
+    except Exception:
+        code = 0
+    return endpoint, code
+
 def _nexus_api_activity_flush(batch):
     """Async aggregation in shared SQLite DB, no urls, tokens, wallets or payloads."""
     if not batch:
         return
     merged = {}
+    issue_counts = {}
     for e in batch:
         ts = int(e.get('ts') or 0)
         key = ((ts // 300) * 300, e['provider'], e['outcome'])
         item = merged.setdefault(key, [0, 0, 0])
         item[0] += 1
+        if e.get("endpoint") and int(e.get("http") or 0) == 400:
+            issue_key = ((ts // 300) * 300, e["provider"], e["endpoint"], int(e.get("binanceCode") or 0))
+            issue = issue_counts.setdefault(issue_key, [0, 0])
+            issue[0] += 1
+            issue[1] = max(issue[1], ts)
         if ts >= item[1]:
             item[1] = ts
             item[2] = int(e.get('http') or 0)
@@ -48876,6 +48989,15 @@ def _nexus_api_activity_flush(batch):
                              'THEN excluded.last_http_code ELSE last_http_code END',
                              (bucket, provider, outcome, cnt, latest, http))
             conn.execute('DELETE FROM nexus_api_activity_buckets WHERE bucket_ts < ?',
+                         (int(time.time()) - 3 * 86400,))
+            for (bucket, provider, endpoint, code), (count, last_ts) in issue_counts.items():
+                conn.execute('INSERT INTO nexus_binance_400_issues '
+                             '(bucket_ts,provider,endpoint,binance_code,request_count,last_ts) '
+                             'VALUES (?,?,?,?,?,?) ON CONFLICT(bucket_ts,provider,endpoint,binance_code) '
+                             'DO UPDATE SET request_count=request_count+excluded.request_count, '
+                             'last_ts=MAX(last_ts,excluded.last_ts)',
+                             (bucket, provider, endpoint, code, count, last_ts))
+            conn.execute('DELETE FROM nexus_binance_400_issues WHERE bucket_ts < ?',
                          (int(time.time()) - 3 * 86400,))
             conn.commit()
     finally:
@@ -48907,7 +49029,7 @@ def _nexus_api_activity_writer():
                 _NEXUS_API_ACTIVITY_QUEUE.task_done()
 
 
-def _nexus_api_activity_record(provider, outcome, http=0):
+def _nexus_api_activity_record(provider, outcome, http=0, endpoint="", binance_code=0):
     """Non-blocking, best-effort provider HTTP outcome, no secrets ever stored."""
     global _NEXUS_API_ACTIVITY_THREAD, _NEXUS_API_ACTIVITY_LOST_LOCAL
     if provider not in _NEXUS_API_ACTIVITY_PROVIDERS or outcome not in _NEXUS_API_ACTIVITY_OUTCOMES:
@@ -48915,7 +49037,8 @@ def _nexus_api_activity_record(provider, outcome, http=0):
     try:
         _NEXUS_API_ACTIVITY_QUEUE.put_nowait({
             'provider': provider, 'outcome': outcome,
-            'http': max(0, int(http or 0)), 'ts': int(time.time())})
+            'http': max(0, int(http or 0)), 'ts': int(time.time()),
+            'endpoint': str(endpoint or "")[:32], 'binanceCode': int(binance_code or 0)})
         with _NEXUS_API_ACTIVITY_LOCK:
             if _NEXUS_API_ACTIVITY_THREAD is None or not _NEXUS_API_ACTIVITY_THREAD.is_alive():
                 _NEXUS_API_ACTIVITY_THREAD = threading.Thread(
@@ -48938,7 +49061,15 @@ def _nexus_observed_http(provider, call):
     code = int(getattr(response, 'status_code', None) or getattr(response, 'status', 0) or 0)
     outcome = ('RATE_LIMIT' if code in (418, 429) else
                'HTTP_OK' if 200 <= code < 300 else 'HTTP_ERROR')
-    _nexus_api_activity_record(provider, outcome, code)
+    # Binance HTTP400 diagnostics are telemetry-only. No retries, order gates or
+    # market routing are changed; never store raw URLs, query or body contents.
+    endpoint, binance_code = ("", 0)
+    if code == 400 and provider in ("Binance Spot", "Binance Futures"):
+        try:
+            endpoint, binance_code = _nexus_binance_error_class(response)
+        except Exception:
+            pass
+    _nexus_api_activity_record(provider, outcome, code, endpoint, binance_code)
     return response
 
 
@@ -48985,8 +49116,17 @@ def _nexus_api_activity_snapshot():
                 if item['outcome'] != 'HTTP_OK' and 'lastErrorOutcome' not in p:
                     p['lastErrorOutcome'] = str(item['outcome'] or '')
                     p['lastErrorHttpStatus'] = code or None
+            issue_rows = conn.execute('SELECT provider,endpoint,binance_code, '
+                                      'SUM(request_count) AS n,MAX(last_ts) AS latest '
+                                      'FROM nexus_binance_400_issues WHERE bucket_ts>=? '
+                                      'GROUP BY provider,endpoint,binance_code '
+                                      'ORDER BY n DESC LIMIT 15', (since,)).fetchall()
+            binance_issues = [{'provider': x['provider'], 'endpoint': x['endpoint'],
+                               'binanceCode': int(x['binance_code']), 'count': int(x['n']),
+                               'lastSeenTs': int(x['latest'])} for x in issue_rows]
             total = sum(p['attempts'] for p in providers.values())
             return {'state': 'OBSERVED' if total else 'READY_EMPTY',
+                    'binance400': binance_issues,
                     'scope': 'shared_db_all_workers', 'windowHours': 24,
                     'attempts': total, 'providers': list(providers.values()),
                     'limitations': 'Only instrumented upstream HTTP paths. HTTP 2xx does not verify payload content; writes are asynchronous and best-effort.'}
