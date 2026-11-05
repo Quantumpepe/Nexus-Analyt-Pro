@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-527-STRATEGIST-FIXES-GLOBAL-OBSERVABILITY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD566-STRATEGIST-FIXES-GLOBAL-OBSERVABILITY"
+BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-528-STRATEGIST-EARLY-OBSERVATION";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD567-STRATEGIST-EARLY-OBSERVATION"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5426,6 +5426,201 @@ def _binance_public_intelligence(symbols: list[str], force: bool = False,
     return payload
 
 
+# ENGINE-528: early Strategist observations from closed Binance Spot 1m candles.
+# This is market intelligence inside the existing Strategist path, NOT a new worker,
+# Shadow mode, trade gate or autonomous order trigger. In particular these metrics
+# are intentionally not mapped to momentum_1m/5m/15m or relative_volume yet.
+_NEXUS_EARLY_LOCK = threading.RLock()
+_NEXUS_EARLY_CACHE = {}  # one process, keyed by spot pair
+_NEXUS_EARLY_REQUESTS = []  # bounded upstream requests during trailing 60s
+_NEXUS_EARLY_CURSOR = 0
+_NEXUS_EARLY_INFLIGHT = set()  # at most two nonblocking background HTTP lookups
+NEXUS_EARLY_ENABLED = str(os.getenv("NEXUS_STRATEGIST_EARLY_ENABLED", "1")).lower() not in {"0", "no", "false"}
+NEXUS_EARLY_TTL_SEC = max(60, int(os.getenv("NEXUS_STRATEGIST_EARLY_TTL_SEC", "90")))
+NEXUS_EARLY_MAX_REQUESTS_MIN = max(1, min(40, int(os.getenv("NEXUS_STRATEGIST_EARLY_MAX_REQUESTS_MIN", "20"))))
+NEXUS_EARLY_SYMBOLS_PER_CYCLE = max(1, min(6, int(os.getenv("NEXUS_STRATEGIST_EARLY_SYMBOLS_PER_CYCLE", "4"))))
+
+
+def _nexus_early_from_closed_klines(klines, now_ms=None):
+    """Compute percent moves, true temporal 5m RVOL, and taker-buy share.
+
+    The Binance Spot /api/v3/klines response uses 1m *closed* candle OHLC,
+    quote asset volume (index 7), taker-buy quote volume (index 10). A partial
+    current candle cannot be compared fairly with a completed historical bar.
+    """
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    closed = []
+    if not isinstance(klines, list):
+        return {"available": False, "reason": "invalid_candle_payload"}
+    for item in klines:
+        if not isinstance(item, (list, tuple)) or len(item) < 11:
+            return {"available": False, "reason": "invalid_candle_shape"}
+        try:
+            opened = int(item[0])
+            ended = int(item[6])
+            close = float(item[4])
+            quote = float(item[7])
+            taker = float(item[10])
+        except (ValueError, TypeError, OverflowError):
+            return {"available": False, "reason": "invalid_candle_value"}
+        if (opened < 10**12 or ended < opened or ended - opened > 60_000
+                or not all(math.isfinite(x) for x in (close, quote, taker))
+                or close <= 0 or quote < 0 or taker < 0 or taker > quote * 1.001):
+            return {"available": False, "reason": "untrusted_candle"}
+        if ended < now_ms:  # exclude still-open current minute
+            closed.append((opened, ended, close, quote, min(taker, quote)))
+    if len(closed) < 45:
+        return {"available": False, "reason": "insufficient_closed_candles", "closedCandles": len(closed)}
+    recent = closed[-45:]
+    if any(recent[i][0] - recent[i-1][0] != 60_000 for i in range(1, len(recent))):
+        return {"available": False, "reason": "candle_gaps"}
+    last = recent[-1]
+    age_sec = max(0, (now_ms - last[1]) / 1000.0)
+    if age_sec > 150:
+        return {"available": False, "reason": "stale_closed_candles", "ageSec": int(age_sec)}
+
+    def pct_back(n):
+        base = recent[-n-1][2]
+        return round(100.0 * (last[2] / base - 1.0), 4) if base > 0 else None
+
+    current_vol = sum(c[3] for c in recent[-5:])
+    prior = recent[:-5]  # 40 candles = 8 previous non-overlapping 5m groups
+    baseline = [sum(x[3] for x in prior[i:i+5]) for i in range(0, 40, 5)]
+    baseline_mean = sum(baseline) / 8.0
+    rvol = round(current_vol / baseline_mean, 4) if baseline_mean > 0 else None
+    taker = sum(c[4] for c in recent[-5:])
+    share = round(100.0 * taker / current_vol, 2) if current_vol > 0 else None
+    m1, m5, m15 = pct_back(1), pct_back(5), pct_back(15)
+    return {
+        "available": True, "source": "binance_spot_closed_1m_klines",
+        "mode": "observation_only", "closedCandles": len(recent),
+        "lastClosedTs": int(last[1] // 1000), "ageSec": int(age_sec),
+        "priceClosed": round(last[2], 10),
+        "momentum1mPct": m1, "momentum5mPct": m5, "momentum15mPct": m15,
+        "rvol5m": rvol, "takerBuyShare5mPct": share,
+        "quoteVolume5m": round(current_vol, 2),
+        "note": "Spot-Daten, keine garantierte DEX-Ausfuehrung oder Handelsprognose",
+    }
+
+
+def _nexus_strategist_early_pair(pair: str) -> dict:
+    """Bounded, cached, read-only observation; no live trading mutation."""
+    p = str(pair or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{4,24}", p):
+        return {"available": False, "reason": "invalid_pair"}
+    now = time.time()
+    with _NEXUS_EARLY_LOCK:
+        saved = _NEXUS_EARLY_CACHE.get(p)
+        if saved and now - saved[0] < NEXUS_EARLY_TTL_SEC:
+            return dict(saved[1])
+        # Prune a small per-process request budget to protect APIs with many wallets.
+        _NEXUS_EARLY_REQUESTS[:] = [t for t in _NEXUS_EARLY_REQUESTS if now - t < 60]
+        if len(_NEXUS_EARLY_REQUESTS) >= NEXUS_EARLY_MAX_REQUESTS_MIN:
+            return {"available": False, "reason": "provider_budget", "mode": "observation_only"}
+        _NEXUS_EARLY_REQUESTS.append(now)
+        # Reserve the pair while requesting, so simultaneous ticks do not duplicate.
+        _NEXUS_EARLY_CACHE[p] = (now, {"available": False, "reason": "pending", "mode": "observation_only"})
+    result = {"available": False, "reason": "provider_unavailable", "mode": "observation_only"}
+    try:
+        url = BINANCE_BASE.rstrip("/") + "/api/v3/klines"
+        response = _nexus_observed_http("Binance Spot", lambda: requests.get(
+            url, params={"symbol": p, "interval": "1m", "limit": 60},
+            timeout=4))
+        if response.status_code == 200:
+            result = _nexus_early_from_closed_klines(response.json())
+        else:
+            result = {"available": False, "reason": "http_" + str(response.status_code), "mode": "observation_only"}
+    except Exception as exc:
+        result = {"available": False, "reason": "provider_error_" + type(exc).__name__, "mode": "observation_only"}
+    result["pair"] = p
+    result["sampledAtTs"] = int(time.time())
+    with _NEXUS_EARLY_LOCK:
+        _NEXUS_EARLY_CACHE[p] = (time.time(), dict(result))
+        if len(_NEXUS_EARLY_CACHE) > 300:
+            for key, _ in sorted(_NEXUS_EARLY_CACHE.items(), key=lambda kv: kv[1][0])[:70]:
+                _NEXUS_EARLY_CACHE.pop(key, None)
+    if result.get("available"):
+        try:
+            # Shared signal-audit write happens on the background thread only.
+            _nexus_signal_audit_record("STRATEGIST_EARLY", p, {
+                "momentum_1m": result.get("momentum1mPct"),
+                "momentum_5m": result.get("momentum5mPct"),
+                "momentum_15m": result.get("momentum15mPct"),
+                "relative_volume": result.get("rvol5m"),
+            }, "OBSERVED_ONLY")
+        except Exception:
+            pass
+    return dict(result)
+
+
+def _nexus_early_nonblocking_pair(pair: str) -> dict:
+    """Never wait for a Binance request on an NKR/Trader live execution tick."""
+    p = str(pair or "").strip().upper()
+    now = time.time()
+    with _NEXUS_EARLY_LOCK:
+        saved = _NEXUS_EARLY_CACHE.get(p)
+        if saved and now - saved[0] < NEXUS_EARLY_TTL_SEC:
+            return dict(saved[1])
+        if p in _NEXUS_EARLY_INFLIGHT:
+            return {"available": False, "reason": "pending", "mode": "observation_only"}
+        if len(_NEXUS_EARLY_INFLIGHT) >= 2:
+            return {"available": False, "reason": "async_capacity", "mode": "observation_only"}
+        _NEXUS_EARLY_REQUESTS[:] = [t for t in _NEXUS_EARLY_REQUESTS if now - t < 60]
+        if len(_NEXUS_EARLY_REQUESTS) >= NEXUS_EARLY_MAX_REQUESTS_MIN:
+            return {"available": False, "reason": "provider_budget", "mode": "observation_only"}
+        _NEXUS_EARLY_INFLIGHT.add(p)
+    def fetch():
+        try:
+            _nexus_strategist_early_pair(p)
+        finally:
+            with _NEXUS_EARLY_LOCK:
+                _NEXUS_EARLY_INFLIGHT.discard(p)
+    try:
+        threading.Thread(target=fetch, name="nexus-strategist-early", daemon=True).start()
+    except Exception:
+        with _NEXUS_EARLY_LOCK:
+            _NEXUS_EARLY_INFLIGHT.discard(p)
+        return {"available": False, "reason": "thread_unavailable", "mode": "observation_only"}
+    return {"available": False, "reason": "pending", "mode": "observation_only"}
+
+
+def _nexus_enrich_early_observations(rows: list[dict]) -> list[dict]:
+    """Sample candidate coins, rotating over the full watchlist across cycles.
+
+    Strictly after the existing _nkr_prepare_strategist_signals scoring step.
+    Changes no inputs, thresholds, live trade quality, trading guards or routes.
+    """
+    global _NEXUS_EARLY_CURSOR
+    if not NEXUS_EARLY_ENABLED or not isinstance(rows, list) or not rows:
+        return rows
+    eligible = [(i, r) for i, r in enumerate(rows) if isinstance(r, dict)
+                and str(r.get("marketDataSource") or "").lower() == "binance_24h"
+                and str(r.get("marketDataPair") or "").upper().endswith(("USDT", "BUSD", "USD"))]
+    if not eligible:
+        return rows
+    # Two most active candidates + rotating slots so long watchlists remain eligible.
+    ordered = sorted(eligible, key=lambda it: (
+        float(_safe_float(it[1].get("strategist_live_quality"), 0)),
+        float(_safe_float(it[1].get("volume24h"), 0))), reverse=True)
+    primary = ordered[: min(2, NEXUS_EARLY_SYMBOLS_PER_CYCLE)]
+    remaining = ordered[len(primary):]
+    picks = list(primary)
+    capacity = NEXUS_EARLY_SYMBOLS_PER_CYCLE - len(picks)
+    if capacity and remaining:
+        with _NEXUS_EARLY_LOCK:
+            start = _NEXUS_EARLY_CURSOR % len(remaining)
+            _NEXUS_EARLY_CURSOR += capacity
+        picks.extend(remaining[(start+j) % len(remaining)] for j in range(min(capacity, len(remaining))))
+    out = list(rows)
+    for i, row in picks:
+        pair = str(row.get("marketDataPair") or "").upper()
+        observation = _nexus_early_nonblocking_pair(pair)
+        amended = dict(row)
+        amended["strategistEarlyObservation"] = observation
+        out[i] = amended
+    return out
+
+
 def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
     if not isinstance(rows, list) or not rows:
         return rows if isinstance(rows, list) else []
@@ -5461,8 +5656,10 @@ def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
                 if "systemScore" in row:
                     row["systemScore"] = round(strategist_score, 4)
         out.append(row)
-    # Attach RVOL / relative-strength / on-chain quality signals (0-impact when absent).
-    return _nkr_prepare_strategist_signals(out)
+    # Do existing live scoring FIRST. Early 1/5/15m observations are strictly
+    # appended afterwards and do not change NKR/Trader entry decisions.
+    scored = _nkr_prepare_strategist_signals(out)
+    return _nexus_enrich_early_observations(scored)
 
 
 @app.get("/api/nexus/binance-public/status")
@@ -38205,6 +38402,14 @@ def api_nexus_system_info_signal_data_quality():
     # independent of the older environment toggle. Keep this fact visible.
     # A provider outage can block NEW entries; existing exits are not changed.
 
+    # ENGINE-528: local read-only candle observations; no new API traffic on audit GET.
+    with _NEXUS_EARLY_LOCK:
+        early_cache_rows = [(pair, ts, dict(obj)) for pair, (ts, obj) in _NEXUS_EARLY_CACHE.items()]
+        early_req_used = sum(1 for x in _NEXUS_EARLY_REQUESTS if now - x < 60)
+    early_recent = sorted(early_cache_rows, key=lambda x: x[1], reverse=True)[:25]
+    early_sample = [{**obj, "pair": pair, "cacheAgeSec": int(max(0, now-ts))}
+                    for pair, ts, obj in early_recent]
+
     # Bounded, read-only recent signal FUNCTION observations in this worker.
     try:
         with _NEXUS_SIGNAL_AUDIT_LOCK:
@@ -38236,6 +38441,15 @@ def api_nexus_system_info_signal_data_quality():
         "apiActivity": _nexus_api_activity_snapshot(),
         "sources": sources, "priceSummary": {"observed": len(prices), **counts},
         "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
+        "strategistEarly": {
+            "enabled": NEXUS_EARLY_ENABLED, "mode": "observation_only",
+            "source": "Binance Spot closed 1m candles", "localCacheOnly": True,
+            "ttlSec": NEXUS_EARLY_TTL_SEC, "perCycleMax": NEXUS_EARLY_SYMBOLS_PER_CYCLE,
+            "requestsLast60s": early_req_used, "requestsBudgetPer60s": NEXUS_EARLY_MAX_REQUESTS_MIN,
+            "cachedPairs": len(early_cache_rows),
+            "availableRecent": sum(1 for x in early_sample if x.get("available") and x.get("cacheAgeSec", 9999) < NEXUS_EARLY_TTL_SEC),
+            "samples": early_sample,
+        },
         "signalPipeline": [
             pipeline_stage("Market → Strategist", "MARKET_STRATEGIST",
                            "Anreicherung im Worker beobachtbar; kein Nachweis eines ausgeführten Trades."),
@@ -41102,6 +41316,7 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
                 row["change24h"] = _safe_float(change, 0.0)
                 row["volume24h"] = _safe_float(volume, 0.0)
                 row["marketDataSource"] = str(px.get("source") or "")
+                row["marketDataPair"] = str(px.get("pair") or "") if str(px.get("source") or "") == "binance_24h" else ""
                 row["marketDataUpdatedAt"] = int(px.get("updatedAt") or int(time.time() * 1000))
         except Exception:
             pass
