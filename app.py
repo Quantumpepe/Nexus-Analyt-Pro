@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-528-STRATEGIST-EARLY-OBSERVATION";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD567-STRATEGIST-EARLY-OBSERVATION"
+BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-529-STRATEGIST-EARLY-SPOT-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD568-STRATEGIST-EARLY-SPOT-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5439,6 +5439,13 @@ NEXUS_EARLY_ENABLED = str(os.getenv("NEXUS_STRATEGIST_EARLY_ENABLED", "1")).lowe
 NEXUS_EARLY_TTL_SEC = max(60, int(os.getenv("NEXUS_STRATEGIST_EARLY_TTL_SEC", "90")))
 NEXUS_EARLY_MAX_REQUESTS_MIN = max(1, min(40, int(os.getenv("NEXUS_STRATEGIST_EARLY_MAX_REQUESTS_MIN", "20"))))
 NEXUS_EARLY_SYMBOLS_PER_CYCLE = max(1, min(6, int(os.getenv("NEXUS_STRATEGIST_EARLY_SYMBOLS_PER_CYCLE", "4"))))
+# ENGINE-529: public market-data-only Binance endpoint (not a trading API).
+# Never change the established live execution/price route BINANCE_BASE.
+NEXUS_EARLY_SPOT_BASE = str(os.getenv("NEXUS_STRATEGIST_EARLY_SPOT_BASE", "https://data-api.binance.vision")).strip().rstrip("/")
+_NEXUS_EARLY_COOLDOWN_UNTIL = 0.0
+_NEXUS_EARLY_REFERENCE_PAIRS = ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "LINKUSDT", "POLUSDT")
+_NEXUS_EARLY_REFERENCE_NEXT_TS = 0.0
+_NEXUS_EARLY_REFERENCE_CURSOR = 0
 
 
 def _nexus_early_from_closed_klines(klines, now_ms=None):
@@ -5505,6 +5512,7 @@ def _nexus_early_from_closed_klines(klines, now_ms=None):
 
 def _nexus_strategist_early_pair(pair: str) -> dict:
     """Bounded, cached, read-only observation; no live trading mutation."""
+    global _NEXUS_EARLY_COOLDOWN_UNTIL
     p = str(pair or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9]{4,24}", p):
         return {"available": False, "reason": "invalid_pair"}
@@ -5513,6 +5521,8 @@ def _nexus_strategist_early_pair(pair: str) -> dict:
         saved = _NEXUS_EARLY_CACHE.get(p)
         if saved and now - saved[0] < NEXUS_EARLY_TTL_SEC:
             return dict(saved[1])
+        if now < _NEXUS_EARLY_COOLDOWN_UNTIL:
+            return {"available": False, "reason": "provider_cooldown", "retryAfterSec": int(_NEXUS_EARLY_COOLDOWN_UNTIL-now), "mode": "observation_only"}
         # Prune a small per-process request budget to protect APIs with many wallets.
         _NEXUS_EARLY_REQUESTS[:] = [t for t in _NEXUS_EARLY_REQUESTS if now - t < 60]
         if len(_NEXUS_EARLY_REQUESTS) >= NEXUS_EARLY_MAX_REQUESTS_MIN:
@@ -5522,14 +5532,20 @@ def _nexus_strategist_early_pair(pair: str) -> dict:
         _NEXUS_EARLY_CACHE[p] = (now, {"available": False, "reason": "pending", "mode": "observation_only"})
     result = {"available": False, "reason": "provider_unavailable", "mode": "observation_only"}
     try:
-        url = BINANCE_BASE.rstrip("/") + "/api/v3/klines"
+        url = NEXUS_EARLY_SPOT_BASE + "/api/v3/klines"
         response = _nexus_observed_http("Binance Spot", lambda: requests.get(
             url, params={"symbol": p, "interval": "1m", "limit": 60},
-            timeout=4))
+            headers={"Accept": "application/json"}, timeout=4))
         if response.status_code == 200:
             result = _nexus_early_from_closed_klines(response.json())
         else:
-            result = {"available": False, "reason": "http_" + str(response.status_code), "mode": "observation_only"}
+            code = int(response.status_code)
+            result = {"available": False, "reason": "http_" + str(code), "httpStatus": code, "mode": "observation_only"}
+            # Respect explicit access-denied and rate-limit responses; never proxy
+            # around geographic restrictions or hammer the provider.
+            if code in (403, 418, 429, 451):
+                with _NEXUS_EARLY_LOCK:
+                    _NEXUS_EARLY_COOLDOWN_UNTIL = max(_NEXUS_EARLY_COOLDOWN_UNTIL, time.time() + (600 if code in (403, 451) else 120))
     except Exception as exc:
         result = {"available": False, "reason": "provider_error_" + type(exc).__name__, "mode": "observation_only"}
     result["pair"] = p
@@ -5539,6 +5555,9 @@ def _nexus_strategist_early_pair(pair: str) -> dict:
         if len(_NEXUS_EARLY_CACHE) > 300:
             for key, _ in sorted(_NEXUS_EARLY_CACHE.items(), key=lambda kv: kv[1][0])[:70]:
                 _NEXUS_EARLY_CACHE.pop(key, None)
+    # Shared, owner-only diagnostic: a different Gunicorn worker can serve System Info.
+    # Failed samples are saved too, so HTTP 4xx/5xx and provider gaps remain visible.
+    _nexus_early_shared_store(p, result)
     if result.get("available"):
         try:
             # Shared signal-audit write happens on the background thread only.
@@ -5561,6 +5580,8 @@ def _nexus_early_nonblocking_pair(pair: str) -> dict:
         saved = _NEXUS_EARLY_CACHE.get(p)
         if saved and now - saved[0] < NEXUS_EARLY_TTL_SEC:
             return dict(saved[1])
+        if now < _NEXUS_EARLY_COOLDOWN_UNTIL:
+            return {"available": False, "reason": "provider_cooldown", "retryAfterSec": int(_NEXUS_EARLY_COOLDOWN_UNTIL-now), "mode": "observation_only"}
         if p in _NEXUS_EARLY_INFLIGHT:
             return {"available": False, "reason": "pending", "mode": "observation_only"}
         if len(_NEXUS_EARLY_INFLIGHT) >= 2:
@@ -5584,6 +5605,69 @@ def _nexus_early_nonblocking_pair(pair: str) -> dict:
     return {"available": False, "reason": "pending", "mode": "observation_only"}
 
 
+def _nexus_early_reference_tick() -> None:
+    """Cheap independent market observation on the EXISTING 15s worker loop.
+
+    No active session, watchlist or user wallet is required. Does not touch the
+    NKR/Trader decision path: merely schedules 1-2 read-only HTTP threads.
+    """
+    global _NEXUS_EARLY_REFERENCE_CURSOR, _NEXUS_EARLY_REFERENCE_NEXT_TS
+    if not NEXUS_EARLY_ENABLED:
+        return
+    now = time.time()
+    with _NEXUS_EARLY_LOCK:
+        if now < _NEXUS_EARLY_REFERENCE_NEXT_TS:
+            return
+        _NEXUS_EARLY_REFERENCE_NEXT_TS = now + 15
+        count = min(2, len(_NEXUS_EARLY_REFERENCE_PAIRS))
+        pairs = [_NEXUS_EARLY_REFERENCE_PAIRS[(_NEXUS_EARLY_REFERENCE_CURSOR + i) % len(_NEXUS_EARLY_REFERENCE_PAIRS)] for i in range(count)]
+        _NEXUS_EARLY_REFERENCE_CURSOR += count
+    for pair in pairs:
+        _nexus_early_nonblocking_pair(pair)
+
+
+def _nexus_early_shared_store(pair: str, payload: dict) -> None:
+    """Best-effort cross-worker diagnostics only; never alters a trading decision."""
+    if not re.fullmatch(r"[A-Z0-9]{4,24}", str(pair or "")) or not isinstance(payload, dict):
+        return
+    try:
+        conn = _db()
+        try:
+            with DB_WRITE_LOCK:
+                conn.execute("INSERT INTO nexus_strategist_early_samples(pair,payload_json,updated_ts) "
+                             "VALUES(?,?,?) ON CONFLICT(pair) DO UPDATE SET "
+                             "payload_json=excluded.payload_json,updated_ts=excluded.updated_ts",
+                             (pair, json.dumps(payload, ensure_ascii=True, separators=(",", ":")), int(time.time())))
+                conn.execute("DELETE FROM nexus_strategist_early_samples WHERE updated_ts < ?", (int(time.time())-3600,))
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Cannot break the read-only sampler or any trading operation.
+
+
+def _nexus_early_shared_recent(limit: int = 25):
+    """Read-only shared samples; None means shared table unavailable."""
+    try:
+        conn = _db()
+        try:
+            rows = conn.execute("SELECT pair,payload_json,updated_ts FROM nexus_strategist_early_samples "
+                                "ORDER BY updated_ts DESC LIMIT ?", (max(1, min(50, int(limit))),)).fetchall()
+            result = []
+            for r in rows:
+                try:
+                    obj = json.loads(r["payload_json"] or "{}")
+                    if isinstance(obj, dict):
+                        result.append({**obj, "pair": r["pair"], "cacheAgeSec": max(0, int(time.time())-int(r["updated_ts"]))})
+                except Exception:
+                    continue
+            return result
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 def _nexus_enrich_early_observations(rows: list[dict]) -> list[dict]:
     """Sample candidate coins, rotating over the full watchlist across cycles.
 
@@ -5593,9 +5677,12 @@ def _nexus_enrich_early_observations(rows: list[dict]) -> list[dict]:
     global _NEXUS_EARLY_CURSOR
     if not NEXUS_EARLY_ENABLED or not isinstance(rows, list) or not rows:
         return rows
+    # The early sampler must not require a successful 24h Binance ticker.
+    # CoinGecko-priced symbols are eligible too; an unsupported spot pair simply
+    # returns a diagnostic with no effect on the live-entry scoring vector.
     eligible = [(i, r) for i, r in enumerate(rows) if isinstance(r, dict)
-                and str(r.get("marketDataSource") or "").lower() == "binance_24h"
-                and str(r.get("marketDataPair") or "").upper().endswith(("USDT", "BUSD", "USD"))]
+                and re.fullmatch(r"[A-Z0-9]{2,16}", str(r.get("symbol") or "").upper())
+                and _safe_float(r.get("price"), 0) > 0]
     if not eligible:
         return rows
     # Two most active candidates + rotating slots so long watchlists remain eligible.
@@ -5613,7 +5700,11 @@ def _nexus_enrich_early_observations(rows: list[dict]) -> list[dict]:
         picks.extend(remaining[(start+j) % len(remaining)] for j in range(min(capacity, len(remaining))))
     out = list(rows)
     for i, row in picks:
-        pair = str(row.get("marketDataPair") or "").upper()
+        known_pair = str(row.get("marketDataPair") or "").upper()
+        if str(row.get("marketDataSource") or "").lower() == "binance_24h" and re.fullmatch(r"[A-Z0-9]{4,24}", known_pair):
+            pair = known_pair
+        else:
+            pair = str(row.get("symbol") or "").upper() + "USDT"
         observation = _nexus_early_nonblocking_pair(pair)
         amended = dict(row)
         amended["strategistEarlyObservation"] = observation
@@ -38409,6 +38500,10 @@ def api_nexus_system_info_signal_data_quality():
     early_recent = sorted(early_cache_rows, key=lambda x: x[1], reverse=True)[:25]
     early_sample = [{**obj, "pair": pair, "cacheAgeSec": int(max(0, now-ts))}
                     for pair, ts, obj in early_recent]
+    shared_early = _nexus_early_shared_recent(25)
+    early_shared_available = shared_early is not None
+    if early_shared_available:
+        early_sample = shared_early
 
     # Bounded, read-only recent signal FUNCTION observations in this worker.
     try:
@@ -38443,10 +38538,13 @@ def api_nexus_system_info_signal_data_quality():
         "prices": prices, "futuresCoverage": {"observed": len(future_rows), "available": len(future_ok)},
         "strategistEarly": {
             "enabled": NEXUS_EARLY_ENABLED, "mode": "observation_only",
-            "source": "Binance Spot closed 1m candles", "localCacheOnly": True,
+            "source": "Binance Spot market-data-only closed 1m candles",
+            "localCacheOnly": not early_shared_available,
+            "scope": "shared_db_all_workers" if early_shared_available else "local_cache_fallback",
             "ttlSec": NEXUS_EARLY_TTL_SEC, "perCycleMax": NEXUS_EARLY_SYMBOLS_PER_CYCLE,
             "requestsLast60s": early_req_used, "requestsBudgetPer60s": NEXUS_EARLY_MAX_REQUESTS_MIN,
-            "cachedPairs": len(early_cache_rows),
+            "providerCooldownSec": max(0, int(_NEXUS_EARLY_COOLDOWN_UNTIL - now)),
+            "cachedPairs": len(early_sample) if early_shared_available else len(early_cache_rows),
             "availableRecent": sum(1 for x in early_sample if x.get("available") and x.get("cacheAgeSec", 9999) < NEXUS_EARLY_TTL_SEC),
             "samples": early_sample,
         },
@@ -47442,6 +47540,12 @@ def _nkr_live_worker_loop() -> None:
         _NKR_LIVE_WORKER_LOOP_COUNT += 1
         try:
             _NKR_LIVE_WORKER_LAST_STAGE = "cycle_running"
+            # ENGINE-529: collect public spot observations even with zero live
+            # sessions. This is non-blocking and cannot submit trades.
+            try:
+                _nexus_early_reference_tick()
+            except Exception:
+                pass
             _live_engine_mark(
                 "NKR",
                 worker_heartbeat_ts=_NKR_LIVE_WORKER_LAST_HEARTBEAT,
@@ -48694,6 +48798,11 @@ def _nexus_observability_bootstrap():
                 )""")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_signal_observations_stage_ts '
                              'ON nexus_signal_observations(stage, observed_ts DESC)')
+                conn.execute("""CREATE TABLE IF NOT EXISTS nexus_strategist_early_samples (
+                    pair TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_ts INTEGER NOT NULL
+                )""")
                 conn.execute("""CREATE TABLE IF NOT EXISTS nexus_api_activity_buckets (
                     bucket_ts INTEGER NOT NULL, provider TEXT NOT NULL,
                     outcome TEXT NOT NULL, request_count INTEGER NOT NULL,
@@ -48843,6 +48952,9 @@ def _nexus_api_activity_snapshot():
             rows = conn.execute('SELECT provider,outcome,SUM(request_count) AS cnt, '
                                 'MAX(last_ts) AS last_ts FROM nexus_api_activity_buckets '
                                 'WHERE bucket_ts>=? GROUP BY provider,outcome', (since,)).fetchall()
+            detail_rows = conn.execute('SELECT provider,outcome,last_ts,last_http_code '
+                                       'FROM nexus_api_activity_buckets WHERE bucket_ts>=? '
+                                       'ORDER BY last_ts DESC, bucket_ts DESC', (since,)).fetchall()
             providers = {p: {'name': p, 'attempts': 0, 'httpOk': 0,
                              'errors': 0, 'rateLimits': 0, 'lastSeenTs': None}
                          for p in _NEXUS_API_ACTIVITY_PROVIDERS}
@@ -48860,6 +48972,19 @@ def _nexus_api_activity_snapshot():
                     p['rateLimits'] += n
                 ts = int(row['last_ts'] or 0)
                 p['lastSeenTs'] = max(p['lastSeenTs'] or 0, ts) or None
+            # The existing aggregated DB already stores last_http_code; expose it
+            # without writing requests, tokens, URL paths or provider responses.
+            for item in detail_rows:
+                p = providers.get(str(item['provider'] or ''))
+                if p is None:
+                    continue
+                code = int(item['last_http_code'] or 0)
+                if 'lastOutcome' not in p:
+                    p['lastOutcome'] = str(item['outcome'] or '')
+                    p['lastHttpStatus'] = code or None
+                if item['outcome'] != 'HTTP_OK' and 'lastErrorOutcome' not in p:
+                    p['lastErrorOutcome'] = str(item['outcome'] or '')
+                    p['lastErrorHttpStatus'] = code or None
             total = sum(p['attempts'] for p in providers.values())
             return {'state': 'OBSERVED' if total else 'READY_EMPTY',
                     'scope': 'shared_db_all_workers', 'windowHours': 24,
