@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.03-ENGINE-526-GLOBAL-OBSERVABILITY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.03-BUILD565-GLOBAL-OBSERVABILITY"
+BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-527-STRATEGIST-FIXES-GLOBAL-OBSERVABILITY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD566-STRATEGIST-FIXES-GLOBAL-OBSERVABILITY"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -19147,21 +19147,27 @@ def _nexus_shadow_slot_quality(item: dict, cfg: dict | None = None) -> dict:
     if confidence_missing and priority > 0 and risk < 48:
         confidence = min(82, max(45, priority + 12))
 
-    liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=70)
+    # Missing liquidity is neutral, not a positive +5 quality confirmation.
+    liquidity = _nexus_trading_signal_value(item, signals, "liquidity_score", "liquidityScore", default=50)
     rvol = _nexus_trading_signal_value(item, signals, "rvol", "relative_volume", default=1.0)
     slippage = _nexus_trading_signal_value(item, signals, "slippage_pct", "slippagePct", default=0)
     overextension = _nexus_trading_signal_value(item, signals, "overextension_pct", "overextension", default=0)
-    structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="INTACT").upper()
-    security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="OK").upper()
+    structure = _nexus_trading_text_value(item, signals, "market_structure", "marketStructure", "structure", default="UNKNOWN").upper()
+    security = _nexus_trading_text_value(item, signals, "security", "security_status", "securityStatus", default="UNKNOWN").upper()
 
     # ENGINE-027: real momentum input for Strategist.
     # Market color is only background. Short-term momentum/recovery can improve entry quality,
     # especially in RED/NEUTRAL markets. Missing momentum stays neutral.
+    # CoinGecko and Binance market-change fields already contain percentage points.
+    # A +0.5 percent move must stay +0.5, not become +50. A ratio may be sent
+    # only with an explicit momentum_unit marker; never infer units by magnitude.
+    momentum_unit = str(signals.get("momentum_unit") or signals.get("momentumUnit") or
+                        item.get("momentum_unit") or item.get("momentumUnit") or
+                        "percent").strip().lower()
     def _norm_momentum_pct(v):
-        x = _clamp_float(v, 0.0, -100.0, 100.0)
-        # Some payloads send fractions (0.012 = 1.2%). Convert small non-zero values.
-        if -1.0 <= x <= 1.0 and abs(x) > 0.0001:
-            x = x * 100.0
+        x = _clamp_float(v, 0.0)
+        if momentum_unit in ("fraction", "ratio", "decimal"):
+            x *= 100.0
         return _clamp_float(x, 0.0, -100.0, 100.0)
 
     m1 = _norm_momentum_pct(_nexus_trading_signal_value(item, signals, "momentum_1m", "momentum1m", "change_1m", "change1m", default=0))
@@ -41033,7 +41039,8 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
     rows = []
     skipped_non_live = 0
     seen = set()
-    for item in (items or [])[:60]:
+    # Scan every configured watchlist asset; per-source caches/batches protect API quotas.
+    for item in (items or []):
         chain_from_item = ""
         if isinstance(item, str):
             sym = item.strip().upper()
@@ -41109,20 +41116,10 @@ def _nkr_live_market_rows(wallet: str) -> list[dict]:
             except Exception:
                 pass
         rows.append(row)
+    # _binance_enrich_market_rows already prepares the canonical Strategist
+    # vector once. Do not prepare it a second time: repeated enrichment can
+    # duplicate traces and interfere with provenance of optional signals.
     enriched = _binance_enrich_market_rows(rows)
-    # ENGINE-348: the live Strategist must consume the same enriched signal contract
-    # on every chain. This adds deterministic score/rating, momentum, RVOL/volume
-    # confirmation, overextension and risk-quality fields before any entry decision.
-    # The function is defined later in the module but is available when worker ticks run.
-    try:
-        enriched = _nkr_prepare_strategist_signals(enriched or [])
-    except Exception as signal_exc:
-        # Market rows remain usable, but surface the loss of signal depth instead of
-        # silently pretending the Strategist received the complete signal set.
-        for r in (enriched or []):
-            if isinstance(r, dict):
-                r["strategistSignalError"] = str(signal_exc)[:240]
-                r["strategistSignalsComplete"] = False
     if isinstance(enriched, list) and skipped_non_live > 0:
         for r in enriched:
             if isinstance(r, dict):
@@ -43048,7 +43045,14 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
     The executor may try the next ranked candidate in the same tick when quote or
     preflight fails, but it stops after the first confirmed OPEN.
     """
-    prepared_rows = _nkr_prepare_strategist_signals(list(market_rows or []))
+    prepared_rows = list(market_rows or [])
+    # The main live-market path already enriched every market row. Preserve that
+    # exact vector; only enrich here for another caller providing raw rows.
+    if prepared_rows and not all(
+        isinstance(r, dict) and isinstance(r.get("signals"), dict)
+        and "strategist_live_quality" in r for r in prepared_rows
+    ):
+        prepared_rows = _nkr_prepare_strategist_signals(prepared_rows)
     row_by_symbol = {str(r.get("symbol") or r.get("sym") or "").upper(): r for r in prepared_rows if isinstance(r, dict)}
     alias_to_display = {
         "WBTC": "BTC", "CBBTC": "BTC", "BTCB": "BTC",
@@ -48262,6 +48266,7 @@ def _nkr_live_full_signal_vector(row: dict) -> dict:
         "momentum_24h": ("momentum_24h", "momentum24h", "change_24h", "change24h", "price_change_percentage_24h"),
         "momentum_7d": ("momentum_7d", "momentum7d", "change_7d", "change7d", "price_change_percentage_7d"),
         "momentum_score": ("momentum_score", "momentumScore"),
+        "momentum_unit": ("momentum_unit", "momentumUnit"),
         "recovery_momentum_score": ("recovery_momentum_score", "recoveryMomentumScore", "recovery_score", "recoveryScore"),
         "volume": ("volume", "volume24h", "volume_24h", "total_volume", "quoteVolume"),
         "relative_volume": ("relative_volume", "relativeVolume", "rvol", "rVol", "strategist_rvol"),
@@ -48708,7 +48713,7 @@ def _nkr_prepare_strategist_signals(rows: list) -> list:
     - Missing fields produce ZERO adjustment (behavior stays identical to before).
     - Only clear positive confirmation boosts; only clear negative confirmation penalizes.
     - Relative strength uses the batch median 24h change (watchlist-relative).
-    - RVOL is proxied as log-volume vs. batch median log-volume when true RVOL is absent.
+    - Only a supplied temporal RVOL may affect scoring; volume vs. peers is diagnostic.
     - All quality overlays are later hard-capped in _nkr_session_score (±6 total).
     """
     if not isinstance(rows, list) or not rows:
@@ -48755,21 +48760,29 @@ def _nkr_prepare_strategist_signals(rows: list) -> list:
         if med_change is not None and len(changes) >= 3:
             row["strategist_relative_strength_pct"] = round(ch - float(med_change), 4)
             row["strategist_batch_median_change_pct"] = round(float(med_change), 4)
-        # RVOL: explicit field wins; else log-volume vs median log-volume.
+        # True RVOL compares an asset's interval volume to its own past volume.
+        # Cross-coin 24h volumes are NOT RVOL. Never use the former proxy as
+        # momentum confirmation in NKR/Trader entry quality.
         explicit_rvol = None
-        for key in ("rvol", "relativeVolume", "relative_volume", "rVol", "strategist_rvol"):
+        for key in ("rvol", "relativeVolume", "relative_volume", "rVol"):
             if row.get(key) is not None:
-                explicit_rvol = _safe_float(row.get(key), 0.0)
-                break
-        if explicit_rvol is not None and explicit_rvol > 0:
+                candidate_rvol = _safe_float(row.get(key), 0.0)
+                if candidate_rvol > 0:
+                    explicit_rvol = candidate_rvol
+                    break
+        if explicit_rvol is not None:
             row["strategist_rvol"] = round(explicit_rvol, 4)
-        elif med_log_vol is not None and _safe_float(row.get("_strategist_vol"), 0.0) > 0:
-            try:
-                lv = math.log10(max(1.0, _safe_float(row.get("_strategist_vol"), 1.0)))
-                # 10^(delta_log) ≈ volume multiple vs median peer.
-                row["strategist_rvol"] = round(max(0.05, min(20.0, 10.0 ** (lv - float(med_log_vol)))), 4)
-            except Exception:
-                pass
+            row["strategist_rvol_source"] = "supplied_temporal_relative_volume"
+        else:
+            row.pop("strategist_rvol", None)  # drop stale cross-asset proxy
+            row.pop("strategist_rvol_source", None)
+            if med_log_vol is not None and _safe_float(row.get("_strategist_vol"), 0.0) > 0:
+                try:
+                    lv = math.log10(max(1.0, _safe_float(row.get("_strategist_vol"), 1.0)))
+                    row["strategist_volume_vs_peers"] = round(
+                        max(0.05, min(20.0, 10.0 ** (lv - float(med_log_vol)))), 4)
+                except Exception:
+                    pass
         # On-chain / rating delta (optional, already small in UI).
         for key in (
             "strategist_onchain_delta", "onchain_delta", "score_delta",
