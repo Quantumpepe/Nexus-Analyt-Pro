@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-530-STRATEGIST-ADVISORY-DIAGNOSTICS";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD569-STRATEGIST-ADVISORY-DIAGNOSTICS"
+BACKEND_BUILD_ID = "B-2026.11.05-ENGINE-531-STRATEGIST-SIGNAL-QUALITY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.05-BUILD570-STRATEGIST-SIGNAL-QUALITY"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5130,6 +5130,14 @@ _BINANCE_PUBLIC_PREVIOUS_OI: dict[str, tuple[float, float]] = {}
 _BINANCE_PUBLIC_LOCK = threading.RLock()
 _BINANCE_PUBLIC_INFLIGHT: dict[str, threading.Event] = {}
 _BINANCE_PUBLIC_COOLDOWN_UNTIL = 0.0
+# A -4108 observed on openInterest has no verified meaning here; limit repeat probes
+# for the affected symbol/endpoint, without disabling valid futures snapshots.
+_BINANCE_OI_NEGATIVE_UNTIL: dict[str, float] = {}
+_BINANCE_OI_NEGATIVE_TTL_SEC = 15 * 60
+
+
+class _BinanceOpenInterestUnavailable(RuntimeError):
+    pass
 
 
 def _binance_public_symbol(symbol: str) -> str:
@@ -5214,6 +5222,17 @@ def _binance_public_get(path: str, params: dict | None = None):
             pass
         _BINANCE_PUBLIC_COOLDOWN_UNTIL = time.time() + min(600, retry_after)
         raise RuntimeError(f"binance rate limited ({r.status_code})")
+    if path == "/fapi/v1/openInterest" and r.status_code == 400:
+        # Binance's -4108 is not documented as a generic invalid symbol;
+        # preserve the exact code and suppress repeated OI-only probes temporarily.
+        try:
+            err_body = r.json()
+            if isinstance(err_body, dict) and int(err_body.get("code") or 0) == -4108:
+                raise _BinanceOpenInterestUnavailable("binance_open_interest_-4108")
+        except _BinanceOpenInterestUnavailable:
+            raise
+        except Exception:
+            pass
     r.raise_for_status()
     return r.json(), {
         "usedWeight1m": r.headers.get("X-MBX-USED-WEIGHT-1M"),
@@ -5338,11 +5357,27 @@ def _binance_public_intelligence(symbols: list[str], force: bool = False,
             oi = None
             ls = None
             fetch_error = None
-            try:
-                oi, oi_meta = _binance_public_get("/fapi/v1/openInterest", {"symbol": pair})
-                max_weight = oi_meta.get("usedWeight1m") or max_weight
-            except Exception as e:
-                fetch_error = str(e)
+            oi_unavailable = False
+            with _BINANCE_PUBLIC_LOCK:
+                oi_backoff = _BINANCE_OI_NEGATIVE_UNTIL.get(pair, 0.0) > now
+            if oi_backoff:
+                oi_unavailable = True
+                fetch_error = "binance_open_interest_-4108_backoff"
+            else:
+                try:
+                    oi, oi_meta = _binance_public_get("/fapi/v1/openInterest", {"symbol": pair})
+                    max_weight = oi_meta.get("usedWeight1m") or max_weight
+                except _BinanceOpenInterestUnavailable:
+                    oi_unavailable = True
+                    fetch_error = "binance_open_interest_-4108"
+                    with _BINANCE_PUBLIC_LOCK:
+                        _BINANCE_OI_NEGATIVE_UNTIL[pair] = now + _BINANCE_OI_NEGATIVE_TTL_SEC
+                        if len(_BINANCE_OI_NEGATIVE_UNTIL) > 2000:
+                            for key in list(_BINANCE_OI_NEGATIVE_UNTIL):
+                                if _BINANCE_OI_NEGATIVE_UNTIL[key] <= now:
+                                    del _BINANCE_OI_NEGATIVE_UNTIL[key]
+                except Exception as e:
+                    fetch_error = str(e)
             try:
                 ls_rows, ls_meta = _binance_public_get(
                     "/futures/data/globalLongShortAccountRatio",
@@ -5358,6 +5393,8 @@ def _binance_public_intelligence(symbols: list[str], force: bool = False,
                 row = dict(cached_row[1])
                 row.update({
                     "cached": True, "stale": True, "staleReason": fetch_error,
+                    "openInterestAvailable": False if oi_unavailable or oi is None else bool(row.get("openInterestAvailable")),
+                    "openInterestIssue": ("-4108_backoff" if oi_backoff else "-4108") if oi_unavailable else row.get("openInterestIssue") or "not_verified",
                     "cacheTier": tier, "cacheTtlSec": ttl_sec, "batchIndex": batch_index,
                 })
                 result[sym] = row
@@ -5382,6 +5419,10 @@ def _binance_public_intelligence(symbols: list[str], force: bool = False,
                 "fundingRate": _safe_float(p.get("lastFundingRate"), 0.0),
                 "nextFundingTime": int(_safe_float(p.get("nextFundingTime"), 0.0)),
                 "openInterest": oi_value, "openInterestChangePct": round(oi_change_pct, 6),
+                # Raw values may be cached; these flags distinguish actually validated fields.
+                "openInterestAvailable": isinstance(oi, dict) and _safe_float(oi.get("openInterest"), 0.0) > 0,
+                "openInterestIssue": "-4108_backoff" if oi_backoff else "-4108" if oi_unavailable else "" if oi is not None else "unavailable",
+                "longShortAvailable": isinstance(ls, dict) and _safe_float(ls.get("longShortRatio"), 0.0) > 0,
                 "globalLongShortRatio": _safe_float((ls or {}).get("longShortRatio"), _safe_float(cached_data.get("globalLongShortRatio"), 0.0)),
                 "globalLongAccountPct": _safe_float((ls or {}).get("longAccount"), 0.0),
                 "globalShortAccountPct": _safe_float((ls or {}).get("shortAccount"), 0.0),
@@ -30576,6 +30617,12 @@ def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
     cleaned = _normalize_strategist_language_leaks(str(cleaned or ""), lang)
     cleaned = _strip_forbidden_strategist_sections(cleaned, intent, lang)
     cleaned = _limit_strategist_number_spam(cleaned, max_numeric_lines=8)
+    # The LLM sometimes lists one coin under both strongest and weakest.
+    # Replace only explicitly labelled ranking lines from comparable supplied data.
+    try:
+        cleaned = _nexus_strategist_rank_guard(cleaned, user_payload)
+    except Exception:
+        pass
     return cleaned.strip()
 
 
@@ -31393,9 +31440,11 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
             ),
             "binance_usdm_available": bool(_fut.get("available")),
             "funding_rate": nf(_fut.get("fundingRate")),
-            "open_interest": nf(_fut.get("openInterest")),
-            "open_interest_change_pct": nf(_fut.get("openInterestChangePct")),
-            "global_long_short_ratio": nf(_fut.get("globalLongShortRatio")),
+            "open_interest": nf(_fut.get("openInterest")) if _fut.get("openInterestAvailable") is True else None,
+            "open_interest_change_pct": nf(_fut.get("openInterestChangePct")) if _fut.get("openInterestAvailable") is True else None,
+            "open_interest_available": _fut.get("openInterestAvailable") is True,
+            "open_interest_issue": _fut.get("openInterestIssue") or ("not_verified" if _fut else "no_futures_data"),
+            "global_long_short_ratio": nf(_fut.get("globalLongShortRatio")) if _fut.get("longShortAvailable") is True else None,
             "mark_index_basis_pct": nf(_fut.get("basisPct")),
             "futures_score_adjustment": nf(_fut.get("futuresScoreAdjustment")),
             "futures_signal_quality": _fut.get("futuresSignalQuality") or "",
@@ -31431,8 +31480,80 @@ def _strategist_context_digest(extra_context: dict | None) -> dict:
         "binance_futures_stale": bool(binance_bundle.get("stale")) if isinstance(binance_bundle, dict) else False,
         "short_term_spot_observations": early_advisory,
         "short_term_spot_mode": "advisory_only_no_trade_score_or_vault_changes",
+        "ranking_evidence": _nexus_strategist_ranking_evidence({"coins": coin_digest}),
     }
 
+
+
+def _nexus_strategist_ranking_evidence(digest: dict) -> dict:
+    """Deterministic, disjoint leaderboard for manual explanation; never a trading score."""
+    rows = digest.get("coins") if isinstance(digest, dict) else None
+    rows = rows if isinstance(rows, list) else []
+    unique = {}
+    for coin in rows:
+        if not isinstance(coin, dict):
+            continue
+        symbol = str(coin.get("symbol") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,16}", symbol) or symbol in unique:
+            continue
+        unique[symbol] = coin
+    # Do not mix score and 24h return into a single invented ranking.
+    metric = "score" if sum(_strategist_num_safe(c.get("score")) is not None for c in unique.values()) >= 2 else "change_24h_pct"
+    ranked = []
+    for symbol, row in unique.items():
+        value = _strategist_num_safe(row.get(metric))
+        if value is not None:
+            ranked.append({"symbol": symbol, "value": round(value, 4), "metric": metric})
+    ranked.sort(key=lambda item: (-item["value"], item["symbol"]))
+    if len(ranked) < 2:
+        return {"available": False, "reason": "less_than_two_comparable_observations", "scope": "provided_coin_digest_only"}
+    per_side = min(3, len(ranked) // 2)
+    return {
+        "available": True,
+        "metric": metric,
+        "source": "provided_market_coin_digest",
+        "scope": "provided_coin_digest_only_not_all_watchlist_assets",
+        "strongest": ranked[:per_side],
+        "weakest": list(reversed(ranked[-per_side:])),
+        "observedSymbols": len(ranked),
+        "note": "Relative to analysed coins only; no execution recommendation. Weakest by same metric, not necessarily negative return.",
+    }
+
+
+def _strategist_num_safe(value):
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _nexus_strategist_rank_guard(answer: str, user_payload: dict) -> str:
+    """Repair only clearly labelled, contradictory strongest/weakest list lines."""
+    digest = user_payload.get("strategist_digest") if isinstance(user_payload, dict) else {}
+    evidence = digest.get("ranking_evidence") if isinstance(digest, dict) else None
+    if not isinstance(evidence, dict):
+        return str(answer or "")
+    lines = str(answer or "").splitlines()
+    strongest_indices = [i for i, line in enumerate(lines) if re.search(r"(?:st[aä]rkste(?:\s+coins?)?|strongest\s+coins?)\s*\*{0,2}\s*:", line, re.I)]
+    weakest_indices = [i for i, line in enumerate(lines) if re.search(r"(?:schw[aä]chste(?:\s+coins?)?|weakest\s+coins?)\s*\*{0,2}\s*:", line, re.I)]
+    if not strongest_indices or not weakest_indices:
+        return str(answer or "")
+    if not evidence.get("available"):
+        # For unsupported ranking, explicitly downgrade the visible claim.
+        for i in strongest_indices + weakest_indices:
+            lines[i] = re.sub(r":.*$", ": nicht ausreichend vergleichbare Messwerte / insufficient comparable data", lines[i], count=1)
+        return "\n".join(lines)
+    metric = evidence.get("metric")
+    def display(group):
+        return ", ".join(f"{x['symbol']} ({metric}={x['value']}{'%' if metric == 'change_24h_pct' else ''})" for x in evidence.get(group, []))
+    for i in strongest_indices:
+        lines[i] = re.sub(r":.*$", ": " + display("strongest") + " [vergleichbare Snapshot-Daten]", lines[i], count=1)
+    for i in weakest_indices:
+        lines[i] = re.sub(r":.*$", ": " + display("weakest") + " [vergleichbare Snapshot-Daten]", lines[i], count=1)
+    return "\n".join(lines)
 
 
 def _strategist_confidence_band(score: float | None, rvol: float | None, overextension: float | None) -> str:
@@ -31882,6 +32003,10 @@ Rules:
 29) For rotation / cheap-vs-expensive questions, answer with a clear conclusion first: "Rotation Vorteil vorhanden", "Kein sauberer Vorteil", or the equivalent in the user's language.
 30) When numbers exist, include the relevant percentage difference. If the only available difference is pair spread, say it is a pair/relative spread. If exchange_intelligence exists, say it is an exchange price difference.
 31) Never invent exchange names, exchange-specific prices, premiums, orderbook depth, or arbitrage edges.
+32) If the question asks for strongest/weakest coins, use ONLY strategist_digest.ranking_evidence. Its strongest and weakest sets are disjoint and use the SAME metric and time basis. If unavailable, do not invent a ranking. Do not call a coin both strongest and weakest in the same ranking.
+33) Source evidence is required: label every numerical claim with the observed metric, source or timeframe when present. No generic claim of full CoinGecko/Binance/on-chain coverage; a provider being configured does not mean it supplied data for the specific coin.
+34) Null or missing futures open_interest, open_interest_change_pct, or long/short ratio means NOT MEASURED, not zero. Funding and mark/index may remain valid despite an OI endpoint error; do not infer liquidation/orderbook data from them.
+35) 1m/5m/15m observations in strategist_digest.short_term_spot_observations are advisory snapshots only; distinguish them from 24h data, and NEVER assert they have been passed to live NKR/Trader execution unless there is explicit runtime evidence.
 {insight_length_rules}
 Task:
 {_ai_kind_instructions(kind)}
@@ -33533,11 +33658,47 @@ def _coincap_search_assets(query: str, limit: int = 25) -> list:
         pass
     return out
 
+# ENGINE-531: provider-confirmed invalid spot symbols, never a trading allowlist.
+# Process-local negative cache only; expiry permits newly listed Binance pairs.
+_BINANCE_SPOT_INVALID_LOCK = threading.RLock()
+_BINANCE_SPOT_INVALID_UNTIL: dict[str, float] = {}
+_BINANCE_SPOT_INVALID_TTL_SEC = 6 * 3600
+
+
+def _binance_spot_note_invalid(response) -> None:
+    """Remember only Binance's explicit -1121 response (no request logging)."""
+    try:
+        if int(getattr(response, "status_code", 0) or 0) != 400:
+            return
+        obj = response.json()
+        if not isinstance(obj, dict) or int(obj.get("code") or 0) != -1121:
+            return
+        raw_url = str(getattr(response, "url", "") or "")
+        if not ("/api/v3/ticker/price" in raw_url or "/api/v3/ticker/24hr" in raw_url):
+            return
+        match = re.search(r"(?:[?&])symbol=([A-Za-z0-9]{4,30})(?:&|$)", raw_url)
+        if not match:
+            return
+        pair = match.group(1).upper()
+        with _BINANCE_SPOT_INVALID_LOCK:
+            _BINANCE_SPOT_INVALID_UNTIL[pair] = time.time() + _BINANCE_SPOT_INVALID_TTL_SEC
+            if len(_BINANCE_SPOT_INVALID_UNTIL) > 1500:
+                now = time.time()
+                for key in list(_BINANCE_SPOT_INVALID_UNTIL):
+                    if _BINANCE_SPOT_INVALID_UNTIL[key] <= now:
+                        del _BINANCE_SPOT_INVALID_UNTIL[key]
+    except Exception:
+        pass  # Diagnostics cannot change an upstream result.
+
+
 def _binance_symbol_candidates(symbol: str) -> list[str]:
     s = (symbol or "").strip().upper()
     if not s:
         return []
-    return [f"{s}USDT", f"{s}BUSD", f"{s}USD"]
+    pairs = [f"{s}USDT", f"{s}BUSD", f"{s}USD"]
+    now = time.time()
+    with _BINANCE_SPOT_INVALID_LOCK:
+        return [p for p in pairs if _BINANCE_SPOT_INVALID_UNTIL.get(p, 0) <= now]
 
 def _binance_price_for_symbol(symbol: str) -> dict | None:
     """Primary CEX price: Binance ticker price. Returns {symbol,pair,price,source}."""
@@ -49067,6 +49228,8 @@ def _nexus_observed_http(provider, call):
     if code == 400 and provider in ("Binance Spot", "Binance Futures"):
         try:
             endpoint, binance_code = _nexus_binance_error_class(response)
+            if provider == "Binance Spot" and binance_code == -1121:
+                _binance_spot_note_invalid(response)
         except Exception:
             pass
     _nexus_api_activity_record(provider, outcome, code, endpoint, binance_code)
