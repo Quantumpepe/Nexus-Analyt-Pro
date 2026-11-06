@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-545-USER-AUTH-STRATEGIST-CAPITAL-RETURN";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD584-USER-AUTH-STRATEGIST-CAPITAL-RETURN"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-546-SYSTEM-CAPITAL-CHECK-SELL-ONLY-GRID";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD585-SYSTEM-CAPITAL-CHECK-SELL-ONLY-GRID"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -25523,6 +25523,32 @@ def api_grid_start():
     item_id = str(item_id).strip()
     chain_key_req = str(body.get("chain") or _grid_chain_key(item_id) or "").strip().upper()
 
+    # ENGINE-546: Grid Start never uses a USDC/USDT trading budget. Require
+    # the actual existing token in the owner's vault; no phantom worker start.
+    try:
+        item_id, chain_key_req = _grid_canonical_item_chain(item_id, chain_key_req)
+        grid_symbol = _grid_asset_symbol(item_id)
+        if not grid_symbol or grid_symbol in GRID_STABLE_ASSETS:
+            raise ValueError('grid_existing_nonstable_asset_required')
+        raw_qty = body.get('invest_qty') or body.get('invest_native') or body.get('budget_qty')
+        if raw_qty is None:
+            raise ValueError('grid_token_quantity_required')
+        grid_funding = _v5_engine_funding_state(wa, chain_key_req, grid_symbol)
+        units = _parse_asset_units(str(raw_qty), int(grid_funding['decimals']))
+        if units <= 0:
+            raise ValueError('grid_token_quantity_required')
+        free_units = int(grid_funding['freeBaseUnits'])
+        if units > free_units:
+            scale = 10 ** int(grid_funding['decimals'])
+            return jsonify({'status':'capital_required','error':'insufficient_vault_asset',
+                'system':'GRID','chain':chain_key_req,'asset':grid_symbol,
+                'requested_qty':units/scale,'available_qty':free_units/scale,
+                'missing_qty':(units-free_units)/scale}),409
+    except ValueError as exc:
+        return jsonify({'status':'blocked','error':str(exc)}),409
+    except Exception as exc:
+        return jsonify({'status':'error','error':'grid_token_balance_unavailable','detail':str(exc)[:160]}),503
+
     # ✅ Use real price if provided or from cached watchlist snapshot
     start_price = body.get("price") or body.get("start_price")
     if start_price is None:
@@ -28471,10 +28497,30 @@ def api_grid_manual_add():
                 return jsonify({"status":"blocked","error":str(exc),"asset":asset_symbol,"chain":chain,"ts":now_ts()}), 409
             except Exception as exc:
                 return jsonify({"status":"error","error":f"grid_v5_funding_read_failed:{exc}","asset":asset_symbol,"chain":chain,"ts":now_ts()}), 502
-            if not funding_state["configured"] or not funding_state["executionEnabled"] or not funding_state["settlementToken"]:
+            # Grid sells a held native/ERC20 token, which is not necessarily
+            # a Stablecoin settlement asset; require execution + withdrawal only.
+            if not funding_state["configured"] or not funding_state["executionEnabled"] or not funding_state["withdrawEnabled"]:
                 return jsonify({"status":"blocked","error":"grid_asset_not_execution_ready","funding":funding_state,"ts":now_ts()}), 409
             requested_units = _parse_asset_units(qty_f, int(funding_state["decimals"]))
             available_units = int(funding_state["freeBaseUnits"])
+            # A pending Grid SELL keeps the asset in freeBase until it fills.
+            # Subtract that logical reservation without changing NKR/Trader funds.
+            try:
+                conn_res = _db()
+                try:
+                    reserved_rows = conn_res.execute(
+                        "SELECT COALESCE(SUM(qty),0) AS reserved FROM grid_orders "
+                        "WHERE wallet_address=? AND UPPER(item_id)=? AND status='OPEN' AND side='SELL'",
+                        (wa, item_id.upper()),
+                    ).fetchone()
+                    reserved_qty = float(reserved_rows['reserved'] or 0) if reserved_rows else 0.0
+                finally:
+                    conn_res.close()
+                reserved_units = _parse_asset_units(str(max(0.0,reserved_qty)), int(funding_state['decimals']))
+                available_units = max(0, available_units - reserved_units)
+            except Exception:
+                # Fail closed: don't let a DB outage cause an overcommitted SELL.
+                return jsonify({'status':'error','error':'grid_reservation_unavailable'}),503
             if requested_units > available_units:
                 scale = float(10 ** int(funding_state["decimals"]))
                 return jsonify({
@@ -28589,6 +28635,29 @@ def api_grid_manual_add():
         conn = _db()
         try:
             with DB_WRITE_LOCK:
+                # Cross-worker, same-asset check under one SQLite write lock.
+                # An OPEN sell is not deducted from on-chain freeBase until fill;
+                # two simultaneous orders must never reserve the same tokens.
+                conn.execute('BEGIN IMMEDIATE')
+                if source == 'GRID':
+                    row_locked = conn.execute(
+                        "SELECT COALESCE(SUM(qty),0) AS reserved FROM grid_orders "
+                        "WHERE wallet_address=? AND UPPER(item_id)=? AND status='OPEN' AND side='SELL'",
+                        (wa,item_id.upper()),
+                    ).fetchone()
+                    open_qty = float(row_locked['reserved'] or 0) if row_locked else 0.0
+                    already_units = _parse_asset_units(str(max(0.0,open_qty)), int(funding_state['decimals']))
+                    available_locked = max(0, int(funding_state['freeBaseUnits']) - already_units)
+                    if requested_units > available_locked:
+                        conn.rollback()
+                        scale = 10 ** int(funding_state['decimals'])
+                        return jsonify({
+                            'status':'capital_required','error':'insufficient_vault_asset',
+                            'system':'GRID','chain':chain,'asset':asset_symbol,
+                            'requested_qty':requested_units/scale,
+                            'available_qty':available_locked/scale,
+                            'missing_qty':(requested_units-available_locked)/scale,
+                        }),409
                 _grid_db_insert_order(conn, wa, item_id, order, chain=chain)
                 conn.commit()
         except Exception as e:
@@ -53492,6 +53561,96 @@ def api_nexus_capital_combined_preview():
         return jsonify({"status":"blocked", "error":str(exc)}), 409
     except Exception as exc:
         return jsonify({"status":"error", "error":"capital_combined_preview_failed", "detail":str(exc)[:180]}), 503
+
+
+# ENGINE-546: per-engine, read-only capital preflight. Shortage is not an HTTP error.
+@app.get('/api/nexus/capital/check-start')
+def api_nexus_capital_check_start():
+    try:
+        from decimal import Decimal
+        wallet = _nca_identity()  # verified Privy access token + exact embedded wallet
+        system = str(request.args.get('system') or '').strip().upper()
+        chain = str(request.args.get('chain') or '').strip().upper()
+        symbol = str(request.args.get('asset') or '').strip().upper()
+        if system not in ('NKR','TRADER','GRID') or chain not in _NEXUS_CORE_TEST_CHAINS:
+            raise ValueError('capital_invalid_system_or_chain')
+        if system in ('NKR','TRADER') and symbol not in ('USDC','USDT'):
+            raise ValueError('capital_stable_asset_required')
+        if system == 'GRID' and (not symbol or symbol in GRID_STABLE_ASSETS):
+            raise ValueError('grid_existing_nonstable_asset_required')
+        amount = Decimal(str(request.args.get('amount') or '0').replace(',', '.'))
+        if not amount.is_finite() or amount <= 0 or amount > Decimal('1000000000000'):
+            raise ValueError('capital_amount_invalid')
+        state = _v5_engine_funding_state(wallet, chain, symbol)
+        if not state.get('configured') or not state.get('executionEnabled'):
+            raise ValueError('capital_asset_not_configured_for_execution')
+        decimals = int(state['decimals'])
+        units = _parse_asset_units(str(amount), decimals)
+        if units <= 0:
+            raise ValueError('capital_amount_too_small')
+        free = max(0, int(state.get('freeBaseUnits') or 0))
+        if system == 'GRID':
+            conn_grid = _db()
+            try:
+                item = f'{chain}:{symbol}'
+                row = conn_grid.execute(
+                    "SELECT COALESCE(SUM(qty),0) AS reserved FROM grid_orders "
+                    "WHERE wallet_address=? AND UPPER(item_id)=? AND status='OPEN' AND side='SELL'",
+                    (wallet,item),
+                ).fetchone()
+                reserved_qty = float(row['reserved'] or 0) if row else 0.0
+                free = max(0, free - _parse_asset_units(str(max(0.0,reserved_qty)), decimals))
+            finally:
+                conn_grid.close()
+        wallet_units = 0
+        can_cover = free >= units
+        route = 'VAULT_READY' if can_cover else 'CAPITAL_MISSING'
+        if system in ('NKR','TRADER') and not can_cover:
+            cid = int(state['chainId'])
+            wallet_units = _nca_balance(cid, state['token'], wallet)
+            if free + wallet_units >= units:
+                can_cover = True
+                route = 'WALLET_STABLE_DEPOSIT_NEEDED'
+            else:
+                # A native-to-stable swap might cover the shortfall. Trust only
+                # an exact on-chain quote; never assume a spot-price conversion.
+                try:
+                    cfg = _privy_trading_cfg(cid)
+                    spendable, _, _ = _nca_max_spend_wei(cid, wallet)
+                    _nca_quote_native_for_deficit(cfg, state['token'], units-free-wallet_units, spendable)
+                    can_cover = True
+                    route = 'NATIVE_SWAP_AND_DEPOSIT_NEEDED'
+                except (ValueError, RuntimeError) as exc:
+                    reason = str(exc)
+                    if any(x in reason for x in (
+                        'capital_native_balance_insufficient_for_shortfall',
+                        'capital_native_route_unavailable',
+                        'wallet_swap_no_verified_onchain_quote_for_pair',
+                    )):
+                        route = 'CAPITAL_MISSING'
+                    else:
+                        raise RuntimeError('capital_native_swap_quote_unavailable') from exc
+        scale = Decimal(10) ** decimals
+        available = free if system == 'GRID' else free + wallet_units
+        missing = max(0, units - available) if not can_cover else 0
+        return jsonify({
+            'status':'ok','readOnly':True,'system':system,'chain':chain,'asset':symbol,
+            'canStart':bool(can_cover),'state':route,
+            'requested':float(Decimal(units)/scale),
+            'available':float(Decimal(available)/scale),
+            'vaultAvailable':float(Decimal(free)/scale),
+            'walletAvailable':float(Decimal(wallet_units)/scale),
+            'missing':float(Decimal(missing)/scale),
+            'message': ('Genug Kapital vorhanden.' if can_cover else
+                        f'{system}: Nicht genuegend {symbol}. Bitte {Decimal(missing)/scale} {symbol} nachladen.'),
+            'ts':now_ts(),
+        })
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+    except ValueError as exc:
+        return jsonify({'status':'blocked','error':str(exc)}),409
+    except Exception as exc:
+        return jsonify({'status':'error','error':'capital_check_unavailable','detail':str(exc)[:150]}),503
 
 
 @app.get('/api/nexus/capital/automation/preview')
