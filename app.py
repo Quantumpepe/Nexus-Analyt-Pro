@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-534-PRIVY-SWAP-AUTH-FIX";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD573-PRIVY-SWAP-AUTH-FIX"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-535-POLYGON-USDC-LEGACY-OPTION";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD574-POLYGON-USDC-LEGACY-OPTION"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27646,6 +27646,86 @@ def _nexus_wallet_swap_decimals(chain_id: int, token: str):
     return decimals
 
 
+# ENGINE-535: Stablecoin identity is the contract address, not the ticker.
+# Existing trade executors and their settlement config are deliberately untouched.
+# Native USDC/USDT destinations require exact V5 CoreVault approval. The clearly
+# labeled optional USDC.e target is WALLET-ONLY and never silently becomes
+# trading settlement. The same legacy token can be a source for migration.
+_POL_USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+_POL_USDC_BRIDGED = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+
+def _nexus_wallet_swap_vault_targets(chain_id: int) -> list[dict]:
+    cid = int(chain_id)
+    if cid not in (1, 56, 137):
+        raise ValueError("unsupported_swap_chain")
+    vault = _norm_addr(_VAULT_BY_CHAIN.get(cid) or "")
+    if not _looks_like_evm_addr(vault):
+        raise RuntimeError("wallet_swap_core_vault_not_configured")
+    cfg = _privy_trading_cfg(cid)
+    if cid == 137:
+        specs = [
+            ("USDC", _POL_USDC_NATIVE, "Circle native USDC"),
+            ("USDT", cfg.get("usdt"), "USDT"),
+        ]
+    else:
+        specs = [("USDC", cfg.get("usdc"), "USDC"), ("USDT", cfg.get("usdt"), "USDT")]
+    targets, failures = [], 0
+    for symbol, token, label in specs:
+        address = _norm_addr(token or "")
+        if not _looks_like_evm_addr(address):
+            continue
+        try:
+            words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["tokenConfig"], address))
+            if len(words) < 10:
+                raise RuntimeError("vault_token_config_incomplete")
+            # Exact V5 tokenConfig fields: configured, deposit, withdraw,
+            # execution, payment, settlement, decimals, limits...
+            if all(bool(words[i]) for i in (0, 1, 2, 3, 5)):
+                token_decimals = _nexus_wallet_swap_decimals(cid, address)
+                if int(words[6]) != token_decimals:
+                    raise RuntimeError("vault_token_decimals_mismatch")
+                targets.append({
+                    "symbol": symbol, "address": address,
+                    "decimals": token_decimals, "label": label,
+                    "vaultSettlementVerified": True,
+                })
+        except Exception:
+            failures += 1
+    if failures >= len(specs):
+        raise RuntimeError("wallet_swap_vault_rpc_unavailable")
+    if cid == 137:
+        # Explicit opt-in legacy destination (NOT Vault settlement) and recovery
+        # source. Keep it available so users can correct historical USDC.e balances.
+        legacy_decimals = _nexus_wallet_swap_decimals(cid, _POL_USDC_BRIDGED)
+        if legacy_decimals != 6:
+            raise RuntimeError("polygon_legacy_usdc_decimals_mismatch")
+        targets.append({
+            "symbol":"USDC.e", "address":_POL_USDC_BRIDGED,
+            "decimals":legacy_decimals, "label":"Bridged USDC.e (wallet only)",
+            "vaultSettlementVerified":False, "legacyOptional":True,
+        })
+    return targets
+
+
+@app.get("/api/wallet/swap/targets")
+def api_wallet_swap_targets():
+    try:
+        if not _looks_like_evm_addr(_norm_addr(_require_auth() or "")):
+            return jsonify({"status":"error","error":"unauthorized"}), 401
+        chain = str(request.args.get("chain") or "").strip().upper()
+        cid = {"ETH":1, "BNB":56, "POL":137}.get(chain)
+        if not cid:
+            return jsonify({"status":"error","error":"unsupported_swap_chain"}), 400
+        targets = _nexus_wallet_swap_vault_targets(cid)
+        return jsonify({"status":"ok","chain":chain,"chainId":cid,
+                        "targets":targets,
+                        "defaultTarget":next((item["symbol"] for item in targets if item.get("vaultSettlementVerified") is True), None),
+                        "note":"Exact contract and live V5 tokenConfig verified; wallet swaps do not deposit into Vault."})
+    except Exception as exc:
+        return jsonify({"status":"error","error":str(exc)[:180]}), 503
+
+
 @app.post("/api/wallet/swap/prepare")
 def api_wallet_swap_prepare():
     """Prepare native/wrapped-native -> USDC/USDT, user signs via Privy.
@@ -27675,16 +27755,33 @@ def api_wallet_swap_prepare():
         raw_in = str(body.get("tokenIn") or "").strip()
         native_symbol = str(cfg.get("nativeSymbol") or chain_key).upper()
         is_native = raw_in.upper() in ("NATIVE", native_symbol)
-        if not is_native and _norm_addr(raw_in).lower() != wrapped.lower():
-            return jsonify({"status":"error","error":"native_or_wrapped_only"}), 400
-        dest = str(body.get("tokenOut") or "").upper().strip()
-        if dest not in ("USDC", "USDT"):
+        from_token = wrapped if is_native else _norm_addr(raw_in)
+        legacy_source = cid == 137 and not is_native and from_token.lower() == _POL_USDC_BRIDGED.lower()
+        if not is_native and from_token.lower() != wrapped.lower() and not legacy_source:
+            return jsonify({"status":"error","error":"native_wrapped_or_polygon_usdce_only"}), 400
+        dest_request = str(body.get("tokenOut") or "").strip().upper()
+        if dest_request not in ("USDC", "USDT", "USDC.E"):
             return jsonify({"status":"error","error":"stablecoin_destination_required"}), 400
-        token_out = _norm_addr(cfg.get(dest.lower()) or "")
-        if not _looks_like_evm_addr(token_out) or token_out.lower() == wrapped.lower():
-            return jsonify({"status":"error","error":"settlement_token_not_configured"}), 503
-        dec_in = _nexus_wallet_swap_decimals(cid, wrapped)
+        if dest_request == "USDC.E" and cid != 137:
+            return jsonify({"status":"error","error":"legacy_usdc_only_on_polygon"}), 400
+        verified_targets = _nexus_wallet_swap_vault_targets(cid)
+        selected = next((v for v in verified_targets if v["symbol"].upper() == dest_request), None)
+        if not selected:
+            return jsonify({"status":"error","error":"selected_stablecoin_not_available"}), 409
+        legacy_target = bool(selected.get("legacyOptional"))
+        if not (selected.get("vaultSettlementVerified") is True or
+                (legacy_target and cid == 137 and selected["address"].lower() == _POL_USDC_BRIDGED.lower())):
+            return jsonify({"status":"error","error":"unverified_stablecoin_destination"}), 409
+        dest = selected["symbol"]  # Never silently substitute USDC.e for USDC.
+        token_out = _norm_addr(selected["address"])
+        if token_out.lower() in (wrapped.lower(), from_token.lower()):
+            return jsonify({"status":"error","error":"swap_source_and_destination_must_differ"}), 400
+        dec_in = _nexus_wallet_swap_decimals(cid, from_token)
+        if legacy_source and dec_in != 6:
+            raise RuntimeError("polygon_legacy_usdc_decimals_mismatch")
         dec_out = _nexus_wallet_swap_decimals(cid, token_out)
+        if dec_out != int(selected["decimals"]):
+            raise RuntimeError("stablecoin_decimals_changed_after_vault_check")
         slip = int(body.get("slippageBps") or 100)
         if not 10 <= slip <= 300:
             return jsonify({"status":"error","error":"slippage_outside_safe_bounds"}), 400
@@ -27700,10 +27797,10 @@ def api_wallet_swap_prepare():
         if native_balance < gas_reserve:
             return jsonify({"status":"error","error":"insufficient_native_gas_reserve",
                             "gasReserveWei":str(gas_reserve)}), 400
-        wrapped_balance = None
+        source_balance = None
         if not is_native:
-            raw_bal = _eth_call(cid, wrapped, "0x70a08231" + _addr_to_32(wallet))
-            wrapped_balance = int(str(raw_bal or "0x0"), 16)
+            raw_bal = _eth_call(cid, from_token, "0x70a08231" + _addr_to_32(wallet))
+            source_balance = int(str(raw_bal or "0x0"), 16)
 
         amount_mode = str(body.get("amountMode") or "CUSTOM").upper().strip()
         if amount_mode == "PERCENT":
@@ -27712,7 +27809,7 @@ def api_wallet_swap_prepare():
             percent = body.get("amountPercent")
             if type(percent) is not int or percent not in (25, 50, 75, 100):
                 return jsonify({"status":"error","error":"invalid_amount_percent"}), 400
-            spendable = (native_balance - gas_reserve) if is_native else wrapped_balance
+            spendable = (native_balance - gas_reserve) if is_native else source_balance
             if spendable is None or spendable <= 0:
                 return jsonify({"status":"error","error":"no_spendable_balance_after_gas_reserve"}), 400
             amount_in = (spendable * percent) // 100
@@ -27740,15 +27837,15 @@ def api_wallet_swap_prepare():
         if is_native and amount_in > native_balance - gas_reserve:
             return jsonify({"status":"error","error":"insufficient_native_after_gas_reserve",
                             "gasReserveWei":str(gas_reserve)}), 400
-        if not is_native and (wrapped_balance is None or amount_in > wrapped_balance):
-            return jsonify({"status":"error","error":"insufficient_wrapped_balance"}), 400
+        if not is_native and (source_balance is None or amount_in > source_balance):
+            return jsonify({"status":"error","error":"insufficient_source_token_balance"}), 400
         # Format the EXACT integer amount without Decimal context rounding.
         scale = 10 ** dec_in
         whole, remainder = divmod(amount_in, scale)
         exact_amount_human = str(whole) + (
             "." + str(remainder).zfill(dec_in).rstrip("0") if remainder else ""
         )
-        quote_out, fee = _nexus_wallet_swap_exact_quote(cfg, wrapped, token_out, amount_in)
+        quote_out, fee = _nexus_wallet_swap_exact_quote(cfg, from_token, token_out, amount_in)
         min_out = (quote_out * (10_000 - slip)) // 10_000
         if min_out <= 0 or min_out < (10 ** dec_out) // 10: # minimum 0.10 stable
             return jsonify({"status":"error","error":"quote_too_small_to_trade_safely"}), 400
@@ -27757,20 +27854,20 @@ def api_wallet_swap_prepare():
         if is_native:
             steps.append({"type":"wrap", "to":wrapped, "data":"0xd0e30db0", "value":hex(amount_in),
                           "label":f"Wrap {native_symbol}"})
-        allowance_raw = _eth_call(cid, wrapped, "0xdd62ed3e" + _addr_to_32(wallet) + _addr_to_32(router))
+        allowance_raw = _eth_call(cid, from_token, "0xdd62ed3e" + _addr_to_32(wallet) + _addr_to_32(router))
         allowance = int(str(allowance_raw or "0x0"), 16)
         if allowance < amount_in:
             if allowance > 0:
-                steps.append({"type":"approve_reset", "to":wrapped, "data":"0x095ea7b3"+_addr_to_32(router)+_uint_to_32(0),
+                steps.append({"type":"approve_reset", "to":from_token, "data":"0x095ea7b3"+_addr_to_32(router)+_uint_to_32(0),
                               "value":"0x0", "label":"Reset existing approval"})
-            steps.append({"type":"approve", "to":wrapped,
+            steps.append({"type":"approve", "to":from_token,
                           "data":"0x095ea7b3"+_addr_to_32(router)+_uint_to_32(amount_in),
                           "value":"0x0", "label":"Approve exact swap amount"})
         # Native wallet route prefers configured selector, switch only after
         # local simulation or proper chain router settings are verified.
         selector = (_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR if cid == 56
                     else _PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
-        swap_data = _router_exact_input_single_data(selector, wrapped, token_out, wallet,
+        swap_data = _router_exact_input_single_data(selector, from_token, token_out, wallet,
                                                     amount_in, min_out, fee, deadline)
         steps.append({"type":"swap","to":router,"data":swap_data,"value":"0x0",
                       "label":f"Swap to {dest}"})
@@ -27778,15 +27875,17 @@ def api_wallet_swap_prepare():
             "status":"ok", "chain":chain_key, "chainId":cid,
             "quoteSource":"ONCHAIN_QUOTER", "quoteAt":int(time.time()),
             "deadline":deadline, "feeTier":fee,
-            "tokenIn":{"address":"native" if is_native else wrapped,
-                       "symbol":native_symbol if is_native else "W"+native_symbol,"decimals":dec_in},
-            "tokenOut":{"address":token_out,"symbol":dest,"decimals":dec_out},
+            "tokenIn":{"address":"native" if is_native else from_token,
+                       "symbol":native_symbol if is_native else ("USDC.e" if legacy_source else "W"+native_symbol),"decimals":dec_in},
+            "tokenOut":{"address":token_out,"symbol":dest,"decimals":dec_out,
+                        "vaultSettlementVerified":bool(selected.get("vaultSettlementVerified")),
+                        "legacyOptional":legacy_target},
             "amountIn":str(amount_in), "amountInHuman":exact_amount_human,
             "amountMode":amount_mode, "amountPercent":percent if amount_mode == "PERCENT" else None,
             "quoteOut":str(quote_out), "minOut":str(min_out),
             "slippageBps":slip, "router":router, "gasReserveWei":str(gas_reserve),
             "steps":steps,
-            "note":"Manual Privy wallet swap. Wait for each mined confirmation. Not a Vault deposit.",
+            "note":"Manual Privy wallet swap. Wait for each mined confirmation. Not a Vault deposit. USDC.e is legacy bridged wallet-only.",
             "ts":now_ts(),
         })
     except Exception as exc:
