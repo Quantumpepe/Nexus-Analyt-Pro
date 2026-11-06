@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-541-CAPITAL-AUTOMATION-GUARDED";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD580-CAPITAL-AUTOMATION-GUARDED"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-542-CAPITAL-COORDINATION-STRICT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD581-CAPITAL-COORDINATION-STRICT"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52778,38 +52778,66 @@ def _nca_max_spend_wei(chain_id, wallet):
 
 
 def _nca_quote_native_for_deficit(cfg, stable_token, need_units, max_spend, slippage_bps=100):
-    """Strict Quoter result; bounded native spend estimated from on-chain pool data."""
+    """Return the smallest practicable native input for the *exact* shortfall.
+
+    A bounded number of on-chain V3 Quoter calls, no oracle approximation,
+    no signed transaction. Fails closed if the resulting amount would buy
+    substantially more than required. Large unused wallet balance is not a
+    licence to spend it.
+    """
     wrapped = _norm_addr(cfg.get("weth") or "")
+    need_units, max_spend = int(need_units), int(max_spend)
+    slippage_bps = int(slippage_bps)
     if not _looks_like_evm_addr(wrapped) or max_spend <= 0 or need_units <= 0:
         raise ValueError("capital_native_route_unavailable")
-    def q(wei):
-        out, fee = _nexus_wallet_swap_exact_quote(cfg, wrapped, stable_token, int(wei))
-        if int(out) <= 0 or int(fee) <= 0:
-            raise ValueError("capital_quote_not_positive")
-        return int(out), int(fee)
-    max_out, _ = q(int(max_spend))
-    if max_out * (10_000 - slippage_bps) // 10_000 < need_units:
+    if slippage_bps < 1 or slippage_bps > 500:
+        raise ValueError("capital_slippage_not_allowed")
+
+    def quote(wei):
+        result, fee = _nexus_wallet_swap_exact_quote(cfg, wrapped, stable_token, int(wei))
+        return int(result), int(fee)
+
+    # Need guaranteed output *after* applying the user's slippage limit.
+    threshold = (need_units * 10000 + (10000 - slippage_bps) - 1) // (10000 - slippage_bps)
+    full_out, full_fee = quote(max_spend)
+    if full_out < threshold:
         raise ValueError("capital_native_balance_insufficient_for_shortfall")
-    # Avoid an overly wide fixed-step binary search: that can overspend native
-    # badly for small budgets. Estimate amount using the *real* on-chain quote.
-    numerator = int(max_spend) * int(need_units) * 10_000
-    denominator = int(max_out) * (10_000 - slippage_bps)
-    estimate = max(1, (numerator + denominator - 1) // denominator)
-    # Bound the buffer to 2%; never silently consume a much larger native amount.
-    candidate = min(int(max_spend), (estimate * 102 + 99) // 100)
-    out, fee = q(candidate)
-    for _ in range(3):
-        min_out = out * (10_000 - slippage_bps) // 10_000
-        if min_out >= need_units:
-            return {"nativeSpendWei": str(candidate), "quoteOutUnits": str(out),
-                    "minOutUnits": str(min_out), "feeTier": fee,
-                    "slippageBps": int(slippage_bps)}
-        if out <= 0:
+    if full_out <= 0:
+        raise ValueError("capital_native_quote_unavailable")
+
+    # Proportional approximation selects a *starting point only*; ALL final
+    # decisions use actual on-chain quotes. If price impact distorts the
+    # approximation, the bracketed search still converges from either side.
+    candidate = max(1, min(max_spend, (max_spend * threshold + full_out - 1) // full_out))
+    lower, upper = 0, max_spend
+    best_out, best_fee = full_out, full_fee
+    for _ in range(22):
+        if candidate <= lower or candidate >= upper:
+            candidate = (lower + upper) // 2
+        if candidate <= lower or candidate >= upper:
             break
-        needed_bump = (candidate * need_units + max(1, min_out) - 1) // max(1, min_out)
-        candidate = min(int(max_spend), max(candidate + 1, (needed_bump * 102 + 99) // 100))
-        out, fee = q(candidate)
-    raise ValueError("capital_swap_cannot_meet_budget_within_bounded_native_spend")
+        current_out, fee = quote(candidate)
+        if current_out >= threshold:
+            upper, best_out, best_fee = candidate, current_out, fee
+        else:
+            lower = candidate
+        if upper - lower <= max(1, upper // 2000):
+            break
+        candidate = (lower + upper) // 2
+
+    # Always re-quote exact amount. Excess input is an error, never permission
+    # to spend the rest of a wallet balance. Up to 3% extra value allowed for
+    # route discreteness and volatile quotes, not an unbounded overbuy.
+    final_out, final_fee = quote(upper)
+    min_out = final_out * (10000 - slippage_bps) // 10000
+    if min_out < need_units:
+        raise ValueError("capital_swap_slippage_cannot_cover_budget")
+    if min_out > (need_units * 103 + 99) // 100 + 2:
+        raise ValueError("capital_native_quote_excessive_overbuy")
+    return {"nativeSpendWei": str(upper), "quoteOutUnits": str(final_out),
+            "minOutUnits": str(min_out), "feeTier": int(final_fee),
+            "slippageBps": slippage_bps, "neededUnits": str(need_units),
+            "excessMinOutUnits": str(max(0, min_out - need_units))}
 
 
 def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
@@ -53157,6 +53185,100 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
             return dict(conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE job_id=?',(job_id,)).fetchone()), True
     finally:
         conn.close()
+
+
+# ENGINE-542: Single shared-pool preview across all engines.
+# The three independent one-engine previews must NOT be added together as if
+# each had exclusive access to the same Vault freeBase and wallet USDC.
+def _nca_combined_preview(wallet, chain, stable, budgets):
+    chain, cid, stable, _ = _nca_validate_input(chain, stable, "NKR")
+    funding = _v5_engine_funding_state(wallet, chain, stable)
+    if not all(bool(funding.get(k)) for k in
+               ("configured", "depositEnabled", "withdrawEnabled", "executionEnabled", "settlementToken")):
+        raise ValueError("capital_vault_settlement_not_ready")
+    vault, token = _norm_addr(funding.get("vault") or ""), _norm_addr(funding.get("token") or "")
+    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(token)):
+        raise ValueError("capital_vault_or_token_invalid")
+    if cid == 137 and stable == "USDC" and token.lower() != _POL_USDC_NATIVE.lower():
+        raise ValueError("capital_polygon_usdc_must_be_native")
+    decimals = int(funding.get("decimals") or 0)
+    if not 1 <= decimals <= 18 or _nexus_wallet_swap_decimals(cid, token) != decimals:
+        raise ValueError("capital_token_decimals_mismatch")
+    maximum = int(funding.get("maxSessionBudgetUnits") or 0)
+    budgets = budgets or {}
+    if not isinstance(budgets, dict) or set(budgets) - set(_NCA_ENGINES):
+        raise ValueError("capital_invalid_engine_budget_set")
+    amounts = {}
+    for engine in ("NKR", "GRID", "TRADER"):
+        try:
+            value = str(budgets.get(engine, "0")).strip()
+            units = 0 if value in ("", "0") else int(_parse_asset_units(value, decimals))
+        except Exception:
+            raise ValueError("capital_invalid_budget:" + engine)
+        if units < 0 or units > (2**128 - 1) or (maximum and units > maximum):
+            raise ValueError("capital_budget_exceeds_limit:" + engine)
+        amounts[engine] = units
+    if not any(amounts.values()):
+        raise ValueError("capital_at_least_one_budget_required")
+
+    free = int(funding.get("freeBaseUnits") or 0)
+    wallet_stable = _nca_balance(cid, token, wallet)
+    remaining_free, remaining_wallet = free, wallet_stable
+    breakdown = []
+    for engine, amount in amounts.items():
+        from_vault = min(remaining_free, amount)
+        remaining_free -= from_vault
+        from_wallet = min(remaining_wallet, amount - from_vault)
+        remaining_wallet -= from_wallet
+        swap = amount - from_vault - from_wallet
+        breakdown.append({"engine": engine, "budgetUnits": str(amount),
+                          "coveredByVaultUnits": str(from_vault),
+                          "coveredByWalletUnits": str(from_wallet),
+                          "nativeSwapShortfallUnits": str(swap)})
+    total = sum(amounts.values())
+    deposit_needed = max(0, total - free)
+    swap_needed = max(0, total - free - wallet_stable)
+
+    # In-flight transfers must be manually reconciled before new money moves.
+    # This check is a *display* and does not replace DB's unique active-job
+    # index or CoreVault's atomic allocation check.
+    _nca_init_db()
+    conn = _db()
+    try:
+        pending = conn.execute("""SELECT job_id,status,engine FROM nexus_capital_automation_jobs
+                WHERE wallet_address=? AND chain_id=?
+                  AND status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING')
+                ORDER BY created_ts DESC LIMIT 1""",
+                (wallet.lower(), cid)).fetchone()
+    finally:
+        conn.close()
+    pending = dict(pending) if pending else None
+    return {"chain": chain, "chainId": cid, "stable": stable,
+            "vault": vault, "token": token, "decimals": decimals,
+            "totalBudgetUnits": str(total), "vaultFreeUnits": str(free),
+            "walletStableUnits": str(wallet_stable), "additionalDepositUnits": str(deposit_needed),
+            "nativeSwapShortfallUnits": str(swap_needed),
+            "breakdown": breakdown, "pendingJob": (
+                {"jobId":pending["job_id"],"status":pending["status"],"engine":pending["engine"]}
+                if pending else None),
+            "readOnlyPreview": True, "createsReservation": False,
+            "automationExecutionAllowed": False,
+            "note": "Gemeinsame Simulation – keine Kapitalreservierung. Die tatsächliche Reservierung erfolgt erst durch createSession im CoreVault. Parallel laufende Funding-Jobs sind gesperrt."}
+
+
+@app.get('/api/nexus/capital/automation/combined-preview')
+def api_nexus_capital_combined_preview():
+    try:
+        wallet = _nca_identity()
+        plan = _nca_combined_preview(wallet, request.args.get('chain'), request.args.get('stable'), {
+            "NKR":request.args.get('nkr','0'), "GRID":request.args.get('grid','0'), "TRADER":request.args.get('trader','0')})
+        return jsonify({"status":"ok", "plan":plan, "ts":now_ts()})
+    except PermissionError as exc:
+        return jsonify({"status":"error", "error":str(exc)}), 403
+    except ValueError as exc:
+        return jsonify({"status":"blocked", "error":str(exc)}), 409
+    except Exception as exc:
+        return jsonify({"status":"error", "error":"capital_combined_preview_failed", "detail":str(exc)[:180]}), 503
 
 
 @app.get('/api/nexus/capital/automation/preview')
