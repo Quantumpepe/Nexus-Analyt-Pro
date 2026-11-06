@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-544-CAPITAL-PILOT-WALLET-GATE";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD583-CAPITAL-PILOT-WALLET-GATE"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-545-USER-AUTH-STRATEGIST-CAPITAL-RETURN";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD584-USER-AUTH-STRATEGIST-CAPITAL-RETURN"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1196,6 +1196,15 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
             conn.commit()
     finally:
         conn.close()
+    # After on-chain FINALIZED confirmation, return the released principal to
+    # its owner's Privy wallet. Isolated thread: a withdrawal failure never
+    # marks a successfully finalized session as failed or retries a broadcast.
+    try:
+        _nca_queue_auto_return(wallet, eng, chain_id, sid, vault)
+    except Exception as _return_exc:
+        _live_engine_mark(eng, decision='CAPITAL_RETURN_REVIEW',
+                          reason='Session finalized; wallet return requires review',
+                          last_error=str(_return_exc)[:300])
     return {
         "sessionId": sid, "status": "finalized", "engine": eng,
         "sessionIdentity": identity,
@@ -1912,6 +1921,13 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
                 _nkr_set_local_stop_state(wallet,"FINALIZED",f"CoreVault session {sid} already finalized")
             _live_engine_mark(engine,status="stopped",decision="FINALIZED",gate_status="",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
             _recovery_job_write(job_id, job_status="SUCCESS", step=5, step_label="ALREADY_FINALIZED", receipt_status="confirmed", last_error="")
+            # A recovery of an already-finalized session must not strand its
+            # released principal in the Vault. Same idempotent return job key.
+            try:
+                _nca_queue_auto_return(wallet, engine, chain_id, sid, vault_addr)
+            except Exception:
+                _live_engine_mark(engine, decision='CAPITAL_RETURN_REVIEW',
+                                  reason='Recovered session return requires manual review')
             return
         if raw_status in (1,2):
             _recovery_job_write(job_id, step=3, step_label="START_CLOSING_SUBMIT", receipt_status="submitting")
@@ -1986,6 +2002,11 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
             _nkr_set_local_stop_state(wallet,"FINALIZED",f"CoreVault session {sid} finalized")
         _recovery_job_write(job_id,raw_status_id=after_status,status_label=after_label,job_status="SUCCESS",step=5,step_label="FINALIZED_CONFIRMED",receipt_status="confirmed",last_error="")
         _live_engine_mark(engine,status="stopped",decision="STALE_RESERVATION_RELEASED",gate_status="",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
+        try:
+            _nca_queue_auto_return(wallet, engine, chain_id, sid, vault_addr)
+        except Exception:
+            _live_engine_mark(engine, decision='CAPITAL_RETURN_REVIEW',
+                              reason='Recovered session return requires manual review')
     except Exception as exc:
         msg=str(exc)[:1500]
         _recovery_job_write(job_id,job_status="FAILED",step_label="FAILED",receipt_status="failed",last_error=msg)
@@ -9886,10 +9907,10 @@ def _pick_wallet_from_request() -> Optional[str]:
 def _require_auth() -> Optional[str]:
     """Return normalized wallet address if caller is authorized, else None."""
 
-    # ✅ DEV/SAFE bypass: allow anonymous access to /api/grid/* and /api/ai/*
-    # when GRID_ALLOW_ANON=1 and a wallet is provided (header/body/query).
+    # Never allow anonymous access to live Grid actions. A development-only
+    # AI preview flag must not bypass the signed wallet identity on Grid.
     allow_anon = os.getenv("GRID_ALLOW_ANON", "0") == "1"
-    if allow_anon and (request.path.startswith("/api/grid") or request.path.startswith("/api/ai/")):
+    if allow_anon and request.path.startswith('/api/ai/'):
         wa = _pick_wallet_from_request()
         if isinstance(wa, str) and _looks_like_evm_addr(wa):
             return wa
@@ -25453,12 +25474,40 @@ def api_resolver_history():
         return err(str(e), 500)
 
 
+def _grid_verified_user_wallet():
+    """Strict signed Nexus/verified Privy identity; ignores Grid anon bypass.
+
+    The header is only an optional match assertion, NEVER an identity source.
+    """
+    try:
+        owner = _norm_addr(_capital_route_verified_wallet() or '')
+    except Exception:
+        return ''
+    if not _looks_like_evm_addr(owner):
+        return ''
+    raw_assertion = str(request.headers.get('X-Wallet-Address') or '').strip()
+    if raw_assertion and _norm_addr(raw_assertion).lower() != owner.lower():
+        return ''
+    return owner
+
+
+@app.before_request
+def _grid_block_unsigned_mutations():
+    path = str(request.path or '')
+    if path.startswith('/api/grid/') and request.method.upper() in ('POST','PUT','PATCH','DELETE'):
+        if not _grid_verified_user_wallet():
+            return jsonify({'status':'error','error':'grid_verified_login_required'}), 401
+
+
 @app.route("/api/grid/start", methods=["POST"])
 def api_grid_start():
     body = request.get_json(silent=True) or {}
-    wa, access, e_access = _require_access_open()
-    if e_access:
-        return e_access
+    wa = _grid_verified_user_wallet()
+    if not wa:
+        return err('grid_verified_login_required', 401)
+    access = _compute_access_status(wa)
+    if not bool(access.get('can_open_new_trades')):
+        return err('grid_core_access_required', 403)
     item_id = body.get("item") or body.get("item_id") or body.get("id")
     addr = body.get("addr") or body.get("wallet_address")
     mode = (body.get("mode") or "SAFE").upper()
@@ -25508,7 +25557,7 @@ def api_grid_start():
 
         session = _sim_build(cfg)
         # Always bind session to authenticated wallet (addr is optional)
-        session["wallet_address"] = _norm_addr(addr) if addr else _norm_addr(wa)
+        session["wallet_address"] = _norm_addr(wa)
         session["running"] = True
         session["stopped"] = False
         # If MANUAL, do not auto-create initial grid orders
@@ -25666,9 +25715,9 @@ def api_grid_tick():
     with _GRID_EXEC_LOCK:
         item_id = str(item_id).strip()
         item_id, chain_eff = _grid_canonical_item_chain(item_id, (body.get("chain") if request.method != "GET" else request.args.get("chain")) or "")
-        wa = _require_auth() or _pick_wallet_from_request()
+        wa = _grid_verified_user_wallet()
         if not wa:
-            return err("unauthorized", 401)
+            return err('grid_verified_login_required', 401)
 
         session = _get_owned_session(item_id, wa)
         if isinstance(session, dict):
@@ -26581,11 +26630,12 @@ def api_grid_autorun():
     """
     body = request.get_json(silent=True) or {}
 
-    wa, policy, e = _require_trading_enabled()
-    if e:
-        wa = _pick_wallet_from_request()
-        if not wa:
-            return e
+    wa = _grid_verified_user_wallet()
+    if not wa:
+        return err('grid_verified_login_required', 401)
+    policy = _compute_access_status(wa)
+    if bool(body.get('enable',True)) and not bool(policy.get('can_open_new_trades')):
+        return err('grid_core_access_required', 403)
 
     item_id = str(body.get("item") or body.get("item_id") or "").strip()
     if not item_id:
@@ -27228,6 +27278,30 @@ def _grid_freebase_withdraw_swap_deposit(
 
 
 
+
+
+def _grid_strategist_audit(wallet, session, order, action):
+    symbol = str((order or {}).get('original_asset') or _grid_asset_symbol(
+        (session or {}).get('item_id') or (session or {}).get('item') or '')).upper()
+    item_id = str((session or {}).get('item_id') or (session or {}).get('item') or '')
+    row = {}
+    for name in (item_id, symbol, symbol.lower()):
+        snap = SNAPSHOTS.get(name) if isinstance(globals().get('SNAPSHOTS'), dict) else None
+        data = snap.get('data') if isinstance(snap, dict) else None
+        if isinstance(data, dict):
+            row = dict(data)
+            break
+    row['symbol'] = symbol
+    signals = _nkr_live_full_signal_vector(row)
+    valid = sum(1 for v in signals.values() if v is not None)
+    quality = _nkr_live_shadow_quality({**row, 'signals':signals}, 'DYNAMIC') if valid else {}
+    decision = str(action or 'HOLD').upper() if valid else 'NO_SIGNALS'
+    # This is a risk assessment. Only the on-chain exit can confirm SELL.
+    _nexus_signal_audit_record('STRATEGIST_GRID', symbol, signals, decision)
+    return {'symbol':symbol,'decision':decision,'signalCount':valid,
+            'hardBlock':bool(quality.get('hard_block')),'source':'shared_signal_vector',
+            'advisoryOnly':True}
+
 def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_price: float) -> dict:
     """ENGINE-463: Grid SELL at target/max-loss → real Vault sell to USDC/USDT.
 
@@ -27259,6 +27333,15 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     chain_id = int(_grid_chain_id_from_key(chain_key) or 0)
     if chain_id <= 0:
         result["reason"] = f"grid_chain_unsupported:{chain_key}"
+        return result
+    # Background workers have no browser JWT. Only orders whose original
+    # creation was signed by this exact wallet may trigger an on-chain exit.
+    proven_owner = _norm_addr((order or {}).get('authenticated_owner') or '').lower()
+    if not _looks_like_evm_addr(wa) or proven_owner != wa.lower():
+        result['reason'] = 'grid_unsigned_legacy_order_requires_recreation'
+        return result
+    if not _nca_wallet_authorized(wa, chain_key, 'RETURN'):
+        result['reason'] = 'grid_privy_owner_mapping_unavailable'
         return result
 
     symbol = str(
@@ -28284,8 +28367,8 @@ def api_nexus_capital_route_audit():
             "swapRouterConfigured":_looks_like_evm_addr(cfg.get("router")),
             "quoteProviderConfigured":_looks_like_evm_addr(cfg.get("quoter")),
             "sessions":session_rows,
-            "automaticSwapExecutionEnabled":bool(chain in _nca_live_chains()),
-            "nextStep":"GUARDED_AUTOMATION: Journalled funding/return available only after explicit operator chain enablement and live Privy/Vault tests.",
+            "automaticSwapExecutionEnabled":bool(chain in _nca_live_chains() and _nca_wallet_authorized(wallet,chain,"FUND")),
+            "nextStep":"Verified Core subscription and user-selected budget control capital funding; live on-chain settlement still requires verification.",
             "note":"A wallet balance is not a Vault balance. A completed session releases freeBase but does not automatically send tokens to the wallet.",
             "ts":now_ts(),
         })
@@ -28311,11 +28394,11 @@ def api_grid_manual_add():
     - This endpoint only stores the order + reserves Qty logically.
     - Execution happens asynchronously by the grid executor (backend) when cycle is running.
     """
-    wa = _require_auth() or _pick_wallet_from_request()
+    wa = _grid_verified_user_wallet()
     if not wa:
-        return jsonify({"error": "unauthorized"}), 401
-
-    _require_trading_enabled()
+        return jsonify({'error':'grid_verified_login_required'}), 401
+    if not bool(_compute_access_status(wa).get('can_open_new_trades')):
+        return jsonify({'error':'grid_core_access_required'}), 403
 
     try:
         payload = request.get_json(silent=True) or {}
@@ -28426,6 +28509,10 @@ def api_grid_manual_add():
         order = {
             "id": order_id,
             "client_order_id": client_order_id or order_id,
+            # Persist proof that the order was submitted by its owner's
+            # signed Nexus or verified Privy session. Legacy unsigned live
+            # Grid orders require the owner to recreate them before trading.
+            "authenticated_owner": _norm_addr(wa).lower(),
             "side": side,
             "price": round(price_f, 12),
             "qty": round(qty_f, 12),
@@ -34714,6 +34801,13 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                 o["triggered_ts"] = int(time.time())
                 o["payout_asset"] = _grid_normalize_payout_asset(o.get("payout_asset") or o.get("payoutAsset") or "USDC")
 
+                # Shared Strategist risk context for every triggered Grid SELL.
+                # A max-loss exit must not wait for AI availability.
+                try:
+                    session['strategist_grid'] = _grid_strategist_audit(
+                        session.get('wallet_address'), session, o, 'SELL_RISK_OR_TARGET')
+                except Exception:
+                    pass
                 # ENGINE-464: EVERY Grid-session SELL requires an on-chain Vault exit.
                 # Do not trust source/rule_mode alone — MANUAL rows from older clients
                 # still hold freeBase and must not mark FILLED without a tx.
@@ -49531,7 +49625,7 @@ def _nexus_signal_audit_shared_read():
                        "signalFields": json.loads(x["signal_fields_json"] or "[]"),
                        "rows": int(x["candidate_rows"])} for x in rows]
             latest = {}
-            for stage in ("MARKET_STRATEGIST", "STRATEGIST_NKR", "STRATEGIST_TRADER", "STRATEGIST_CONTEXT"):
+            for stage in ("MARKET_STRATEGIST", "STRATEGIST_NKR", "STRATEGIST_TRADER", "STRATEGIST_GRID", "STRATEGIST_CONTEXT"):
                 row = conn.execute(
                     "SELECT observed_ts,stage,symbol,decision,signal_count,signal_fields_json,candidate_rows "
                     "FROM nexus_signal_observations WHERE stage=? ORDER BY observed_ts DESC LIMIT 1", (stage,)
@@ -52718,29 +52812,47 @@ _NCA_ACTIVE = frozenset({"QUEUED", "RUNNING", "BROADCAST_UNKNOWN", "RECEIPT_PEND
 
 
 def _nca_live_chains():
-    enabled = str(os.getenv("NEXUS_CAPITAL_AUTOMATION_ENABLED") or "").strip().lower() in ("1", "true", "yes")
-    allowed = {x.strip().upper() for x in str(os.getenv("NEXUS_CAPITAL_AUTOMATION_LIVE_CHAINS") or "").split(",") if x.strip()}
-    # Future networks require a separate verified-network attestation; a Vault
-    # address or public RPC URL alone must never enable fund movement.
-    verified_future = {x.strip().upper() for x in str(os.getenv("NEXUS_CAPITAL_AUTOMATION_VERIFIED_CHAINS") or "").split(",") if x.strip()}
-    return {x for x in allowed if x in _NEXUS_CORE_TEST_CHAINS or x in verified_future} if enabled else set()
+    """Only existing, previously deployed core-chain routes may fund automatically.
+
+    There is NO owner-managed wallet allowlist. An authenticated paid Core user
+    starts a bounded funding operation only by explicitly starting an engine
+    with a chosen budget. Emergency-disable remains possible without becoming
+    an activation requirement. Future networks still require separate on-chain
+    verification and cannot become active merely by declaring an RPC URL.
+    """
+    setting = str(os.getenv('NEXUS_CAPITAL_AUTOMATION_ENABLED', '1')).strip().lower()
+    if setting not in ('1', 'true', 'yes', 'on'):
+        return set()
+    requested = {x.strip().upper() for x in str(
+        os.getenv('NEXUS_CAPITAL_AUTOMATION_LIVE_CHAINS') or 'ETH,BNB,POL'
+    ).split(',') if x.strip()}
+    verified_future = {x.strip().upper() for x in str(
+        os.getenv('NEXUS_CAPITAL_AUTOMATION_VERIFIED_CHAINS') or ''
+    ).split(',') if x.strip()}
+    return {x for x in requested if x in _NEXUS_CORE_TEST_CHAINS or x in verified_future}
 
 
-# ENGINE-544: PILOT ACCESS IS NOT THE SAME AS CHAIN ACCESS.
-# An accidental global chain flag must NEVER enable funded transactions
-# for every Nexus customer. Explicit wallet IDs are lowercased EVM addresses;
-# invalid entries fail closed. Empty environment = no pilot transfers.
-def _nca_pilot_wallet_allowed(wallet):
-    addr = _norm_addr(wallet or '').lower()
-    if not _looks_like_evm_addr(addr):
+def _nca_wallet_authorized(wallet, chain='', kind='FUND'):
+    """Privy wallet mapping + own active Core entitlement replace pilot wallet ENV.
+
+    No request-supplied address grants access: HTTP callers MUST pass through
+    _nca_identity (verified Privy JWT + exact X-Wallet match). The durable job
+    stores that verified wallet, and the worker checks the entitlement again.
+    Closing and withdrawing already-owned capital is allowed after expiry;
+    new funding is not. Redeem/test unlocks are not live-Vault authorization.
+    """
+    wallet = _norm_addr(wallet or '')
+    if not _looks_like_evm_addr(wallet) or not _privy_wallet_id_for_user(wallet):
         return False
-    raw = str(os.getenv('NEXUS_CAPITAL_AUTOMATION_PILOT_WALLETS') or '').strip()
-    if not raw:
+    if str(kind or 'FUND').upper() == 'RETURN':
+        return True
+    st = _compute_access_status(wallet)
+    if not (bool(st.get('can_live_execute')) and bool(st.get('can_open_new_trades'))):
         return False
-    entries = [part.strip().lower() for part in re.split(r'[,;\s]+', raw) if part.strip()]
-    if not entries or any(not _looks_like_evm_addr(a) for a in entries):
+    if str(st.get('source') or '').lower() in ('code', 'redeem', 'test'):
         return False
-    return addr in entries
+    allowed = {str(x).upper() for x in (st.get('chains_allowed') or [])}
+    return bool(str(chain or '').upper() in allowed)
 
 
 def _nca_validate_input(chain, stable, engine):
@@ -52926,9 +53038,9 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
     elif swap_deficit:
         blockers.append("native_swap_quote_not_requested")
     allowlisted = chain in _nca_live_chains()
-    pilot_wallet = _nca_pilot_wallet_allowed(wallet)
+    pilot_wallet = _nca_wallet_authorized(wallet, chain, "FUND")
     if not pilot_wallet:
-        blockers.append('capital_wallet_not_approved_for_pilot')
+        blockers.append('capital_user_not_entitled_or_privy_missing')
     return {
         "chain": chain, "chainId": cid, "engine": engine, "stable": stable,
         "vault": vault, "token": token, "wallet": wallet,
@@ -53098,8 +53210,8 @@ def _nca_approve_if_needed(wallet, wallet_id, cid, job, steps, token, spender, t
 
 
 def _nca_execute_fund(wallet, job_id, intent, steps):
-    if not _nca_pilot_wallet_allowed(wallet):
-        raise RuntimeError('capital_pilot_wallet_permission_revoked')
+    if not _nca_wallet_authorized(wallet, intent['chain'], 'FUND'):
+        raise RuntimeError('capital_user_entitlement_revoked')
     chain = intent['chain']; cid = int(intent['chainId']); stable = intent['stable']; engine = intent['engine']
     cfg = _privy_trading_cfg(cid)
     wallet_id = _privy_wallet_id_for_user(wallet)
@@ -53166,8 +53278,8 @@ def _nca_return_plan(wallet, chain, stable, engine, session_id):
 
 
 def _nca_execute_return(wallet, job_id, intent, steps):
-    if not _nca_pilot_wallet_allowed(wallet):
-        raise RuntimeError('capital_pilot_wallet_permission_revoked')
+    if not _nca_wallet_authorized(wallet, intent["chain"], "RETURN"):
+        raise RuntimeError('capital_wallet_mapping_revoked')
     plan = _nca_return_plan(wallet, intent['chain'], intent['stable'], intent['engine'], intent['sessionId'])
     if plan['chain'] not in _nca_live_chains():
         raise RuntimeError('capital_return_chain_not_approved')
@@ -53221,8 +53333,8 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
     chain, cid, stable, engine = _nca_validate_input(chain, stable, engine)
     if chain not in _nca_live_chains():
         raise ValueError('capital_automation_disabled_for_chain')
-    if not _nca_pilot_wallet_allowed(wallet):
-        raise ValueError('capital_wallet_not_approved_for_pilot')
+    if not _nca_wallet_authorized(wallet, chain, kind):
+        raise ValueError('capital_wallet_not_authorized_for_operation')
     if kind == 'FUND':
         plan = _nca_plan(wallet, chain, stable, engine, amount)
         if plan['blockers']:
@@ -53451,7 +53563,7 @@ def _nca_execution_guard_report(wallet, chain, stable):
     recent = [_nca_public_job(dict(row)) for row in recent_rows]
     limit = _nca_daily_pilot_limit()
     allowed = chain in _nca_live_chains()
-    pilot_wallet = _nca_pilot_wallet_allowed(wallet)
+    pilot_wallet = _nca_wallet_authorized(wallet, chain, "FUND")
     return {
         'chain': chain, 'chainId': cid, 'stable': stable,
         'operatorEnabled': bool(allowed),
@@ -53465,8 +53577,8 @@ def _nca_execution_guard_report(wallet, chain, stable):
         'crossWorkerDbLock': True,
         'onchainSessionAllocationIsAuthoritative': True,
         'readOnly': True,
-        'transactionsSent': 0,
-        'note': 'Nur ausdrücklich zugelassene Test-Wallets dürfen Pilottransfers starten. Unklare Transaktionen werden nicht wiederholt. Diese Prüfung bewegt kein Geld.'
+        'transactionsSent': sum(sum(1 for st in (x.get('steps') or []) if st.get('txHash')) for x in (recent or [])),
+        'note': 'Kapitalaktionen nur mit verifizierter Privy-Wallet und gültigem Core-Zugang. Keine Wallet-Liste in Render. Unklare Transaktionen werden nie automatisch wiederholt; diese Prüfung bewegt kein Geld.'
     }
 
 
@@ -53521,3 +53633,59 @@ def api_nexus_capital_auto_receipts(job_id):
         return jsonify({'status':'error','error':str(exc)}),403
     except Exception as exc:
         return jsonify({'status':'error','error':'capital_receipt_audit_failed','detail':str(exc)[:150]}),503
+
+
+# ENGINE-545: Return principal from a *confirmed* finalized CoreVault session.
+# This is a ledgered, at-most-once job, never a new wallet signature.
+def _nca_queue_auto_return(wallet, engine, chain_id, session_id, vault):
+    chain = _nkr_chain_key_from_id(int(chain_id))
+    if chain not in _nca_live_chains():
+        return {'status': 'DISABLED'}
+    if not _nca_wallet_authorized(wallet, chain, 'RETURN'):
+        return {'status': 'WALLET_NOT_MAPPED'}
+    _nca_init_db()
+    con = _db()
+    try:
+        row = con.execute(
+            "SELECT id,engine,chain_id,vault_address,privy_wallet_id,status "
+            "FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? "
+            "AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? "
+            "AND engine=? AND status='FINALIZED' LIMIT 1",
+            (_norm_addr(wallet).lower(), int(chain_id), _norm_addr(vault).lower(),
+             str(int(session_id)), str(engine).upper())
+        ).fetchone()
+        if not row:
+            return {'status':'SESSION_NOT_REGISTERED_FINALIZED'}
+    finally:
+        con.close()
+    # Exact settlement token comes from sessionOf, never from a frontend ticker.
+    words = _core_vault_words(_core_vault_call(
+        int(chain_id), _norm_addr(vault), _core_selector('sessionOf(uint256)'),
+        _uint_to_32(int(session_id))))
+    if len(words) < 13 or int(words[3]) != 4 or int(words[12]) != 0:
+        return {'status':'ONCHAIN_FINALIZE_NOT_CONFIRMED'}
+    settled = '0x' + format(int(words[1]), '040x')
+    cfg = _privy_trading_cfg(int(chain_id))
+    stable = next((s for s in ('USDC','USDT') if
+                   _norm_addr(cfg.get(s.lower()) or '').lower() == settled.lower()), '')
+    if not stable:
+        return {'status':'NON_STABLE_SESSION_NOT_AUTO_WITHDRAWN'}
+    # A larger session must never be partly withdrawn on the assumption that
+    # previously free deposits belong to the just-completed session.
+    budget = int(words[8]); cash = int(words[9])
+    if budget <= 0 or cash <= 0:
+        return {'status':'NOTHING_TO_RETURN'}
+    try:
+        plan = _nca_return_plan(wallet, chain, stable, engine, int(session_id))
+    except ValueError as exc:
+        return {'status':'GUARDED_REVIEW', 'reason':str(exc)[:160]}
+    if int(plan.get('withdrawUnits') or 0) <= 0:
+        return {'status':'NOTHING_TO_RETURN'}
+    key = f'auto-finalized-{int(chain_id)}-{str(engine).upper()}-{int(session_id)}'
+    job, created = _nca_create_job(wallet, 'RETURN', key, chain, stable, engine,
+                                   session_id=int(session_id))
+    if created:
+        threading.Thread(target=_nca_job_worker,
+            args=(wallet,job['job_id']), daemon=True,
+            name='nca-return-'+str(job['job_id'])[-8:]).start()
+    return {'status':job.get('status'), 'jobId':job.get('job_id'), 'created':created}
