@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-538-CAPITAL-AUDIT-NO-SIGN";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD577-CAPITAL-AUDIT-NO-SIGN"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-539-PRIVY-VERIFIED-AUDIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD578-PRIVY-VERIFIED-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27911,10 +27911,168 @@ def api_wallet_swap_prepare():
         return jsonify({"status":"error","error":str(exc)[:240],"ts":now_ts()}), 502
 
 
-# ENGINE-537: Capital-route audit returns wallet-specific financial information.
-# Only a SIGNED Nexus backend bearer token is accepted. Do not fall back to an
-# unverified/decoded Privy JWT or a user-provided X-Wallet-Address for identity.
-# This deliberately does not change the auth policy of other existing routes.
+# ENGINE-539: Read-only capital audit accepts two VERIFIED identities:
+#  (1) existing Nexus-signed bearer for backwards compatibility;
+#  (2) Privy access JWT (ES256, correct app/issuer/expiry) plus a server-side
+#      Privy USER lookup that binds the DID to an embedded EVM wallet.
+# Never trust an unverified JWT payload or a wallet header alone.
+# No signing / trading / balance mutations occur in this authentication path.
+class _CapitalRoutePrivyUnavailable(Exception):
+    pass
+
+
+class _CapitalRouteWalletMismatch(Exception):
+    pass
+
+
+_CAPITAL_PRIVY_JWKS_CACHE = {"expires": 0, "app": "", "keys": []}
+
+
+def _capital_privy_b64decode(value):
+    import base64
+    value = str(value or "")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _capital_privy_jwks(app_id, required_kid=""):
+    from urllib.parse import quote
+    now = time.time()
+    entry = _CAPITAL_PRIVY_JWKS_CACHE
+    existing = entry.get("keys") or []
+    if entry.get("app") == app_id and float(entry.get("expires") or 0) > now:
+        if not required_kid or any(str(k.get("kid") or "") == required_kid for k in existing):
+            return existing
+    encoded_app_id = quote(app_id, safe="")
+    # Both domains are Privy-operated; only this exact trusted path is queried.
+    urls = (
+        f"https://api.privy.io/v1/apps/{encoded_app_id}/jwks.json",
+        f"https://auth.privy.io/api/v1/apps/{encoded_app_id}/jwks.json",
+    )
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=(3, 6), headers={"Accept": "application/json"})
+            if not response.ok:
+                continue
+            data = response.json()
+            keys = data.get("keys") if isinstance(data, dict) else None
+            if isinstance(keys, list) and keys:
+                entry.update({"app": app_id, "keys": keys, "expires": now + 600})
+                return keys
+        except (requests.RequestException, ValueError):
+            continue
+    # Fail closed after cache expiry: an unreachable key service cannot authorize users.
+    raise _CapitalRoutePrivyUnavailable("privy_jwks_unavailable")
+
+
+def _capital_privy_verify_claims(token):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, utils
+    import json
+    app_id = (os.getenv("PRIVY_APP_ID") or "").strip()
+    if not app_id:
+        raise _CapitalRoutePrivyUnavailable("privy_app_id_missing")
+    if len(str(token or "")) > 8192:
+        return None
+    parts = str(token or "").split(".")
+    if len(parts) != 3 or any(not x for x in parts):
+        return None
+    try:
+        header = json.loads(_capital_privy_b64decode(parts[0]).decode("utf-8"))
+        claims = json.loads(_capital_privy_b64decode(parts[1]).decode("utf-8"))
+        if not isinstance(header, dict) or not isinstance(claims, dict):
+            return None
+        if header.get("alg") != "ES256" or header.get("typ", "JWT").upper() != "JWT":
+            return None
+        if claims.get("iss") != "privy.io" or claims.get("aud") != app_id:
+            return None
+        issued_at, expires = int(claims.get("iat") or 0), int(claims.get("exp") or 0)
+        now = int(time.time())
+        if issued_at <= 0 or issued_at > now + 60 or expires <= now or expires <= issued_at:
+            return None
+        if claims.get("nbf") is not None and int(claims["nbf"]) > now + 60:
+            return None
+        did = str(claims.get("sub") or "")
+        if not did.startswith("did:privy:") or len(did) > 255 or not str(claims.get("sid") or ""):
+            return None
+        sig = _capital_privy_b64decode(parts[2])
+        if len(sig) != 64:
+            return None
+        r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+        der_sig = utils.encode_dss_signature(r, s)
+        msg = f"{parts[0]}.{parts[1]}".encode("ascii")
+        kid = str(header.get("kid") or "")
+        # Optional official dashboard verification key for installations that
+        # do not allow outbound JWKS requests. Never accept unsigned tokens.
+        pem = (os.getenv("PRIVY_VERIFICATION_KEY") or "").strip()
+        if pem:
+            try:
+                public = serialization.load_pem_public_key(pem.replace("\\n", "\n").encode("utf-8"))
+                if isinstance(public, ec.EllipticCurvePublicKey) and isinstance(public.curve, ec.SECP256R1):
+                    public.verify(der_sig, msg, ec.ECDSA(hashes.SHA256()))
+                    return claims
+            except Exception:
+                pass
+        keys = _capital_privy_jwks(app_id, kid)
+        for jwk in keys:
+            if not isinstance(jwk, dict) or jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
+                continue
+            if kid and jwk.get("kid") != kid:
+                continue
+            if jwk.get("alg", "ES256") != "ES256":
+                continue
+            try:
+                x = int.from_bytes(_capital_privy_b64decode(jwk["x"]), "big")
+                y = int.from_bytes(_capital_privy_b64decode(jwk["y"]), "big")
+                pk = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
+                pk.verify(der_sig, msg, ec.ECDSA(hashes.SHA256()))
+                return claims
+            except Exception:
+                # A failed signature must not be treated as a valid identity.
+                continue
+    except (_CapitalRoutePrivyUnavailable,):
+        raise
+    except Exception:
+        return None
+    return None
+
+
+def _capital_privy_wallet_from_token(token, requested_address):
+    from urllib.parse import quote
+    claims = _capital_privy_verify_claims(token)
+    if not claims:
+        return ""
+    # DID is cryptographically verified before using it with the server's
+    # authenticated Privy REST API. The request header is never evidence of ownership.
+    did = claims["sub"]
+    user_res = _privy_basic_get(f"/v1/users/{quote(did, safe='')}")
+    if not user_res.get("ok"):
+        raise _CapitalRoutePrivyUnavailable("privy_user_lookup_unavailable")
+    data = user_res.get("data") or {}
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict) or data.get("id") != did:
+        return ""
+    accounts = data.get("linked_accounts") or []
+    if not isinstance(accounts, list):
+        return ""
+    valid = set()
+    for account in accounts:
+        if not isinstance(account, dict) or account.get("type") != "wallet":
+            continue
+        chain_type = str(account.get("chain_type") or "").lower()
+        wallet_type = str(account.get("wallet_client_type") or account.get("wallet_client") or "").lower()
+        connector = str(account.get("connector_type") or "").lower()
+        if chain_type != "ethereum" or not (wallet_type == "privy" or connector == "embedded"):
+            continue
+        addr = _norm_addr(account.get("address") or "")
+        if _looks_like_evm_addr(addr):
+            valid.add(addr.lower())
+    requested = _norm_addr(requested_address or "")
+    if not _looks_like_evm_addr(requested) or requested.lower() not in valid:
+        raise _CapitalRouteWalletMismatch("wallet_identity_mismatch")
+    return requested
+
+
 def _capital_route_verified_wallet():
     authorization = str(request.headers.get("Authorization") or "").strip()
     if not authorization.lower().startswith("bearer "):
@@ -27922,16 +28080,20 @@ def _capital_route_verified_wallet():
     signed_token = authorization.split(" ", 1)[1].strip()
     if not signed_token:
         return ""
+    # Older signed Nexus sessions are still accepted, and identity-bound.
     try:
         payload = _AUTH_SERIALIZER.loads(signed_token, max_age=60 * 60 * 24 * 30)
-        if not isinstance(payload, dict):
-            return ""
-        wallet = _norm_addr(payload.get("wallet_address") or payload.get("wallet") or payload.get("walletAddress") or "")
-        return wallet if _looks_like_evm_addr(wallet) else ""
+        if isinstance(payload, dict):
+            wallet = _norm_addr(payload.get("wallet_address") or payload.get("wallet") or payload.get("walletAddress") or "")
+            if _looks_like_evm_addr(wallet):
+                return wallet
     except (SignatureExpired, BadSignature):
-        return ""
+        pass
     except Exception:
-        return ""
+        pass
+    if signed_token.count(".") == 2:
+        return _capital_privy_wallet_from_token(signed_token, request.headers.get("X-Wallet-Address"))
+    return ""
 
 
 # ENGINE-536/537: Read-only capital audit shared by NKR, GRID and TRADER.
@@ -27939,7 +28101,12 @@ def _capital_route_verified_wallet():
 @app.get("/api/nexus/capital/route-audit")
 def api_nexus_capital_route_audit():
     try:
-        wallet = _capital_route_verified_wallet()
+        try:
+            wallet = _capital_route_verified_wallet()
+        except _CapitalRouteWalletMismatch:
+            return jsonify({"status":"error", "error":"wallet_identity_mismatch"}), 403
+        except _CapitalRoutePrivyUnavailable as auth_exc:
+            return jsonify({"status":"error", "error":str(auth_exc)}), 503
         if not wallet:
             return jsonify({"status":"error", "error":"auth_required_or_expired"}), 401
         requested_wallet = _norm_addr(request.headers.get("X-Wallet-Address") or "")
