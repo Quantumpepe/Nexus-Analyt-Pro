@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-532-PRIVY-SWAP-SAFETY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD571-PRIVY-SWAP-SAFETY"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-534-PRIVY-SWAP-AUTH-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD573-PRIVY-SWAP-AUTH-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27685,38 +27685,69 @@ def api_wallet_swap_prepare():
             return jsonify({"status":"error","error":"settlement_token_not_configured"}), 503
         dec_in = _nexus_wallet_swap_decimals(cid, wrapped)
         dec_out = _nexus_wallet_swap_decimals(cid, token_out)
-        amount_text = str(body.get("amount") or "").strip()
-        try:
-            amount = Decimal(amount_text)
-        except (InvalidOperation, ValueError):
-            return jsonify({"status":"error","error":"amount_invalid"}), 400
-        if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -dec_in:
-            return jsonify({"status":"error","error":"amount_invalid_or_excess_decimals"}), 400
-        raw_units = amount * (Decimal(10) ** dec_in)
-        if raw_units > Decimal(2**128 - 1):
-            return jsonify({"status":"error","error":"amount_exceeds_limit"}), 400
-        amount_in = int(raw_units.to_integral_value(rounding=ROUND_DOWN))
-        if amount_in <= 0:
-            return jsonify({"status":"error","error":"amount_too_small"}), 400
         slip = int(body.get("slippageBps") or 100)
         if not 10 <= slip <= 300:
             return jsonify({"status":"error","error":"slippage_outside_safe_bounds"}), 400
-        # Reserve 2 x ~650k gas units for wrap/approve/swap, never spend wallet gas.
+        # BUILD533: Gas reserve is read from the chain BEFORE calculating an
+        # amount. Auto/Max always uses actual on-chain balances, not stale UI
+        # cache values. Native spendable = balance minus reserved network gas.
         gas_price_hex = _rpc_call(cid, "eth_gasPrice", [])
         gas_price = int(str(gas_price_hex), 16)
         if gas_price <= 0:
             raise RuntimeError("wallet_swap_gas_price_unavailable")
         native_balance = int(str(_rpc_call(cid, "eth_getBalance", [wallet, "latest"])), 16)
         gas_reserve = 2 * 650_000 * gas_price
-        if is_native and native_balance < amount_in + gas_reserve:
-            return jsonify({"status":"error","error":"insufficient_native_after_gas_reserve",
+        if native_balance < gas_reserve:
+            return jsonify({"status":"error","error":"insufficient_native_gas_reserve",
                             "gasReserveWei":str(gas_reserve)}), 400
-        if not is_native and native_balance < gas_reserve:
-            return jsonify({"status":"error","error":"insufficient_native_gas_reserve"}), 400
+        wrapped_balance = None
         if not is_native:
             raw_bal = _eth_call(cid, wrapped, "0x70a08231" + _addr_to_32(wallet))
-            if int(str(raw_bal or "0x0"), 16) < amount_in:
-                return jsonify({"status":"error","error":"insufficient_wrapped_balance"}), 400
+            wrapped_balance = int(str(raw_bal or "0x0"), 16)
+
+        amount_mode = str(body.get("amountMode") or "CUSTOM").upper().strip()
+        if amount_mode == "PERCENT":
+            # Explicitly supported preset percentages only. Never trust a
+            # client's display amount for an auto swap.
+            percent = body.get("amountPercent")
+            if type(percent) is not int or percent not in (25, 50, 75, 100):
+                return jsonify({"status":"error","error":"invalid_amount_percent"}), 400
+            spendable = (native_balance - gas_reserve) if is_native else wrapped_balance
+            if spendable is None or spendable <= 0:
+                return jsonify({"status":"error","error":"no_spendable_balance_after_gas_reserve"}), 400
+            amount_in = (spendable * percent) // 100
+            if amount_in <= 0:
+                return jsonify({"status":"error","error":"amount_too_small"}), 400
+            amount = Decimal(amount_in) / (Decimal(10) ** dec_in)
+        elif amount_mode == "CUSTOM":
+            amount_text = str(body.get("amount") or "").strip()
+            try:
+                amount = Decimal(amount_text)
+            except (InvalidOperation, ValueError):
+                return jsonify({"status":"error","error":"amount_invalid"}), 400
+            if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -dec_in:
+                return jsonify({"status":"error","error":"amount_invalid_or_excess_decimals"}), 400
+            raw_units = amount * (Decimal(10) ** dec_in)
+            if raw_units > Decimal(2**128 - 1):
+                return jsonify({"status":"error","error":"amount_exceeds_limit"}), 400
+            amount_in = int(raw_units.to_integral_value(rounding=ROUND_DOWN))
+        else:
+            return jsonify({"status":"error","error":"unsupported_amount_mode"}), 400
+        if amount_in <= 0:
+            return jsonify({"status":"error","error":"amount_too_small"}), 400
+        if amount_in > 2**128 - 1:
+            return jsonify({"status":"error","error":"amount_exceeds_limit"}), 400
+        if is_native and amount_in > native_balance - gas_reserve:
+            return jsonify({"status":"error","error":"insufficient_native_after_gas_reserve",
+                            "gasReserveWei":str(gas_reserve)}), 400
+        if not is_native and (wrapped_balance is None or amount_in > wrapped_balance):
+            return jsonify({"status":"error","error":"insufficient_wrapped_balance"}), 400
+        # Format the EXACT integer amount without Decimal context rounding.
+        scale = 10 ** dec_in
+        whole, remainder = divmod(amount_in, scale)
+        exact_amount_human = str(whole) + (
+            "." + str(remainder).zfill(dec_in).rstrip("0") if remainder else ""
+        )
         quote_out, fee = _nexus_wallet_swap_exact_quote(cfg, wrapped, token_out, amount_in)
         min_out = (quote_out * (10_000 - slip)) // 10_000
         if min_out <= 0 or min_out < (10 ** dec_out) // 10: # minimum 0.10 stable
@@ -27750,7 +27781,8 @@ def api_wallet_swap_prepare():
             "tokenIn":{"address":"native" if is_native else wrapped,
                        "symbol":native_symbol if is_native else "W"+native_symbol,"decimals":dec_in},
             "tokenOut":{"address":token_out,"symbol":dest,"decimals":dec_out},
-            "amountIn":str(amount_in), "amountInHuman":str(amount),
+            "amountIn":str(amount_in), "amountInHuman":exact_amount_human,
+            "amountMode":amount_mode, "amountPercent":percent if amount_mode == "PERCENT" else None,
             "quoteOut":str(quote_out), "minOut":str(min_out),
             "slippageBps":slip, "router":router, "gasReserveWei":str(gas_reserve),
             "steps":steps,
