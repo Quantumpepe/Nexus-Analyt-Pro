@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-540-MULTICHAIN-REGISTRY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD579-MULTICHAIN-REGISTRY"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-541-CAPITAL-AUTOMATION-GUARDED";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD580-CAPITAL-AUTOMATION-GUARDED"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -28170,7 +28170,7 @@ def _nexus_chain_capability(key):
         "stablecoins": stables,
         "capitalAuditAvailable": audit_available,
         "liveExecutionVerifiedByRegistry": False,
-        "automatedFundingEnabledByRegistry": False,
+        "automatedFundingEnabledByRegistry": bool(key in _nca_live_chains()),
         "notes": "Existing chain; independent trade/exit tests still required" if current
                  else "Future network; must pass on-chain and Privy checks before activation",
     }
@@ -28284,8 +28284,8 @@ def api_nexus_capital_route_audit():
             "swapRouterConfigured":_looks_like_evm_addr(cfg.get("router")),
             "quoteProviderConfigured":_looks_like_evm_addr(cfg.get("quoter")),
             "sessions":session_rows,
-            "automaticSwapExecutionEnabled":False,
-            "nextStep":"PREVIEW_ONLY: Automatic native-to-stable funding still requires safeguarded transaction journal and chain-specific end-to-end live test.",
+            "automaticSwapExecutionEnabled":bool(chain in _nca_live_chains()),
+            "nextStep":"GUARDED_AUTOMATION: Journalled funding/return available only after explicit operator chain enablement and live Privy/Vault tests.",
             "note":"A wallet balance is not a Vault balance. A completed session releases freeBase but does not automatically send tokens to the wallet.",
             "ts":now_ts(),
         })
@@ -52707,3 +52707,501 @@ def api_nexus_eth_pol_readiness_audit():
 
 # ENGINE-526: initialize observability tables once when each WSGI worker imports this module.
 _nexus_observability_bootstrap()
+
+
+# ENGINE-541: Isolated, journalled capital automation for NKR, GRID and TRADER.
+# No action is enabled by a build/deploy alone. Explicit chain allowlist and
+# operator flag must be set after independent chain/Privy policy live testing.
+# This module uses existing authenticated Privy wallet and V5 CoreVault helpers.
+_NCA_ENGINES = {"NKR": 0, "TRADER": 1, "GRID": 2}
+_NCA_ACTIVE = frozenset({"QUEUED", "RUNNING", "BROADCAST_UNKNOWN", "RECEIPT_PENDING"})
+
+
+def _nca_live_chains():
+    enabled = str(os.getenv("NEXUS_CAPITAL_AUTOMATION_ENABLED") or "").strip().lower() in ("1", "true", "yes")
+    allowed = {x.strip().upper() for x in str(os.getenv("NEXUS_CAPITAL_AUTOMATION_LIVE_CHAINS") or "").split(",") if x.strip()}
+    # Future networks require a separate verified-network attestation; a Vault
+    # address or public RPC URL alone must never enable fund movement.
+    verified_future = {x.strip().upper() for x in str(os.getenv("NEXUS_CAPITAL_AUTOMATION_VERIFIED_CHAINS") or "").split(",") if x.strip()}
+    return {x for x in allowed if x in _NEXUS_CORE_TEST_CHAINS or x in verified_future} if enabled else set()
+
+
+def _nca_validate_input(chain, stable, engine):
+    chain = str(chain or "").upper().strip()
+    stable = str(stable or "").upper().strip()
+    engine = str(engine or "").upper().strip().replace("TRADING", "TRADER")
+    if engine not in _NCA_ENGINES or stable not in ("USDC", "USDT"):
+        raise ValueError("capital_invalid_engine_or_stable")
+    cid = int(_CHAIN_ID_BY_KEY.get(chain) or 0)
+    caps = _nexus_chain_capability(chain)
+    if not cid or not caps or not caps.get("capitalAuditAvailable"):
+        raise ValueError("capital_chain_not_configured")
+    return chain, cid, stable, engine
+
+
+def _nca_identity():
+    try:
+        wallet = _capital_route_verified_wallet()
+    except _CapitalRouteWalletMismatch as exc:
+        raise PermissionError("capital_wallet_mismatch") from exc
+    if not wallet:
+        raise PermissionError("capital_login_required")
+    header_wallet = _norm_addr(request.headers.get("X-Wallet-Address") or "")
+    if not _looks_like_evm_addr(header_wallet) or wallet.lower() != header_wallet.lower():
+        raise PermissionError("capital_wallet_mismatch")
+    return wallet
+
+
+def _nca_balance(chain_id, token, wallet):
+    raw = _eth_call(int(chain_id), _norm_addr(token), "0x70a08231" + _addr_to_32(wallet))
+    value = str(raw or "0x")
+    if value in ("", "0x"):
+        raise RuntimeError("capital_wallet_balance_unavailable")
+    return int(value, 16)
+
+
+def _nca_allowance(chain_id, token, wallet, spender):
+    raw = _eth_call(int(chain_id), token, "0xdd62ed3e" + _addr_to_32(wallet) + _addr_to_32(spender))
+    if not raw or str(raw) == "0x":
+        raise RuntimeError("capital_allowance_unavailable")
+    return int(str(raw), 16)
+
+
+def _nca_max_spend_wei(chain_id, wallet):
+    gas_price = int(str(_rpc_call(chain_id, "eth_gasPrice", []) or "0x0"), 16)
+    balance = int(str(_rpc_call(chain_id, "eth_getBalance", [wallet, "latest"]) or "0x0"), 16)
+    if gas_price <= 0:
+        raise RuntimeError("capital_gas_price_unavailable")
+    # Deliberately conservative: wrap, approve, swap, approve, deposit.
+    gas_reserve = max(1, gas_price * 1_400_000 * 2)
+    return max(0, balance - gas_reserve), gas_reserve, balance
+
+
+def _nca_quote_native_for_deficit(cfg, stable_token, need_units, max_spend, slippage_bps=100):
+    """Strict Quoter result; bounded native spend estimated from on-chain pool data."""
+    wrapped = _norm_addr(cfg.get("weth") or "")
+    if not _looks_like_evm_addr(wrapped) or max_spend <= 0 or need_units <= 0:
+        raise ValueError("capital_native_route_unavailable")
+    def q(wei):
+        out, fee = _nexus_wallet_swap_exact_quote(cfg, wrapped, stable_token, int(wei))
+        if int(out) <= 0 or int(fee) <= 0:
+            raise ValueError("capital_quote_not_positive")
+        return int(out), int(fee)
+    max_out, _ = q(int(max_spend))
+    if max_out * (10_000 - slippage_bps) // 10_000 < need_units:
+        raise ValueError("capital_native_balance_insufficient_for_shortfall")
+    # Avoid an overly wide fixed-step binary search: that can overspend native
+    # badly for small budgets. Estimate amount using the *real* on-chain quote.
+    numerator = int(max_spend) * int(need_units) * 10_000
+    denominator = int(max_out) * (10_000 - slippage_bps)
+    estimate = max(1, (numerator + denominator - 1) // denominator)
+    # Bound the buffer to 2%; never silently consume a much larger native amount.
+    candidate = min(int(max_spend), (estimate * 102 + 99) // 100)
+    out, fee = q(candidate)
+    for _ in range(3):
+        min_out = out * (10_000 - slippage_bps) // 10_000
+        if min_out >= need_units:
+            return {"nativeSpendWei": str(candidate), "quoteOutUnits": str(out),
+                    "minOutUnits": str(min_out), "feeTier": fee,
+                    "slippageBps": int(slippage_bps)}
+        if out <= 0:
+            break
+        needed_bump = (candidate * need_units + max(1, min_out) - 1) // max(1, min_out)
+        candidate = min(int(max_spend), max(candidate + 1, (needed_bump * 102 + 99) // 100))
+        out, fee = q(candidate)
+    raise ValueError("capital_swap_cannot_meet_budget_within_bounded_native_spend")
+
+
+def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
+    from decimal import Decimal
+    chain, cid, stable, engine = _nca_validate_input(chain, stable, engine)
+    funding = _v5_engine_funding_state(wallet, chain, stable)
+    required_fields = ("configured", "depositEnabled", "withdrawEnabled", "executionEnabled", "settlementToken")
+    if not all(bool(funding.get(k)) for k in required_fields):
+        raise ValueError("capital_vault_settlement_not_ready")
+    vault, token = _norm_addr(funding.get("vault") or ""), _norm_addr(funding.get("token") or "")
+    if not (_looks_like_evm_addr(vault) and _looks_like_evm_addr(token)):
+        raise ValueError("capital_vault_or_token_invalid")
+    if cid == 137 and stable == "USDC" and token.lower() != _POL_USDC_NATIVE.lower():
+        raise ValueError("capital_polygon_usdc_must_be_native")
+    decimals = int(funding.get("decimals") or 0)
+    if not 1 <= decimals <= 18:
+        raise ValueError("capital_settlement_decimals_invalid")
+    actual_decimals = _nexus_wallet_swap_decimals(cid, token)
+    if decimals != actual_decimals:
+        raise ValueError("capital_token_decimals_mismatch")
+    units = _parse_asset_units(str(amount), decimals)
+    if units <= 0 or units > 2**128 - 1:
+        raise ValueError("capital_budget_outside_limits")
+    max_per_session = int(funding.get("maxSessionBudgetUnits") or 0)
+    if max_per_session and units > max_per_session:
+        raise ValueError("capital_session_budget_over_vault_limit")
+    # A freshly deployed automation is a bounded pilot, never an unlimited
+    # background-spend authority. Raise only after independent live testing.
+    try:
+        test_limit = Decimal(str(os.getenv("NEXUS_CAPITAL_AUTOMATION_TEST_LIMIT_USD") or "25"))
+        if not test_limit.is_finite() or test_limit <= 0:
+            raise ValueError("invalid_limit")
+    except Exception:
+        test_limit = Decimal("25")
+    free = int(funding.get("freeBaseUnits") or 0)
+    deficit = max(0, units - free)
+    stable_wallet = _nca_balance(cid, token, wallet)
+    native_spendable, gas_reserve, native_balance = _nca_max_spend_wei(cid, wallet)
+    cfg = _privy_trading_cfg(cid)
+    wallet_id = str(_privy_wallet_id_for_user(wallet) or "").strip()
+    blockers = []
+    if Decimal(str(amount)) > test_limit:
+        blockers.append("operator_capital_test_limit_exceeded")
+    if not wallet_id:
+        blockers.append("privy_wallet_not_provisioned")
+    if not (cfg.get("appId") and cfg.get("appSecret") and cfg.get("authorizationKey") and cfg.get("signerId") and cfg.get("policyId")):
+        blockers.append("privy_backend_signer_or_policy_missing")
+    try:
+        if bool((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["paused"])) or [1])[0]):
+            blockers.append("corevault_paused")
+    except Exception:
+        blockers.append("corevault_pause_read_unavailable")
+    try:
+        words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["solvency"], token))
+        if len(words) < 3 or not bool(words[2]):
+            blockers.append("corevault_solvency_not_confirmed")
+    except Exception:
+        blockers.append("corevault_solvency_unavailable")
+    swap_deficit = max(0, deficit - stable_wallet)
+    quote = None
+    if swap_deficit and allow_quote:
+        if not (_looks_like_evm_addr(cfg.get("router")) and _looks_like_evm_addr(cfg.get("quoter"))):
+            blockers.append("native_router_or_quoter_missing")
+        else:
+            try:
+                quote = _nca_quote_native_for_deficit(cfg, token, swap_deficit, native_spendable)
+            except Exception as exc:
+                blockers.append("native_swap_quote_failed:" + str(exc)[:120])
+    elif swap_deficit:
+        blockers.append("native_swap_quote_not_requested")
+    allowlisted = chain in _nca_live_chains()
+    return {
+        "chain": chain, "chainId": cid, "engine": engine, "stable": stable,
+        "vault": vault, "token": token, "wallet": wallet,
+        "decimals": decimals, "budgetUnits": str(units), "vaultFreeUnits": str(free),
+        "depositNeededUnits": str(deficit), "walletStableUnits": str(stable_wallet),
+        "nativeBalanceWei": str(native_balance), "nativeGasReserveWei": str(gas_reserve),
+        "nativeSwapShortfallUnits": str(swap_deficit), "nativeSwapQuote": quote,
+        "route": "ALREADY_FUNDED" if not deficit else ("DEPOSIT_STABLE" if not swap_deficit else "SWAP_NATIVE_THEN_DEPOSIT"),
+        "privyProvisioned": bool(wallet_id), "blockers": blockers,
+        "automationLiveAllowed": bool(allowlisted and not blockers),
+        "enabledByOperator": bool(allowlisted), "readOnlyPreview": True,
+        "note": "A successful swap must be followed by a confirmed Vault deposit; neither is a completed trade.",
+    }
+
+
+def _nca_init_db():
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("""CREATE TABLE IF NOT EXISTS nexus_capital_automation_jobs (
+                job_id TEXT PRIMARY KEY, operation_key TEXT UNIQUE NOT NULL,
+                wallet_address TEXT NOT NULL, chain_id INTEGER NOT NULL,
+                engine TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '', intent_json TEXT NOT NULL DEFAULT '{}',
+                steps_json TEXT NOT NULL DEFAULT '{}', created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nca_wallet_chain ON nexus_capital_automation_jobs(wallet_address,chain_id,status)")
+            # Atomic cross-worker protection: Python locks alone are not shared
+            # among multiple Render/Gunicorn workers.
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_nca_one_active_wallet_chain
+                ON nexus_capital_automation_jobs(wallet_address,chain_id)
+                WHERE status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING')""")
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nca_get_job(wallet, job_id=None, operation_key=None):
+    _nca_init_db()
+    conn = _db()
+    try:
+        if operation_key is not None:
+            r = conn.execute("SELECT * FROM nexus_capital_automation_jobs WHERE wallet_address=? AND operation_key=?",
+                             (_norm_addr(wallet).lower(), operation_key)).fetchone()
+        else:
+            r = conn.execute("SELECT * FROM nexus_capital_automation_jobs WHERE wallet_address=? AND job_id=?",
+                             (_norm_addr(wallet).lower(), str(job_id))).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def _nca_update_job(job_id, *, status, detail='', steps=None):
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            if steps is None:
+                conn.execute("UPDATE nexus_capital_automation_jobs SET status=?,detail=?,updated_ts=? WHERE job_id=?",
+                             (status, str(detail)[:300], now_ts(), job_id))
+            else:
+                conn.execute("UPDATE nexus_capital_automation_jobs SET status=?,detail=?,steps_json=?,updated_ts=? WHERE job_id=?",
+                             (status, str(detail)[:300], json.dumps(steps, separators=(',', ':')), now_ts(), job_id))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _nca_public_job(row):
+    if not row:
+        return None
+    intent = json.loads(row.get("intent_json") or '{}')
+    steps = json.loads(row.get("steps_json") or '{}')
+    return {"jobId": row["job_id"], "kind": row["kind"], "engine": row["engine"],
+            "chainId": row["chain_id"], "status": row["status"], "detail": row["detail"],
+            "chain": intent.get("chain"), "stable": intent.get("stable"),
+            "budget": intent.get("amount"), "sessionId": intent.get("sessionId"),
+            "steps": [{"step": name, "status": value.get("status"), "txHash": value.get("txHash")}
+                      for name, value in steps.items()], "updatedTs": row["updated_ts"]}
+
+
+def _nca_step(wallet, wallet_id, cid, job, steps, name, contract, data, value="0x0"):
+    if name in steps:
+        raise RuntimeError("capital_step_already_attempted_manual_reconcile_required:" + name)
+    ref = "nca541-" + hashlib.sha256((job + ":" + name).encode()).hexdigest()[:36]
+    steps[name] = {"status": "BROADCAST_UNKNOWN", "reference": ref}
+    _nca_update_job(job, status="BROADCAST_UNKNOWN", detail=name, steps=steps)
+    try:
+        sent = _privy_send_delegated_transaction(wallet_id,
+            {"from": wallet, "to": _norm_addr(contract), "data": data, "value": value},
+            ref, chain_id=cid)
+    except Exception:
+        # Do not retry: Privy may have accepted the transaction before timeout.
+        raise RuntimeError("capital_broadcast_uncertain_manual_reconciliation:" + name)
+    tx_hash = str(sent.get("hash") or "")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+        raise RuntimeError("capital_transaction_hash_missing:" + name)
+    steps[name] = {"status": "RECEIPT_PENDING", "reference": ref, "txHash": tx_hash}
+    _nca_update_job(job, status="RECEIPT_PENDING", detail=name, steps=steps)
+    _privy_wait_receipt(tx_hash, timeout_sec=100, chain_id=cid)
+    steps[name]["status"] = "CONFIRMED"
+    _nca_update_job(job, status="RUNNING", detail=name + ":confirmed", steps=steps)
+    return tx_hash
+
+
+def _nca_approve_if_needed(wallet, wallet_id, cid, job, steps, token, spender, target, prefix):
+    if _nca_allowance(cid, token, wallet, spender) >= int(target):
+        return
+    existing = _nca_allowance(cid, token, wallet, spender)
+    if existing:
+        _nca_step(wallet, wallet_id, cid, job, steps, prefix + '_reset', token,
+                  '0x095ea7b3' + _addr_to_32(spender) + _uint_to_32(0))
+    _nca_step(wallet, wallet_id, cid, job, steps, prefix + '_exact', token,
+              '0x095ea7b3' + _addr_to_32(spender) + _uint_to_32(target))
+
+
+def _nca_execute_fund(wallet, job_id, intent, steps):
+    chain = intent['chain']; cid = int(intent['chainId']); stable = intent['stable']; engine = intent['engine']
+    cfg = _privy_trading_cfg(cid)
+    wallet_id = _privy_wallet_id_for_user(wallet)
+    plan = _nca_plan(wallet, chain, stable, engine, intent['amount'])
+    if chain not in _nca_live_chains() or plan['blockers']:
+        raise RuntimeError('capital_execution_preflight_blocked:' + ','.join(plan['blockers']))
+    vault, token = plan['vault'], plan['token']
+    needed = int(plan['depositNeededUnits'])
+    if not needed:
+        return 'already_sufficient_free_vault_capital'
+    quote = plan.get('nativeSwapQuote')
+    if quote:
+        wrapped, router = _norm_addr(cfg.get('weth')), _norm_addr(cfg.get('router'))
+        amount_native = int(quote['nativeSpendWei'])
+        _nca_step(wallet, wallet_id, cid, job_id, steps, 'wrap', wrapped, '0xd0e30db0', hex(amount_native))
+        _nca_approve_if_needed(wallet, wallet_id, cid, job_id, steps, wrapped, router, amount_native, 'router_approval')
+        deadline = now_ts() + 360
+        selector = _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR if cid == 56 else _PRIVY_EXACT_INPUT_SINGLE_SELECTOR
+        calldata = _router_exact_input_single_data(selector, wrapped, token, wallet, amount_native,
+                     int(quote['minOutUnits']), int(quote['feeTier']), deadline)
+        # Simulate the actual router call from the user's wallet before broadcasting.
+        _eth_call_from(cid, wallet, router, calldata)
+        _nca_step(wallet, wallet_id, cid, job_id, steps, 'swap', router, calldata)
+    if _nca_balance(cid, token, wallet) < needed:
+        raise RuntimeError('capital_stable_wallet_balance_below_needed_after_swap')
+    _nca_approve_if_needed(wallet, wallet_id, cid, job_id, steps, token, vault, needed, 'vault_approval')
+    data = _core_selector('deposit(address,uint256)') + _addr_to_32(token) + _uint_to_32(needed)
+    _eth_call_from(cid, wallet, vault, data)
+    _nca_step(wallet, wallet_id, cid, job_id, steps, 'vault_deposit', vault, data)
+    after = _v5_engine_funding_state(wallet, chain, stable)
+    if int(after['freeBaseUnits']) < int(plan['vaultFreeUnits']) + needed:
+        raise RuntimeError('capital_vault_credit_not_confirmed')
+    return 'wallet_to_vault_capital_confirmed'
+
+
+def _nca_return_plan(wallet, chain, stable, engine, session_id):
+    chain, cid, stable, engine = _nca_validate_input(chain, stable, engine)
+    sid = int(session_id)
+    if sid <= 0:
+        raise ValueError('capital_session_id_invalid')
+    funding = _v5_engine_funding_state(wallet, chain, stable)
+    vault, token = _norm_addr(funding['vault']), _norm_addr(funding['token'])
+    words = _core_vault_words(_core_vault_call(cid, vault, _core_selector('sessionOf(uint256)'), _uint_to_32(sid)))
+    if len(words) < 13:
+        raise RuntimeError('capital_onchain_session_unavailable')
+    owner = '0x' + format(int(words[0]), '040x')
+    settled_token = '0x' + format(int(words[1]), '040x')
+    if owner.lower() != wallet.lower() or settled_token.lower() != token.lower() or int(words[2]) != _NCA_ENGINES[engine]:
+        raise PermissionError('capital_session_owner_engine_or_stable_mismatch')
+    if int(words[3]) != 4 or int(words[12]) != 0:
+        raise ValueError('capital_session_not_completed_or_position_open')
+    budget = int(words[8]); cash = int(words[9]); free = int(funding['freeBaseUnits'])
+    payout = min(budget, cash, free)
+    if payout <= 0:
+        raise ValueError('capital_nothing_free_to_return')
+    # Early live pilots are strictly bounded for payouts as well as deposits.
+    from decimal import Decimal
+    limit = Decimal(str(os.getenv('NEXUS_CAPITAL_AUTOMATION_TEST_LIMIT_USD') or '25'))
+    if limit <= 0 or Decimal(payout) / Decimal(10**int(funding['decimals'])) > limit:
+        raise ValueError('capital_return_above_operator_pilot_limit')
+    return {'chain': chain, 'chainId': cid, 'stable': stable, 'engine': engine, 'vault': vault, 'token': token,
+            'sessionId': sid, 'returnedBaseUnits': str(min(budget, cash)), 'withdrawUnits': str(payout),
+            'freeBaseUnits': str(free), 'note': 'Return excludes secured profit and other allocated capital.'}
+
+
+def _nca_execute_return(wallet, job_id, intent, steps):
+    plan = _nca_return_plan(wallet, intent['chain'], intent['stable'], intent['engine'], intent['sessionId'])
+    if plan['chain'] not in _nca_live_chains():
+        raise RuntimeError('capital_return_chain_not_approved')
+    cfg = _privy_trading_cfg(plan['chainId'])
+    if not all((cfg.get('appId'), cfg.get('appSecret'), cfg.get('signerId'), cfg.get('policyId'), cfg.get('authorizationKey'))):
+        raise RuntimeError('capital_privy_signer_policy_unavailable')
+    wallet_id = _privy_wallet_id_for_user(wallet)
+    if not wallet_id:
+        raise RuntimeError('capital_privy_wallet_missing')
+    units = int(plan['withdrawUnits'])
+    data = _CORE_VAULT_SELECTORS['withdrawBase'] + _addr_to_32(plan['token']) + _uint_to_32(units) + _addr_to_32(wallet)
+    _eth_call_from(plan['chainId'], wallet, plan['vault'], data)
+    before = _nca_balance(plan['chainId'], plan['token'], wallet)
+    _nca_step(wallet, wallet_id, plan['chainId'], job_id, steps, 'vault_withdraw', plan['vault'], data)
+    if _nca_balance(plan['chainId'], plan['token'], wallet) < before + units:
+        raise RuntimeError('capital_wallet_payout_balance_delta_not_confirmed')
+    return 'confirmed_usdc_usdt_returned_to_privy_wallet'
+
+
+def _nca_job_worker(wallet, job_id):
+    row = _nca_get_job(wallet, job_id=job_id)
+    if not row:
+        return
+    intent = json.loads(row.get('intent_json') or '{}')
+    steps = json.loads(row.get('steps_json') or '{}')
+    # A persisted unknown transaction must never be automatically replayed.
+    if steps:
+        _nca_update_job(job_id, status='BROADCAST_UNKNOWN', detail='operator_reconciliation_required', steps=steps)
+        return
+    try:
+        _nca_update_job(job_id, status='RUNNING', detail='preflight')
+        if row['kind'] == 'FUND':
+            detail = _nca_execute_fund(wallet, job_id, intent, steps)
+        elif row['kind'] == 'RETURN':
+            detail = _nca_execute_return(wallet, job_id, intent, steps)
+        else:
+            raise ValueError('capital_unknown_job_kind')
+        _nca_update_job(job_id, status='CONFIRMED', detail=detail, steps=steps)
+    except Exception as exc:
+        # Even a CONFIRMED earlier step matters: wrapping/swapping may already
+        # have moved assets before a later deposit failed. No automatic replay.
+        dangerous = bool(steps)
+        _nca_update_job(job_id, status='BROADCAST_UNKNOWN' if dangerous else 'BLOCKED', detail=str(exc)[:300], steps=steps)
+
+
+def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=None, session_id=None):
+    _nca_init_db()
+    chain, cid, stable, engine = _nca_validate_input(chain, stable, engine)
+    if chain not in _nca_live_chains():
+        raise ValueError('capital_automation_disabled_for_chain')
+    if kind == 'FUND':
+        plan = _nca_plan(wallet, chain, stable, engine, amount)
+        if plan['blockers']:
+            raise ValueError('capital_preflight_failed:' + ','.join(plan['blockers']))
+    else:
+        _nca_return_plan(wallet, chain, stable, engine, session_id)
+    intent = {'chain': chain, 'chainId': cid, 'stable': stable, 'engine': engine,
+              'amount': str(amount or ''), 'sessionId': int(session_id or 0)}
+    operation_key = str(operation_key or '')
+    if not re.fullmatch(r'[a-zA-Z0-9._:-]{8,100}', operation_key):
+        raise ValueError('capital_idempotency_key_invalid')
+    if kind == 'RETURN':
+        operation_key = f'RETURN:{wallet.lower()}:{cid}:{engine}:{int(session_id)}'
+    else:
+        operation_key = f'FUND:{wallet.lower()}:{cid}:{engine}:{operation_key}'
+    job_id = 'nca-' + hashlib.sha256(operation_key.encode()).hexdigest()[:32]
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            existing = conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE operation_key=?',(operation_key,)).fetchone()
+            if existing:
+                old = dict(existing)
+                # A pre-broadcast rejection can be safely retried using the
+                # same idempotency key, never one that recorded any step.
+                if old['status'] == 'BLOCKED' and json.loads(old.get('steps_json') or '{}') == {}:
+                    previous = json.loads(old.get('intent_json') or '{}')
+                    if previous != intent:
+                        raise ValueError('capital_idempotency_payload_mismatch')
+                    conn.execute("UPDATE nexus_capital_automation_jobs SET status='QUEUED',detail='safe_prebroadcast_retry',updated_ts=? WHERE job_id=?", (now_ts(),old['job_id']))
+                    conn.commit()
+                    return dict(conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE job_id=?', (old['job_id'],)).fetchone()), True
+                if json.loads(old.get('intent_json') or '{}') != intent:
+                    raise ValueError('capital_idempotency_payload_mismatch')
+                return old, False
+            ongoing = conn.execute("SELECT job_id FROM nexus_capital_automation_jobs WHERE wallet_address=? AND chain_id=? AND status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING') LIMIT 1", (wallet.lower(),cid)).fetchone()
+            if ongoing:
+                raise ValueError('capital_job_already_running_or_pending_manual_review')
+            now = now_ts()
+            conn.execute("INSERT INTO nexus_capital_automation_jobs(job_id,operation_key,wallet_address,chain_id,engine,kind,status,detail,intent_json,steps_json,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id,operation_key,wallet.lower(),cid,engine,kind,'QUEUED','created',json.dumps(intent), '{}',now,now))
+            conn.commit()
+            return dict(conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE job_id=?',(job_id,)).fetchone()), True
+    finally:
+        conn.close()
+
+
+@app.get('/api/nexus/capital/automation/preview')
+def api_nexus_capital_auto_preview():
+    try:
+        wallet = _nca_identity()
+        row = _nca_plan(wallet, request.args.get('chain'), request.args.get('stable'), request.args.get('engine'), request.args.get('amount'))
+        return jsonify({'status':'ok','plan':row,'ts':now_ts()})
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+    except ValueError as exc:
+        return jsonify({'status':'blocked','error':str(exc)}),409
+    except Exception as exc:
+        return jsonify({'status':'error','error':'capital_automation_preview_failed','detail':str(exc)[:180]}),503
+
+
+@app.post('/api/nexus/capital/automation/jobs')
+def api_nexus_capital_auto_create():
+    try:
+        wallet = _nca_identity()
+        body = request.get_json(silent=True) or {}
+        kind = str(body.get('kind') or '').upper()
+        if kind not in ('FUND','RETURN'):
+            raise ValueError('capital_job_kind_invalid')
+        row, created = _nca_create_job(wallet, kind, body.get('requestId'), body.get('chain'),
+            body.get('stable'), body.get('engine'), body.get('amount'),body.get('sessionId'))
+        if created:
+            threading.Thread(target=_nca_job_worker, args=(wallet,row['job_id']),daemon=True,name='nca-'+row['job_id'][-8:]).start()
+        return jsonify({'status':'ok','created':created,'job':_nca_public_job(row)})
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+    except ValueError as exc:
+        return jsonify({'status':'blocked','error':str(exc)}),409
+    except Exception as exc:
+        return jsonify({'status':'error','error':'capital_automation_job_failed','detail':str(exc)[:160]}),503
+
+
+@app.get('/api/nexus/capital/automation/jobs/<job_id>')
+def api_nexus_capital_auto_status(job_id):
+    try:
+        wallet = _nca_identity()
+        row = _nca_get_job(wallet,job_id=job_id)
+        if not row:
+            return jsonify({'status':'error','error':'capital_job_not_found'}),404
+        return jsonify({'status':'ok','job':_nca_public_job(row)})
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+
