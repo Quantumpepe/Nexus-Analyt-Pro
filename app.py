@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-543-CAPITAL-PILOT-GUARDS";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD582-CAPITAL-PILOT-GUARDS"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-544-CAPITAL-PILOT-WALLET-GATE";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD583-CAPITAL-PILOT-WALLET-GATE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52726,6 +52726,23 @@ def _nca_live_chains():
     return {x for x in allowed if x in _NEXUS_CORE_TEST_CHAINS or x in verified_future} if enabled else set()
 
 
+# ENGINE-544: PILOT ACCESS IS NOT THE SAME AS CHAIN ACCESS.
+# An accidental global chain flag must NEVER enable funded transactions
+# for every Nexus customer. Explicit wallet IDs are lowercased EVM addresses;
+# invalid entries fail closed. Empty environment = no pilot transfers.
+def _nca_pilot_wallet_allowed(wallet):
+    addr = _norm_addr(wallet or '').lower()
+    if not _looks_like_evm_addr(addr):
+        return False
+    raw = str(os.getenv('NEXUS_CAPITAL_AUTOMATION_PILOT_WALLETS') or '').strip()
+    if not raw:
+        return False
+    entries = [part.strip().lower() for part in re.split(r'[,;\s]+', raw) if part.strip()]
+    if not entries or any(not _looks_like_evm_addr(a) for a in entries):
+        return False
+    return addr in entries
+
+
 def _nca_validate_input(chain, stable, engine):
     chain = str(chain or "").upper().strip()
     stable = str(stable or "").upper().strip()
@@ -52909,6 +52926,9 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
     elif swap_deficit:
         blockers.append("native_swap_quote_not_requested")
     allowlisted = chain in _nca_live_chains()
+    pilot_wallet = _nca_pilot_wallet_allowed(wallet)
+    if not pilot_wallet:
+        blockers.append('capital_wallet_not_approved_for_pilot')
     return {
         "chain": chain, "chainId": cid, "engine": engine, "stable": stable,
         "vault": vault, "token": token, "wallet": wallet,
@@ -52918,8 +52938,9 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
         "nativeSwapShortfallUnits": str(swap_deficit), "nativeSwapQuote": quote,
         "route": "ALREADY_FUNDED" if not deficit else ("DEPOSIT_STABLE" if not swap_deficit else "SWAP_NATIVE_THEN_DEPOSIT"),
         "privyProvisioned": bool(wallet_id), "blockers": blockers,
-        "automationLiveAllowed": bool(allowlisted and not blockers),
-        "enabledByOperator": bool(allowlisted), "readOnlyPreview": True,
+        "automationLiveAllowed": bool(allowlisted and pilot_wallet and not blockers),
+        "enabledByOperator": bool(allowlisted), "pilotWalletAllowed": bool(pilot_wallet),
+        "readOnlyPreview": True,
         "note": "A successful swap must be followed by a confirmed Vault deposit; neither is a completed trade.",
     }
 
@@ -53077,6 +53098,8 @@ def _nca_approve_if_needed(wallet, wallet_id, cid, job, steps, token, spender, t
 
 
 def _nca_execute_fund(wallet, job_id, intent, steps):
+    if not _nca_pilot_wallet_allowed(wallet):
+        raise RuntimeError('capital_pilot_wallet_permission_revoked')
     chain = intent['chain']; cid = int(intent['chainId']); stable = intent['stable']; engine = intent['engine']
     cfg = _privy_trading_cfg(cid)
     wallet_id = _privy_wallet_id_for_user(wallet)
@@ -53143,6 +53166,8 @@ def _nca_return_plan(wallet, chain, stable, engine, session_id):
 
 
 def _nca_execute_return(wallet, job_id, intent, steps):
+    if not _nca_pilot_wallet_allowed(wallet):
+        raise RuntimeError('capital_pilot_wallet_permission_revoked')
     plan = _nca_return_plan(wallet, intent['chain'], intent['stable'], intent['engine'], intent['sessionId'])
     if plan['chain'] not in _nca_live_chains():
         raise RuntimeError('capital_return_chain_not_approved')
@@ -53196,6 +53221,8 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
     chain, cid, stable, engine = _nca_validate_input(chain, stable, engine)
     if chain not in _nca_live_chains():
         raise ValueError('capital_automation_disabled_for_chain')
+    if not _nca_pilot_wallet_allowed(wallet):
+        raise ValueError('capital_wallet_not_approved_for_pilot')
     if kind == 'FUND':
         plan = _nca_plan(wallet, chain, stable, engine, amount)
         if plan['blockers']:
@@ -53424,19 +53451,22 @@ def _nca_execution_guard_report(wallet, chain, stable):
     recent = [_nca_public_job(dict(row)) for row in recent_rows]
     limit = _nca_daily_pilot_limit()
     allowed = chain in _nca_live_chains()
+    pilot_wallet = _nca_pilot_wallet_allowed(wallet)
     return {
         'chain': chain, 'chainId': cid, 'stable': stable,
         'operatorEnabled': bool(allowed),
+        'pilotWalletAllowed': bool(pilot_wallet),
+        'pilotTransferEnabled': bool(allowed and pilot_wallet and not pending and used < limit),
         'pilot24hLimit': str(limit), 'pilot24hUsed': str(used),
         'pilot24hRemaining': str(max(0, limit-used)),
         'pendingJobs': pending, 'recentJobs': recent,
-        'newFundingJobBlocked': bool(pending or used >= limit or not allowed),
+        'newFundingJobBlocked': bool(pending or used >= limit or not allowed or not pilot_wallet),
         'duplicateWorkerClaimProtection': True,
         'crossWorkerDbLock': True,
         'onchainSessionAllocationIsAuthoritative': True,
         'readOnly': True,
         'transactionsSent': 0,
-        'note': 'Ein Job kann nur einmal gestartet werden. Pending/unklare Transaktionen werden nie automatisch wiederholt. Die Vorschau reserviert kein Kapital.'
+        'note': 'Nur ausdrücklich zugelassene Test-Wallets dürfen Pilottransfers starten. Unklare Transaktionen werden nicht wiederholt. Diese Prüfung bewegt kein Geld.'
     }
 
 
