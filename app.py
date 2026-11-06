@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-546-SYSTEM-CAPITAL-CHECK-SELL-ONLY-GRID";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD585-SYSTEM-CAPITAL-CHECK-SELL-ONLY-GRID"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-547-CAPITAL-ACCESS-PARITY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD586-CAPITAL-ACCESS-PARITY"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52902,13 +52902,17 @@ def _nca_live_chains():
 
 
 def _nca_wallet_authorized(wallet, chain='', kind='FUND'):
-    """Privy wallet mapping + own active Core entitlement replace pilot wallet ENV.
+    """Use the EXACT existing Nexus Core live-entitlement decision.
 
-    No request-supplied address grants access: HTTP callers MUST pass through
-    _nca_identity (verified Privy JWT + exact X-Wallet match). The durable job
-    stores that verified wallet, and the worker checks the entitlement again.
-    Closing and withdrawing already-owned capital is allowed after expiry;
-    new funding is not. Redeem/test unlocks are not live-Vault authorization.
+    ENGINE-547: ENGINE-545 introduced a second, contradictory source check:
+    it rejected the permanent ('code') Core-LIVE state even though the central
+    access service explicitly grants live execution. The additional gate broke
+    previously working wallets. Do not create a second subscription policy.
+
+    The caller is identity-bound by _nca_identity (verified token + matching
+    wallet). The worker verifies this mapping and entitlement again. DEMO and
+    EXPIRED still cannot FUND. RETURN is permitted for the owner's capital
+    after their Core subscription expires.
     """
     wallet = _norm_addr(wallet or '')
     if not _looks_like_evm_addr(wallet) or not _privy_wallet_id_for_user(wallet):
@@ -52917,8 +52921,6 @@ def _nca_wallet_authorized(wallet, chain='', kind='FUND'):
         return True
     st = _compute_access_status(wallet)
     if not (bool(st.get('can_live_execute')) and bool(st.get('can_open_new_trades'))):
-        return False
-    if str(st.get('source') or '').lower() in ('code', 'redeem', 'test'):
         return False
     allowed = {str(x).upper() for x in (st.get('chains_allowed') or [])}
     return bool(str(chain or '').upper() in allowed)
@@ -53118,6 +53120,7 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
         "nativeBalanceWei": str(native_balance), "nativeGasReserveWei": str(gas_reserve),
         "nativeSwapShortfallUnits": str(swap_deficit), "nativeSwapQuote": quote,
         "route": "ALREADY_FUNDED" if not deficit else ("DEPOSIT_STABLE" if not swap_deficit else "SWAP_NATIVE_THEN_DEPOSIT"),
+        "budgetAlreadyCovered": bool(not deficit),
         "privyProvisioned": bool(wallet_id), "blockers": blockers,
         "automationLiveAllowed": bool(allowlisted and pilot_wallet and not blockers),
         "enabledByOperator": bool(allowlisted), "pilotWalletAllowed": bool(pilot_wallet),
