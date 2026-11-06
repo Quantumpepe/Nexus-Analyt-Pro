@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-547-CAPITAL-ACCESS-PARITY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD586-CAPITAL-ACCESS-PARITY"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-548-CAPITAL-AUDIT-GRID-SEPARATE";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD587-CAPITAL-AUDIT-GRID-SEPARATE"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -53064,8 +53064,10 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
     max_per_session = int(funding.get("maxSessionBudgetUnits") or 0)
     if max_per_session and units > max_per_session:
         raise ValueError("capital_session_budget_over_vault_limit")
-    # A freshly deployed automation is a bounded pilot, never an unlimited
-    # background-spend authority. Raise only after independent live testing.
+    # IMPORTANT: a budget that is already in the Vault does not need an
+    # automated funding transaction. Do not present FUND-only restrictions as
+    # a trading-capital shortage on ETH, BNB or POL. Actual live session
+    # authorization is still checked independently by the existing engine path.
     try:
         test_limit = Decimal(str(os.getenv("NEXUS_CAPITAL_AUTOMATION_TEST_LIMIT_USD") or "25"))
         if not test_limit.is_finite() or test_limit <= 0:
@@ -53075,43 +53077,56 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
     free = int(funding.get("freeBaseUnits") or 0)
     deficit = max(0, units - free)
     stable_wallet = _nca_balance(cid, token, wallet)
-    native_spendable, gas_reserve, native_balance = _nca_max_spend_wei(cid, wallet)
     cfg = _privy_trading_cfg(cid)
     wallet_id = str(_privy_wallet_id_for_user(wallet) or "").strip()
-    blockers = []
-    if Decimal(str(amount)) > test_limit:
-        blockers.append("operator_capital_test_limit_exceeded")
-    if not wallet_id:
-        blockers.append("privy_wallet_not_provisioned")
-    if not (cfg.get("appId") and cfg.get("appSecret") and cfg.get("authorizationKey") and cfg.get("signerId") and cfg.get("policyId")):
-        blockers.append("privy_backend_signer_or_policy_missing")
+    allowlisted = chain in _nca_live_chains()
+    # This is an authorization to send new money, NOT a proxy for whether
+    # already-deposited capital can be used by the existing live engines.
+    pilot_wallet = bool(_nca_wallet_authorized(wallet, chain, "FUND"))
+    vault_health_blockers = []
     try:
         if bool((_core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["paused"])) or [1])[0]):
-            blockers.append("corevault_paused")
+            vault_health_blockers.append("corevault_paused")
     except Exception:
-        blockers.append("corevault_pause_read_unavailable")
+        vault_health_blockers.append("corevault_pause_read_unavailable")
     try:
         words = _core_vault_words(_core_vault_call(cid, vault, _CORE_VAULT_SELECTORS["solvency"], token))
         if len(words) < 3 or not bool(words[2]):
-            blockers.append("corevault_solvency_not_confirmed")
+            vault_health_blockers.append("corevault_solvency_not_confirmed")
     except Exception:
-        blockers.append("corevault_solvency_unavailable")
+        vault_health_blockers.append("corevault_solvency_unavailable")
+    # The native balance and quote are only relevant if the Vault needs funds.
+    native_spendable = gas_reserve = native_balance = 0
     swap_deficit = max(0, deficit - stable_wallet)
     quote = None
-    if swap_deficit and allow_quote:
-        if not (_looks_like_evm_addr(cfg.get("router")) and _looks_like_evm_addr(cfg.get("quoter"))):
-            blockers.append("native_router_or_quoter_missing")
-        else:
-            try:
-                quote = _nca_quote_native_for_deficit(cfg, token, swap_deficit, native_spendable)
-            except Exception as exc:
-                blockers.append("native_swap_quote_failed:" + str(exc)[:120])
-    elif swap_deficit:
-        blockers.append("native_swap_quote_not_requested")
-    allowlisted = chain in _nca_live_chains()
-    pilot_wallet = _nca_wallet_authorized(wallet, chain, "FUND")
-    if not pilot_wallet:
-        blockers.append('capital_user_not_entitled_or_privy_missing')
+    funding_blockers = []
+    if deficit:
+        if Decimal(str(amount)) > test_limit:
+            funding_blockers.append("operator_capital_test_limit_exceeded")
+        if not allowlisted:
+            funding_blockers.append("capital_funding_not_enabled_for_chain")
+        if not pilot_wallet:
+            funding_blockers.append("capital_user_not_entitled_or_privy_missing")
+        if not wallet_id:
+            funding_blockers.append("privy_wallet_not_provisioned")
+        if not (cfg.get("appId") and cfg.get("appSecret") and cfg.get("authorizationKey") and cfg.get("signerId") and cfg.get("policyId")):
+            funding_blockers.append("privy_backend_signer_or_policy_missing")
+        if swap_deficit:
+            native_spendable, gas_reserve, native_balance = _nca_max_spend_wei(cid, wallet)
+            if allow_quote:
+                if not (_looks_like_evm_addr(cfg.get("router")) and _looks_like_evm_addr(cfg.get("quoter"))):
+                    funding_blockers.append("native_router_or_quoter_missing")
+                else:
+                    try:
+                        quote = _nca_quote_native_for_deficit(cfg, token, swap_deficit, native_spendable)
+                    except Exception as exc:
+                        funding_blockers.append("native_swap_quote_failed:" + str(exc)[:120])
+            else:
+                funding_blockers.append("native_swap_quote_not_requested")
+    # On-chain pause/solvency warnings remain visible. FUND can never execute
+    # while the Vault is unhealthy; an already-funded balance is not a claim
+    # that the user's normal trading session will necessarily start.
+    blockers = funding_blockers + vault_health_blockers if deficit else []
     return {
         "chain": chain, "chainId": cid, "engine": engine, "stable": stable,
         "vault": vault, "token": token, "wallet": wallet,
@@ -53120,9 +53135,11 @@ def _nca_plan(wallet, chain, stable, engine, amount, *, allow_quote=True):
         "nativeBalanceWei": str(native_balance), "nativeGasReserveWei": str(gas_reserve),
         "nativeSwapShortfallUnits": str(swap_deficit), "nativeSwapQuote": quote,
         "route": "ALREADY_FUNDED" if not deficit else ("DEPOSIT_STABLE" if not swap_deficit else "SWAP_NATIVE_THEN_DEPOSIT"),
-        "budgetAlreadyCovered": bool(not deficit),
+        "budgetAlreadyCovered": bool(not deficit), "fundingRequired": bool(deficit),
+        "existingCapitalIndependentOfFundingGate": bool(not deficit),
         "privyProvisioned": bool(wallet_id), "blockers": blockers,
-        "automationLiveAllowed": bool(allowlisted and pilot_wallet and not blockers),
+        "vaultHealthBlockers": vault_health_blockers,
+        "automationLiveAllowed": bool(deficit and allowlisted and pilot_wallet and not blockers),
         "enabledByOperator": bool(allowlisted), "pilotWalletAllowed": bool(pilot_wallet),
         "readOnlyPreview": True,
         "note": "A successful swap must be followed by a confirmed Vault deposit; neither is a completed trade.",
@@ -53472,9 +53489,10 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
         conn.close()
 
 
-# ENGINE-542: Single shared-pool preview across all engines.
-# The three independent one-engine previews must NOT be added together as if
-# each had exclusive access to the same Vault freeBase and wallet USDC.
+# ENGINE-548: Read-only combined stablecoin preview is ONLY NKR + TRADER.
+# GRID is sell-only for already-held tokens and must NEVER be counted as a
+# USDC/USDT budget. Its actual token balance is checked independently by
+# /api/nexus/capital/check-start, without changing any live trading route.
 def _nca_combined_preview(wallet, chain, stable, budgets):
     chain, cid, stable, _ = _nca_validate_input(chain, stable, "NKR")
     funding = _v5_engine_funding_state(wallet, chain, stable)
@@ -53493,8 +53511,10 @@ def _nca_combined_preview(wallet, chain, stable, budgets):
     budgets = budgets or {}
     if not isinstance(budgets, dict) or set(budgets) - set(_NCA_ENGINES):
         raise ValueError("capital_invalid_engine_budget_set")
+    # Ignore an old client's GRID amount. Never charge native Grid tokens against
+    # stablecoin reserves, even if an older frontend still sends grid=10.
     amounts = {}
-    for engine in ("NKR", "GRID", "TRADER"):
+    for engine in ("NKR", "TRADER"):
         try:
             value = str(budgets.get(engine, "0")).strip()
             units = 0 if value in ("", "0") else int(_parse_asset_units(value, decimals))
@@ -53547,8 +53567,9 @@ def _nca_combined_preview(wallet, chain, stable, budgets):
                 {"jobId":pending["job_id"],"status":pending["status"],"engine":pending["engine"]}
                 if pending else None),
             "readOnlyPreview": True, "createsReservation": False,
+            "gridCapitalIndependent": True,
             "automationExecutionAllowed": False,
-            "note": "Gemeinsame Simulation – keine Kapitalreservierung. Die tatsächliche Reservierung erfolgt erst durch createSession im CoreVault. Parallel laufende Funding-Jobs sind gesperrt."}
+            "note": "Nur NKR und Trader teilen den USDC/USDT-Pool. Grid prueft seine vorhandenen Token getrennt. Diese Vorschau reserviert kein Kapital; parallele Funding-Jobs bleiben gesperrt."}
 
 
 @app.get('/api/nexus/capital/automation/combined-preview')
