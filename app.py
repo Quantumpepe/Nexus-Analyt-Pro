@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-551-CAPITAL-INFO-ENGLISH";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD590-CAPITAL-INFO-ENGLISH"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-552-RETAIN-VAULT-PRINCIPAL";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD591-NKR-VAULT-ACCOUNT"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -1196,9 +1196,8 @@ def _finalize_one_live_session(wallet: str, engine: str, row: dict, *, allow_ear
             conn.commit()
     finally:
         conn.close()
-    # After on-chain FINALIZED confirmation, return the released principal to
-    # its owner's Privy wallet. Isolated thread: a withdrawal failure never
-    # marks a successfully finalized session as failed or retries a broadcast.
+    # ENGINE-552: Finalization already releases principal inside CoreVault.
+    # The compatibility hook does not initiate an automatic wallet withdrawal.
     try:
         _nca_queue_auto_return(wallet, eng, chain_id, sid, vault)
     except Exception as _return_exc:
@@ -1921,8 +1920,7 @@ def _run_recovery_job(job_id, wallet, engine, chain_id, vault_addr, session_snap
                 _nkr_set_local_stop_state(wallet,"FINALIZED",f"CoreVault session {sid} already finalized")
             _live_engine_mark(engine,status="stopped",decision="FINALIZED",gate_status="",reason=f"CoreVault session {sid} finalized",pending_tx="",last_error="")
             _recovery_job_write(job_id, job_status="SUCCESS", step=5, step_label="ALREADY_FINALIZED", receipt_status="confirmed", last_error="")
-            # A recovery of an already-finalized session must not strand its
-            # released principal in the Vault. Same idempotent return job key.
+            # ENGINE-552: Keep freed principal in CoreVault after recovery too.
             try:
                 _nca_queue_auto_return(wallet, engine, chain_id, sid, vault_addr)
             except Exception:
@@ -53833,57 +53831,16 @@ def api_nexus_capital_auto_receipts(job_id):
         return jsonify({'status':'error','error':'capital_receipt_audit_failed','detail':str(exc)[:150]}),503
 
 
-# ENGINE-545: Return principal from a *confirmed* finalized CoreVault session.
-# This is a ledgered, at-most-once job, never a new wallet signature.
+# ENGINE-552: No automatic principal withdrawal after session finalization.
+# Manual withdrawals and the existing capital/automation RETURN API remain available.
 def _nca_queue_auto_return(wallet, engine, chain_id, session_id, vault):
-    chain = _nkr_chain_key_from_id(int(chain_id))
-    if chain not in _nca_live_chains():
-        return {'status': 'DISABLED'}
-    if not _nca_wallet_authorized(wallet, chain, 'RETURN'):
-        return {'status': 'WALLET_NOT_MAPPED'}
-    _nca_init_db()
-    con = _db()
-    try:
-        row = con.execute(
-            "SELECT id,engine,chain_id,vault_address,privy_wallet_id,status "
-            "FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? "
-            "AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? "
-            "AND engine=? AND status='FINALIZED' LIMIT 1",
-            (_norm_addr(wallet).lower(), int(chain_id), _norm_addr(vault).lower(),
-             str(int(session_id)), str(engine).upper())
-        ).fetchone()
-        if not row:
-            return {'status':'SESSION_NOT_REGISTERED_FINALIZED'}
-    finally:
-        con.close()
-    # Exact settlement token comes from sessionOf, never from a frontend ticker.
-    words = _core_vault_words(_core_vault_call(
-        int(chain_id), _norm_addr(vault), _core_selector('sessionOf(uint256)'),
-        _uint_to_32(int(session_id))))
-    if len(words) < 13 or int(words[3]) != 4 or int(words[12]) != 0:
-        return {'status':'ONCHAIN_FINALIZE_NOT_CONFIRMED'}
-    settled = '0x' + format(int(words[1]), '040x')
-    cfg = _privy_trading_cfg(int(chain_id))
-    stable = next((s for s in ('USDC','USDT') if
-                   _norm_addr(cfg.get(s.lower()) or '').lower() == settled.lower()), '')
-    if not stable:
-        return {'status':'NON_STABLE_SESSION_NOT_AUTO_WITHDRAWN'}
-    # A larger session must never be partly withdrawn on the assumption that
-    # previously free deposits belong to the just-completed session.
-    budget = int(words[8]); cash = int(words[9])
-    if budget <= 0 or cash <= 0:
-        return {'status':'NOTHING_TO_RETURN'}
-    try:
-        plan = _nca_return_plan(wallet, chain, stable, engine, int(session_id))
-    except ValueError as exc:
-        return {'status':'GUARDED_REVIEW', 'reason':str(exc)[:160]}
-    if int(plan.get('withdrawUnits') or 0) <= 0:
-        return {'status':'NOTHING_TO_RETURN'}
-    key = f'auto-finalized-{int(chain_id)}-{str(engine).upper()}-{int(session_id)}'
-    job, created = _nca_create_job(wallet, 'RETURN', key, chain, stable, engine,
-                                   session_id=int(session_id))
-    if created:
-        threading.Thread(target=_nca_job_worker,
-            args=(wallet,job['job_id']), daemon=True,
-            name='nca-return-'+str(job['job_id'])[-8:]).start()
-    return {'status':job.get('status'), 'jobId':job.get('job_id'), 'created':created}
+    """Do not withdraw principal automatically after session finalization.
+
+    CoreVault V5 finalizeSession already releases the session reservation to
+    freeBase within that user's settlement-token account. Both regular stop and
+    recovery call this compatibility hook; it must never queue a RETURN job.
+
+    Explicit user-initiated withdrawal and profit-payout flows are unchanged.
+    Existing previously queued return jobs must be reconciled separately.
+    """
+    return {'status': 'RETAINED_IN_CORE_VAULT', 'mutations': 0}
