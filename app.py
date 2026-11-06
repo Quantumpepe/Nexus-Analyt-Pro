@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-548-CAPITAL-AUDIT-GRID-SEPARATE";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD587-CAPITAL-AUDIT-GRID-SEPARATE"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-549-ALL-CORE-CAPITAL-ROUTES";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD588-ALL-CORE-CAPITAL-ROUTES"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52892,13 +52892,20 @@ def _nca_live_chains():
     setting = str(os.getenv('NEXUS_CAPITAL_AUTOMATION_ENABLED', '1')).strip().lower()
     if setting not in ('1', 'true', 'yes', 'on'):
         return set()
+    # ENGINE-549: ETH, BNB and POL were already live long before the
+    # temporary capital pilot. A stale pilot-only value such as "POL" must
+    # not turn off automated funding on the other two existing core networks.
+    # A global emergency-off flag is still authoritative; every actual FUND
+    # must still pass the usual authenticated wallet, entitlement, token,
+    # on-chain vault and per-transaction safety checks.
     requested = {x.strip().upper() for x in str(
-        os.getenv('NEXUS_CAPITAL_AUTOMATION_LIVE_CHAINS') or 'ETH,BNB,POL'
+        os.getenv('NEXUS_CAPITAL_AUTOMATION_LIVE_CHAINS') or ''
     ).split(',') if x.strip()}
     verified_future = {x.strip().upper() for x in str(
         os.getenv('NEXUS_CAPITAL_AUTOMATION_VERIFIED_CHAINS') or ''
     ).split(',') if x.strip()}
-    return {x for x in requested if x in _NEXUS_CORE_TEST_CHAINS or x in verified_future}
+    future = {x for x in requested if x in verified_future and x not in _NEXUS_CORE_TEST_CHAINS}
+    return set(_NEXUS_CORE_TEST_CHAINS) | future
 
 
 def _nca_wallet_authorized(wallet, chain='', kind='FUND'):
