@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-542-CAPITAL-COORDINATION-STRICT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD581-CAPITAL-COORDINATION-STRICT"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-543-CAPITAL-PILOT-GUARDS";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD582-CAPITAL-PILOT-GUARDS"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52976,6 +52976,58 @@ def _nca_update_job(job_id, *, status, detail='', steps=None):
         conn.close()
 
 
+# ENGINE-543: Every job must be claimed by exactly one worker. Persisted DB
+# transitions are atomic across Gunicorn/Render processes; Python locks alone
+# do not protect against two worker processes acquiring the same job.
+def _nca_claim_job(job_id):
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            cur = conn.execute("""UPDATE nexus_capital_automation_jobs
+                SET status='RUNNING', detail='preflight', updated_ts=?
+                WHERE job_id=? AND status='QUEUED'
+                  AND (steps_json='{}' OR steps_json='' OR steps_json IS NULL)""",
+                (now_ts(), str(job_id)))
+            conn.commit()
+            return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
+def _nca_daily_pilot_limit():
+    # The ceiling is a separate guard, not an override of the per-job ceiling.
+    # An invalid/disabled value FAILS CLOSED. Units are nominal USDC/USDT.
+    from decimal import Decimal, InvalidOperation
+    try:
+        limit = Decimal(str(os.getenv('NEXUS_CAPITAL_AUTOMATION_24H_LIMIT_USD') or '25'))
+    except InvalidOperation as exc:
+        raise ValueError('capital_24h_limit_invalid') from exc
+    if not limit.is_finite() or limit <= 0 or limit > Decimal('25'):
+        raise ValueError('capital_24h_limit_invalid')
+    return limit
+
+
+def _nca_fund_24h_used(conn, wallet):
+    # Count all chains together: repeated requests cannot bypass the pilot cap
+    # by switching chain/engine. Include unknown outcomes until reconciled.
+    from decimal import Decimal, InvalidOperation
+    rows = conn.execute("""SELECT intent_json, status FROM nexus_capital_automation_jobs
+        WHERE wallet_address=? AND kind='FUND' AND created_ts >= ? AND
+          status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING','CONFIRMED')""",
+        (_norm_addr(wallet).lower(), now_ts()-86400)).fetchall()
+    total = Decimal('0')
+    for row in rows:
+        try:
+            intent = json.loads(row['intent_json'] or '{}')
+            nominal = Decimal(str(intent.get('amount') or '0'))
+        except (ValueError, TypeError, InvalidOperation) as exc:
+            raise ValueError('capital_24h_ledger_unreadable') from exc
+        if not nominal.is_finite() or nominal < 0:
+            raise ValueError('capital_24h_ledger_unreadable')
+        total += nominal
+    return total
+
+
 def _nca_public_job(row):
     if not row:
         return None
@@ -53111,6 +53163,10 @@ def _nca_execute_return(wallet, job_id, intent, steps):
 
 
 def _nca_job_worker(wallet, job_id):
+    # Claim before reading or executing. A second thread/process must NEVER
+    # run the same queued job (even if two HTTP retries created two threads).
+    if not _nca_claim_job(job_id):
+        return
     row = _nca_get_job(wallet, job_id=job_id)
     if not row:
         return
@@ -53121,7 +53177,6 @@ def _nca_job_worker(wallet, job_id):
         _nca_update_job(job_id, status='BROADCAST_UNKNOWN', detail='operator_reconciliation_required', steps=steps)
         return
     try:
-        _nca_update_job(job_id, status='RUNNING', detail='preflight')
         if row['kind'] == 'FUND':
             detail = _nca_execute_fund(wallet, job_id, intent, steps)
         elif row['kind'] == 'RETURN':
@@ -53160,6 +53215,9 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
     conn = _db()
     try:
         with DB_WRITE_LOCK:
+            # BEGIN IMMEDIATE serializes this wallet's cap check and job
+            # creation across backend processes, not just Python threads.
+            conn.execute('BEGIN IMMEDIATE')
             existing = conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE operation_key=?',(operation_key,)).fetchone()
             if existing:
                 old = dict(existing)
@@ -53169,7 +53227,14 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
                     previous = json.loads(old.get('intent_json') or '{}')
                     if previous != intent:
                         raise ValueError('capital_idempotency_payload_mismatch')
-                    conn.execute("UPDATE nexus_capital_automation_jobs SET status='QUEUED',detail='safe_prebroadcast_retry',updated_ts=? WHERE job_id=?", (now_ts(),old['job_id']))
+                    # A retry is a NEW pilot attempt, so re-check the
+                    # rolling limit and renew created_ts. No step is allowed
+                    # on a job that has ever broadcast a transaction.
+                    if kind == 'FUND':
+                        from decimal import Decimal
+                        if _nca_fund_24h_used(conn, wallet) + Decimal(str(amount)) > _nca_daily_pilot_limit():
+                            raise ValueError('capital_24h_pilot_limit_reached')
+                    conn.execute("UPDATE nexus_capital_automation_jobs SET status='QUEUED',detail='safe_prebroadcast_retry',created_ts=?,updated_ts=? WHERE job_id=?", (now_ts(),now_ts(),old['job_id']))
                     conn.commit()
                     return dict(conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE job_id=?', (old['job_id'],)).fetchone()), True
                 if json.loads(old.get('intent_json') or '{}') != intent:
@@ -53178,11 +53243,20 @@ def _nca_create_job(wallet, kind, operation_key, chain, stable, engine, amount=N
             ongoing = conn.execute("SELECT job_id FROM nexus_capital_automation_jobs WHERE wallet_address=? AND chain_id=? AND status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING') LIMIT 1", (wallet.lower(),cid)).fetchone()
             if ongoing:
                 raise ValueError('capital_job_already_running_or_pending_manual_review')
+            if kind == 'FUND':
+                from decimal import Decimal
+                used = _nca_fund_24h_used(conn, wallet)
+                requested = Decimal(str(amount))
+                if used + requested > _nca_daily_pilot_limit():
+                    raise ValueError('capital_24h_pilot_limit_reached')
             now = now_ts()
             conn.execute("INSERT INTO nexus_capital_automation_jobs(job_id,operation_key,wallet_address,chain_id,engine,kind,status,detail,intent_json,steps_json,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id,operation_key,wallet.lower(),cid,engine,kind,'QUEUED','created',json.dumps(intent), '{}',now,now))
             conn.commit()
             return dict(conn.execute('SELECT * FROM nexus_capital_automation_jobs WHERE job_id=?',(job_id,)).fetchone()), True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -53327,3 +53401,93 @@ def api_nexus_capital_auto_status(job_id):
     except PermissionError as exc:
         return jsonify({'status':'error','error':str(exc)}),403
 
+
+
+# ENGINE-543: Read-only execution-safety diagnostics. Never retry a broadcast
+# from this endpoint. This is not a substitute for a live receipt/settlement audit.
+def _nca_execution_guard_report(wallet, chain, stable):
+    chain, cid, stable, _ = _nca_validate_input(chain, stable, 'NKR')
+    _nca_init_db()
+    conn = _db()
+    try:
+        used = _nca_fund_24h_used(conn, wallet)
+        pending_rows = conn.execute("""SELECT * FROM nexus_capital_automation_jobs
+            WHERE wallet_address=? AND chain_id=?
+              AND status IN ('QUEUED','RUNNING','BROADCAST_UNKNOWN','RECEIPT_PENDING')
+            ORDER BY created_ts DESC LIMIT 5""", (_norm_addr(wallet).lower(), cid)).fetchall()
+        recent_rows = conn.execute("""SELECT * FROM nexus_capital_automation_jobs
+            WHERE wallet_address=? AND chain_id=?
+            ORDER BY created_ts DESC LIMIT 5""", (_norm_addr(wallet).lower(), cid)).fetchall()
+    finally:
+        conn.close()
+    pending = [_nca_public_job(dict(row)) for row in pending_rows]
+    recent = [_nca_public_job(dict(row)) for row in recent_rows]
+    limit = _nca_daily_pilot_limit()
+    allowed = chain in _nca_live_chains()
+    return {
+        'chain': chain, 'chainId': cid, 'stable': stable,
+        'operatorEnabled': bool(allowed),
+        'pilot24hLimit': str(limit), 'pilot24hUsed': str(used),
+        'pilot24hRemaining': str(max(0, limit-used)),
+        'pendingJobs': pending, 'recentJobs': recent,
+        'newFundingJobBlocked': bool(pending or used >= limit or not allowed),
+        'duplicateWorkerClaimProtection': True,
+        'crossWorkerDbLock': True,
+        'onchainSessionAllocationIsAuthoritative': True,
+        'readOnly': True,
+        'transactionsSent': 0,
+        'note': 'Ein Job kann nur einmal gestartet werden. Pending/unklare Transaktionen werden nie automatisch wiederholt. Die Vorschau reserviert kein Kapital.'
+    }
+
+
+@app.get('/api/nexus/capital/automation/safety')
+def api_nexus_capital_auto_safety():
+    try:
+        wallet = _nca_identity()
+        report = _nca_execution_guard_report(wallet, request.args.get('chain'), request.args.get('stable'))
+        return jsonify({'status':'ok','safety':report,'ts':now_ts()})
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+    except ValueError as exc:
+        return jsonify({'status':'blocked','error':str(exc)}),409
+    except Exception as exc:
+        return jsonify({'status':'error','error':'capital_safety_check_failed','detail':str(exc)[:150]}),503
+
+
+def _nca_read_receipt_states(chain_id, row):
+    # Read-only status, never changes a job from UNKNOWN to CONFIRMED. A complete
+    # outcome requires owner review plus actual Vault/Walet balances.
+    steps = json.loads(row.get('steps_json') or '{}')
+    out = []
+    for step_name, record in steps.items():
+        tx_hash = str(record.get('txHash') or '')
+        state = 'HASH_UNKNOWN'
+        if re.fullmatch(r'0x[0-9a-fA-F]{64}', tx_hash):
+            try:
+                receipt = _rpc_call(int(chain_id), 'eth_getTransactionReceipt', [tx_hash])
+                if receipt is None:
+                    state = 'NOT_MINED_OR_UNAVAILABLE'
+                else:
+                    raw_status = receipt.get('status') or '0x0'
+                    mined_success = int(raw_status, 16) == 1 if isinstance(raw_status, str) else int(raw_status) == 1
+                    state = 'MINED_SUCCESS' if mined_success else 'MINED_REVERTED'
+            except Exception:
+                state = 'RPC_UNAVAILABLE'
+        out.append({'step':step_name, 'txHash':tx_hash, 'receiptStatus':state})
+    return out
+
+
+@app.get('/api/nexus/capital/automation/jobs/<job_id>/receipts')
+def api_nexus_capital_auto_receipts(job_id):
+    try:
+        wallet = _nca_identity()
+        row = _nca_get_job(wallet, job_id=job_id)
+        if not row:
+            return jsonify({'status':'error','error':'capital_job_not_found'}),404
+        return jsonify({'status':'ok','job':_nca_public_job(row),
+            'receipts':_nca_read_receipt_states(row['chain_id'], row),
+            'readOnly':True,'mutations':0})
+    except PermissionError as exc:
+        return jsonify({'status':'error','error':str(exc)}),403
+    except Exception as exc:
+        return jsonify({'status':'error','error':'capital_receipt_audit_failed','detail':str(exc)[:150]}),503
