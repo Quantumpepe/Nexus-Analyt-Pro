@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-536-CAPITAL-ROUTE-AUDIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD575-CAPITAL-ROUTE-AUDIT"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-537-CAPITAL-AUTH-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD576-CAPITAL-AUTH-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -27911,15 +27911,40 @@ def api_wallet_swap_prepare():
         return jsonify({"status":"error","error":str(exc)[:240],"ts":now_ts()}), 502
 
 
-# ENGINE-536: Authoritative, read-only capital route check shared by NKR, GRID and
-# TRADER. Never treat a background worker heartbeat as evidence of a successful
-# exit, and never claim that a wallet swap deposited funds into the Vault.
+# ENGINE-537: Capital-route audit returns wallet-specific financial information.
+# Only a SIGNED Nexus backend bearer token is accepted. Do not fall back to an
+# unverified/decoded Privy JWT or a user-provided X-Wallet-Address for identity.
+# This deliberately does not change the auth policy of other existing routes.
+def _capital_route_verified_wallet():
+    authorization = str(request.headers.get("Authorization") or "").strip()
+    if not authorization.lower().startswith("bearer "):
+        return ""
+    signed_token = authorization.split(" ", 1)[1].strip()
+    if not signed_token:
+        return ""
+    try:
+        payload = _AUTH_SERIALIZER.loads(signed_token, max_age=60 * 60 * 24 * 30)
+        if not isinstance(payload, dict):
+            return ""
+        wallet = _norm_addr(payload.get("wallet_address") or payload.get("wallet") or payload.get("walletAddress") or "")
+        return wallet if _looks_like_evm_addr(wallet) else ""
+    except (SignatureExpired, BadSignature):
+        return ""
+    except Exception:
+        return ""
+
+
+# ENGINE-536/537: Read-only capital audit shared by NKR, GRID and TRADER.
+# Never treat worker heartbeat as an executed trade or create a transaction.
 @app.get("/api/nexus/capital/route-audit")
 def api_nexus_capital_route_audit():
     try:
-        wallet = _norm_addr(_require_auth() or "")
-        if not _looks_like_evm_addr(wallet):
-            return jsonify({"status":"error", "error":"unauthorized"}), 401
+        wallet = _capital_route_verified_wallet()
+        if not wallet:
+            return jsonify({"status":"error", "error":"auth_required_or_expired"}), 401
+        requested_wallet = _norm_addr(request.headers.get("X-Wallet-Address") or "")
+        if not _looks_like_evm_addr(requested_wallet) or requested_wallet.lower() != wallet.lower():
+            return jsonify({"status":"error", "error":"wallet_identity_mismatch"}), 403
         chain = str(request.args.get("chain") or "").strip().upper()
         cid = {"ETH":1, "BNB":56, "POL":137}.get(chain, 0)
         if not cid:
