@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-549-ALL-CORE-CAPITAL-ROUTES";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD588-ALL-CORE-CAPITAL-ROUTES"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-551-CAPITAL-INFO-ENGLISH";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD590-CAPITAL-INFO-ENGLISH"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -53603,7 +53603,10 @@ def api_nexus_capital_check_start():
         system = str(request.args.get('system') or '').strip().upper()
         chain = str(request.args.get('chain') or '').strip().upper()
         symbol = str(request.args.get('asset') or '').strip().upper()
-        if system not in ('NKR','TRADER','GRID') or chain not in _NEXUS_CORE_TEST_CHAINS:
+        # ENGINE-550: the same per-system capital check follows the selected
+        # network. ETH/BNB/POL already work; a later chain is accepted only
+        # once the verified network has become live through the existing guard.
+        if system not in ('NKR','TRADER','GRID') or chain not in (_NEXUS_CORE_TEST_CHAINS | _nca_live_chains()):
             raise ValueError('capital_invalid_system_or_chain')
         if system in ('NKR','TRADER') and symbol not in ('USDC','USDT'):
             raise ValueError('capital_stable_asset_required')
@@ -53630,7 +53633,10 @@ def api_nexus_capital_check_start():
                     (wallet,item),
                 ).fetchone()
                 reserved_qty = float(row['reserved'] or 0) if row else 0.0
-                free = max(0, free - _parse_asset_units(str(max(0.0,reserved_qty)), decimals))
+                # No active SELL orders is normal, not an invalid zero amount.
+                # Do not send zero to _parse_asset_units (which requires > 0).
+                reserved_units = _parse_asset_units(str(reserved_qty), decimals) if reserved_qty > 0 else 0
+                free = max(0, free - reserved_units)
             finally:
                 conn_grid.close()
         wallet_units = 0
@@ -53672,8 +53678,10 @@ def api_nexus_capital_check_start():
             'vaultAvailable':float(Decimal(free)/scale),
             'walletAvailable':float(Decimal(wallet_units)/scale),
             'missing':float(Decimal(missing)/scale),
-            'message': ('Genug Kapital vorhanden.' if can_cover else
-                        f'{system}: Nicht genuegend {symbol}. Bitte {Decimal(missing)/scale} {symbol} nachladen.'),
+            'message': ('Enough capital is available.' if can_cover else
+                        (f'Grid: No {symbol} tokens are available in the {chain} vault. Add {symbol} to start Grid.'
+                         if system == 'GRID' and free == 0 else
+                         f'{system}: Not enough {symbol} on {chain} to start. Add {Decimal(missing)/scale} {symbol}.')),
             'ts':now_ts(),
         })
     except PermissionError as exc:
@@ -53768,7 +53776,7 @@ def _nca_execution_guard_report(wallet, chain, stable):
         'onchainSessionAllocationIsAuthoritative': True,
         'readOnly': True,
         'transactionsSent': sum(sum(1 for st in (x.get('steps') or []) if st.get('txHash')) for x in (recent or [])),
-        'note': 'Kapitalaktionen nur mit verifizierter Privy-Wallet und gültigem Core-Zugang. Keine Wallet-Liste in Render. Unklare Transaktionen werden nie automatisch wiederholt; diese Prüfung bewegt kein Geld.'
+        'note': 'Capital transfers require a verified Privy wallet and valid Core access. No wallet allowlist in Render. Unconfirmed transactions are never retried automatically. This check moves no funds.'
     }
 
 
