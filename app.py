@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-539-PRIVY-VERIFIED-AUDIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD578-PRIVY-VERIFIED-AUDIT"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-540-MULTICHAIN-REGISTRY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD579-MULTICHAIN-REGISTRY"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -26792,7 +26792,8 @@ def _grid_normalize_payout_asset(value, default: str = "USDC") -> str:
 
 def _grid_chain_id_from_key(chain_key: str) -> int:
     key = str(chain_key or "").upper().strip()
-    return {"ETH": 1, "BNB": 56, "POL": 137, "MATIC": 137, "BASE": 8453, "ARB": 42161}.get(key, 0)
+    aliases = {"MATIC": "POL", "ARB": "ARBITRUM", "OP": "OPTIMISM", "AVAX": "AVALANCHE"}
+    return int(_CHAIN_ID_BY_KEY.get(aliases.get(key, _normalize_chain_key(key)), 0) or 0)
 
 
 def _grid_find_live_vault_row(wallet: str, chain_id: int = 0) -> dict | None:
@@ -28096,6 +28097,101 @@ def _capital_route_verified_wallet():
     return ""
 
 
+# ENGINE-540: Future EVM networks can be prepared by configuration.  This
+# extends the existing chain/RPC/V5 Vault/stablecoin maps used by all three
+# engines, but does NOT activate execution or send transactions.
+# No RPC URLs, signing keys or policy IDs are exposed to the browser.
+_NEXUS_FUTURE_EVM_CHAINS = (
+    ("BASE", 8453), ("ARBITRUM", 42161), ("OPTIMISM", 10),
+    ("AVALANCHE", 43114), ("LINEA", 59144),
+    ("SCROLL", 534352), ("ZKSYNC", 324),
+)
+_NEXUS_CORE_TEST_CHAINS = frozenset(("ETH", "BNB", "POL"))
+
+
+def _nexus_chain_env(*keys):
+    for name in keys:
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _nexus_register_future_chain_addresses():
+    for key, cid in _NEXUS_FUTURE_EVM_CHAINS:
+        rpc = _nexus_chain_env(f"RPC_URL_{key}", f"RPC_URL_{cid}")
+        if rpc.startswith("https://") or rpc.startswith("http://"):
+            _RPC_URL_BY_CHAIN.setdefault(cid, rpc)
+        for target, env_prefixes in (
+            (_VAULT_BY_CHAIN, ("CORE_VAULTV5_ADDRESS", "NEXUS_CORE_VAULT_V5")),
+            (_USDC_BY_CHAIN, ("USDC_ADDRESS",)),
+            (_USDT_BY_CHAIN, ("USDT_ADDRESS",)),
+        ):
+            names = [f"{prefix}_{suffix}" for prefix in env_prefixes for suffix in (key, str(cid))]
+            address = _nexus_chain_env(*names)
+            if _looks_like_evm_addr(address) and int(address, 16) != 0:
+                target.setdefault(cid, address)
+
+
+_nexus_register_future_chain_addresses()
+
+
+def _nexus_chain_capability(key):
+    key = str(key or "").upper().strip()
+    cid = int(_CHAIN_ID_BY_KEY.get(key, 0) or 0)
+    if not cid:
+        return None
+    rpc = _rpc_url_for_chain(cid)
+    vault = str(_VAULT_BY_CHAIN.get(cid) or "")
+    router = str(_ROUTER_V3_BY_CHAIN.get(cid) or _ROUTER_BY_CHAIN.get(cid) or "")
+    wrapped = str(_WNATIVE_BY_CHAIN.get(cid) or "")
+    vault_ok = _looks_like_evm_addr(vault) and int(vault, 16) != 0
+    router_ok = _looks_like_evm_addr(router) and int(router, 16) != 0
+    wrapped_ok = _looks_like_evm_addr(wrapped) and int(wrapped, 16) != 0
+    stables = []
+    for symbol, addr_map in (("USDC", _USDC_BY_CHAIN), ("USDT", _USDT_BY_CHAIN)):
+        address = str(addr_map.get(cid) or "")
+        if _looks_like_evm_addr(address) and int(address, 16) != 0:
+            stables.append(symbol)
+    # Read-only capital audit requires a Vault, RPC and at least one stablecoin.
+    # This is NOT a proof of on-chain tokenConfig, router approval or solvency.
+    audit_available = bool(vault_ok and rpc and stables)
+    current = key in _NEXUS_CORE_TEST_CHAINS
+    return {
+        "chain": key, "chainId": cid,
+        "nativeSymbol": str(_NATIVE_SYMBOL_BY_CHAIN.get(cid) or "ETH"),
+        "nativeDecimals": int(_NATIVE_DECIMALS_BY_CHAIN.get(cid, 18)),
+        "stage": "CURRENT_TEST_CHAIN" if current else "PREPARATION_ONLY",
+        "configuredInBackend": key in _ENABLED_EVM_CHAINS,
+        "vaultConfigured": bool(vault_ok),
+        "rpcConfigured": bool(rpc),
+        "routerConfigured": bool(router_ok),
+        "wrappedNativeConfigured": bool(wrapped_ok),
+        "stablecoins": stables,
+        "capitalAuditAvailable": audit_available,
+        "liveExecutionVerifiedByRegistry": False,
+        "automatedFundingEnabledByRegistry": False,
+        "notes": "Existing chain; independent trade/exit tests still required" if current
+                 else "Future network; must pass on-chain and Privy checks before activation",
+    }
+
+
+@app.get("/api/nexus/chains/registry")
+def api_nexus_chains_registry():
+    # Only public network metadata. Never expose user balances, credentials or RPC URLs.
+    network_keys = ("ETH", "BNB", "POL", "BASE", "ARBITRUM", "OPTIMISM",
+                    "AVALANCHE", "LINEA", "SCROLL", "ZKSYNC")
+    chains = [_nexus_chain_capability(k) for k in network_keys]
+    return jsonify({
+        "status": "ok", "version": 1,
+        "engines": ["GRID", "NKR", "TRADER"],
+        "chains": [row for row in chains if row],
+        "liveTradingUnaffected": True,
+        "futureNetworksExecutionEnabled": False,
+        "ts": now_ts(),
+    })
+
+
 # ENGINE-536/537: Read-only capital audit shared by NKR, GRID and TRADER.
 # Never treat worker heartbeat as an executed trade or create a transaction.
 @app.get("/api/nexus/capital/route-audit")
@@ -28113,9 +28209,10 @@ def api_nexus_capital_route_audit():
         if not _looks_like_evm_addr(requested_wallet) or requested_wallet.lower() != wallet.lower():
             return jsonify({"status":"error", "error":"wallet_identity_mismatch"}), 403
         chain = str(request.args.get("chain") or "").strip().upper()
-        cid = {"ETH":1, "BNB":56, "POL":137}.get(chain, 0)
-        if not cid:
-            return jsonify({"status":"error", "error":"chain_required_ETH_BNB_POL"}), 400
+        cid = int(_CHAIN_ID_BY_KEY.get(chain, 0) or 0)
+        capability = _nexus_chain_capability(chain)
+        if not cid or not capability or not capability.get("capitalAuditAvailable"):
+            return jsonify({"status":"error", "error":"chain_not_configured_for_read_only_audit"}), 400
         engine = str(request.args.get("engine") or "ALL").strip().upper()
         if engine not in ("NKR", "GRID", "TRADER", "ALL"):
             return jsonify({"status":"error", "error":"invalid_engine"}), 400
