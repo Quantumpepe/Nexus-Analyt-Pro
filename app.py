@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-535-POLYGON-USDC-LEGACY-OPTION";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD574-POLYGON-USDC-LEGACY-OPTION"
+BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-536-CAPITAL-ROUTE-AUDIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD575-CAPITAL-ROUTE-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -3107,9 +3107,10 @@ def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     """Authoritative V5 funding state shared by Grid, NKR and Trader.
 
     Reads tokenConfig and freeBase directly from the selected chain's V5 Vault.
-    For USDC, tries primary + alternate contracts and prefers the token that is
-    configured as settlement AND has the highest freeBase (fixes POL native vs
-    bridged and BNB address mismatches).
+    Polygon USDC is ALWAYS the exact Circle-native contract, even if an older
+    USDC.e contract has a larger freeBase. Legacy USDC.e can be read explicitly,
+    but never silently used by an NKR/Grid/Trader session as "USDC".
+    Other chains retain their established contract-selection behavior.
     """
     chain_key = _normalize_chain_key(chain_value or "ETH") or "ETH"
     chain_id = int((_CHAIN_ID_BY_KEY or {}).get(chain_key, 0) or 0)
@@ -3122,7 +3123,11 @@ def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     wa = _norm_addr(wallet)
 
     candidates = []
-    if sym == "USDC":
+    if sym == "USDC" and chain_id == 137:
+        candidates = [(_POL_USDC_NATIVE, 6, False)]
+    elif sym in ("USDC.E", "USDC_E", "USDC_BRIDGED") and chain_id == 137:
+        candidates = [(_POL_USDC_BRIDGED, 6, False)]
+    elif sym == "USDC":
         candidates = [(addr, 6, False) for addr in _v5_usdc_token_candidates(chain_id)]
     else:
         token, fallback_decimals, is_native = _vault_asset_spec_for_chain(chain_id, sym)
@@ -3166,6 +3171,15 @@ def _v5_engine_funding_state(wallet: str, chain_value, symbol: str) -> dict:
     if not best:
         raise ValueError("settlement_asset_not_configured")
     result = dict(best[1])
+    if chain_id == 137 and sym == "USDC":
+        # The on-chain contract can be unconfigured: expose that honestly; never
+        # fall back to USDC.e even when it contains the user's entire balance.
+        result["settlementIdentity"] = "CIRCLE_NATIVE_USDC_ONLY"
+        result["vaultSettlementReady"] = all(bool(result.get(x)) for x in
+            ("configured", "depositEnabled", "withdrawEnabled", "executionEnabled", "settlementToken")) and int(result["decimals"]) == 6
+    if chain_id == 137 and sym in ("USDC.E", "USDC_E", "USDC_BRIDGED"):
+        result["settlementIdentity"] = "USDC_E_LEGACY_EXPLICIT_ONLY"
+        result["vaultSettlementReady"] = False
     result["usdcCandidatesProbed"] = probed if sym == "USDC" else []
     return result
 
@@ -10480,9 +10494,10 @@ _RPC_URL_BY_CHAIN = {
 _USDC_BY_CHAIN = {
     1: os.getenv("USDC_ADDRESS_ETH") or os.getenv("USDC_ADDRESS_1") or "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     56: os.getenv("USDC_ADDRESS_BNB") or os.getenv("USDC_ADDRESS_56") or "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
-    # Polygon native Circle USDC. Old bridged USDC is accepted as alternate below.
-    # Prefer Circle native USDC on Polygon; bridged USDC.e remains in alts / candidate probe.
-    137: os.getenv("USDC_ADDRESS_POL") or os.getenv("USDC_ADDRESS_POLYGON") or os.getenv("USDC_ADDRESS_137") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    # ENGINE-536: Polygon "USDC" always means Circle-native, regardless of
+    # legacy Render USDC_ADDRESS_POL environment settings. USDC.e is recoverable
+    # only under its EXPLICIT symbol/address and never chosen as new settlement.
+    137: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
 }
 
 _USDC_ALT_BY_CHAIN = {
@@ -10490,7 +10505,8 @@ _USDC_ALT_BY_CHAIN = {
     56: [x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_BNB") or os.getenv("USDC_ALT_ADDRESSES_56") or "").split(",") if x.strip()],
     137: list(dict.fromkeys([
         *[x.strip() for x in (os.getenv("USDC_ALT_ADDRESSES_POL") or os.getenv("USDC_ALT_ADDRESSES_POLYGON") or os.getenv("USDC_ALT_ADDRESSES_137") or "").split(",") if x.strip()],
-        (os.getenv("USDC_NATIVE_ADDRESS_137") or os.getenv("USDC_NATIVE_ADDRESS_POL") or os.getenv("USDC_NATIVE_ADDRESS_POLYGON") or "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359").strip(),
+        *[x.strip() for x in (os.getenv("USDC_ADDRESS_POL"), os.getenv("USDC_ADDRESS_POLYGON"), os.getenv("USDC_ADDRESS_137")) if x],
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", # legacy bridged, read-only migration
     ])),
 }
 
@@ -20534,6 +20550,9 @@ def _vault_asset_spec_for_chain(chain_id: int, symbol: str) -> tuple[str, int, b
         return NEXUS_NATIVE_TOKEN, int(_NATIVE_DECIMALS_BY_CHAIN.get(chain_id) or 18), True
     if sym == "USDC":
         return _norm_addr(_USDC_BY_CHAIN.get(chain_id) or ""), 6, False
+    if sym in {"USDC.E", "USDC_E", "USDC_BRIDGED"} and int(chain_id) == 137:
+        # Explicit legacy withdrawal/recovery ONLY, never the engine default.
+        return _POL_USDC_BRIDGED, 6, False
     if sym in {"USDC_NATIVE", "NATIVE_USDC"} and int(chain_id) == 137:
         return _norm_addr(
             os.getenv("USDC_NATIVE_ADDRESS_137") or
@@ -27890,6 +27909,99 @@ def api_wallet_swap_prepare():
         })
     except Exception as exc:
         return jsonify({"status":"error","error":str(exc)[:240],"ts":now_ts()}), 502
+
+
+# ENGINE-536: Authoritative, read-only capital route check shared by NKR, GRID and
+# TRADER. Never treat a background worker heartbeat as evidence of a successful
+# exit, and never claim that a wallet swap deposited funds into the Vault.
+@app.get("/api/nexus/capital/route-audit")
+def api_nexus_capital_route_audit():
+    try:
+        wallet = _norm_addr(_require_auth() or "")
+        if not _looks_like_evm_addr(wallet):
+            return jsonify({"status":"error", "error":"unauthorized"}), 401
+        chain = str(request.args.get("chain") or "").strip().upper()
+        cid = {"ETH":1, "BNB":56, "POL":137}.get(chain, 0)
+        if not cid:
+            return jsonify({"status":"error", "error":"chain_required_ETH_BNB_POL"}), 400
+        engine = str(request.args.get("engine") or "ALL").strip().upper()
+        if engine not in ("NKR", "GRID", "TRADER", "ALL"):
+            return jsonify({"status":"error", "error":"invalid_engine"}), 400
+        stable = str(request.args.get("stable") or "USDC").strip().upper()
+        if stable not in ("USDC", "USDT"):
+            return jsonify({"status":"error", "error":"only_USDC_USDT_for_trading"}), 400
+        funding = _v5_engine_funding_state(wallet, chain, stable)
+        vault = _norm_addr(funding.get("vault") or "")
+        token = _norm_addr(funding.get("token") or "")
+        cfg = _privy_trading_cfg(cid)
+        if not _looks_like_evm_addr(token) or not _looks_like_evm_addr(vault):
+            raise RuntimeError("capital_route_token_or_vault_missing")
+        decimals = int(funding.get("decimals") or 0)
+        if not 1 <= decimals <= 18:
+            raise RuntimeError("capital_route_invalid_decimals")
+        token_ready = all(bool(funding.get(k)) for k in
+            ("configured", "depositEnabled", "withdrawEnabled", "executionEnabled", "settlementToken"))
+        if cid == 137 and stable == "USDC":
+            token_ready = token_ready and token.lower() == _POL_USDC_NATIVE.lower() and decimals == 6
+        wallet_stable = _eth_call(cid, token, "0x70a08231" + _addr_to_32(wallet))
+        wallet_stable_units = int(str(wallet_stable or "0x0"), 16)
+        native_wallet_wei = int(str(_rpc_call(cid,"eth_getBalance",[wallet,"latest"]) or "0x0"),16)
+        gas_price = int(str(_rpc_call(cid,"eth_gasPrice",[]) or "0x0"),16)
+        gas_reserve = max(0, 2 * 650_000 * gas_price)
+        requested_engines = ("NKR","GRID","TRADER") if engine == "ALL" else (engine,)
+        session_rows = []
+        for eng in requested_engines:
+            try:
+                rows = list(_live_active_sessions(wallet, eng) or [])
+            except Exception as exc:
+                session_rows.append({"engine":eng,"verification":"registry_read_failed","reason":str(exc)[:130]})
+                continue
+            for row in rows:
+                if int(row.get("chain_id") or 0) != cid:
+                    continue
+                sid = str(row.get("onchain_session_id") or "")
+                rvault = _norm_addr(row.get("vault_address") or "")
+                entry = {"engine":eng,"sessionId":sid,"registryStatus":str(row.get("status") or ""),
+                         "verification":"not_verified"}
+                if not sid.isdigit() or int(sid) <= 0 or rvault.lower() != vault.lower():
+                    entry["reason"] = "session_identity_or_vault_mismatch"
+                else:
+                    try:
+                        words = _core_vault_words(_core_vault_call(cid,vault,_core_selector("sessionOf(uint256)"),_uint_to_32(int(sid))))
+                        # Solidity V5 Session = owner, settlementToken, system,
+                        # status, startsAt, endsAt, slippage, loss, budget,
+                        # settlementCash, realizedProfit, realizedLoss, openAssetCount.
+                        if len(words) < 13:
+                            raise RuntimeError("session_state_incomplete")
+                        settled_token = "0x" + format(int(words[1]),"040x")
+                        entry.update(verification="ONCHAIN",statusCode=int(words[3]),
+                                     settlementToken=settled_token,settlementMatchesTarget=(settled_token.lower()==token.lower()),
+                                     budgetUnits=str(words[8]),settlementCashUnits=str(words[9]),
+                                     openAssetCount=int(words[12]),
+                                     canFinalize=bool(int(words[3]) == 3 and int(words[12]) == 0))
+                    except Exception as exc:
+                        entry["reason"] = "onchain_session_read_failed:" + str(exc)[:150]
+                session_rows.append(entry)
+        return jsonify({
+            "status":"ok","chain":chain,"chainId":cid,"engine":engine,"stable":stable,
+            "vault":vault,"token":token,"decimals":decimals,
+            "settlementIdentity":str(funding.get("settlementIdentity") or "CHAIN_CONFIGURED_TOKEN"),
+            "vaultSettlementReady":bool(token_ready),
+            "walletStableUnits":str(wallet_stable_units),
+            "walletNativeWei":str(native_wallet_wei),
+            "nativeGasReserveWei":str(gas_reserve),
+            "vaultFreeBaseUnits":str(funding.get("freeBaseUnits") or 0),
+            "privyWalletProvisioned":bool(_privy_wallet_id_for_user(wallet)),
+            "swapRouterConfigured":_looks_like_evm_addr(cfg.get("router")),
+            "quoteProviderConfigured":_looks_like_evm_addr(cfg.get("quoter")),
+            "sessions":session_rows,
+            "automaticSwapExecutionEnabled":False,
+            "nextStep":"PREVIEW_ONLY: Automatic native-to-stable funding still requires safeguarded transaction journal and chain-specific end-to-end live test.",
+            "note":"A wallet balance is not a Vault balance. A completed session releases freeBase but does not automatically send tokens to the wallet.",
+            "ts":now_ts(),
+        })
+    except Exception as exc:
+        return jsonify({"status":"error","error":"capital_route_audit_failed","detail":str(exc)[:230]}),503
 
 
 @app.route("/api/grid/manual/add", methods=["POST"])
