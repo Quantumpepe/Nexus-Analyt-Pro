@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-557-LEDGER-HISTORY-REENTRY-AUDIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD597-LEDGER-HISTORY-REENTRY-AUDIT"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-558-BNB-LEDGER-RPC-SCAN-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -54174,67 +54174,168 @@ def _nexus_wallet_ledger_recorded(wallet, limit=250):
     return sorted(best.values(),key=lambda x:x.get('createdAt') or 0,reverse=True)[:limit]
 
 
+def _nexus_ledger_rpc_problem(exc):
+    """Public diagnostic codes only: never return private RPC URLs or provider keys."""
+    message = str(exc).lower()
+    if any(term in message for term in (
+        'block range', 'range limit', 'too many block', 'maximum block',
+        'max block', 'query returned more', 'more than 10000',
+        'more than 5000', 'response too large', 'result too large',
+        'too many results', 'limit exceeded', 'exceeds the limit',
+        'exceed maximum', 'log response size', 'query limit',
+    )):
+        return 'RPC_LOG_RANGE_OR_RESULT_LIMIT'
+    if any(term in message for term in (
+        'method not found', 'method not available', 'method is not supported',
+        'eth_getlogs is disabled', 'eth_getlogs not supported',
+        'does not exist', 'not supported',
+    )):
+        return 'RPC_GETLOGS_UNSUPPORTED'
+    if any(term in message for term in ('429', 'rate limit', 'too many requests', 'throttl')):
+        return 'RPC_RATE_LIMITED'
+    if any(term in message for term in ('timeout', 'timed out', 'connecttimeout', 'readtimeout')):
+        return 'RPC_TIMEOUT'
+    if any(term in message for term in ('401', '403', 'unauthorized', 'forbidden', 'invalid api key')):
+        return 'RPC_ACCESS_DENIED'
+    if 'SCAN_TIME_BUDGET' in str(exc):
+        return 'SCAN_TIME_BUDGET'
+    if 'SCAN_REQUEST_BUDGET' in str(exc):
+        return 'SCAN_REQUEST_BUDGET'
+    return 'RPC_GETLOGS_FAILED'
+
+
 def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
-    """Bounded ERC-20 Transfer logs involving this wallet; no Vault-wide public leakage."""
-    cid=_NEXUS_LEDGER_CHAIN_MAP[chain]
-    block_raw=_rpc_call(cid,'eth_blockNumber',[])
-    latest=int(block_raw,16) if isinstance(block_raw,str) else int(block_raw)
-    depth=min(12000,max(1000,int(scan_blocks)))
-    first=max(0,latest-depth+1)
-    topic='0x'+str(wallet).lower().replace('0x','').rjust(64,'0')
-    found={}; scanned_to=first-1; failures=[]
-    # Two recipient filters per chunk. Public RPC limits can be strict;
-    # incomplete scans are returned as partial, never as 'all transactions'.
-    for start in range(first,latest+1,2000):
-        end=min(latest,start+1999)
+    """Bounded read-only ERC-20 Transfer scan with adaptive RPC range handling.
+
+    A node can reject addressless eth_getLogs over 2,000 BSC blocks even when
+    eth_blockNumber and transaction receipts succeed. We use smaller 1,000-block
+    windows, split only on *range/result* limits, and return truthful partial
+    coverage on provider/time limits. Newest blocks take priority. No signing.
+    """
+    cid = _NEXUS_LEDGER_CHAIN_MAP[chain]
+    wallet_address = str(wallet or '').lower()
+    if not re.fullmatch(r'0x[0-9a-f]{40}', wallet_address):
+        raise ValueError('invalid_wallet_address')
+    block_raw = _rpc_call(cid, 'eth_blockNumber', [])
+    latest = int(block_raw, 16) if isinstance(block_raw, str) else int(block_raw)
+    depth = min(12000, max(1000, int(scan_blocks)))
+    first = max(0, latest - depth + 1)
+    wallet_topic = '0x' + wallet_address[2:].rjust(64, '0')
+    found = {}
+    errors = []
+    oldest_scanned = None
+    completed_windows = 0
+    requests_used = 0
+    started = time.monotonic()
+    # The endpoint is synchronous and should not crowd out live trading workers.
+    max_requests = 48
+    max_elapsed_sec = 18.0
+
+    def get_logs(lo, hi, topics):
+        nonlocal requests_used
+        if time.monotonic() - started >= max_elapsed_sec:
+            raise RuntimeError('SCAN_TIME_BUDGET')
+        if requests_used >= max_requests:
+            raise RuntimeError('SCAN_REQUEST_BUDGET')
+        requests_used += 1
         try:
-            for topics in ([_NEXUS_TRANSFER_TOPIC,topic],[_NEXUS_TRANSFER_TOPIC,None,topic]):
-                logs=_rpc_call(cid,'eth_getLogs',[{'fromBlock':hex(start),'toBlock':hex(end),'topics':topics}])
-                for log in (logs or []):
-                    if not isinstance(log,dict):continue
-                    tx=str(log.get('transactionHash') or '')
-                    if not re.fullmatch(r'0x[0-9a-fA-F]{64}',tx):continue
-                    idx=str(log.get('logIndex') or '0x0')
-                    topics_log=log.get('topics') or []
-                    if len(topics_log)<3:continue
-                    sender='0x'+str(topics_log[1])[-40:].lower()
-                    receiver='0x'+str(topics_log[2])[-40:].lower()
-                    direction='IN' if receiver==str(wallet).lower() else 'OUT'
-                    if sender==receiver:direction='SELF'
-                    raw=str(log.get('data') or '0x0')
-                    try: amount_raw=str(int(raw,16))
-                    except (TypeError,ValueError):amount_raw=''
-                    found[(tx.lower(),idx)]={'id':f'erc20:{chain}:{tx.lower()}:{idx}',
-                        'txHash':tx, 'chain':chain, 'type':'TOKEN TRANSFER', 'direction':direction,
-                        'source':'ONCHAIN_ERC20_LOG', 'status':'CONFIRMED', 'from':sender,'to':receiver,
-                        'contract':str(log.get('address') or ''),'amountRaw':amount_raw,'amount':None,
-                        'asset':'TOKEN', 'createdAt':0, 'blockNumber':int(str(log.get('blockNumber') or '0x0'),16),
-                        'note':'Confirmed Transfer event; raw token units shown if decimals are unavailable.'}
-            scanned_to=end
+            rows = _rpc_call(cid, 'eth_getLogs', [{
+                'fromBlock': hex(lo), 'toBlock': hex(hi), 'topics': topics,
+            }])
+            if not isinstance(rows, list):
+                raise RuntimeError('RPC_GETLOGS_INVALID_RESPONSE')
+            return rows
         except Exception as exc:
-            failures.append(type(exc).__name__)
+            # Retry only when the provider explicitly complains about range/size.
+            # Repeatedly splitting rate limits/unsupported methods would worsen
+            # provider pressure and delay legitimate Vault transactions.
+            if (hi - lo + 1 > 64 and
+                    _nexus_ledger_rpc_problem(exc) == 'RPC_LOG_RANGE_OR_RESULT_LIMIT'):
+                mid = (lo + hi) // 2
+                return get_logs(lo, mid, topics) + get_logs(mid + 1, hi, topics)
+            raise
+
+    # Scan newest first: an incomplete request can still display recent events.
+    for high in range(latest, first - 1, -1000):
+        low = max(first, high - 999)
+        chunk_logs = []
+        try:
+            for topics in (
+                [_NEXUS_TRANSFER_TOPIC, wallet_topic],
+                [_NEXUS_TRANSFER_TOPIC, None, wallet_topic],
+            ):
+                chunk_logs.extend(get_logs(low, high, topics))
+        except Exception as exc:
+            errors.append(_nexus_ledger_rpc_problem(exc))
             break
-    # Token decimals only from exact contract; never assume all tokens use 6/18.
-    decimals_cache={}
-    for ev in found.values():
-        address=ev['contract'].lower()
-        if address not in decimals_cache and len(decimals_cache)<15:
+        # Only a fully successful two-direction query counts as scanned.
+        completed_windows += 1
+        oldest_scanned = low
+        for log in chunk_logs:
+            if not isinstance(log, dict):
+                continue
+            tx = str(log.get('transactionHash') or '')
+            if not re.fullmatch(r'0x[0-9a-fA-F]{64}', tx):
+                continue
+            idx = str(log.get('logIndex') or '0x0')
+            topics_log = log.get('topics') or []
+            if len(topics_log) < 3:
+                continue
+            sender = '0x' + str(topics_log[1])[-40:].lower()
+            receiver = '0x' + str(topics_log[2])[-40:].lower()
+            # Recheck indexed wallet address; do not leak unrelated activity.
+            if sender != wallet_address and receiver != wallet_address:
+                continue
+            direction = 'SELF' if sender == receiver else ('IN' if receiver == wallet_address else 'OUT')
+            raw = str(log.get('data') or '0x0')
             try:
-                decoded=_eth_call(cid,address,'0x313ce567')
-                d=int(str(decoded),16)
-                decimals_cache[address]=d if 0<=d<=36 else None
-            except Exception:decimals_cache[address]=None
-        dec=decimals_cache.get(address)
+                amount_raw = str(int(raw, 16))
+                block = int(str(log.get('blockNumber') or '0x0'), 16)
+            except (TypeError, ValueError):
+                continue
+            found[(tx.lower(), idx)] = {
+                'id': f'erc20:{chain}:{tx.lower()}:{idx}',
+                'txHash': tx, 'chain': chain, 'type': 'TOKEN TRANSFER',
+                'direction': direction, 'source': 'ONCHAIN_ERC20_LOG',
+                'status': 'CONFIRMED', 'from': sender, 'to': receiver,
+                'contract': str(log.get('address') or ''),
+                'amountRaw': amount_raw, 'amount': None, 'asset': 'TOKEN',
+                'createdAt': 0, 'blockNumber': block,
+                'note': 'Confirmed Transfer event; raw token units shown if decimals are unavailable.',
+            }
+
+    # Token decimals only from the exact token contract; never assume 6/18.
+    decimals_cache = {}
+    for ev in found.values():
+        address = ev['contract'].lower()
+        if address not in decimals_cache and len(decimals_cache) < 15:
+            try:
+                decoded = _eth_call(cid, address, '0x313ce567')
+                d = int(str(decoded), 16)
+                decimals_cache[address] = d if 0 <= d <= 36 else None
+            except Exception:
+                decimals_cache[address] = None
+        dec = decimals_cache.get(address)
         if dec is not None and ev['amountRaw']:
             from decimal import Decimal
-            ev['amount']=str(Decimal(ev['amountRaw'])/(Decimal(10)**dec))
-        ev['asset']=address[:8]+'…'+address[-6:]
-        ev['decimals']=dec
-    return {'events':sorted(found.values(),key=lambda x:(x['blockNumber'],x['id']),reverse=True)[:180],
-            'chain':chain, 'fromBlock':first, 'lastBlockScanned':scanned_to, 'latestBlock':latest,
-            'completeForRequestedRange':not failures and scanned_to==latest,
-            'errors':failures[:3], 'scope':'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
-            'limitations':'Recent ERC20 logs only. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.'}
+            ev['amount'] = str(Decimal(ev['amountRaw']) / (Decimal(10) ** dec))
+        ev['asset'] = address[:8] + '…' + address[-6:]
+        ev['decimals'] = dec
+
+    complete = not errors and oldest_scanned == first
+    if errors:
+        # Diagnostic is safe for clients and Render logs (no RPC credentials).
+        app.logger.warning('Wallet ledger ERC20 scan incomplete chain=%s issue=%s', chain, errors[0])
+    return {
+        'events': sorted(found.values(), key=lambda x: (x['blockNumber'], x['id']), reverse=True)[:180],
+        'chain': chain, 'fromBlock': first, 'lastBlockScanned': latest if completed_windows else first - 1,
+        'oldestBlockScanned': oldest_scanned, 'latestBlock': latest,
+        'completeForRequestedRange': complete, 'error': errors[0] if errors else '',
+        'errors': errors[:3], 'scannedWindows': completed_windows,
+        'rpcRequests': requests_used,
+        'scope': 'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
+        'limitations': 'Recent ERC20 logs only; partial on RPC limitations. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.',
+    }
 
 
 def _nexus_wallet_ledger_verify_receipts(wallet, chain, items, max_receipts=18):
@@ -54340,7 +54441,7 @@ def api_nexus_wallet_ledger():
                     int(request.args.get('blocks') or 6000))
             except Exception as exc:
                 response['recentOnchain']={'chain':chain,'events':[],'completeForRequestedRange':False,
-                    'error':type(exc).__name__,'scope':'RECENT_SCAN_UNAVAILABLE'}
+                    'error':_nexus_ledger_rpc_problem(exc),'scope':'RECENT_SCAN_UNAVAILABLE'}
         return jsonify(response)
     except Exception as exc:
         return jsonify({'status':'error','error':'read_only_ledger_unavailable','detail':type(exc).__name__}),503
