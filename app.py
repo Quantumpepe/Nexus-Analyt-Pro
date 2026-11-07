@@ -186,9 +186,9 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-556-STRATEGIST-SECURITY-EXIT";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD596-STRATEGIST-SECURITY-EXIT"
-STRATEGIST_BUILD_ID = "S-ENGINE-077-SECURITY-EXIT-VALIDATION"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-557-LEDGER-HISTORY-REENTRY-AUDIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD597-LEDGER-HISTORY-REENTRY-AUDIT"
+STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
@@ -35054,6 +35054,24 @@ def _sim_tick(session: dict, new_price: Optional[float] = None) -> dict:
                 o["filled_ts"] = int(time.time())
                 o["fill_price"] = round(float(price), 8)
                 fills.append({k: o.get(k) for k in ("id", "side", "level", "price", "fill_price", "filled_ts", "qty", "usd", "payout_asset", "fill_trigger", "tx_hash")})
+                # ENGINE-557: persist actual, receipt-backed Grid SELL separately
+                # from UI-only OPEN/ACTIVE status snapshots. Never block a sale if
+                # history persistence temporarily fails.
+                try:
+                    _grid_wa = _norm_addr(session.get("wallet_address") or "")
+                    _grid_c = str(o.get("chain") or session.get("chain") or _grid_chain_key(session.get("item_id") or session.get("item") or "") or "").upper()
+                    if _grid_wa and re.fullmatch(r"0x[0-9a-fA-F]{64}", str(o.get("tx_hash") or "")):
+                        _engine_history_record(
+                            _grid_wa, "GRID", "EXIT",
+                            eventKey=f"GRID:CHAIN:{_grid_c}:{str(o['tx_hash']).lower()}",
+                            asset=str(o.get("original_asset") or o.get("symbol") or session.get("item_id") or "").upper(),
+                            chain=_grid_c, side="SELL", action="CLOSE", priceUsd=o.get("fill_price") or 0,
+                            quantity=o.get("qty") or 0, txHash=o.get("tx_hash"),
+                            sessionId=str(session.get("onchain_session_id") or ""),
+                            reason=f"Grid {trigger} exit: mined swap and payout evidence recorded",
+                        )
+                except Exception:
+                    pass
                 filled_now += 1
 
     session["fills"] = fills[-500:]
@@ -51742,6 +51760,24 @@ def api_nkr_executor_tick():
 # -------------------------
 # ENGINE-136: persistent Grid / Trader Event History
 # -------------------------
+# ENGINE-557: normalize all persisted UI, Unix and legacy millisecond timestamps.
+# Never fabricate a transaction time from a malformed client value.
+def _nexus_history_epoch_seconds(value, default=0):
+    try:
+        if value is None or value == '':
+            return int(default or 0)
+        number = float(value)
+        if not math.isfinite(number) or number <= 0:
+            return int(default or 0)
+        while number >= 100_000_000_000:  # milliseconds / microseconds / ns
+            number /= 1000.0
+        now = int(time.time())
+        if not (946684800 <= number <= now + 86400):
+            return int(default or 0)
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return int(default or 0)
+
 def _engine_history_init():
     with DB_WRITE_LOCK:
         conn = _db()
@@ -51803,6 +51839,8 @@ def _engine_history_record(wallet, engine, event_type, **fields):
         "reason": str(fields.get("reason") or fields.get("detail") or "")[:400],
         "txHash": tx,
         "sessionId": sid,
+        "source": "RECORDED_TX" if re.fullmatch(r"0x[0-9a-fA-F]{64}", tx) else "SESSION_STATE",
+        "onchainConfirmed": False,  # A stored tx hash is not a receipt.
         "date": time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(now_i)),
     }
     try:
@@ -51826,7 +51864,14 @@ def _engine_history_record(wallet, engine, event_type, **fields):
             finally:
                 conn.close()
         return True
-    except Exception:
+    except Exception as history_exc:
+        # Never abort a confirmed trade because history storage failed; leave
+        # a server-side, wallet-free diagnostic marker for operator review.
+        try:
+            app.logger.warning('NEXUS_ENGINE_HISTORY_WRITE_FAILED engine=%s event=%s class=%s',
+                               eng, event_type, type(history_exc).__name__)
+        except Exception:
+            pass
         return False
 
 
@@ -51862,9 +51907,56 @@ def api_nexus_engine_history_get():
         if not isinstance(payload, dict): payload={}
         payload.setdefault("eventKey", row["event_key"])
         payload.setdefault("eventType", row["event_type"])
-        payload.setdefault("ts", int(row["event_ts"] or 0))
+        payload["ts"] = _nexus_history_epoch_seconds(row["event_ts"] or payload.get("ts"), 0)
+        payload.pop("date", None)  # Broken legacy YYYY values must never override the real epoch.
+        payload.setdefault("source", "RECORDED_TX" if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(payload.get("txHash") or "")) else "SESSION_STATE")
+        payload.setdefault("onchainConfirmed", False)
         events.append(payload)
-    return jsonify({"status":"ok","wallet":_norm_addr(wa),"engine":engine,"events":events,"count":len(events),"ts":now_ts()})
+    # ENGINE-557: supplement client-projected status history with durable real
+    # execution records. Never pretend a registry status without tx hash was a trade.
+    try:
+        conn = _db()
+        try:
+            has_ops = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nexus_live_operations'").fetchone()
+            if has_ops:
+                operations = conn.execute(
+                    "SELECT o.op_type,o.status,o.tx_hash,o.updated_ts,o.chain_id,o.onchain_session_id,o.token_address "
+                    "FROM nexus_live_operations o JOIN nexus_live_core_vault_sessions s "
+                    "ON lower(o.wallet_address)=lower(s.wallet_address) AND o.chain_id=s.chain_id "
+                    "AND lower(o.vault_address)=lower(s.vault_address) AND o.onchain_session_id=s.onchain_session_id "
+                    "WHERE lower(o.wallet_address)=? AND upper(s.engine)=? "
+                    "AND length(o.tx_hash)=66 ORDER BY o.updated_ts DESC LIMIT 300",
+                    (_norm_addr(wa).lower(), engine),
+                ).fetchall()
+            else:
+                operations = []
+        finally:
+            conn.close()
+        known = {(str(e.get('chain') or '').upper(), str(e.get('txHash') or '').lower())
+                 for e in events if e.get('txHash')}
+        for op in operations:
+            tx = str(op['tx_hash'] or '')
+            chain = {1:'ETH',56:'BNB',137:'POL'}.get(int(op['chain_id'] or 0), str(op['chain_id'] or ''))
+            if (chain, tx.lower()) in known or not re.fullmatch(r'0x[0-9a-fA-F]{64}', tx):
+                continue
+            typ = str(op['op_type'] or '').upper()
+            mapped = {'ENTRY':'ENTRY', 'EXIT':'EXIT', 'FINALIZE':'SESSION_FINALIZED',
+                      'START_CLOSING':'SESSION_CLOSING', 'CLOSE':'EXIT'}.get(typ, 'ONCHAIN_OPERATION')
+            if typ not in ('ENTRY','EXIT','CLOSE','FINALIZE','START_CLOSING'):
+                continue
+            events.append({'eventKey':f'CHAIN:{chain}:{tx.lower()}', 'eventType':mapped, 'status':mapped,
+                'source':'RECORDED_TX', 'onchainConfirmed':False,
+                'ts':_nexus_history_epoch_seconds(op['updated_ts']), 'chain':chain,
+                'asset':'', 'side':mapped, 'txHash':tx,
+                'sessionId':str(op['onchain_session_id'] or ''),
+                'reason':f'Backend operation {typ}: {str(op["status"] or "UNKNOWN").upper()}; receipt not independently checked'})
+            known.add((chain, tx.lower()))
+    except Exception:
+        pass  # Legacy history remains readable even if operation tables are absent.
+    events.sort(key=lambda x: int(x.get('ts') or 0), reverse=True)
+    events = events[:limit]
+    return jsonify({"status":"ok","wallet":_norm_addr(wa),"engine":engine,"events":events,"count":len(events),
+        "historyScope":"RECORDED_BACKEND_AND_CLIENT_EVENTS_NOT_FULL_CHAIN_INDEX", "ts":now_ts()})
 
 
 @app.route("/api/nexus/engine-history/sync", methods=["POST"])
@@ -51891,13 +51983,16 @@ def api_nexus_engine_history_sync():
                 if not event_key:
                     continue
                 event_type=str(raw.get("eventType") or raw.get("event_type") or raw.get("status") or raw.get("action") or "EVENT").strip().upper()[:80]
-                try: event_ts=int(raw.get("ts") or raw.get("updatedTs") or raw.get("createdTs") or now_i)
-                except Exception: event_ts=now_i
+                event_ts = _nexus_history_epoch_seconds(
+                    raw.get("ts") or raw.get("updatedTs") or raw.get("createdTs"), now_i)
                 payload=dict(raw)
                 payload["engine"]=engine
                 payload["eventKey"]=event_key
                 payload["eventType"]=event_type
-                payload["ts"]=event_ts
+                payload["ts"] = event_ts
+                payload.pop("date", None)
+                payload["source"] = "CLIENT_SESSION_STATE"  # Untrusted UI state is not an on-chain receipt.
+                payload["onchainConfirmed"] = False
                 conn.execute("""
                     INSERT INTO nexus_engine_event_history(wallet_address,engine,event_key,event_type,event_ts,payload_json,created_ts,updated_ts)
                     VALUES(?,?,?,?,?,?,?,?)
@@ -53992,6 +54087,264 @@ def _nca_queue_auto_return(wallet, engine, chain_id, session_id, vault):
     return {'status': 'RETAINED_IN_CORE_VAULT', 'mutations': 0}
 
 
+# ENGINE-557: user-owned unified transaction ledger (recorded DB + optional recent chain scan).
+# Never signs or submits transactions, never reads other users' Vault activity.
+_NEXUS_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+_NEXUS_LEDGER_CHAIN_MAP = {'ETH':1, 'BNB':56, 'POL':137}
+
+
+def _nexus_wallet_ledger_recorded(wallet, limit=250):
+    result=[]
+    wallet=str(wallet).lower()
+    conn=_db()
+    try:
+        tables={str(r['name']) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if 'nexus_capital_automation_jobs' in tables:
+            jobs=conn.execute("SELECT chain_id,engine,kind,status,intent_json,steps_json,updated_ts "
+                "FROM nexus_capital_automation_jobs WHERE lower(wallet_address)=? ORDER BY updated_ts DESC LIMIT 120",(wallet,)).fetchall()
+            for job in jobs:
+                try: intent=json.loads(job['intent_json'] or '{}'); steps=json.loads(job['steps_json'] or '{}')
+                except Exception: continue
+                chain={1:'ETH',56:'BNB',137:'POL'}.get(int(job['chain_id'] or 0),'')
+                for name, step in steps.items():
+                    if not isinstance(step,dict): continue
+                    tx=str(step.get('txHash') or '')
+                    if not re.fullmatch(r'0x[0-9a-fA-F]{64}',tx): continue
+                    label={'vault_deposit':'VAULT DEPOSIT','vault_withdraw':'VAULT WITHDRAW',
+                           'wrap':'WRAP', 'swap':'WALLET SWAP',
+                           'vault_approval':'APPROVAL', 'router_approval':'APPROVAL'}.get(name,name.upper())
+                    flow={'vault_deposit':'TO_VAULT','vault_withdraw':'TO_PRIVY'}.get(name,'WALLET_OPERATION')
+                    result.append({'id':f'job:{chain}:{tx.lower()}:{name}', 'txHash':tx, 'chain':chain,
+                        'type':label, 'direction':flow,'source':'NEXUS_CAPITAL_JOB', 'asset':str(intent.get('stable') or ''),
+                        'amount':None, 'status':'RECORDED' if str(step.get('status'))=='CONFIRMED' else 'PENDING_REVIEW',
+                        'createdAt':_nexus_history_epoch_seconds(job['updated_ts'])*1000,
+                        'note':'Backend job receipt recorded; amount must be verified from token Transfer logs.'})
+        if 'nexus_live_operations' in tables and 'nexus_live_core_vault_sessions' in tables:
+            ops=conn.execute("SELECT op_type,status,chain_id,tx_hash,updated_ts,token_address,onchain_session_id "
+                "FROM nexus_live_operations WHERE lower(wallet_address)=? AND length(tx_hash)=66 ORDER BY updated_ts DESC LIMIT 250",(wallet,)).fetchall()
+            for op in ops:
+                typ=str(op['op_type'] or '').upper()
+                chain={1:'ETH',56:'BNB',137:'POL'}.get(int(op['chain_id'] or 0),'')
+                result.append({'id':f'op:{chain}:{str(op["tx_hash"]).lower()}:{typ}',
+                    'txHash':str(op['tx_hash']), 'chain':chain, 'type':{'ENTRY':'TRADE BUY','EXIT':'TRADE SELL',
+                    'START_CLOSING':'SESSION CLOSING','FINALIZE':'SESSION FINALIZE'}.get(typ,typ),
+                    'direction':'VAULT_INTERNAL','source':'NEXUS_LIVE_OPERATION', 'asset':'', 'amount':None,
+                    'status':'RECORDED' if str(op['status']).upper()=='SUCCEEDED' else 'PENDING_REVIEW',
+                    'createdAt':_nexus_history_epoch_seconds(op['updated_ts'])*1000,
+                    'note':'Backend operation record; consult transaction receipt for chain confirmation.'})
+        if 'nexus_live_core_vault_sessions' in tables:
+            sess=conn.execute("SELECT tx_hash,finalized_tx_hash,chain_id,created_ts,updated_ts,engine "
+                "FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? ORDER BY updated_ts DESC LIMIT 120",(wallet,)).fetchall()
+            for row in sess:
+                chain={1:'ETH',56:'BNB',137:'POL'}.get(int(row['chain_id'] or 0),'')
+                for col,label,ts in [('tx_hash','SESSION CREATE','created_ts'),('finalized_tx_hash','SESSION FINALIZE','updated_ts')]:
+                    tx=str(row[col] or '')
+                    if re.fullmatch(r'0x[0-9a-fA-F]{64}',tx):
+                        result.append({'id':f'session:{chain}:{tx.lower()}:{col}', 'txHash':tx,
+                            'chain':chain, 'type':label, 'direction':'VAULT_INTERNAL','source':'SESSION_REGISTRY',
+                            'status':'RECORDED','asset':'','amount':None,
+                            'createdAt':_nexus_history_epoch_seconds(row[ts])*1000,
+                            'note':str(row['engine'] or '')+' registry transaction; independent receipt not checked.'})
+        if 'nexus_engine_event_history' in tables:
+            evts=conn.execute("SELECT event_ts,payload_json,engine FROM nexus_engine_event_history "
+                "WHERE lower(wallet_address)=? ORDER BY event_ts DESC LIMIT 200",(wallet,)).fetchall()
+            for row in evts:
+                try: data=json.loads(row['payload_json'] or '{}')
+                except Exception: continue
+                tx=str(data.get('txHash') or '')
+                if not re.fullmatch(r'0x[0-9a-fA-F]{64}',tx): continue
+                chain=str(data.get('chain') or '').upper()
+                if chain not in _NEXUS_LEDGER_CHAIN_MAP: continue
+                result.append({'id':f'engine:{chain}:{tx.lower()}:{row["engine"]}',
+                    'txHash':tx,'chain':chain,'type':str(row['engine'])+' '+str(data.get('eventType') or 'TRADE'),
+                    'direction':'VAULT_INTERNAL','source':'ENGINE_EVENT_HISTORY','status':'RECORDED',
+                    'asset':str(data.get('asset') or ''),'amount':None,
+                    'createdAt':_nexus_history_epoch_seconds(row['event_ts'])*1000,
+                    'note':'Engine event has tx hash; amount/receipt not independently verified.'})
+    finally:
+        conn.close()
+    # Deduplicate one underlying transaction per chain. Prefer movement details
+    # over bare session/operation records; never add amounts together.
+    preference={'NEXUS_CAPITAL_JOB':4,'ENGINE_EVENT_HISTORY':3,'NEXUS_LIVE_OPERATION':2,'SESSION_REGISTRY':1}
+    best={}
+    for item in result:
+        key=(item['chain'],item['txHash'].lower())
+        if key not in best or preference.get(item['source'],0)>preference.get(best[key]['source'],0):
+            best[key]=item
+    return sorted(best.values(),key=lambda x:x.get('createdAt') or 0,reverse=True)[:limit]
+
+
+def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
+    """Bounded ERC-20 Transfer logs involving this wallet; no Vault-wide public leakage."""
+    cid=_NEXUS_LEDGER_CHAIN_MAP[chain]
+    block_raw=_rpc_call(cid,'eth_blockNumber',[])
+    latest=int(block_raw,16) if isinstance(block_raw,str) else int(block_raw)
+    depth=min(12000,max(1000,int(scan_blocks)))
+    first=max(0,latest-depth+1)
+    topic='0x'+str(wallet).lower().replace('0x','').rjust(64,'0')
+    found={}; scanned_to=first-1; failures=[]
+    # Two recipient filters per chunk. Public RPC limits can be strict;
+    # incomplete scans are returned as partial, never as 'all transactions'.
+    for start in range(first,latest+1,2000):
+        end=min(latest,start+1999)
+        try:
+            for topics in ([_NEXUS_TRANSFER_TOPIC,topic],[_NEXUS_TRANSFER_TOPIC,None,topic]):
+                logs=_rpc_call(cid,'eth_getLogs',[{'fromBlock':hex(start),'toBlock':hex(end),'topics':topics}])
+                for log in (logs or []):
+                    if not isinstance(log,dict):continue
+                    tx=str(log.get('transactionHash') or '')
+                    if not re.fullmatch(r'0x[0-9a-fA-F]{64}',tx):continue
+                    idx=str(log.get('logIndex') or '0x0')
+                    topics_log=log.get('topics') or []
+                    if len(topics_log)<3:continue
+                    sender='0x'+str(topics_log[1])[-40:].lower()
+                    receiver='0x'+str(topics_log[2])[-40:].lower()
+                    direction='IN' if receiver==str(wallet).lower() else 'OUT'
+                    if sender==receiver:direction='SELF'
+                    raw=str(log.get('data') or '0x0')
+                    try: amount_raw=str(int(raw,16))
+                    except (TypeError,ValueError):amount_raw=''
+                    found[(tx.lower(),idx)]={'id':f'erc20:{chain}:{tx.lower()}:{idx}',
+                        'txHash':tx, 'chain':chain, 'type':'TOKEN TRANSFER', 'direction':direction,
+                        'source':'ONCHAIN_ERC20_LOG', 'status':'CONFIRMED', 'from':sender,'to':receiver,
+                        'contract':str(log.get('address') or ''),'amountRaw':amount_raw,'amount':None,
+                        'asset':'TOKEN', 'createdAt':0, 'blockNumber':int(str(log.get('blockNumber') or '0x0'),16),
+                        'note':'Confirmed Transfer event; raw token units shown if decimals are unavailable.'}
+            scanned_to=end
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+            break
+    # Token decimals only from exact contract; never assume all tokens use 6/18.
+    decimals_cache={}
+    for ev in found.values():
+        address=ev['contract'].lower()
+        if address not in decimals_cache and len(decimals_cache)<15:
+            try:
+                decoded=_eth_call(cid,address,'0x313ce567')
+                d=int(str(decoded),16)
+                decimals_cache[address]=d if 0<=d<=36 else None
+            except Exception:decimals_cache[address]=None
+        dec=decimals_cache.get(address)
+        if dec is not None and ev['amountRaw']:
+            from decimal import Decimal
+            ev['amount']=str(Decimal(ev['amountRaw'])/(Decimal(10)**dec))
+        ev['asset']=address[:8]+'…'+address[-6:]
+        ev['decimals']=dec
+    return {'events':sorted(found.values(),key=lambda x:(x['blockNumber'],x['id']),reverse=True)[:180],
+            'chain':chain, 'fromBlock':first, 'lastBlockScanned':scanned_to, 'latestBlock':latest,
+            'completeForRequestedRange':not failures and scanned_to==latest,
+            'errors':failures[:3], 'scope':'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
+            'limitations':'Recent ERC20 logs only. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.'}
+
+
+def _nexus_wallet_ledger_verify_receipts(wallet, chain, items, max_receipts=18):
+    """Verify exact prior Nexus capital transfers from mined receipts on demand."""
+    cid=_NEXUS_LEDGER_CHAIN_MAP[chain]
+    try:
+        cfg=_privy_trading_cfg(cid)
+    except Exception:
+        cfg={}
+    token_by_symbol={}
+    for sym in ('USDC','USDT'):
+        address=str(cfg.get(sym.lower()) or '').lower()
+        if re.fullmatch(r'0x[0-9a-f]{40}',address):token_by_symbol[sym]=address
+    checked=0; confirmed=0
+    decimals_cache={}
+    for item in items:
+        if checked>=max_receipts:break
+        if item.get('chain') != chain or item.get('source')!='NEXUS_CAPITAL_JOB':continue
+        if item.get('direction') not in ('TO_PRIVY','TO_VAULT'):continue
+        tx=str(item.get('txHash') or '')
+        if not re.fullmatch(r'0x[0-9a-fA-F]{64}',tx):continue
+        checked+=1
+        try:
+            receipt=_rpc_call(cid,'eth_getTransactionReceipt',[tx])
+            if not isinstance(receipt,dict):continue
+            success=int(str(receipt.get('status') or '0x0'),16)==1
+            if not success:
+                item['status']='FAILED';item['note']='On-chain transaction receipt status 0 (reverted).'
+                continue
+            item['status']='CONFIRMED';confirmed+=1
+            item['blockNumber']=int(str(receipt.get('blockNumber') or '0x0'),16)
+            expected=token_by_symbol.get(str(item.get('asset') or '').upper())
+            if not expected:
+                item['note']='Receipt confirmed; exact settlement-token contract configuration unavailable. Amount not asserted.'
+                continue
+            candidates=[]
+            for log in receipt.get('logs') or []:
+                if not isinstance(log,dict):continue
+                topics=log.get('topics') or []
+                if len(topics)<3 or str(topics[0]).lower()!=_NEXUS_TRANSFER_TOPIC:continue
+                sender='0x'+str(topics[1])[-40:].lower()
+                recipient='0x'+str(topics[2])[-40:].lower()
+                direction=item['direction']
+                if direction=='TO_PRIVY' and recipient!=str(wallet).lower():continue
+                if direction=='TO_VAULT' and sender!=str(wallet).lower():continue
+                contract=str(log.get('address') or '').lower()
+                if contract!=expected:continue
+                try: units=int(str(log.get('data') or '0x0'),16)
+                except (ValueError,TypeError):continue
+                candidates.append((contract,units,sender,recipient))
+            if not candidates:
+                item['note']='Receipt confirmed; no matching wallet stablecoin Transfer log decoded.'
+                continue
+            contracts={a for a,_,_,_ in candidates}
+            if len(contracts)!=1:
+                item['note']='Receipt confirmed; multiple token contracts; exact amount requires review.'
+                continue
+            token_address=next(iter(contracts))
+            if token_address not in decimals_cache:
+                try:
+                    decoded=_eth_call(cid,token_address,'0x313ce567')
+                    decimals_cache[token_address]=int(str(decoded),16)
+                except Exception:
+                    decimals_cache[token_address]=None
+            decimals=decimals_cache[token_address]
+            item['contract']=token_address
+            item['from']=candidates[0][2]
+            item['to']=candidates[0][3]
+            item['amountRaw']=str(sum(v for _,v,_,_ in candidates))
+            if decimals is not None and 0<=decimals<=36:
+                from decimal import Decimal
+                item['amount']=str(Decimal(item['amountRaw'])/(Decimal(10)**decimals))
+                item['note']='Mined receipt and wallet token Transfer logs independently verified.'
+            else:
+                item['note']='Mined receipt verified; token decimals unavailable, amount shown as raw units.'
+        except Exception:
+            item['note']='Stored transaction; receipt lookup unavailable.'
+    return {'checked':checked,'minedConfirmed':confirmed,'scope':'EXACT_RECORDED_CAPITAL_JOB_RECEIPTS_ONLY'}
+
+
+@app.get('/api/nexus/wallet/ledger')
+def api_nexus_wallet_ledger():
+    try:
+        wallet=_nca_identity()
+    except (PermissionError,ValueError):
+        return jsonify({'status':'error','error':'verified_privy_login_required'}),401
+    try:
+        scan=str(request.args.get('scan') or '0')=='1'
+        chain=str(request.args.get('chain') or 'BNB').upper()
+        if chain not in _NEXUS_LEDGER_CHAIN_MAP:
+            return jsonify({'status':'error','error':'invalid_chain'}),400
+        events=_nexus_wallet_ledger_recorded(wallet)
+        response={'status':'ok','readOnly':True,'mutations':0,'walletScoped':True,
+                  'events':events,'count':len(events),'scope':'RECORDED_NEXUS_TRANSACTIONS',
+                  'coverage':'Known backend transactions across ETH/BNB/POL; does not imply full blockchain history.',
+                  'ts':int(time.time())}
+        if scan:
+            # An exact stored return transaction (including an older 5 USDC
+            # payout) can be verified regardless of the recent-log lookback.
+            response['receiptProof'] = _nexus_wallet_ledger_verify_receipts(wallet,chain,events)
+            try:
+                response['recentOnchain']=_nexus_wallet_ledger_recent_erc20(wallet,chain,
+                    int(request.args.get('blocks') or 6000))
+            except Exception as exc:
+                response['recentOnchain']={'chain':chain,'events':[],'completeForRequestedRange':False,
+                    'error':type(exc).__name__,'scope':'RECENT_SCAN_UNAVAILABLE'}
+        return jsonify(response)
+    except Exception as exc:
+        return jsonify({'status':'error','error':'read_only_ledger_unavailable','detail':type(exc).__name__}),503
+
 # ENGINE-555: OWNER SYSTEM INFO STRATEGIST DIAGNOSTICS (STRICTLY READ-ONLY).
 #  - GET only, no wallets/contracts/RPC/provider calls or live worker mutation.
 #  - Scenario mode calls the actual Strategist gate and exit rules with explicitly
@@ -54090,6 +54443,34 @@ def _strategist_diag_observations(engine, chain, mode):
                        'fields': list(sample.get('signalFields') or [])[:25],
                        'ts': ts or None, 'ageSec': age,
                        'state': 'RECENT' if age is not None and age <= 300 else 'OLD' if age is not None else 'NOT_OBSERVED'})
+    # No trading session = no requirement for a constantly fresh live-engine audit.
+    # Preserve the original timestamps: never invent a current signal or call a feed.
+    active_rows = 0
+    last_worker_tick = None
+    try:
+        conn = _db()
+        try:
+            active_rows = int(conn.execute(
+                "SELECT COUNT(*) FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? AND upper(engine)=? "
+                "AND chain_id=? AND status IN ('ACTIVE','PAUSED','CLOSING','STOPPING')",
+                (str(_nca_identity()).lower(), engine, _STRATEGIST_DIAG_CHAIN_IDS[chain]),
+            ).fetchone()[0])
+            health = conn.execute("SELECT payload_json FROM nexus_live_engine_runtime_health WHERE engine=?", (engine,)).fetchone()
+            if health:
+                try:
+                    snapshot = json.loads(health['payload_json'] or '{}')
+                    last_worker_tick = _nexus_history_epoch_seconds(snapshot.get('last_tick_ts') or snapshot.get('lastTickTs')) or None
+                except Exception:
+                    last_worker_tick = None
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    for stage in stages:
+        if not active_rows and stage['state'] == 'OLD':
+            stage['state'] = 'IDLE_LAST_OBSERVED'
+        elif active_rows and stage['state'] == 'OLD':
+            stage['state'] = 'STALE_WHILE_SESSION_REGISTERED'
     # Snapshot is process-local. Only rows with real cached score+signals and
     # observed timestamps can be evaluated. Never claim a route/chain was checked.
     snapshot_rows = []
@@ -54120,6 +54501,9 @@ def _strategist_diag_observations(engine, chain, mode):
                 item['reason'] = 'quality_eval_failed_' + type(exc).__name__
         snapshot_rows.append(item)
     return {'traceShared': bool(shared), 'traceChainScope': 'GLOBAL_NOT_CHAIN_ATTRIBUTED',
+            'sessionContext': {'registeredActiveSessions': active_rows, 'lastWorkerTickTs': last_worker_tick,
+                               'lastWorkerTickAgeSec': max(0, now-last_worker_tick) if last_worker_tick else None,
+                               'scope': 'selected_wallet_engine_chain; audit signal stages remain global'},
             'stages': stages, 'recentDecisions': [
                 {'ts': e.get('ts'), 'stage': e.get('stage'), 'symbol': e.get('symbol'),
                  'decision': e.get('decision'), 'signalCount': e.get('signalCount')}
@@ -54162,7 +54546,7 @@ def _strategist_diag_last_session(owner, engine, chain):
                     if str(payload.get('chain') or '').upper() != chain:
                         continue
                     out['events'].append({'type': str(r['event_type'] or '')[:30],
-                                          'ts': int(r['event_ts'] or 0),
+                                          'ts': _nexus_history_epoch_seconds(r['event_ts']),
                                           'asset': str(payload.get('asset') or '')[:18],
                                           'hasTxHash': bool(payload.get('txHash'))})
                     if len(out['events']) >= 12:
@@ -54176,7 +54560,7 @@ def _strategist_diag_last_session(owner, engine, chain):
     # outstanding operations and cross-worker locks are not read by this GET.
     last_exit = next((e for e in out['events'] if str(e['type']).upper() in
                       ('EXIT', 'SELL', 'CLOSE')), None)
-    elapsed = max(0, int(time.time()) - int(last_exit['ts'])) if last_exit else None
+    elapsed = max(0, int(time.time()) - int(last_exit['ts'])) if last_exit and int(last_exit['ts'] or 0) else None
     cooldown = int(_NKR_LIVE_REENTRY_COOLDOWN_SEC) if engine == 'NKR' else None
     out['reentry'] = {'lastExitAgeSec': elapsed, 'cooldownSec': cooldown,
                       'cooldownTimeElapsed': bool(elapsed is not None and cooldown is not None and elapsed >= cooldown)
@@ -54185,6 +54569,81 @@ def _strategist_diag_last_session(owner, engine, chain):
                       'note': 'Confirm zero open positions, settled trade and cross-worker locks before a real re-entry.'}
     return out
 
+
+def _strategist_diag_reentry_onchain(wallet, engine, chain):
+    """Explicitly requested proof of on-chain session state; no broadcasts/DB writes."""
+    cid = _STRATEGIST_DIAG_CHAIN_IDS[chain]
+    output = {'state':'NOT_VERIFIED', 'readOnly':True, 'rpcCalls':0, 'ordersSent':0,
+              'positionClearanceVerified':False, 'readyForNewEntry':False,
+              'limitations':'On-chain session status does not prove trade route, quote, price freshness or a next successful buy.'}
+    try:
+        conn = _db()
+        try:
+            row = conn.execute("SELECT * FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? AND upper(engine)=? AND chain_id=? "
+                "ORDER BY updated_ts DESC LIMIT 1", (str(wallet).lower(), engine, cid)).fetchone()
+            if not row:
+                output['state']='NO_REGISTERED_SESSION'
+                return output
+            row=dict(row)
+            sid=int(row.get('onchain_session_id') or 0)
+            vault=_norm_addr(row.get('vault_address') or '')
+            output.update({'sessionId':sid, 'vault':vault, 'recordedStatus':str(row.get('status') or '')})
+            if not sid or not _looks_like_evm_addr(vault):
+                output['state']='INVALID_REGISTERED_SESSION'
+                return output
+            pending=conn.execute("SELECT op_type,status,tx_hash FROM nexus_live_operations "
+                "WHERE lower(wallet_address)=? AND chain_id=? AND lower(vault_address)=? "
+                "AND onchain_session_id=? AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING') "
+                "ORDER BY updated_ts DESC LIMIT 15", (str(wallet).lower(),cid,vault.lower(),str(sid))).fetchall()
+            output['pendingOperations']=[{'action':str(op['op_type']),'status':str(op['status'])} for op in pending]
+            lock_row=None
+            if engine=='NKR' and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nexus_nkr_position_locks'").fetchone():
+                lock_row=conn.execute("SELECT state,updated_ts FROM nexus_nkr_position_locks WHERE lower(wallet_address)=? "
+                    "AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? LIMIT 1",
+                    (str(wallet).lower(),cid,vault.lower(),str(sid))).fetchone()
+            output['positionLockState']=str(lock_row['state']) if lock_row else 'NONE'
+            last_exit=conn.execute("SELECT updated_ts,tx_hash FROM nexus_live_operations WHERE lower(wallet_address)=? AND chain_id=? "
+                "AND lower(vault_address)=? AND onchain_session_id=? AND op_type='EXIT' AND status='SUCCEEDED' "
+                "AND length(tx_hash)=66 ORDER BY updated_ts DESC LIMIT 1", (str(wallet).lower(),cid,vault.lower(),str(sid))).fetchone()
+            cooldown=int(_NKR_LIVE_REENTRY_COOLDOWN_SEC) if engine=='NKR' else 0
+            age=max(0,int(time.time())-_nexus_history_epoch_seconds(last_exit['updated_ts'])) if last_exit else None
+            output['lastExitAgeSec']=age
+            output['cooldownSec']=cooldown
+            output['cooldownElapsed']=(age is not None and age>=cooldown)
+        finally:
+            conn.close()
+        raw = _eth_call(cid, vault, _core_selector('sessionOf(uint256)')+_uint_to_32(sid))
+        output['rpcCalls']=1
+        words=_core_words(raw)
+        if len(words)<13:
+            output['state']='ONCHAIN_SESSION_DECODE_FAILED'; return output
+        owner='0x'+format(int(words[0]),'040x')
+        if owner.lower()!=str(wallet).lower():
+            output['state']='ONCHAIN_OWNER_MISMATCH'; return output
+        status_id=int(words[3]); open_count=int(words[12])
+        output.update({'onchainSessionStatus':status_id,'onchainOpenAssetCount':open_count,
+                       'positionClearanceVerified':bool(open_count==0), 'onchainOwnerVerified':True})
+        if status_id==4:
+            output['state']='FINALIZED_NEW_SESSION_REQUIRED'
+        elif status_id != 1:
+            output['state']='SESSION_NOT_ACTIVE'
+        elif open_count>0:
+            output['state']='OPEN_POSITION_PRESENT'
+        elif pending:
+            output['state']='PENDING_OPERATION'
+        elif str(output.get('positionLockState')).upper() in ('LOCKED','EXIT_PENDING'):
+            output['state']='PERSISTENT_POSITION_LOCK'
+        elif last_exit and not output['cooldownElapsed']:
+            output['state']='REENTRY_COOLDOWN'
+        elif not last_exit:
+            output['state']='ENTRY_ELIGIBILITY_NOT_REENTRY_PROOF'
+        else:
+            output['state']='REENTRY_PRECHECK_PASSED'
+            output['readyForNewEntry']=True
+    except Exception as exc:
+        output['state']='VERIFY_FAILED'
+        output['errorType']=type(exc).__name__
+    return output
 
 @app.get('/api/nexus/system-info/strategist-diagnostics')
 def api_nexus_strategist_diagnostics():
@@ -54204,7 +54663,7 @@ def api_nexus_strategist_diagnostics():
     mode = str(request.args.get('mode') or 'DYNAMIC').upper()
     view = str(request.args.get('view') or 'overview').lower()
     if (engine not in ('NKR', 'TRADER') or chain not in _STRATEGIST_DIAG_CHAIN_IDS
-            or mode not in _STRATEGIST_DIAG_THRESHOLDS or view not in ('overview', 'market', 'last-session', 'scenarios')):
+            or mode not in _STRATEGIST_DIAG_THRESHOLDS or view not in ('overview', 'market', 'last-session', 'scenarios', 'reentry')):
         return jsonify({'status': 'error', 'error': 'invalid_diagnostic_selection'}), 400
     result = {'status': 'ok', 'readOnly': True, 'shadowActivated': False,
               'mutations': 0, 'tradesSent': 0, 'engine': engine, 'chain': chain,
@@ -54217,4 +54676,8 @@ def api_nexus_strategist_diagnostics():
         result['lastSession'] = _strategist_diag_last_session(owner, engine, chain)
     if view in ('overview', 'scenarios'):
         result['scenarios'] = _strategist_diag_scenarios(engine, chain, mode)
+    if view == 'reentry':
+        result['reentryProof'] = _strategist_diag_reentry_onchain(verified_wallet, engine, chain)
+        result['noOnchainProof'] = not bool(result['reentryProof'].get('onchainOwnerVerified'))
+        result['decisionScope'] = 'explicit_read_only_onchain_session_verification'
     return jsonify(result)
