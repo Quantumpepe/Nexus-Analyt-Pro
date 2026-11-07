@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-559-BNB-DEDICATED-LEDGER-RPC";
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-560-BNB-LEDGER-RPC-DIAGNOSTICS";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -54222,6 +54222,36 @@ def _nexus_ledger_rpc_problem(exc):
 _NEXUS_BNB_LEDGER_RPC_DEFAULT = 'https://rpc-bsc.blockmachine.io'
 
 
+# ENGINE-560: Only short, explicitly allowlisted provider diagnostics may enter
+# logs or API responses. Never print the RPC URL, response body, error.message,
+# request headers, secrets, wallet address, or auth-bearing query parameters.
+def _nexus_ledger_error(category, method='', http_status=None, rpc_code=None):
+    err = RuntimeError(str(category))
+    err.ledger_method = str(method) if method in (
+        'eth_chainId', 'eth_blockNumber', 'eth_getLogs', 'eth_call'
+    ) else 'other'
+    try:
+        err.ledger_http_status = int(http_status) if http_status is not None else None
+    except (TypeError, ValueError):
+        err.ledger_http_status = None
+    try:
+        code = int(rpc_code) if rpc_code is not None else None
+        err.ledger_rpc_code = code if code is not None and -99999999 <= code <= 99999999 else None
+    except (TypeError, ValueError):
+        err.ledger_rpc_code = None
+    return err
+
+
+def _nexus_ledger_safe_diagnostic(exc):
+    # No arbitrary exception text: an upstream RPC error may embed credentials.
+    return {
+        'category': _nexus_ledger_rpc_problem(exc),
+        'httpStatus': getattr(exc, 'ledger_http_status', None),
+        'rpcErrorCode': getattr(exc, 'ledger_rpc_code', None),
+        'method': getattr(exc, 'ledger_method', 'unknown'),
+    }
+
+
 def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
     cid = int(chain_id or 0)
     if cid != 56:
@@ -54237,38 +54267,39 @@ def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
                 parsed.fragment):
             raise ValueError('unsafe_url')
     except (ValueError, TypeError):
-        raise RuntimeError('RPC_LEDGER_HTTPS_REQUIRED')
+        raise _nexus_ledger_error('RPC_LEDGER_HTTPS_REQUIRED', method)
     payload = {'jsonrpc': '2.0', 'id': 1, 'method': str(method), 'params': list(params or [])}
     try:
         response = _RPC_HTTP_SESSION.post(url, json=payload, timeout=(2, 6))
     except requests.exceptions.Timeout as exc:
-        raise RuntimeError('RPC_TIMEOUT') from exc
+        raise _nexus_ledger_error('RPC_TIMEOUT', method) from exc
     except requests.exceptions.RequestException as exc:
-        raise RuntimeError('RPC_LEDGER_NETWORK_UNAVAILABLE') from exc
-    if response.status_code == 429:
-        raise RuntimeError('RPC_RATE_LIMITED')
-    if response.status_code in (401, 403):
-        raise RuntimeError('RPC_ACCESS_DENIED')
+        raise _nexus_ledger_error('RPC_LEDGER_NETWORK_UNAVAILABLE', method) from exc
+    http_status = int(response.status_code)
+    if http_status == 429:
+        raise _nexus_ledger_error('RPC_RATE_LIMITED', method, http_status)
+    if http_status in (401, 403):
+        raise _nexus_ledger_error('RPC_ACCESS_DENIED', method, http_status)
     if not response.ok:
-        raise RuntimeError('RPC_LEDGER_HTTP_ERROR')
+        raise _nexus_ledger_error('RPC_LEDGER_HTTP_ERROR', method, http_status)
     try:
         data = response.json()
     except (ValueError, TypeError) as exc:
-        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE') from exc
+        raise _nexus_ledger_error('RPC_LEDGER_INVALID_RESPONSE', method, http_status) from exc
     if not isinstance(data, dict):
-        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE')
+        raise _nexus_ledger_error('RPC_LEDGER_INVALID_RESPONSE', method, http_status)
     if data.get('error') is not None:
-        err = data.get('error')
-        msg = str(err.get('message') or '') if isinstance(err, dict) else str(err)
-        status = _nexus_ledger_rpc_problem(RuntimeError(msg))
-        # Never expose raw RPC error messages: custom endpoints may contain keys.
+        provider_error = data.get('error')
+        # Used for local classification ONLY. No raw remote text in a diagnostic.
+        remote_message = str(provider_error.get('message') or '') if isinstance(provider_error, dict) else str(provider_error)
+        remote_code = provider_error.get('code') if isinstance(provider_error, dict) else None
+        status = _nexus_ledger_rpc_problem(RuntimeError(remote_message))
         if status == 'RPC_GETLOGS_FAILED':
             status = 'RPC_LEDGER_PROVIDER_ERROR'
-        raise RuntimeError(status)
+        raise _nexus_ledger_error(status, method, http_status, remote_code)
     if 'result' not in data:
-        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE')
+        raise _nexus_ledger_error('RPC_LEDGER_INVALID_RESPONSE', method, http_status)
     return data['result']
-
 
 def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     """Bounded read-only ERC-20 Transfer scan with adaptive RPC range handling.
@@ -54294,6 +54325,7 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     wallet_topic = '0x' + wallet_address[2:].rjust(64, '0')
     found = {}
     errors = []
+    rpc_diagnostic = None
     oldest_scanned = None
     completed_windows = 0
     requests_used = 0
@@ -54330,14 +54362,17 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     for high in range(latest, first - 1, -1000):
         low = max(first, high - 999)
         chunk_logs = []
+        phase = 'OUTGOING'
         try:
-            for topics in (
-                [_NEXUS_TRANSFER_TOPIC, wallet_topic],
-                [_NEXUS_TRANSFER_TOPIC, None, wallet_topic],
+            for phase, topics in (
+                ('OUTGOING', [_NEXUS_TRANSFER_TOPIC, wallet_topic]),
+                ('INCOMING', [_NEXUS_TRANSFER_TOPIC, None, wallet_topic]),
             ):
                 chunk_logs.extend(get_logs(low, high, topics))
         except Exception as exc:
             errors.append(_nexus_ledger_rpc_problem(exc))
+            rpc_diagnostic = _nexus_ledger_safe_diagnostic(exc)
+            rpc_diagnostic['phase'] = phase
             break
         # Only a fully successful two-direction query counts as scanned.
         completed_windows += 1
@@ -54396,13 +54431,18 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     complete = not errors and oldest_scanned == first
     if errors:
         # Diagnostic is safe for clients and Render logs (no RPC credentials).
-        app.logger.warning('Wallet ledger ERC20 scan incomplete chain=%s issue=%s', chain, errors[0])
+        d = rpc_diagnostic or {}
+        app.logger.warning(
+            'Wallet ledger ERC20 scan incomplete chain=%s issue=%s httpStatus=%s rpcCode=%s method=%s phase=%s',
+            chain, errors[0], d.get('httpStatus'), d.get('rpcErrorCode'),
+            d.get('method', 'unknown'), d.get('phase', 'unknown'),
+        )
     return {
         'events': sorted(found.values(), key=lambda x: (x['blockNumber'], x['id']), reverse=True)[:180],
         'chain': chain, 'fromBlock': first, 'lastBlockScanned': latest if completed_windows else first - 1,
         'oldestBlockScanned': oldest_scanned, 'latestBlock': latest,
         'completeForRequestedRange': complete, 'error': errors[0] if errors else '',
-        'errors': errors[:3], 'scannedWindows': completed_windows,
+        'errors': errors[:3], 'rpcDiagnostic': rpc_diagnostic, 'scannedWindows': completed_windows,
         'rpcRequests': requests_used,
         'scope': 'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
         'limitations': 'Recent ERC20 logs only; partial on RPC limitations. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.',
