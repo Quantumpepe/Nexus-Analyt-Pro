@@ -186,9 +186,9 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-554-STRATEGIST-DECISION-CONSISTENCY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD594-STRATEGIST-DECISION-CONSISTENCY"
-STRATEGIST_BUILD_ID = "S-ENGINE-075-DECISION-CONSISTENCY-SHADOW-STOP-TEST"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-555-STRATEGIST-DIAGNOSTICS-READONLY";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD595-STRATEGIST-DIAGNOSTICS-READONLY"
+STRATEGIST_BUILD_ID = "S-ENGINE-076-DIAGNOSTICS-READONLY"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
@@ -17266,7 +17266,7 @@ def _nkr_shadow_stop_candidate(mode: str, net_pct: float, gross: float, cost: fl
     return {"thresholdPct": threshold, "triggered": candidate, "liveEnabled": False}
 
 
-def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, prior_meta: dict, mode: str, chain_id: int) -> dict:
+def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, prior_meta: dict, mode: str, chain_id: int, *, diagnostic_exit_cost_usd=None) -> dict:
     """Use the Shadow Strategist signal/exit model for a live open NKR position.
 
     ENGINE-421 live rules (NKR + Trader via shared base):
@@ -17282,7 +17282,10 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
     q = _nkr_live_shadow_quality(row, mode)
     cost = max(0.0, _safe_float(snap.get("costBasisUsd"), 0.0))
     value = max(0.0, _safe_float(snap.get("valueUsd"), 0.0))
-    price = _nkr_row_price_usd(row)
+    # Offline diagnostics must NEVER use the live price-refresh helper: it can
+    # trigger an upstream fetch and mutate caches even for a synthetic asset.
+    price = (_safe_float(row.get("price") or row.get("current_price") or row.get("priceUsd"), 0.0)
+             if diagnostic_exit_cost_usd is not None else _nkr_row_price_usd(row))
     try:
         qty = int(snap.get("amount") or 0) / float(10 ** max(0, min(36, int((snap.get("tokenDecimals") or 18)))))
         if price > 0 and qty > 0:
@@ -17295,7 +17298,8 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
         cost = value
     gross = value - cost
     gross_pct = (gross / cost * 100.0) if cost > 0 else 0.0
-    costs = _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0)
+    costs = (max(0.0, _safe_float(diagnostic_exit_cost_usd, 0.0)) if diagnostic_exit_cost_usd is not None
+             else _safe_float(_nkr_live_exit_cost_estimate(value, price, chain_id).get("totalCostUsd"), 0.0))
     net = gross - costs
     net_pct = (net / cost * 100.0) if cost > 0 else 0.0
     now = int(time.time())
@@ -46336,14 +46340,15 @@ def _trader_live_slot_state(snap: dict, budget_usd: float, slot_count: int) -> d
     return {"slotCount": slots, "filledSlots": filled, "freeSlots": max(0, slots-filled), "trancheUsd": tranche}
 
 
-def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, prior_meta: dict, mode: str, chain_id: int) -> dict:
+def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, prior_meta: dict, mode: str, chain_id: int, *, diagnostic_exit_cost_usd=None) -> dict:
     """Trader adaptation of the proven Shadow decision model.
 
     It uses the full shared signal vector and the Shadow slot risk state machine.
     A normal red candle is not an exit. Profitable tranche harvesting, confirmed
     risk clusters and hard safety blocks are valid exits; recovery remains active.
     """
-    base = _nkr_live_shadow_exit_decision(symbol, market_row, snap, prior_meta, mode, chain_id)
+    base = _nkr_live_shadow_exit_decision(symbol, market_row, snap, prior_meta, mode, chain_id,
+                                          diagnostic_exit_cost_usd=diagnostic_exit_cost_usd)
     signals = dict(base.get("signalVector") or _nkr_live_full_signal_vector(dict(market_row or {})))
     quality = _nexus_shadow_slot_quality({"symbol": symbol, "signals": signals, **dict(market_row or {})}, {"risk_mode": mode})
     risk_decision = _nexus_trading_decide_slot({
@@ -46374,10 +46379,11 @@ def _trader_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict,
         decision, reason = "RECOVERY", str(base.get("reason") or "shadow_trader_recovery")
     else:
         decision, reason = "HOLD", "shadow_trader_no_confirmed_exit"
-    try:
-        _nexus_signal_audit_record("STRATEGIST_TRADER", symbol, signals, decision)
-    except Exception:
-        pass
+    if diagnostic_exit_cost_usd is None:
+        try:
+            _nexus_signal_audit_record("STRATEGIST_TRADER", symbol, signals, decision)
+        except Exception:
+            pass
     return {**base, "decision": decision, "reason": reason, "slotRiskDecision": risk_decision,
             "slotQuality": quality, "signalVector": signals}
 
@@ -50166,7 +50172,7 @@ def _nexus_signal_audit_record(stage: str, symbol: str = "", signals=None, decis
         pass  # Audit must NEVER change trading outcome.
 
 
-def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC") -> dict:
+def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC", *, diagnostic: bool = False) -> dict:
     """Shared full-signal live entry gate; 24h red alone can no longer suppress recovery."""
     q = _nkr_live_shadow_quality(row, mode)
     score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
@@ -50181,8 +50187,9 @@ def _nkr_live_entry_gate(row: dict, threshold: float, mode: str = "DYNAMIC") -> 
         reason = "FULL_SIGNAL_SCORE_BLOCKED"
     elif momentum < -6.0 and recovery < 55.0:
         reason = "FULL_SIGNAL_MOMENTUM_BLOCKED"
-    _nexus_signal_audit_record("STRATEGIST_NKR", row.get("symbol") or row.get("sym") or "",
-                               q.get("signal_vector"), "ALLOW" if allowed else reason)
+    if not diagnostic:
+        _nexus_signal_audit_record("STRATEGIST_NKR", row.get("symbol") or row.get("sym") or "",
+                                   q.get("signal_vector"), "ALLOW" if allowed else reason)
     return {"allowed": allowed, "reason": reason, "score": score, "quality": q}
 
 
@@ -53977,3 +53984,231 @@ def _nca_queue_auto_return(wallet, engine, chain_id, session_id, vault):
     Existing previously queued return jobs must be reconciled separately.
     """
     return {'status': 'RETAINED_IN_CORE_VAULT', 'mutations': 0}
+
+
+# ENGINE-555: OWNER SYSTEM INFO STRATEGIST DIAGNOSTICS (STRICTLY READ-ONLY).
+#  - GET only, no wallets/contracts/RPC/provider calls or live worker mutation.
+#  - Scenario mode calls the actual Strategist gate and exit rules with explicitly
+#    synthetic, deterministic inputs; it never starts Shadow or emits live audit.
+#  - Current market mode uses previously observed caches/trace only; missing
+#    inputs are marked unavailable, never invented as live BUY/SELL evidence.
+_STRATEGIST_DIAG_CHAIN_IDS = {'ETH': 1, 'BNB': 56, 'POL': 137}
+_STRATEGIST_DIAG_THRESHOLDS = {'AGGRESSIVE': 48., 'DYNAMIC': 62., 'TACTICAL': 65., 'DEFENSIVE': 70.}
+_STRATEGIST_DIAG_LIVE_STOPS = {'AGGRESSIVE': -15., 'DYNAMIC': -10., 'TACTICAL': -7., 'DEFENSIVE': -5.}
+
+
+def _strategist_diag_scenarios(engine, chain, mode):
+    """Exercise actual signal entry/exit functions, with NO I/O or trade attempts."""
+    now = int(time.time())
+    cid = _STRATEGIST_DIAG_CHAIN_IDS[chain]
+    threshold = _STRATEGIST_DIAG_THRESHOLDS[mode]
+    cases = [
+        ('Strong entry', 'ENTRY', 1.0, 0, True, 'OK', 90, 2.4, 1.2),
+        ('Weak entry', 'ENTRY', 1.0, 0, True, 'OK', 15, -4.0, -3.5),
+        ('Take profit', 'EXIT', 1.03, 240, True, 'OK', 75, 0.8, 1.2),
+        ('Small loss / recovery', 'EXIT', 0.98, 240, True, 'OK', 65, 0.7, 1.4),
+        ('Deep hard stop', 'EXIT', 0.75, 240, True, 'OK', 25, -6.0, -7.0),
+        ('Unknown buy time', 'EXIT', 1.08, 0, False, 'OK', 75, 1.0, 1.5),
+        ('Fast profit / anti-race', 'EXIT', 1.06, 10, True, 'OK', 75, 1.0, 1.5),
+        ('Security alarm', 'EXIT', 0.99, 5, True, 'HONEYPOT', 20, -5.0, -5.0),
+    ]
+    out = []
+    t0 = time.perf_counter()
+    for label, kind, px, held_sec, verified, security, confidence, m5, m15 in cases:
+        sig = {
+            'price': px, 'confidence': confidence, 'risk_score': (80 if security != 'OK' else 15),
+            'security': security, 'market_structure': ('BROKEN' if px < 0.8 else 'INTACT'),
+            'momentum_1m': m5 / 2, 'momentum_5m': m5, 'momentum_15m': m15,
+            'momentum_1h': m15, 'momentum_24h': (px - 1.0) * 100,
+            'liquidity_score': 85, 'liquidity_usd': 2500000,
+            'relative_volume': 1.5, 'slippage_pct': 0.12,
+        }
+        row = {'symbol': 'TEST', 'price': px, 'score': confidence, 'signals': sig,
+               'confidence': confidence, 'risk_score': sig['risk_score']}
+        try:
+            if kind == 'ENTRY':
+                gate = _nkr_live_entry_gate(row, threshold, mode, diagnostic=True)
+                decision = 'BUY_CANDIDATE' if gate['allowed'] else 'WAIT'
+                detail = str(gate['reason'])
+                extra = {'score': round(float(gate['score']), 2), 'threshold': threshold,
+                         'momentum': round(float(gate['quality'].get('momentum_score') or 0), 3),
+                         'recovery': round(float(gate['quality'].get('recovery_momentum_score') or 0), 3)}
+            else:
+                snap = {'amount': 100000000, 'tokenDecimals': 6,
+                        'costBasisUsd': 100., 'valueUsd': 100. * px,
+                        'entryPriceUsd': 1.0}
+                meta = {'nkr_position_opened_ts': now - held_sec if verified else 0,
+                        'nkr_opened_ts_verified': bool(verified), 'nkr_entry_price_usd': 1.0}
+                fn = _trader_live_shadow_exit_decision if engine == 'TRADER' else _nkr_live_shadow_exit_decision
+                result = fn('TEST', row, snap, meta, mode, cid, diagnostic_exit_cost_usd=0.10)
+                decision = str(result.get('decision') or 'UNKNOWN')
+                detail = str(result.get('reason') or 'no_confirmed_exit')
+                extra = {'grossUsd': round(float(result.get('grossUsd') or 0), 4),
+                         'netUsd': round(float(result.get('netUsd') or 0), 4),
+                         'heldSec': result.get('heldSec'),
+                         'verifiedBuyTime': bool(result.get('openTimeKnown')),
+                         'candidateStop': result.get('shadowStopCandidate'),
+                         'actualLiveStopPct': _STRATEGIST_DIAG_LIVE_STOPS[mode]}
+            # Expectations are independent of the actual strategy result. A
+            # regression must be marked FAIL, not hidden as 'evaluated'.
+            expected = {'Strong entry': 'BUY_CANDIDATE', 'Weak entry': 'WAIT',
+                        'Take profit': 'EXIT', 'Small loss / recovery': 'RECOVERY',
+                        'Deep hard stop': 'EXIT', 'Unknown buy time': 'HOLD',
+                        'Fast profit / anti-race': 'HOLD', 'Security alarm': 'EXIT'}[label]
+            out.append({'case': label, 'kind': kind, 'decision': decision, 'expected': expected,
+                        'reason': detail, 'result': 'PASS' if decision == expected else 'FAIL',
+                        'details': extra})
+        except Exception as exc:
+            out.append({'case': label, 'kind': kind, 'decision': 'NOT_EVALUATED',
+                        'reason': type(exc).__name__, 'result': 'ERROR', 'details': {}})
+    return {'cases': out, 'errors': sum(1 for x in out if x['result'] == 'ERROR'),
+            'failedChecks': sum(1 for x in out if x['result'] == 'FAIL'),
+            'passedChecks': sum(1 for x in out if x['result'] == 'PASS'),
+            'computeMs': round((time.perf_counter() - t0) * 1000, 2),
+            'source': 'synthetic_scenarios_actual_signal_and_exit_functions',
+            'limitations': 'Offline rule evaluation only. No route, quote, wallet, liquidity execution, RPC latency, blockchain confirmation or past real trades were tested.'}
+
+
+def _strategist_diag_observations(engine, chain, mode):
+    """Read only prior observations; absence/freshness is explicit."""
+    now = int(time.time())
+    latest, recent, shared = _nexus_signal_audit_shared_read()
+    desired = ('STRATEGIST_NKR' if engine == 'NKR' else 'STRATEGIST_TRADER')
+    stages = []
+    for key in ('MARKET_STRATEGIST', 'STRATEGIST_CONTEXT', desired):
+        sample = latest.get(key) or {}
+        ts = int(sample.get('ts') or 0)
+        age = max(0, now - ts) if ts else None
+        stages.append({'stage': key, 'decision': sample.get('decision') or None,
+                       'symbol': sample.get('symbol') or None, 'signalCount': int(sample.get('signalCount') or 0),
+                       'fields': list(sample.get('signalFields') or [])[:25],
+                       'ts': ts or None, 'ageSec': age,
+                       'state': 'RECENT' if age is not None and age <= 300 else 'OLD' if age is not None else 'NOT_OBSERVED'})
+    # Snapshot is process-local. Only rows with real cached score+signals and
+    # observed timestamps can be evaluated. Never claim a route/chain was checked.
+    snapshot_rows = []
+    candidates = ('BTC', 'ETH', 'BNB', 'POL', 'LINK', 'UNI', 'SOL', 'XRP')
+    for sym in candidates:
+        snap = (globals().get('SNAPSHOTS') or {}).get(sym) if isinstance(globals().get('SNAPSHOTS'), dict) else None
+        data = snap.get('data') if isinstance(snap, dict) and isinstance(snap.get('data'), dict) else snap
+        ts = int(snap.get('ts') or 0) if isinstance(snap, dict) else 0
+        if not isinstance(data, dict) or not data:
+            continue
+        age = max(0, now - ts) if ts else None
+        prices = data.get('price') or data.get('current_price') or data.get('priceUsd')
+        try: price = float(prices or 0)
+        except (TypeError, ValueError, OverflowError): price = 0
+        item = {'symbol': sym, 'price': price, 'ageSec': age,
+                'state': 'CACHED' if age is not None else 'UNKNOWN_AGE',
+                'decision': 'NOT_EVALUATED', 'reason': 'need_fresh_full_signal_and_score'}
+        signal = data.get('signals')
+        score = data.get('score') or data.get('systemScore')
+        if age is not None and age <= 300 and price > 0 and isinstance(signal, dict) and score is not None:
+            try:
+                gate = _nkr_live_entry_gate({**data, 'symbol': sym}, _STRATEGIST_DIAG_THRESHOLDS[mode], mode, diagnostic=True)
+                item['decision'] = 'BUY_CANDIDATE' if gate['allowed'] else 'WAIT'
+                item['reason'] = gate['reason']
+                item['score'] = round(float(gate['score']), 2)
+                item['state'] = 'SIGNAL_EVALUATED'
+            except Exception as exc:
+                item['reason'] = 'quality_eval_failed_' + type(exc).__name__
+        snapshot_rows.append(item)
+    return {'traceShared': bool(shared), 'traceChainScope': 'GLOBAL_NOT_CHAIN_ATTRIBUTED',
+            'stages': stages, 'recentDecisions': [
+                {'ts': e.get('ts'), 'stage': e.get('stage'), 'symbol': e.get('symbol'),
+                 'decision': e.get('decision'), 'signalCount': e.get('signalCount')}
+                for e in (recent or []) if e.get('stage') in ('MARKET_STRATEGIST', desired)
+            ][:10], 'cachedMarket': snapshot_rows,
+            'limitations': 'Signal trace does not store historical values or chain/route. Cached prices are process-local. A BUY_CANDIDATE is not an executable on-chain buy. No external market request made.'}
+
+
+def _strategist_diag_last_session(owner, engine, chain):
+    """Owner-only sanitized session/history metadata. Never read wallet balances."""
+    out = {'session': None, 'events': [], 'source': 'shared_db_registered_events',
+           'status': 'NOT_FOUND', 'limitations': 'DB records are not independent blockchain receipt proof.'}
+    cid = _STRATEGIST_DIAG_CHAIN_IDS[chain]
+    try:
+        conn = _db()
+        try:
+            table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='nexus_live_core_vault_sessions'").fetchone()
+            if table:
+                row = conn.execute(
+                    "SELECT status,created_ts,updated_ts,onchain_session_id,finalized_tx_hash "
+                    "FROM nexus_live_core_vault_sessions WHERE lower(wallet_address)=? AND upper(engine)=? AND chain_id=? "
+                    "ORDER BY updated_ts DESC LIMIT 1", (str(owner).lower(), engine, cid)
+                ).fetchone()
+                if row:
+                    out['session'] = {'status': str(row['status'] or ''),
+                                      'startedAt': int(row['created_ts'] or 0),
+                                      'updatedAt': int(row['updated_ts'] or 0),
+                                      'finalizeRecorded': bool(row['finalized_tx_hash'])}
+                    out['status'] = 'RECORDED'
+            table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='nexus_engine_event_history'").fetchone()
+            if table:
+                rows = conn.execute(
+                    "SELECT event_type,event_ts,payload_json FROM nexus_engine_event_history "
+                    "WHERE lower(wallet_address)=? AND upper(engine)=? ORDER BY event_ts DESC LIMIT 80",
+                    (str(owner).lower(), engine),
+                ).fetchall()
+                for r in rows:
+                    try: payload = json.loads(r['payload_json'] or '{}')
+                    except (ValueError, TypeError): payload = {}
+                    if str(payload.get('chain') or '').upper() != chain:
+                        continue
+                    out['events'].append({'type': str(r['event_type'] or '')[:30],
+                                          'ts': int(r['event_ts'] or 0),
+                                          'asset': str(payload.get('asset') or '')[:18],
+                                          'hasTxHash': bool(payload.get('txHash'))})
+                    if len(out['events']) >= 12:
+                        break
+        finally:
+            conn.close()
+    except Exception as exc:
+        out['status'] = 'UNAVAILABLE'
+        out['error'] = 'db_read_' + type(exc).__name__
+    # Readiness is never inferred solely from history: the on-chain open-count,
+    # outstanding operations and cross-worker locks are not read by this GET.
+    last_exit = next((e for e in out['events'] if str(e['type']).upper() in
+                      ('EXIT', 'SELL', 'CLOSE')), None)
+    elapsed = max(0, int(time.time()) - int(last_exit['ts'])) if last_exit else None
+    cooldown = int(_NKR_LIVE_REENTRY_COOLDOWN_SEC) if engine == 'NKR' else None
+    out['reentry'] = {'lastExitAgeSec': elapsed, 'cooldownSec': cooldown,
+                      'cooldownTimeElapsed': bool(elapsed is not None and cooldown is not None and elapsed >= cooldown)
+                                             if cooldown is not None else None,
+                      'positionClearanceVerified': False, 'state': 'ONCHAIN_AND_LOCKS_NOT_VERIFIED',
+                      'note': 'Confirm zero open positions, settled trade and cross-worker locks before a real re-entry.'}
+    return out
+
+
+@app.get('/api/nexus/system-info/strategist-diagnostics')
+def api_nexus_strategist_diagnostics():
+    owner, denied = _require_owner_system_info()
+    if denied:
+        return denied
+    # Unlike legacy System Info views, this endpoint also requires a VERIFIED
+    # Privy/Nexus bearer identity. A spoofed X-Wallet-Address is insufficient.
+    try:
+        verified_wallet = _nca_identity()
+    except (PermissionError, ValueError):
+        return jsonify({'status': 'error', 'error': 'verified_privy_login_required'}), 401
+    if str(verified_wallet).lower() != str(owner).lower():
+        return jsonify({'status': 'error', 'error': 'owner_only'}), 403
+    engine = str(request.args.get('engine') or 'NKR').upper()
+    chain = str(request.args.get('chain') or 'BNB').upper()
+    mode = str(request.args.get('mode') or 'DYNAMIC').upper()
+    view = str(request.args.get('view') or 'overview').lower()
+    if (engine not in ('NKR', 'TRADER') or chain not in _STRATEGIST_DIAG_CHAIN_IDS
+            or mode not in _STRATEGIST_DIAG_THRESHOLDS or view not in ('overview', 'market', 'last-session', 'scenarios')):
+        return jsonify({'status': 'error', 'error': 'invalid_diagnostic_selection'}), 400
+    result = {'status': 'ok', 'readOnly': True, 'shadowActivated': False,
+              'mutations': 0, 'tradesSent': 0, 'engine': engine, 'chain': chain,
+              'mode': mode, 'view': view, 'ts': int(time.time()),
+              'decisionScope': 'read_only_offline_or_recorded',
+              'noOnchainProof': True}
+    if view in ('overview', 'market'):
+        result['market'] = _strategist_diag_observations(engine, chain, mode)
+    if view in ('overview', 'last-session'):
+        result['lastSession'] = _strategist_diag_last_session(owner, engine, chain)
+    if view in ('overview', 'scenarios'):
+        result['scenarios'] = _strategist_diag_scenarios(engine, chain, mode)
+    return jsonify(result)
