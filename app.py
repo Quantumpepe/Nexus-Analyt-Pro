@@ -186,9 +186,9 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.06-ENGINE-552-RETAIN-VAULT-PRINCIPAL";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.06-BUILD591-NKR-VAULT-ACCOUNT"
-STRATEGIST_BUILD_ID = "S-ENGINE-073-SHADOW-LIVE-FULL-SIGNAL-PARITY"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-553-STRATEGIST-TASK-AND-FOCUS";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD593-STRATEGIST-QUESTION-FOCUS"
+STRATEGIST_BUILD_ID = "S-ENGINE-074-QUESTION-FOCUS-WORKSPACE-ROUTING"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
@@ -33055,6 +33055,45 @@ def _symbols_from_ai_context(ctx: dict, limit: int = 8) -> list[str]:
         for part in pair.split("/")[:2]: add(part)
     return out[:max(1,min(int(limit or 8),12))]
 
+# ENGINE-553: For research, the user's actual coin question takes precedence over
+# a pre-existing Compare selection. This changes only AI context order, never
+# Strategist market signals, NKR/Trader gates or Vault instructions.
+def _strategist_focus_research_symbols(question, symbols, context=None):
+    context = context if isinstance(context, dict) else {}
+    base = []
+    def add_base(value):
+        value = str(value or "").strip().upper()
+        if re.fullmatch(r"[A-Z0-9]{2,12}", value) and value not in base:
+            base.append(value)
+    for value in symbols if isinstance(symbols, list) else []:
+        add_base(value)
+    known = set(base)
+    for value in context.get("analysis_symbols") or []:
+        if isinstance(value, str) and re.fullmatch(r"[A-Z0-9]{2,12}", value.upper()):
+            known.add(value.upper())
+    for row in context.get("coins") or []:
+        if isinstance(row, dict):
+            value = str(row.get("symbol") or "").strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{2,12}", value):
+                known.add(value)
+    known.update(("BTC", "ETH", "BNB", "POL", "SOL", "XRP", "LINK", "UNI", "ADA", "AVAX", "DOGE", "LTC", "XLM", "TRX", "ARB", "ATOM"))
+    raw = str(question or "").upper()
+    aliases = (("BITCOIN", "BTC"), ("ETHEREUM", "ETH"), ("POLYGON", "POL"), ("SOLANA", "SOL"), ("RIPPLE", "XRP"))
+    matched = []
+    for symbol in known:
+        # Whole-symbol boundary avoids matching e.g. SOL inside a normal word.
+        match = re.search(r"(?<![A-Z0-9])" + re.escape(symbol) + r"(?![A-Z0-9])", raw)
+        if match:
+            matched.append((match.start(), symbol))
+    for label, symbol in aliases:
+        match = re.search(r"(?<![A-Z0-9])" + label + r"(?![A-Z0-9])", raw)
+        if match:
+            matched.append((match.start(), symbol))
+    matched.sort(key=lambda item: item[0])
+    focused = list(dict.fromkeys(symbol for _, symbol in matched))
+    return focused + [symbol for symbol in base if symbol not in focused]
+
+
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
     """AI Analyst endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
@@ -33113,8 +33152,15 @@ def api_ai_run():
 
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
-    if not sym_norm and isinstance(ai_signal_context, dict):
-        sym_norm = _symbols_from_ai_context(ai_signal_context, limit=8)
+    # ENGINE-553: A task-based Pine/strategy/backtest request stays a workspace
+    # even when Compare data exists in the hidden frontend context. Only actual
+    # research/report requests infer market symbols from that optional context.
+    research_kinds = {"ask", "research", "daily_report"}
+    if kind in research_kinds:
+        if not sym_norm and isinstance(ai_signal_context, dict):
+            sym_norm = _symbols_from_ai_context(ai_signal_context, limit=8)
+        sym_norm = _strategist_focus_research_symbols(
+            body.get("raw_user_question") or "", sym_norm, ai_signal_context)
 
     # New AI Analyst workspace mode:
     # The analyst is now task-based and must also run without visible coin chips / Compare symbols.
