@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-562-BNB-LEDGER-TOKEN-FILTER";
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-563-ALCHEMY-WALLET-INDEX";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -54577,6 +54577,265 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     }
 
 
+# ENGINE-563: Alchemy indexed wallet-history reader, only on an explicit
+# Wallet -> Transactions scan. The key was already stored in Render as ALCHEMY_KEY.
+# NEVER reuse this API for execution, live positions, swaps, price feeds,
+# live workers, CoreVault signing, or receipt proofs. Those keep _rpc_call().
+# Transfers By Wallet (Beta) is a READ-ONLY HTTP POST on api.g.alchemy.com.
+_NEXUS_ALCHEMY_LEDGER_NETWORKS = {
+    'ETH': 'eth-mainnet', 'BNB': 'bnb-mainnet', 'POL': 'matic-mainnet',
+}
+_NEXUS_ALCHEMY_LEDGER_CACHE = {}
+_NEXUS_ALCHEMY_LEDGER_CACHE_LOCK = threading.RLock()
+
+
+def _nexus_alchemy_ledger_error(error_code, chain, lookback_days, events=None, extra=None):
+    '''Stable public failure categories; never return a provider URL, key or body.'''
+    code = str(error_code or 'ALCHEMY_UNAVAILABLE')
+    result = {
+        'chain': chain, 'events': list(events or []), 'readOnly': True,
+        'completeForRequestedRange': False, 'error': code, 'errors': [code],
+        'scope': 'ALCHEMY_INDEXED_WALLET_TRANSFERS', 'provider': 'ALCHEMY',
+        'lookbackDays': lookback_days,
+        'limitations': 'Only wallet-address transfers in the configured time window; internal CoreVault trading events are recorded separately.',
+    }
+    if isinstance(extra, dict):
+        for key in ('pagesFetched', 'partialErrors', 'hasMore', 'totalIndexedEvents'):
+            if key in extra:
+                result[key] = extra[key]
+    return result
+
+
+def _nexus_alchemy_ledger_transfer(item, wallet, chain):
+    '''Normalize one verified-wallet-indexed transfer to the existing UI shape.'''
+    if not isinstance(item, dict):
+        return None
+    if str(item.get('network') or '').lower() != _NEXUS_ALCHEMY_LEDGER_NETWORKS[chain]:
+        return None
+    tx = str(item.get('hash') or '').strip()
+    if not re.fullmatch(r'0x[0-9a-fA-F]{64}', tx):
+        return None
+    src = str(item.get('from') or '').lower()
+    dst = str(item.get('to') or '').lower()
+    if src != wallet and dst != wallet:
+        # An upstream response may not widen authenticated wallet scope.
+        return None
+    kind = str(item.get('category') or '').lower()
+    if kind not in ('erc20', 'external', 'internal'):
+        return None
+    date_text = str(item.get('blockTimestamp') or '')
+    try:
+        timestamp_ms = int(datetime.fromisoformat(date_text.replace('Z', '+00:00')).timestamp() * 1000)
+    except (ValueError, OverflowError, TypeError):
+        timestamp_ms = 0
+    block_text = str(item.get('blockNum') or '0x0')
+    try:
+        block_number = int(block_text, 16) if block_text.lower().startswith('0x') else int(block_text)
+    except (ValueError, TypeError):
+        block_number = 0
+    contract = str(item.get('contractAddress') or '').lower()
+    if kind == 'erc20' and not re.fullmatch(r'0x[0-9a-f]{40}', contract):
+        return None
+    if kind != 'erc20':
+        contract = ''
+
+    fungible = item.get('fungible') if isinstance(item.get('fungible'), dict) else {}
+    amount_raw = fungible.get('rawValue')
+    amount_units = None
+    try:
+        if isinstance(amount_raw, str) and amount_raw.startswith('0x'):
+            amount_units = str(int(amount_raw, 16))
+        elif amount_raw is not None:
+            amount_units = str(int(amount_raw))
+    except (ValueError, TypeError):
+        amount_units = None
+    # The indexed value may be numeric or a decimal string. Convert without
+    # inventing decimals when the provider has no fungible metadata.
+    amount = None
+    try:
+        from decimal import Decimal
+        indexed_value = fungible.get('value')
+        if indexed_value is not None and not isinstance(indexed_value, bool):
+            number = Decimal(str(indexed_value))
+            if number.is_finite() and number >= 0:
+                amount = format(number, 'f')
+        if amount is None and amount_units is not None:
+            decimals = int(fungible.get('decimals'))
+            if 0 <= decimals <= 36:
+                amount = format(Decimal(amount_units) / (Decimal(10) ** decimals), 'f')
+    except (ValueError, TypeError, ArithmeticError):
+        pass
+    native_symbol = {'ETH':'ETH','BNB':'BNB','POL':'POL'}[chain]
+    asset = str(fungible.get('asset') or (native_symbol if kind != 'erc20' else 'TOKEN')).strip()[:36]
+    direction = 'SELF' if src == dst else ('IN' if dst == wallet else 'OUT')
+    unique = str(item.get('uniqueId') or '')[:400]
+    # Stable ID per transfer event, not just per transaction hash: one swap can
+    # emit multiple erc20 transfers and must not accidentally discard a leg.
+    stable_seed = unique or '|'.join((tx.lower(), kind, src, dst, contract, str(amount_units or '')))
+    stable_id = hashlib.sha256(stable_seed.encode('utf-8')).hexdigest()[:20]
+    return {
+        'id': f'alc:{chain}:{tx.lower()}:{stable_id}',
+        'txHash': tx, 'chain': chain,
+        'type': 'TOKEN TRANSFER' if kind == 'erc20' else ('INTERNAL TRANSFER' if kind == 'internal' else 'NATIVE TRANSFER'),
+        'direction': direction,
+        # Frontend 598 keeps distinct erc20 event IDs rather than deduplicating
+        # all transfers from the same transaction into a single card.
+        'source': 'ONCHAIN_ERC20_LOG' if kind == 'erc20' else 'ALCHEMY_NATIVE_TRANSFER',
+        'provider': 'ALCHEMY', 'status': 'CONFIRMED',
+        'from': src, 'to': dst, 'contract': contract,
+        'amountRaw': amount_units, 'amount': amount, 'asset': asset,
+        'createdAt': timestamp_ms, 'blockNumber': block_number,
+        'note': 'Indexed wallet transfer from Alchemy; separate CoreVault operation/receipt verification remains authoritative.',
+    }
+
+
+def _nexus_wallet_ledger_alchemy_transfers(wallet, chain, scan_blocks=6000):
+    '''Bounded, on-demand, cached read of the Alchemy multichain Transfers API.
+
+    This replaces the *optional* eth_getLogs wallet-history scan ONLY. The
+    selected chain maps to one Alchemy network, so the visible Scan BNB/ETH/POL
+    button never consumes CU on other chains. It does not alter `_rpc_call`.
+    '''
+    chain = str(chain or '').upper().strip()
+    if chain not in _NEXUS_ALCHEMY_LEDGER_NETWORKS:
+        return _nexus_alchemy_ledger_error('ALCHEMY_UNSUPPORTED_CHAIN', chain, 0)
+    wallet = str(wallet or '').lower().strip()
+    if not re.fullmatch(r'0x[0-9a-f]{40}', wallet):
+        return _nexus_alchemy_ledger_error('ALCHEMY_INVALID_WALLET', chain, 0)
+
+    days = max(1, min(180, int(os.getenv('NEXUS_ALCHEMY_LEDGER_LOOKBACK_DAYS', '30'))))
+    page_size = max(25, min(200, int(os.getenv('NEXUS_ALCHEMY_LEDGER_PAGE_SIZE', '100'))))
+    max_pages = max(1, min(5, int(os.getenv('NEXUS_ALCHEMY_LEDGER_MAX_PAGES', '3'))))
+    cache_ttl = max(30, min(900, int(os.getenv('NEXUS_ALCHEMY_LEDGER_CACHE_TTL_SEC', '300'))))
+    if str(os.getenv('NEXUS_ALCHEMY_LEDGER_ENABLED', '1')).lower() in ('0','false','off','no'):
+        return _nexus_alchemy_ledger_error('ALCHEMY_LEDGER_DISABLED', chain, days)
+    api_key = str(os.getenv('ALCHEMY_KEY') or '').strip()
+    # Do not allow user-supplied URLs or unsupported key characters to form an
+    # outbound URL. Never include the key in logs, exceptions or API responses.
+    if not api_key:
+        return _nexus_alchemy_ledger_error('ALCHEMY_KEY_NOT_CONFIGURED', chain, days)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{4,256}', api_key):
+        return _nexus_alchemy_ledger_error('ALCHEMY_KEY_INVALID_FORMAT', chain, days)
+
+    now = time.time()
+    cache_key = (wallet, chain, days, page_size, max_pages)
+    with _NEXUS_ALCHEMY_LEDGER_CACHE_LOCK:
+        cached = _NEXUS_ALCHEMY_LEDGER_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            # Returning an independent copy avoids accidental cross-request writes.
+            import copy
+            result = copy.deepcopy(cached[1])
+            result['cached'] = True
+            return result
+
+    since = datetime.utcfromtimestamp(now - days * 86400).strftime('%Y-%m-%dT%H:%M:%SZ')
+    categories = ['external', 'erc20']
+    if chain in ('ETH','POL'):
+        categories.append('internal')  # Not supported for BNB.
+    body = {
+        'address': wallet, 'direction': 'both',
+        'networks': [_NEXUS_ALCHEMY_LEDGER_NETWORKS[chain]],
+        'category': categories, 'fromTimestamp': since,
+        'order': 'desc', 'maxCount': page_size,
+    }
+    url = 'https://api.g.alchemy.com/data/v1/' + api_key + '/transfers/by-address'
+    page_key = None
+    seen_page_keys = set()
+    events = {}
+    pages_fetched = 0
+    partial_errors = []
+    has_more = False
+    failure = None
+
+    for _ in range(max_pages):
+        if page_key is not None:
+            body['pageKey'] = page_key
+        try:
+            response = requests.post(url, json=body, headers={'Content-Type':'application/json'}, timeout=(3, 15))
+        except requests.exceptions.Timeout:
+            failure = 'ALCHEMY_TIMEOUT'
+            break
+        except requests.exceptions.RequestException:
+            failure = 'ALCHEMY_NETWORK_ERROR'
+            break
+        if response.status_code == 429:
+            failure = 'ALCHEMY_RATE_LIMITED'
+            break
+        if response.status_code in (401, 403):
+            failure = 'ALCHEMY_ACCESS_DENIED'
+            break
+        if not response.ok:
+            failure = 'ALCHEMY_HTTP_ERROR'
+            break
+        try:
+            data = response.json()
+        except (TypeError, ValueError):
+            failure = 'ALCHEMY_INVALID_RESPONSE'
+            break
+        if not isinstance(data, dict) or not isinstance(data.get('transfers'), list):
+            failure = 'ALCHEMY_INVALID_RESPONSE'
+            break
+        pages_fetched += 1
+        for entry in data['transfers']:
+            mapped = _nexus_alchemy_ledger_transfer(entry, wallet, chain)
+            if mapped:
+                events[mapped['id']] = mapped
+        # HTTP 200 can contain only partial data; never mark as a complete scan
+        # if Alchemy reports a network or category error.
+        upstream_error = data.get('error') if isinstance(data.get('error'), dict) else {}
+        for err in upstream_error.get('partialErrors') or []:
+            if not isinstance(err, dict):
+                continue
+            category = str(err.get('category') or '')[:40]
+            network = str(err.get('network') or '')[:40]
+            state = str(err.get('state') or 'error').lower()
+            if state not in ('unsupported', 'timeout', 'error'):
+                state = 'error'
+            if network and network != _NEXUS_ALCHEMY_LEDGER_NETWORKS[chain]:
+                continue
+            partial_errors.append({'network': _NEXUS_ALCHEMY_LEDGER_NETWORKS[chain],
+                                   'state': state, 'category': category})
+        page_key = data.get('pageKey')
+        if page_key is not None and (not isinstance(page_key, str) or not page_key or len(page_key) > 8192 or page_key in seen_page_keys):
+            failure = 'ALCHEMY_INVALID_PAGE_KEY'
+            break
+        has_more = bool(page_key)
+        if not page_key:
+            break
+        seen_page_keys.add(page_key)
+    if not failure and partial_errors:
+        failure = 'ALCHEMY_PARTIAL_RESULTS'
+    if not failure and has_more:
+        failure = 'ALCHEMY_PAGE_LIMIT_REACHED'
+    sorted_events = sorted(events.values(), key=lambda e: (e['createdAt'], e['id']), reverse=True)
+    result = {
+        'chain': chain, 'events': sorted_events,
+        'readOnly': True, 'completeForRequestedRange': failure is None,
+        'error': failure or '', 'errors': [failure] if failure else [],
+        'scope': 'ALCHEMY_INDEXED_WALLET_TRANSFERS', 'provider': 'ALCHEMY',
+        'lookbackDays': days, 'pagesFetched': pages_fetched,
+        'hasMore': has_more, 'partialErrors': partial_errors[:8],
+        'cached': False, 'totalIndexedEvents': len(sorted_events),
+        'limitations': (
+            f'Alchemy-indexed wallet transfers for the selected chain, last {days} days, max {page_size * max_pages} indexed events. '
+            'Historical native/ERC-20 transfers outside this window, additional pages and internal CoreVault trading require separate sources. '
+            'A partial API response is never considered complete.'
+        ),
+    }
+    # Cache completed results only. A short partial-result cache is useful when
+    # callers repeatedly refresh after a provider-side error.
+    cache_for = cache_ttl if failure is None else min(30, cache_ttl)
+    with _NEXUS_ALCHEMY_LEDGER_CACHE_LOCK:
+        if len(_NEXUS_ALCHEMY_LEDGER_CACHE) > 255:
+            _NEXUS_ALCHEMY_LEDGER_CACHE.clear()
+        import copy
+        _NEXUS_ALCHEMY_LEDGER_CACHE[cache_key] = (time.time() + cache_for, copy.deepcopy(result))
+    if failure:
+        app.logger.warning('Wallet Alchemy scan partial chain=%s code=%s pages=%s partialCount=%s',
+                           chain, failure, pages_fetched, len(partial_errors))
+    return result
+
+
 def _nexus_wallet_ledger_verify_receipts(wallet, chain, items, max_receipts=18):
     """Verify exact prior Nexus capital transfers from mined receipts on demand."""
     cid=_NEXUS_LEDGER_CHAIN_MAP[chain]
@@ -54675,18 +54934,23 @@ def api_nexus_wallet_ledger():
             # An exact stored return transaction (including an older 5 USDC
             # payout) can be verified regardless of the recent-log lookback.
             response['receiptProof'] = _nexus_wallet_ledger_verify_receipts(wallet,chain,events)
-            if chain == 'BNB':
-                response['coverage'] = (
-                    'Known backend transactions across ETH/BNB/POL; the BNB scan '
-                    'covers only configured and approved Nexus ERC-20 contracts, '
-                    'not all wallet tokens or complete blockchain history.'
-                )
+            # ENGINE-563: Alchemy is a history-only index, called only when
+            # the signed-in user explicitly requests the Wallet scan.
+            # The previous eth_getLogs scanner remains defined for diagnostics,
+            # but is no longer invoked here. No live RPC/worker is changed.
+            response['coverage'] = (
+                'Recorded Nexus actions across ETH/BNB/POL plus an optional '
+                'on-demand Alchemy wallet transfer index for the selected chain. '
+                'CoreVault-internal trades are proved by recorded operations and receipts, not wallet transfers.'
+            )
             try:
-                response['recentOnchain']=_nexus_wallet_ledger_recent_erc20(wallet,chain,
-                    int(request.args.get('blocks') or 6000))
-            except Exception as exc:
-                response['recentOnchain']={'chain':chain,'events':[],'completeForRequestedRange':False,
-                    'error':_nexus_ledger_rpc_problem(exc),'scope':'RECENT_SCAN_UNAVAILABLE'}
+                response['recentOnchain'] = _nexus_wallet_ledger_alchemy_transfers(
+                    wallet, chain, int(request.args.get('blocks') or 6000))
+            except Exception:
+                # A malformed Render setting or future beta schema change must
+                # never leak a provider URL, API key or arbitrary exception.
+                response['recentOnchain'] = _nexus_alchemy_ledger_error(
+                    'ALCHEMY_HISTORY_UNAVAILABLE', chain, 0)
         return jsonify(response)
     except Exception as exc:
         return jsonify({'status':'error','error':'read_only_ledger_unavailable','detail':type(exc).__name__}),503
