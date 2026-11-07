@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-566-STRATEGIST-QUESTION-SCOPE";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD606-STRATEGIST-QUESTION-SCOPE"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-567-STRATEGIST-FULL-ANSWER";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD607-STRATEGIST-FULL-ANSWER"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -31384,12 +31384,9 @@ def _append_strategist_depth_quality_block(text: str, user_payload: dict, lang: 
             f"Confidence: {conf_text}" + (f" · Tactical state: {tactical}" if tactical else ""),
         ]
 
-    combined = (base + "\n".join(lines)).strip()
-    # Keep it compact; do not allow the quality block to create a huge report.
-    max_chars = 2600 if lang == "de" else 2400
-    if len(combined) > max_chars:
-        combined = combined[:max_chars].rsplit("\n", 1)[0].strip()
-    return combined
+    # ENGINE-567: Never truncate a real GPT explanation to make room for diagnostics.
+    # The optional Strategist Check follows the COMPLETE answer, even for long reads.
+    return (base + "\n\n" + "\n".join(lines).strip()).strip()
 
 
 
@@ -31400,7 +31397,8 @@ def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
 
     cleaned = _normalize_strategist_language_leaks(str(ans or ""), lang)
     cleaned = _strip_forbidden_strategist_sections(cleaned, intent, lang)
-    cleaned = _limit_strategist_number_spam(cleaned, max_numeric_lines=6)
+    # ENGINE-567: Do not drop GPT comparison lines by counting numeric metrics.
+    # The request can legitimately ask for separate BTC and ETH figures.
 
     if _answer_looks_wrong_for_intent(cleaned, lang, intent):
         if intent == "rotation_spread":
@@ -31419,7 +31417,7 @@ def _enforce_strategist_answer_contract(ans: str, user_payload: dict) -> str:
 
     cleaned = _normalize_strategist_language_leaks(str(cleaned or ""), lang)
     cleaned = _strip_forbidden_strategist_sections(cleaned, intent, lang)
-    cleaned = _limit_strategist_number_spam(cleaned, max_numeric_lines=8)
+    # Preserve all subject-relevant analysis before and after Strategist Check.
     # The LLM sometimes lists one coin under both strongest and weakest.
     # Replace only explicitly labelled ranking lines from comparable supplied data.
     try:
@@ -31455,7 +31453,12 @@ def _ai_call_openai(
         "model": model,
         "input": ([{"role": "system", "content": sys_prompt}] + (mem_msgs if isinstance(mem_msgs, list) else []) + [{"role": "user", "content": user}]),
         "temperature": 0.3,
-        "max_output_tokens": 220 if short_insight_mode else 900,
+        "max_output_tokens": (220 if short_insight_mode else (
+            1300 if isinstance(user_payload.get("ai_signal_context"), dict)
+            and user_payload.get("kind") in ("ask", "research", "daily_report")
+            and user_payload.get("strategist_depth_profile") is not None
+            else 900
+        )),
     }
 
     try:
@@ -31485,6 +31488,10 @@ def _ai_call_openai(
         if not ans:
             # Fallback: try legacy shape
             ans = (data.get("output_text") or "").strip()
+        if not str(ans or "").strip():
+            # A successful HTTP status without an answer must not be passed to the
+            # Strategist quality overlay as though GPT produced an analysis.
+            return None, ("OpenAI response contained no analysis text", 502)
 
         if short_insight_mode:
             try:
