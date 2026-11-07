@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-558-BNB-LEDGER-RPC-SCAN-FIX";
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-559-BNB-DEDICATED-LEDGER-RPC";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -54177,6 +54177,16 @@ def _nexus_wallet_ledger_recorded(wallet, limit=250):
 def _nexus_ledger_rpc_problem(exc):
     """Public diagnostic codes only: never return private RPC URLs or provider keys."""
     message = str(exc).lower()
+    for status in (
+        'RPC_LEDGER_HTTPS_REQUIRED', 'RPC_LEDGER_NETWORK_UNAVAILABLE',
+        'RPC_LEDGER_HTTP_ERROR', 'RPC_LEDGER_INVALID_RESPONSE',
+        'RPC_LEDGER_PROVIDER_ERROR', 'RPC_LEDGER_WRONG_CHAIN',
+        'RPC_GETLOGS_INVALID_RESPONSE', 'RPC_GETLOGS_UNSUPPORTED',
+        'RPC_LOG_RANGE_OR_RESULT_LIMIT', 'RPC_RATE_LIMITED',
+        'RPC_TIMEOUT', 'RPC_ACCESS_DENIED',
+    ):
+        if status.lower() in message:
+            return status
     if any(term in message for term in (
         'block range', 'range limit', 'too many block', 'maximum block',
         'max block', 'query returned more', 'more than 10000',
@@ -54204,6 +54214,62 @@ def _nexus_ledger_rpc_problem(exc):
     return 'RPC_GETLOGS_FAILED'
 
 
+# ENGINE-559: This gateway is used ONLY by the optional, read-only BNB
+# Wallet -> Transactions recent ERC-20 log scan. CoreVault, GRID, NKR,
+# TRADER, receipt verification, pricing and any transaction/broadcast
+# paths keep their existing centralized _rpc_call() RPC configuration.
+# Override in Render only if desired; RPC_URL_56 is NOT changed.
+_NEXUS_BNB_LEDGER_RPC_DEFAULT = 'https://rpc-bsc.blockmachine.io'
+
+
+def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
+    cid = int(chain_id or 0)
+    if cid != 56:
+        return _rpc_call(cid, method, params)
+    url = str(os.getenv('NEXUS_BNB_LEDGER_RPC_URL') or _NEXUS_BNB_LEDGER_RPC_DEFAULT).strip()
+    # Only an administrator-controlled HTTPS endpoint, never an address supplied
+    # by the request/browser. Never return its contents (including API tokens).
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme.lower() != 'https' or not parsed.hostname or
+                parsed.username is not None or parsed.password is not None or
+                parsed.fragment):
+            raise ValueError('unsafe_url')
+    except (ValueError, TypeError):
+        raise RuntimeError('RPC_LEDGER_HTTPS_REQUIRED')
+    payload = {'jsonrpc': '2.0', 'id': 1, 'method': str(method), 'params': list(params or [])}
+    try:
+        response = _RPC_HTTP_SESSION.post(url, json=payload, timeout=(2, 6))
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError('RPC_TIMEOUT') from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError('RPC_LEDGER_NETWORK_UNAVAILABLE') from exc
+    if response.status_code == 429:
+        raise RuntimeError('RPC_RATE_LIMITED')
+    if response.status_code in (401, 403):
+        raise RuntimeError('RPC_ACCESS_DENIED')
+    if not response.ok:
+        raise RuntimeError('RPC_LEDGER_HTTP_ERROR')
+    try:
+        data = response.json()
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE') from exc
+    if not isinstance(data, dict):
+        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE')
+    if data.get('error') is not None:
+        err = data.get('error')
+        msg = str(err.get('message') or '') if isinstance(err, dict) else str(err)
+        status = _nexus_ledger_rpc_problem(RuntimeError(msg))
+        # Never expose raw RPC error messages: custom endpoints may contain keys.
+        if status == 'RPC_GETLOGS_FAILED':
+            status = 'RPC_LEDGER_PROVIDER_ERROR'
+        raise RuntimeError(status)
+    if 'result' not in data:
+        raise RuntimeError('RPC_LEDGER_INVALID_RESPONSE')
+    return data['result']
+
+
 def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     """Bounded read-only ERC-20 Transfer scan with adaptive RPC range handling.
 
@@ -54216,7 +54282,12 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     wallet_address = str(wallet or '').lower()
     if not re.fullmatch(r'0x[0-9a-f]{40}', wallet_address):
         raise ValueError('invalid_wallet_address')
-    block_raw = _rpc_call(cid, 'eth_blockNumber', [])
+    if cid == 56:
+        chain_id_raw = _nexus_wallet_ledger_rpc_call(cid, 'eth_chainId', [])
+        parsed_chain_id = int(chain_id_raw, 16) if str(chain_id_raw).startswith('0x') else int(chain_id_raw)
+        if parsed_chain_id != 56:
+            raise RuntimeError('RPC_LEDGER_WRONG_CHAIN')
+    block_raw = _nexus_wallet_ledger_rpc_call(cid, 'eth_blockNumber', [])
     latest = int(block_raw, 16) if isinstance(block_raw, str) else int(block_raw)
     depth = min(12000, max(1000, int(scan_blocks)))
     first = max(0, latest - depth + 1)
@@ -54239,7 +54310,7 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
             raise RuntimeError('SCAN_REQUEST_BUDGET')
         requests_used += 1
         try:
-            rows = _rpc_call(cid, 'eth_getLogs', [{
+            rows = _nexus_wallet_ledger_rpc_call(cid, 'eth_getLogs', [{
                 'fromBlock': hex(lo), 'toBlock': hex(hi), 'topics': topics,
             }])
             if not isinstance(rows, list):
@@ -54310,7 +54381,7 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
         address = ev['contract'].lower()
         if address not in decimals_cache and len(decimals_cache) < 15:
             try:
-                decoded = _eth_call(cid, address, '0x313ce567')
+                decoded = _nexus_wallet_ledger_rpc_call(cid, 'eth_call', [{'to': address, 'data': '0x313ce567'}, 'latest'])
                 d = int(str(decoded), 16)
                 decimals_cache[address] = d if 0 <= d <= 36 else None
             except Exception:
