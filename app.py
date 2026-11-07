@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-564-FAST-MARKET-LOAD";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD604-COMPARE-WATCH-FIRST-PAINT"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-565-AI-REGEX-REPAIR";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD605-AI-REGEX-REPAIR"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -31769,7 +31769,7 @@ def _detect_user_language_from_text(text: str, explicit: str | None = None) -> s
             return val
 
     # If the frontend sends the raw user sentence inside the JSON, use that slice.
-    raw_match = re.search(r'"raw_user_question"\s*:\s*"([^"\]*(?:\\.[^"\]*)*)"', t_raw)
+    raw_match = re.search(r'"raw_user_question"\s*:\s*"((?:\\.|[^"\\])*)"', t_raw)
     if raw_match:
         try:
             t_raw = json.loads('"' + raw_match.group(1) + '"')
