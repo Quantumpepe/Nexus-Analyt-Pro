@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-565-AI-REGEX-REPAIR";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD605-AI-REGEX-REPAIR"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-566-STRATEGIST-QUESTION-SCOPE";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD606-STRATEGIST-QUESTION-SCOPE"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -32521,6 +32521,17 @@ def _build_ai_response(kind: str, sym_norm: list[str], profile: str, include_hea
     strategist_profile = _strategist_response_profile(strategist_intent, response_language)
     strategist_digest = _strategist_context_digest(extra_context if isinstance(extra_context, dict) else {})
     strategist_overlay = _strategist_deterministic_overlay(strategist_intent, response_language, strategist_digest)
+    # Named-asset research is a strict scope, not a request to scan every
+    # Compare pair. Old chat messages must not introduce unrelated symbols.
+    requested_scope = (extra_context or {}).get("requested_symbols") if isinstance(extra_context, dict) else None
+    requested_scope = requested_scope if isinstance(requested_scope, list) else []
+    requested_scope = [str(x).strip().upper() for x in requested_scope if isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9]{2,12}", x.strip())]
+    strict_question_scope_rule = (
+        "STRICT USER QUESTION SCOPE: Only analyse these explicitly requested assets: "
+        + ", ".join(requested_scope)
+        + ". Do not introduce other coin pairs from Compare, Watchlist or previous chat. "
+        + "General market-wide facts may support the answer, but not replace the requested assets."
+    ) if requested_scope else ""
 
     strategist_memory_v2 = {}
     ai_insight_bridge = {}
@@ -32658,6 +32669,7 @@ AI ANALYST OUTPUT FORMAT — KEEP IT SHORT:
     sys = f"""You are Nexus Strategist, the intelligent market and strategy layer inside Nexus Analyt.
 
 {language_hard_rule}
+{strict_question_scope_rule}
 
 STRATEGIST INTENT LAYER:
 - Understand natural user language, even when the user does not use professional trading terms.
@@ -32857,6 +32869,10 @@ Task:
         user_payload["insight_profile"] = insight_profile
 
     mem_msgs = _ai_mem_get(chat_memory_wallet) if use_chat_memory else None
+    if requested_scope and not _forced_followup:
+        # A fresh, explicit BTC/ETH question is not a follow-up to any previous
+        # DUAL/ROSE chat. Market Memory V2 remains available independently.
+        mem_msgs = []
     resp, err_pair = _ai_call_openai(
         sys,
         user_payload,
@@ -33200,6 +33216,83 @@ def _strategist_focus_research_symbols(question, symbols, context=None):
     return focused + [symbol for symbol in base if symbol not in focused]
 
 
+# ENGINE-566: Scope a manual Strategist answer to the assets the user actually
+# named. Watchlist-wide research remains available when no narrow scope was asked.
+# This only affects /api/ai/run; NEVER live NKR/GRID/TRADER signal input.
+_STRATEGIST_SCOPE_STOPWORDS = frozenset({
+    "AI", "API", "USD", "USDC", "USDT", "THE", "AND", "ARE", "FOR", "WITH", "FROM",
+    "ALL", "TOP", "BEST", "REST", "OTHER", "THIS", "THAT", "WHEN", "WHAT",
+    "WHY", "HOW", "CAN", "ONE", "MORE", "LESS", "IN", "ON", "AS", "OR",
+    "IS", "IT", "TO", "OF", "AT", "AN", "DO", "NO", "YOU", "YOUR",
+    "GRID", "NKR", "TRADER", "COIN", "COINS", "MARKET", "RISK", "BUY", "SELL",
+})
+
+def _strategist_explicit_question_symbols(question: str, context: dict | None = None, symbols=None) -> list[str]:
+    q = str(question or "").upper()
+    ctx = context if isinstance(context, dict) else {}
+    known = {"BTC", "ETH", "BNB", "POL", "SOL", "XRP", "LINK", "UNI", "ADA", "AVAX", "DOGE", "LTC", "XLM", "TRX", "ARB", "ATOM"}
+    for sym in (symbols or []) + (ctx.get("analysis_symbols") or []):
+        if isinstance(sym, str):
+            known.add(sym.strip().upper())
+    for item in ctx.get("coins") or []:
+        if isinstance(item, dict):
+            known.add(str(item.get("symbol") or "").strip().upper())
+    for key in ("relevant_pairs", "all_compare_pairs"):
+        for item in ctx.get(key) or []:
+            if isinstance(item, dict):
+                known.update(str(item.get("pair") or "").upper().split("/")[:2])
+    known = {s for s in known if re.fullmatch(r"[A-Z0-9]{2,12}", s) and s not in _STRATEGIST_SCOPE_STOPWORDS}
+    hits = []
+    for symbol in known:
+        match = re.search(r"(?<![A-Z0-9])" + re.escape(symbol) + r"(?![A-Z0-9])", q)
+        if match:
+            hits.append((match.start(), symbol))
+    for alias, symbol in (("BITCOIN", "BTC"), ("ETHEREUM", "ETH"), ("POLYGON", "POL"), ("SOLANA", "SOL"), ("RIPPLE", "XRP")):
+        match = re.search(r"(?<![A-Z0-9])" + alias + r"(?![A-Z0-9])", q)
+        if match:
+            hits.append((match.start(), symbol))
+    hits.sort(key=lambda x: x[0])
+    return list(dict.fromkeys(sym for _, sym in hits))[:12]
+
+def _strategist_question_needs_broad_market_scope(question: str) -> bool:
+    return bool(re.search(
+        r"\b(other coins?|other assets?|rest of|all coins?|all assets?|entire market|whole market|"
+        r"whole watchlist|all watchlist|across (?:the )?market|market.wide|top coins?|"
+        r"strongest coins?|weakest coins?|which (?:watchlist )?coins?|which (?:watchlist )?assets?|"
+        r"andere coins?|andere token|alle coins?|alle token|ganze(?:n|r)? markt|"
+        r"ganze watchlist|welche coins?|welche token|stärkste coins?|schwächste coins?)\b",
+        str(question or ""), re.IGNORECASE,
+    ))
+
+def _strategist_scope_question_context(context: dict, focused_symbols: list[str]) -> dict:
+    if not focused_symbols:
+        return context
+    allow = set(focused_symbols)
+    scoped = dict(context)
+    scoped["analysis_symbols"] = list(focused_symbols)
+    scoped["selected_origin"] = "explicit_user_question"
+    scoped["requested_symbols"] = list(focused_symbols)
+    for key in ("coins",):
+        if isinstance(scoped.get(key), list):
+            scoped[key] = [c for c in scoped[key] if isinstance(c, dict) and str(c.get("symbol") or "").upper() in allow]
+    def pair_matches(item):
+        if not isinstance(item, dict):
+            return False
+        parts = [s.strip().upper() for s in str(item.get("pair") or "").split("/")]
+        return len(parts) == 2 and all(s in allow for s in parts)
+    for key in ("relevant_pairs", "all_compare_pairs", "movement_opportunities", "pair_alerts"):
+        if isinstance(scoped.get(key), list):
+            scoped[key] = [p for p in scoped[key] if pair_matches(p)]
+    if isinstance(scoped.get("ai_engine_v2"), dict):
+        scoped["ai_engine_v2"] = dict(scoped["ai_engine_v2"])
+        if isinstance(scoped["ai_engine_v2"].get("pair_alerts"), list):
+            scoped["ai_engine_v2"]["pair_alerts"] = [p for p in scoped["ai_engine_v2"]["pair_alerts"] if pair_matches(p)]
+    # A prepared trade on another asset is unrelated to a named-coin research question.
+    scoped.pop("nexus_trading", None)
+    scoped.pop("strategist_depth_profile", None)
+    return scoped
+
+
 @app.route("/api/ai/run", methods=["POST"])
 def api_ai_run():
     """AI Analyst endpoint (chat/follow-up). Uses ai_memory only, never order_memory."""
@@ -33226,16 +33319,27 @@ def api_ai_run():
 
     include_health = bool(body.get("include_health", True))
     question = str(body.get("question") or "").strip()
+    raw_question = str(body.get("raw_user_question") or "").strip()
     timeframe = _normalize_ai_timeframe(body.get("timeframe") or "90D")
     index_mode = bool(body.get("index_mode", False))
     raw_series_stats = body.get("series_stats") or {}
     ai_signal_context = body.get("ai_signal_context") or body.get("ai_context") or {}
+    user_scope = []
     if isinstance(ai_signal_context, dict):
         ai_signal_context = dict(ai_signal_context)
+        # Explicit BTC/ETH question: prevent unrelated Watchlist/Compare pairs from
+        # influencing GPT, the depth overlay, memory pair or displayed confidence.
+        # Broad questions (which coins, whole watchlist, general market) retain breadth.
+        user_scope = _strategist_explicit_question_symbols(raw_question, ai_signal_context, symbols)
+        if user_scope and not _strategist_question_needs_broad_market_scope(raw_question):
+            ai_signal_context = _strategist_scope_question_context(ai_signal_context, user_scope)
+            if str(kind).lower() in ("ask", "research", "daily_report"):
+                symbols = list(user_scope)
+        else:
+            user_scope = []
         try:
             ai_signal_context["strategist_depth_profile"] = _build_strategist_depth_profile(
-                body.get("raw_user_question") or question,
-                ai_signal_context,
+                raw_question or question, ai_signal_context,
             )
         except Exception:
             pass
@@ -33256,6 +33360,12 @@ def api_ai_run():
         if body.get("strategist_phase"):
             ai_signal_context["strategist_phase"] = body.get("strategist_phase")
 
+    # The frontend prompt embeds all Watchlist pairs as prose. For manual research,
+    # the actual user question is authoritative; system/context carries the rules.
+    # Keep task-based builders and Pine untouched.
+    if raw_question and str(kind).lower() in ("ask", "research", "daily_report"):
+        question = raw_question
+
     sym_norm = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
     sym_norm = list(dict.fromkeys(sym_norm))
     # ENGINE-553: A task-based Pine/strategy/backtest request stays a workspace
@@ -33266,7 +33376,9 @@ def api_ai_run():
         if not sym_norm and isinstance(ai_signal_context, dict):
             sym_norm = _symbols_from_ai_context(ai_signal_context, limit=8)
         sym_norm = _strategist_focus_research_symbols(
-            body.get("raw_user_question") or "", sym_norm, ai_signal_context)
+            raw_question or "", sym_norm, ai_signal_context)
+        if user_scope and str(kind).lower() in ("ask", "research", "daily_report"):
+            sym_norm = list(user_scope)
 
     # New AI Analyst workspace mode:
     # The analyst is now task-based and must also run without visible coin chips / Compare symbols.
