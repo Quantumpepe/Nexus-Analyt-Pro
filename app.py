@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-563-ALCHEMY-WALLET-INDEX";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-564-FAST-MARKET-LOAD";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD604-COMPARE-WATCH-FIRST-PAINT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -18550,6 +18550,15 @@ def api_compare():
 
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
 
+        # Fast shared response cache for normal page loads. Explicit refresh with `_` or `force`
+        # continues to rebuild data; trading/Strategist pathways are not involved.
+        compare_cache_key = f"{','.join(symbols)}:{range_key}"
+        force_compare = str(request.args.get("force") or request.args.get("refresh") or request.args.get("_") or "").strip() not in ("", "0", "false", "False")
+        if not force_compare and len(symbols) >= 2:
+            fresh_compare = _cache_get_fresh(_COMPARE_CACHE, compare_cache_key, min(_COMPARE_TTL_SEC, 90))
+            if fresh_compare is not None:
+                return jsonify(fresh_compare), 200
+
         # Instead of 400 -> return empty ok (frontend stays stable)
         if len(symbols) < 2:
             return jsonify({
@@ -18568,34 +18577,39 @@ def api_compare():
         errors = {}
         health_out = {}
 
-        for sym in symbols:
+        # Independent historical price reads used to run serially (one 8s upstream timeout
+        # per symbol). Parallelism only affects this read-only Compare endpoint.
+        def _load_compare_symbol(sym):
             try:
                 series = _get_series_for_symbol(sym, days) or []
-                series_out[sym] = series
-
-                # daily close (defensive)
                 try:
                     dc = _daily_close(series)
-                    daily_out[sym] = dc[-(days + 2):] if days and len(dc) > (days + 2) else dc
+                    daily = dc[-(days + 2):] if days and len(dc) > (days + 2) else dc
                 except Exception:
-                    daily_out[sym] = []
-
-                # health (defensive)
+                    daily = []
                 try:
-                    h = _health_for_symbol(sym, series)
-                    if h:
-                        health_out[sym] = h
+                    health = _health_for_symbol(sym, series)
                 except Exception:
-                    pass
+                    health = None
+                return sym, series, daily, health, None
+            except Exception as ex:
+                return sym, [], [], None, str(ex)
 
-            except Exception as e:
-                errors[sym] = str(e)
-                series_out[sym] = []
-                daily_out[sym] = []
+        if len(symbols) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(4, len(symbols))) as executor:
+                compare_rows = list(executor.map(_load_compare_symbol, symbols))
+        else:
+            compare_rows = [_load_compare_symbol(sym) for sym in symbols]
+        for sym, series, daily, health, error in compare_rows:
+            series_out[sym] = series
+            daily_out[sym] = daily
+            if health: health_out[sym] = health
+            if error: errors[sym] = error
 
         # If everything empty, try cache fallback
         if all(len(series_out.get(s, [])) == 0 for s in symbols):
-            stale = _cache_get_any(_COMPARE_CACHE, f"{','.join(symbols)}:{range_key}")
+            stale = _cache_get_any(_COMPARE_CACHE, compare_cache_key)
             if stale:
                 stale = dict(stale)
                 stale["status"] = "partial"
@@ -18619,7 +18633,7 @@ def api_compare():
             out["health"] = health_out
 
         # Cache good/partial response (key must match fallback key!)
-        _cache_set(_COMPARE_CACHE, f"{','.join(symbols)}:{range_key}", out)
+        _cache_set(_COMPARE_CACHE, compare_cache_key, out)
 
         return jsonify(out), 200
 
