@@ -186,9 +186,9 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-555-STRATEGIST-DIAGNOSTICS-READONLY";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD595-STRATEGIST-DIAGNOSTICS-READONLY"
-STRATEGIST_BUILD_ID = "S-ENGINE-076-DIAGNOSTICS-READONLY"
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-556-STRATEGIST-SECURITY-EXIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD596-STRATEGIST-SECURITY-EXIT"
+STRATEGIST_BUILD_ID = "S-ENGINE-077-SECURITY-EXIT-VALIDATION"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
 SHADOW_PROMOTION_MODE = "AGGRESSIVE_RED_ENTRY_GUARD_V1_DECISION_LOG"
@@ -17355,8 +17355,14 @@ def _nkr_live_shadow_exit_decision(symbol: str, market_row: dict, snap: dict, pr
             or (recovery < 35 and momentum < 2 and net_pct >= max(0.25, tp * 0.35))
         )
     )
-    # Only true security emergencies (honeypot / malicious), not generic risk.
-    sec_raw = str(q.get("security") or q.get("security_status") or "").upper()
+    # ENGINE-556: the Shadow quality model returns a boolean security_emergency,
+    # but does NOT return security/security_status. Read the same canonical input
+    # it classified instead of requiring a nonexistent quality-output field.
+    # Confirmed token-security alarms bypass ordinary hold/profit gates; generic
+    # market risk, liquidity or slippage changes remain context-only.
+    sec_raw = _nexus_trading_text_value(
+        row, signals, "security", "security_status", "securityStatus", default="UNKNOWN"
+    ).strip().upper()
     security_emergency = bool(
         q.get("security_emergency")
         and sec_raw in {"FAIL", "HONEYPOT", "MALICIOUS", "BLACKLIST", "BLOCKED"}
