@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-561-BNB-LEDGER-TIMEOUT-ADAPTIVE-SCAN";
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-562-BNB-LEDGER-TOKEN-FILTER";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -54306,6 +54306,67 @@ def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
         raise _nexus_ledger_error('RPC_LEDGER_INVALID_RESPONSE', method, http_status)
     return data['result']
 
+
+# ENGINE-562: BNB historical getLogs is scoped to existing Nexus contracts.
+# This only narrows optional wallet history; it never changes the execution
+# token allowlist, trading RPC, approvals, Vault configuration or any trade.
+def _nexus_wallet_ledger_bnb_token_scope(max_contracts=24):
+    cid = 56
+    cap = max(3, min(48, int(max_contracts)))
+    base = []
+    extra = set()
+
+    def valid_address(value):
+        value = str(value or '').strip().lower()
+        return value if re.fullmatch(r'0x[0-9a-f]{40}', value) and int(value, 16) != 0 else None
+
+    # Only official configured settlement tokens, wrapped native tokens and
+    # explicit Nexus-approved contracts. The market watchlist is not trusted
+    # as an authorization source and is never used to widen this filter.
+    for value in (
+        _USDC_BY_CHAIN.get(cid), _USDT_BY_CHAIN.get(cid),
+        _WNATIVE_BY_CHAIN.get(cid),
+        *(_USDC_ALT_BY_CHAIN.get(cid) or []),
+    ):
+        addr = valid_address(value)
+        if addr and addr not in base:
+            base.append(addr)
+    try:
+        for chain_id, value in _vault_approved_token_contracts():
+            if int(chain_id) == cid:
+                addr = valid_address(value)
+                if addr and addr not in base:
+                    extra.add(addr)
+    except Exception:
+        # Configured settlement tokens still provide a useful narrow scope.
+        pass
+    try:
+        conn = _db()
+        try:
+            rows = conn.execute(
+                "SELECT token_address FROM nexus_evm_token_registry "
+                "WHERE chain_id=? AND status='APPROVED' ORDER BY token_address",
+                (cid,),
+            ).fetchall()
+            for row in rows:
+                addr = valid_address(row[0])
+                if addr and addr not in base:
+                    extra.add(addr)
+        finally:
+            conn.close()
+    except Exception:
+        # Missing/older registry tables are not a reason to disable the scan.
+        pass
+    candidates = base + sorted(extra - set(base))
+    selected = candidates[:cap]
+    return {
+        'addresses': selected,
+        'configuredCount': len(candidates),
+        'truncated': len(candidates) > len(selected),
+        'policy': 'NEXUS_CONFIGURED_AND_APPROVED_CONTRACTS_ONLY',
+    }
+
+
 def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     """Read-only wallet Transfer history, with bounded timeout/range splitting.
 
@@ -54328,6 +54389,13 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     depth = min(12000, max(1000, int(scan_blocks)))
     first = max(0, latest - depth + 1)
     wallet_topic = '0x' + wallet_address[2:].rjust(64, '0')
+    # Passing an address allowlist is critical: BNB providers can time out
+    # even on short addressless Transfer queries due to chain-wide volume.
+    # ETH/POL retain their existing optional wallet-wide scan behavior.
+    token_scope = _nexus_wallet_ledger_bnb_token_scope() if cid == 56 else None
+    token_addresses = token_scope['addresses'] if token_scope else None
+    if token_scope and not token_addresses:
+        raise _nexus_ledger_error('RPC_LEDGER_TOKEN_SCOPE_EMPTY', 'eth_getLogs')
     found = {}
     errors = []
     rpc_diagnostic = None
@@ -54355,9 +54423,12 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
             return [], False, _nexus_ledger_error('SCAN_REQUEST_BUDGET', 'eth_getLogs')
         requests_used += 1
         try:
-            rows = _nexus_wallet_ledger_rpc_call(cid, 'eth_getLogs', [{
+            log_filter = {
                 'fromBlock': hex(lo), 'toBlock': hex(hi), 'topics': topics,
-            }])
+            }
+            if token_addresses:
+                log_filter['address'] = token_addresses
+            rows = _nexus_wallet_ledger_rpc_call(cid, 'eth_getLogs', [log_filter])
             if not isinstance(rows, list):
                 raise _nexus_ledger_error('RPC_GETLOGS_INVALID_RESPONSE', 'eth_getLogs')
             successful_log_queries += 1
@@ -54407,6 +54478,10 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
 
         for log in chunk_logs:
             if not isinstance(log, dict):
+                continue
+            # Defense in depth: a provider response must not introduce an
+            # unconfigured token even if it ignores the address filter.
+            if token_addresses and str(log.get('address') or '').lower() not in token_addresses:
                 continue
             tx = str(log.get('transactionHash') or '')
             if not re.fullmatch(r'0x[0-9a-fA-F]{64}', tx):
@@ -54466,7 +54541,10 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
         ev['asset'] = address[:8] + '…' + address[-6:]
         ev['decimals'] = dec
 
-    complete = not errors and completed_windows == (depth + window_size - 1) // window_size and oldest_scanned == first
+    total_windows = (latest - first + window_size) // window_size
+    if token_scope and token_scope['truncated'] and not errors:
+        errors.append('TOKEN_SCOPE_TRUNCATED')
+    complete = not errors and completed_windows == total_windows and oldest_scanned == first
     if errors:
         d = rpc_diagnostic or {}
         app.logger.warning(
@@ -54484,8 +54562,18 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
         'partialWindows': partial_windows, 'adaptiveSplits': adaptive_splits,
         'successfulLogQueries': successful_log_queries,
         'rpcRequests': requests_used,
-        'scope': 'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
-        'limitations': 'Recent ERC20 logs only; partial on RPC limitations. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.',
+        'scope': ('NEXUS_KNOWN_TOKEN_ERC20_TRANSFERS_ONLY' if token_scope else 'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY'),
+        'tokenFilterCount': len(token_addresses) if token_addresses else None,
+        'tokenScopeTruncated': bool(token_scope and token_scope['truncated']),
+        'tokenScopeConfiguredCount': token_scope['configuredCount'] if token_scope else None,
+        'limitations': (
+            'Only configured/approved Nexus BNB token contracts in the recent range were scanned. '
+            'Other token contracts, native coin transfers, Vault-internal movements and older blocks are excluded; '
+            'a full wallet history requires a separate indexer.'
+            if token_scope else
+            'Recent ERC20 logs only; partial on RPC limitations. Historical transfers outside these blocks, '
+            'native coin transfers and Vault-internal movements require a full indexer.'
+        ),
     }
 
 
@@ -54587,6 +54675,12 @@ def api_nexus_wallet_ledger():
             # An exact stored return transaction (including an older 5 USDC
             # payout) can be verified regardless of the recent-log lookback.
             response['receiptProof'] = _nexus_wallet_ledger_verify_receipts(wallet,chain,events)
+            if chain == 'BNB':
+                response['coverage'] = (
+                    'Known backend transactions across ETH/BNB/POL; the BNB scan '
+                    'covers only configured and approved Nexus ERC-20 contracts, '
+                    'not all wallet tokens or complete blockchain history.'
+                )
             try:
                 response['recentOnchain']=_nexus_wallet_ledger_recent_erc20(wallet,chain,
                     int(request.args.get('blocks') or 6000))
