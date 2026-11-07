@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-560-BNB-LEDGER-RPC-DIAGNOSTICS";
+BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-561-BNB-LEDGER-TIMEOUT-ADAPTIVE-SCAN";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD598-WALLET-LEDGER-PRIVY-SCOPE-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -54294,7 +54294,12 @@ def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
         remote_message = str(provider_error.get('message') or '') if isinstance(provider_error, dict) else str(provider_error)
         remote_code = provider_error.get('code') if isinstance(provider_error, dict) else None
         status = _nexus_ledger_rpc_problem(RuntimeError(remote_message))
-        if status == 'RPC_GETLOGS_FAILED':
+        # BNB history providers commonly use JSON-RPC -32002 for a timed-out
+        # eth_getLogs query. Classify the code, not only the remote error text;
+        # the upstream message is never included in the client response/logs.
+        if method == 'eth_getLogs' and str(remote_code) == '-32002' and status == 'RPC_GETLOGS_FAILED':
+            status = 'RPC_TIMEOUT'
+        elif status == 'RPC_GETLOGS_FAILED':
             status = 'RPC_LEDGER_PROVIDER_ERROR'
         raise _nexus_ledger_error(status, method, http_status, remote_code)
     if 'result' not in data:
@@ -54302,12 +54307,12 @@ def _nexus_wallet_ledger_rpc_call(chain_id, method, params):
     return data['result']
 
 def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
-    """Bounded read-only ERC-20 Transfer scan with adaptive RPC range handling.
+    """Read-only wallet Transfer history, with bounded timeout/range splitting.
 
-    A node can reject addressless eth_getLogs over 2,000 BSC blocks even when
-    eth_blockNumber and transaction receipts succeed. We use smaller 1,000-block
-    windows, split only on *range/result* limits, and return truthful partial
-    coverage on provider/time limits. Newest blocks take priority. No signing.
+    The separate BNB history RPC is never used for live trading. An addressless
+    eth_getLogs request may time out on busy BNB blocks even for modest ranges.
+    Scan newest-first, split *only* range limits/timeouts, preserve confirmed
+    sub-range events, and never claim complete coverage after a partial failure.
     """
     cid = _NEXUS_LEDGER_CHAIN_MAP[chain]
     wallet_address = str(wallet or '').lower()
@@ -54328,55 +54333,78 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
     rpc_diagnostic = None
     oldest_scanned = None
     completed_windows = 0
+    partial_windows = 0
+    successful_log_queries = 0
+    adaptive_splits = 0
     requests_used = 0
     started = time.monotonic()
-    # The endpoint is synchronous and should not crowd out live trading workers.
-    max_requests = 48
-    max_elapsed_sec = 18.0
+    # One wallet scan must stay substantially below the advertised public RPC
+    # 60-RU/min quota. eth_chainId/blockNumber and decimals calls are additional.
+    # Limits are per scan; repeated/concurrent callers may still hit 429.
+    max_requests = 36
+    max_elapsed_sec = 20.0
+    min_split_blocks = 16
+    window_size = 500
 
     def get_logs(lo, hi, topics):
-        nonlocal requests_used
+        """Return (logs, all_subranges_succeeded, error) newest-subrange-first."""
+        nonlocal requests_used, successful_log_queries, adaptive_splits
         if time.monotonic() - started >= max_elapsed_sec:
-            raise RuntimeError('SCAN_TIME_BUDGET')
+            return [], False, _nexus_ledger_error('SCAN_TIME_BUDGET', 'eth_getLogs')
         if requests_used >= max_requests:
-            raise RuntimeError('SCAN_REQUEST_BUDGET')
+            return [], False, _nexus_ledger_error('SCAN_REQUEST_BUDGET', 'eth_getLogs')
         requests_used += 1
         try:
             rows = _nexus_wallet_ledger_rpc_call(cid, 'eth_getLogs', [{
                 'fromBlock': hex(lo), 'toBlock': hex(hi), 'topics': topics,
             }])
             if not isinstance(rows, list):
-                raise RuntimeError('RPC_GETLOGS_INVALID_RESPONSE')
-            return rows
+                raise _nexus_ledger_error('RPC_GETLOGS_INVALID_RESPONSE', 'eth_getLogs')
+            successful_log_queries += 1
+            return rows, True, None
         except Exception as exc:
-            # Retry only when the provider explicitly complains about range/size.
-            # Repeatedly splitting rate limits/unsupported methods would worsen
-            # provider pressure and delay legitimate Vault transactions.
-            if (hi - lo + 1 > 64 and
-                    _nexus_ledger_rpc_problem(exc) == 'RPC_LOG_RANGE_OR_RESULT_LIMIT'):
+            kind = _nexus_ledger_rpc_problem(exc)
+            if kind in ('RPC_TIMEOUT', 'RPC_LOG_RANGE_OR_RESULT_LIMIT') and hi - lo + 1 > min_split_blocks:
+                # Narrow retries, never repeat the same failed range. Preserve
+                # logs from successful subranges if a later subrange fails.
+                adaptive_splits += 1
                 mid = (lo + hi) // 2
-                return get_logs(lo, mid, topics) + get_logs(mid + 1, hi, topics)
-            raise
+                newer, newer_ok, newer_error = get_logs(mid + 1, hi, topics)
+                if newer_error and _nexus_ledger_rpc_problem(newer_error) in (
+                    'SCAN_TIME_BUDGET', 'SCAN_REQUEST_BUDGET',
+                ):
+                    return newer, False, newer_error
+                older, older_ok, older_error = get_logs(lo, mid, topics)
+                return newer + older, newer_ok and older_ok, newer_error or older_error
+            # 429/access denial/unsupported method: stop immediately to avoid
+            # exceeding provider quota. A 16-block timeout also stops splitting.
+            return [], False, exc
 
-    # Scan newest first: an incomplete request can still display recent events.
-    for high in range(latest, first - 1, -1000):
-        low = max(first, high - 999)
+    # Newest-first; each window needs BOTH outgoing and incoming filters for
+    # complete coverage. However, previously retrieved directional logs are
+    # still valid, and must survive a later timeout.
+    for high in range(latest, first - 1, -window_size):
+        low = max(first, high - window_size + 1)
         chunk_logs = []
+        window_ok = True
+        failure = None
         phase = 'OUTGOING'
-        try:
-            for phase, topics in (
-                ('OUTGOING', [_NEXUS_TRANSFER_TOPIC, wallet_topic]),
-                ('INCOMING', [_NEXUS_TRANSFER_TOPIC, None, wallet_topic]),
-            ):
-                chunk_logs.extend(get_logs(low, high, topics))
-        except Exception as exc:
-            errors.append(_nexus_ledger_rpc_problem(exc))
-            rpc_diagnostic = _nexus_ledger_safe_diagnostic(exc)
-            rpc_diagnostic['phase'] = phase
-            break
-        # Only a fully successful two-direction query counts as scanned.
-        completed_windows += 1
-        oldest_scanned = low
+        for phase, topics in (
+            ('OUTGOING', [_NEXUS_TRANSFER_TOPIC, wallet_topic]),
+            ('INCOMING', [_NEXUS_TRANSFER_TOPIC, None, wallet_topic]),
+        ):
+            rows, query_ok, query_error = get_logs(low, high, topics)
+            chunk_logs.extend(rows)
+            if not query_ok:
+                window_ok = False
+                failure = query_error or _nexus_ledger_error('RPC_GETLOGS_FAILED', 'eth_getLogs')
+                break
+        if window_ok:
+            completed_windows += 1
+            oldest_scanned = low
+        elif chunk_logs:
+            partial_windows += 1
+
         for log in chunk_logs:
             if not isinstance(log, dict):
                 continue
@@ -54389,7 +54417,6 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
                 continue
             sender = '0x' + str(topics_log[1])[-40:].lower()
             receiver = '0x' + str(topics_log[2])[-40:].lower()
-            # Recheck indexed wallet address; do not leak unrelated activity.
             if sender != wallet_address and receiver != wallet_address:
                 continue
             direction = 'SELF' if sender == receiver else ('IN' if receiver == wallet_address else 'OUT')
@@ -54409,17 +54436,28 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
                 'createdAt': 0, 'blockNumber': block,
                 'note': 'Confirmed Transfer event; raw token units shown if decimals are unavailable.',
             }
+        if failure is not None:
+            errors.append(_nexus_ledger_rpc_problem(failure))
+            rpc_diagnostic = _nexus_ledger_safe_diagnostic(failure)
+            rpc_diagnostic['phase'] = phase
+            break
 
-    # Token decimals only from the exact token contract; never assume 6/18.
+    # Token decimals only from exact contracts, never guessed. Limit metadata
+    # lookups too so history reads do not consume the whole public RPC quota.
     decimals_cache = {}
+    decimals_queries = 0
     for ev in found.values():
         address = ev['contract'].lower()
-        if address not in decimals_cache and len(decimals_cache) < 15:
-            try:
-                decoded = _nexus_wallet_ledger_rpc_call(cid, 'eth_call', [{'to': address, 'data': '0x313ce567'}, 'latest'])
-                d = int(str(decoded), 16)
-                decimals_cache[address] = d if 0 <= d <= 36 else None
-            except Exception:
+        if address not in decimals_cache:
+            if decimals_queries < 10:
+                decimals_queries += 1
+                try:
+                    decoded = _nexus_wallet_ledger_rpc_call(cid, 'eth_call', [{'to': address, 'data': '0x313ce567'}, 'latest'])
+                    d = int(str(decoded), 16)
+                    decimals_cache[address] = d if 0 <= d <= 36 else None
+                except Exception:
+                    decimals_cache[address] = None
+            else:
                 decimals_cache[address] = None
         dec = decimals_cache.get(address)
         if dec is not None and ev['amountRaw']:
@@ -54428,14 +54466,14 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
         ev['asset'] = address[:8] + '…' + address[-6:]
         ev['decimals'] = dec
 
-    complete = not errors and oldest_scanned == first
+    complete = not errors and completed_windows == (depth + window_size - 1) // window_size and oldest_scanned == first
     if errors:
-        # Diagnostic is safe for clients and Render logs (no RPC credentials).
         d = rpc_diagnostic or {}
         app.logger.warning(
-            'Wallet ledger ERC20 scan incomplete chain=%s issue=%s httpStatus=%s rpcCode=%s method=%s phase=%s',
+            'Wallet ledger ERC20 scan incomplete chain=%s issue=%s httpStatus=%s rpcCode=%s method=%s phase=%s requests=%s splits=%s',
             chain, errors[0], d.get('httpStatus'), d.get('rpcErrorCode'),
             d.get('method', 'unknown'), d.get('phase', 'unknown'),
+            requests_used, adaptive_splits,
         )
     return {
         'events': sorted(found.values(), key=lambda x: (x['blockNumber'], x['id']), reverse=True)[:180],
@@ -54443,6 +54481,8 @@ def _nexus_wallet_ledger_recent_erc20(wallet, chain, scan_blocks=6000):
         'oldestBlockScanned': oldest_scanned, 'latestBlock': latest,
         'completeForRequestedRange': complete, 'error': errors[0] if errors else '',
         'errors': errors[:3], 'rpcDiagnostic': rpc_diagnostic, 'scannedWindows': completed_windows,
+        'partialWindows': partial_windows, 'adaptiveSplits': adaptive_splits,
+        'successfulLogQueries': successful_log_queries,
         'rpcRequests': requests_used,
         'scope': 'ERC20_TRANSFERS_INVOLVING_PRIVY_WALLET_ONLY',
         'limitations': 'Recent ERC20 logs only; partial on RPC limitations. Historical transfers outside these blocks, native coin transfers and Vault-internal movements require a full indexer.',
