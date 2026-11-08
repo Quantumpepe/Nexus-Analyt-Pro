@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-570-TRADER-INTRADAY-DIAG";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD610-HEADER-CONTROLS"
+BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-571-HISTORY-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD611-ENGINE-HISTORY-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52317,7 +52317,7 @@ def api_nexus_engine_history_get():
     conn = _db()
     try:
         rows = conn.execute(
-            "SELECT event_key,event_type,event_ts,payload_json,created_ts,updated_ts FROM nexus_engine_event_history WHERE wallet_address=? AND engine=? ORDER BY event_ts DESC, id DESC LIMIT ?",
+            "SELECT event_key,event_type,event_ts,payload_json,created_ts,updated_ts FROM nexus_engine_event_history WHERE wallet_address=? AND engine=? AND (json_extract(payload_json,'$.txHash') GLOB '0x*' OR upper(coalesce(json_extract(payload_json,'$.source'),'')) NOT IN ('SESSION_STATE','CLIENT_SESSION_STATE')) ORDER BY event_ts DESC, id DESC LIMIT ?",
             (_norm_addr(wa), engine, limit),
         ).fetchall()
     finally:
@@ -52335,6 +52335,10 @@ def api_nexus_engine_history_get():
         payload.pop("date", None)  # Broken legacy YYYY values must never override the real epoch.
         payload.setdefault("source", "RECORDED_TX" if re.fullmatch(r"0x[0-9a-fA-F]{64}", str(payload.get("txHash") or "")) else "SESSION_STATE")
         payload.setdefault("onchainConfirmed", False)
+        # BUILD571: hide historical client polling snapshots with no tx evidence.
+        # They remain in the DB for audit; a state poll is never a trade.
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(payload.get("txHash") or "")) and str(payload.get("source") or "").upper() in ("SESSION_STATE", "CLIENT_SESSION_STATE"):
+            continue
         events.append(payload)
     # ENGINE-557: supplement client-projected status history with durable real
     # execution records. Never pretend a registry status without tx hash was a trade.
@@ -52405,6 +52409,11 @@ def api_nexus_engine_history_sync():
                     continue
                 event_key=str(raw.get("eventKey") or raw.get("event_key") or raw.get("id") or raw.get("orderId") or raw.get("sessionId") or "").strip()[:240]
                 if not event_key:
+                    continue
+                # BUILD571: a client-side ACTIVE/OPEN snapshot is not a trade/event.
+                # Only tx-linked rows are eligible for this append-only trade history.
+                tx_candidate = str(raw.get("txHash") or raw.get("tx_hash") or "")
+                if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_candidate):
                     continue
                 event_type=str(raw.get("eventType") or raw.get("event_type") or raw.get("status") or raw.get("action") or "EVENT").strip().upper()[:80]
                 event_ts = _nexus_history_epoch_seconds(
