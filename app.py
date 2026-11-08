@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.07-ENGINE-567-STRATEGIST-FULL-ANSWER";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.07-BUILD607-STRATEGIST-FULL-ANSWER"
+BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-569-SESSION-CLOCK-FIX";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD609-SESSION-CLOCK-FIX"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -37654,7 +37654,7 @@ def _nkr_pool_slot0_quote(chain_id: int, token_in: str, token_out: str, amount_i
     return {"amountOut": 0, "detail": last_detail}
 
 
-def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
+def _privy_quote(cfg, token_in, token_out, amount_in, fee=None, *, best_fee=False, allow_pool_fallback=True):
     """Quote Uniswap/Pancake V3 exact-input across fee tiers and ABI variants.
 
     Tries QuoterV2 struct encoding (offset+fields) and QuoterV1 flat encoding
@@ -37685,7 +37685,7 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
         _fee_hint = int(fee) if fee is not None else int(cfg.get("poolFee") or 0) or None
     except Exception:
         _fee_hint = None
-    if _fee_hint:
+    if _fee_hint and not best_fee:
         _ck = _nkr_quote_cache_key(chain_id, tin, tout, amount_in, _fee_hint)
         _hit = _nkr_quote_cache_get(_ck)
         if _hit is not None:
@@ -37736,6 +37736,7 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
         )
     strategies = (("v2", _build_v2), ("v1", _build_v1), ("v2flat", _build_v2_flat))
     last_err = "quoter_no_strategy_worked"
+    best = None  # (output_units, fee_tier, strategy, quoter_address)
     for f in fees:
         for sname, builder in strategies:
             try:
@@ -37753,6 +37754,10 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                         words = []
                 out = int(words[0]) if words else 0
                 if out > 0:
+                    if best_fee:
+                        if best is None or out > best[0]:
+                            best = (int(out), int(f), sname, _norm_addr(cfg["quoter"]))
+                        break  # One successful ABI strategy per fee tier.
                     try:
                         if isinstance(cfg, dict):
                             cfg["_last_quote_fee"] = int(f)
@@ -37778,6 +37783,10 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
             "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         ],
     }.get(chain_id, [])
+    # A working primary Quoter has already supplied all available fee-tier
+    # comparisons. Avoid unnecessary extra calls to alternative deployments.
+    if best_fee and best is not None:
+        alt_quoters = []
     primary = _norm_addr(cfg.get("quoter") or "")
     for alt in alt_quoters:
         alt_n = _norm_addr(alt)
@@ -37797,6 +37806,10 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                             words = []
                     out = int(words[0]) if words else 0
                     if out > 0:
+                        if best_fee:
+                            if best is None or out > best[0]:
+                                best = (int(out), int(f), f"{sname}@{alt_n[:10]}", alt_n)
+                            break
                         try:
                             if isinstance(cfg, dict):
                                 cfg["_last_quote_fee"] = int(f)
@@ -37812,7 +37825,22 @@ def _privy_quote(cfg, token_in, token_out, amount_in, fee=None):
                 except Exception as exc:
                     last_err = f"alt:{alt_n[:10]}:{sname}:fee={f}:{str(exc)[:80]}"
                     continue
-    # ENGINE-298: pool slot0 fallback when all quoter contracts fail (Alchemy or not).
+    # ENGINE-568: For live ENTRIES choose the highest *executable* fee-tier quote.
+    # Never use spot-price-only slot0 estimates as live minimum-output guarantees.
+    if best is not None:
+        out, f, strategy, quoter_address = best
+        if isinstance(cfg, dict):
+            cfg["_last_quote_fee"] = int(f)
+            cfg["_last_quote_strategy"] = strategy
+            cfg["quoter"] = quoter_address
+        _nkr_quote_cache_put(_nkr_quote_cache_key(chain_id, tin, tout, amount_in, f), out)
+        return out
+    if not allow_pool_fallback:
+        raise RuntimeError(
+            f"quoter_failed_verified_quote_required:chain={chain_id}:tokenIn={tin}:tokenOut={tout}:"
+            f"amount={amount_in}:last={last_err}"
+        )
+    # ENGINE-298: legacy pool slot0 fallback for non-entry callers only.
     pool_out = _nkr_pool_slot0_quote(chain_id, tin, tout, int(amount_in), fees) or {}
     if int(pool_out.get("amountOut") or 0) > 0:
         try:
@@ -41636,19 +41664,31 @@ def _nkr_apply_campaign_clock(sessions: list[dict], period_days, period_hours=No
     active = [x for x in rows if str(x.get("status") or "").upper() not in {"STOPPED","CLOSED","EXPIRED","CANCELLED","DELETED","ARCHIVED","REBALANCED_OUT"}]
     hours = _nkr_normalize_period_hours(period_hours, None, None, period_days or 10)
     days = hours / 24.0
+    def _epoch_ms(value):
+        try:
+            n = int(float(value or 0))
+            if 1_000_000_000 <= n < 10_000_000_000:
+                return n * 1000
+            return n if n >= 1_000_000_000_000 else 0
+        except Exception:
+            return 0
+
     starts=[]; explicit=[]
     for x in active:
         m=x.get("meta") if isinstance(x.get("meta"),dict) else {}
-        pos=_rotation_ms(x.get("positionOpenedAt") or m.get("position_opened_at") or x.get("startedAt") or x.get("createdAt"),0)
-        camp=_rotation_ms(x.get("campaignStartedAt") or m.get("campaign_started_at"),0)
-        if pos>0: starts.append(pos)
+        pos=_epoch_ms(x.get("positionOpenedAt") or m.get("position_opened_at"))
+        # Session creation, not a later trade's position-open time, is the clock.
+        started=_epoch_ms(x.get("startsAt") or x.get("startedAt") or x.get("createdAt") or m.get("session_started_ts"))
+        camp=_epoch_ms(x.get("campaignStartedAt") or m.get("campaign_started_at"))
+        if started or pos: starts.append(started or pos)
         if camp>0: explicit.append(camp)
-    campaign_start=min(explicit or starts or [int(time.time()*1000)])
-    campaign_expires=campaign_start + int(hours*3600000)
+    # No fabricated 'now' if the persisted session lacks a verifiable start.
+    campaign_start=min(explicit or starts or [0])
+    campaign_expires=campaign_start + int(hours*3600000) if campaign_start else 0
     out=[]
     for x in rows:
         m=dict(x.get("meta") if isinstance(x.get("meta"),dict) else {})
-        pos=_rotation_ms(x.get("positionOpenedAt") or m.get("position_opened_at") or x.get("startedAt") or x.get("createdAt"),campaign_start)
+        pos=_epoch_ms(x.get("positionOpenedAt") or m.get("position_opened_at"))
         x["positionOpenedAt"] = pos
         x["campaignStartedAt"] = campaign_start
         x["campaignExpiresAt"] = campaign_expires
@@ -41813,8 +41853,17 @@ def _nkr_get_wallet_bundle(wa: str) -> dict:
         _cid = int(_sess.get("chainId") or _sess.get("chain_id") or _meta.get("chain_id") or 0)
         _sid = str(_sess.get("onchainSessionId") or _sess.get("onchain_session_id") or _meta.get("onchain_session_id") or "")
         _locked = _nkr_get_exact_start_config(wa, _cid, _sid)
-        _days = _nkr_normalize_period_days(_locked.get("nkrPeriodDays") or _sess.get("nkrPeriodDays") or _sess.get("periodDays") or _meta.get("nkr_period_days") or 1)
-        _one, _clk = _nkr_apply_campaign_clock([_sess], _days)
+        # ENGINE-569: do not round a session chosen in hours up to whole days.
+        # The immutable exact start config takes precedence over old presentation
+        # rows, then the session's own hours/days. Never use the new setup draft.
+        _hours = _nkr_normalize_period_hours(
+            _locked.get("nkrPeriodHours") or _sess.get("nkrPeriodHours") or
+            _sess.get("runtimeHours") or _meta.get("nkr_period_hours") or _meta.get("runtime_hours"),
+            _locked.get("nkrPeriodValue") or _sess.get("nkrPeriodValue") or _meta.get("nkr_period_value"),
+            _locked.get("nkrPeriodUnit") or _sess.get("nkrPeriodUnit") or _meta.get("nkr_period_unit"),
+            _locked.get("nkrPeriodDays") or _sess.get("nkrPeriodDays") or _sess.get("periodDays") or _meta.get("nkr_period_days") or 1,
+        )
+        _one, _clk = _nkr_apply_campaign_clock([_sess], _hours / 24.0, period_hours=_hours)
         _clock_rows.extend(_one)
         _clock_values.append(_clk)
     nkr_sessions = _clock_rows
@@ -44609,7 +44658,14 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
     # Current NKR architecture: one open position per chain/session.  The value from
     # old capital-allocation settings must not silently create multiple live slots.
     max_active = 1
-    threshold = {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
+    trader_mode = str((settings or {}).get("_live_engine") or "NKR").upper() == "TRADER"
+    # ENGINE-568: Trader is a short-horizon multi-slot engine. Previously it
+    # inherited NKR rotation thresholds and waited even when valid momentum
+    # opportunities were present. Keep hard security blocks and quote preflight.
+    if trader_mode:
+        threshold = {"AGGRESSIVE": 44.0, "DYNAMIC": 52.0, "TACTICAL": 55.0, "DEFENSIVE": 65.0}.get(mode, 52.0)
+    else:
+        threshold = {"AGGRESSIVE": 48.0, "DYNAMIC": 62.0, "TACTICAL": 65.0, "DEFENSIVE": 70.0}.get(mode, 62.0)
     regime, avg_change = _nkr_live_market_regime(prepared_rows)
     soft = 0.0
     if str(regime or "").upper() in {"GREEN", "RISK_ON", "BULL", "RISKON"} or avg_change >= 0.20:
@@ -44766,6 +44822,33 @@ def _resolve_exact_input_selector(vault, router, chain_id, cfg):
     # Backward-compatible helper for diagnostics and older callers.
     return _exact_input_selector_candidates(vault, router, chain_id, cfg)[0]
 
+def _nkr_entry_market_price_guard(amount_in_units: int, settlement_decimals: int,
+                                   quoted_out_units: int, asset_decimals: int,
+                                   reference_price_usd: float, *, max_deviation_bps: int = 250) -> dict:
+    """Fail closed on bad live *entry* routes, independently of Quoter slippage.
+
+    USD stablecoin is the CoreVault settlement. A market feed reference and an
+    executable DEX quote must agree; a tight minOut alone cannot detect a DEX pool
+    already quoting an expensive coin. Only ENTRY uses this check: risk EXITs must
+    remain possible even during data-provider failures or temporary depegs.
+    """
+    spend = int(amount_in_units) / (10 ** int(settlement_decimals))
+    quantity = int(quoted_out_units) / (10 ** int(asset_decimals))
+    reference = float(reference_price_usd or 0)
+    if not (0 < spend < 1e15 and quantity > 0 and math.isfinite(reference) and reference > 0):
+        raise RuntimeError("entry_market_reference_unavailable_or_invalid")
+    quote_value_usd = quantity * reference
+    divergence_bps = abs(quote_value_usd - spend) / spend * 10000.0
+    limit = max(50, min(500, int(max_deviation_bps)))
+    if not math.isfinite(divergence_bps) or divergence_bps > limit:
+        raise RuntimeError(
+            f"entry_market_price_divergence:deviationBps={divergence_bps:.1f}:"
+            f"limitBps={limit}:spendUsd={spend:.6f}:quotedAssetValueUsd={quote_value_usd:.6f}"
+        )
+    return {"deviationBps": round(divergence_bps, 2), "spendUsd": spend,
+            "quotedAssetValueUsd": quote_value_usd, "maxDeviationBps": limit}
+
+
 def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: str, token_out: str,
                           amount_in: int, *, action: str) -> dict:
     """Execute one live NKR entry or exit with direction-correct unit handling.
@@ -44904,9 +44987,36 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
 
     quote_in = _quote_token_for_router(cfg, token_in)
     quote_out = _quote_token_for_router(cfg, token_out)
-    quote = int(_privy_quote(cfg, quote_in, quote_out, amount_in, fee=fee))
+    # ENGINE-568: every live ENTRY must have a genuine executable quote and an
+    # independent USD market reference. EXIT stays on the established recovery path.
+    quote = int(_privy_quote(
+        cfg, quote_in, quote_out, amount_in, fee=fee,
+        best_fee=not is_exit, allow_pool_fallback=is_exit,
+    ))
     fee_used = int(cfg.get("_last_quote_fee") or fee or cfg.get("poolFee") or 3000)
-    slip = max(int(cfg.get("slippageBps") or 100), 200 if is_exit else 150)
+    if not is_exit:
+        reference_price = _safe_float((route or {}).get("market_reference_price_usd"), 0.0)
+        if reference_price <= 0:
+            raise RuntimeError("entry_market_reference_unavailable")
+        target_decimals = _nexus_wallet_swap_decimals(chain_id, token_out)
+        route_decimals = int((route or {}).get("decimals") or target_decimals)
+        if route_decimals != target_decimals:
+            raise RuntimeError(
+                f"entry_route_decimals_mismatch:route={route_decimals}:onchain={target_decimals}"
+            )
+        try:
+            max_market_dev_bps = int(os.getenv("NEXUS_ENTRY_MAX_MARKET_DEVIATION_BPS", "250"))
+        except (ValueError, TypeError):
+            max_market_dev_bps = 250
+        _nkr_entry_market_price_guard(
+            amount_in, int(settlement_cfg.get("decimals") or 0), quote,
+            target_decimals, reference_price, max_deviation_bps=max_market_dev_bps,
+        )
+    # Maximum 1.5% ENTRY execution slippage after independent price validation;
+    # do not tighten EXIT conditions, as liquidation/recovery must still work.
+    slip = max(int(cfg.get("slippageBps") or 100), 200 if is_exit else 50)
+    if not is_exit:
+        slip = min(150, slip)
     min_out = quote * (10_000 - slip) // 10_000
     if min_out <= 0:
         raise RuntimeError(f"quote_min_out_zero:action={mode}:quote={quote}:fee={fee_used}")
@@ -46472,9 +46582,10 @@ def _trader_live_slot_count(settings: dict, live_row: dict | None = None) -> int
     row = live_row if isinstance(live_row, dict) else {}
     meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
     vals = [
-        (settings or {}).get("traderSlots"), (settings or {}).get("slots"),
-        (settings or {}).get("maxCombinedSlots"), (settings or {}).get("max_combined_slots"),
-        row.get("trader_slots"), row.get("slots"), meta.get("trader_slots"), meta.get("slots"),
+        (settings or {}).get("traderSlots"), (settings or {}).get("slotCount"),
+        (settings or {}).get("slot_count"), (settings or {}).get("slots"),
+        row.get("trader_slots"), row.get("slotCount"), row.get("slots"),
+        meta.get("trader_slots"), meta.get("slotCount"), meta.get("slot_count"), meta.get("slots"),
     ]
     for v in vals:
         try:
@@ -46829,7 +46940,8 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
     except Exception:
         pass
     snapshots = {sym: _nkr_position_snapshot(vault, sid, route, cfg) for sym, route in routes.items()}
-    plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, settings)
+    plan_settings = {**(settings or {}), "_live_engine": engine_name}
+    plan = _nkr_live_portfolio_plan(market_rows, routes, budget_usd, plan_settings)
     targets = dict(plan["targetsUsd"])
     # ENGINE-391 Trader policy: one Strategist-selected asset per session, multiple
     # staggered slots/tranches of that SAME asset. NKR remains a one-position rotator.
@@ -46840,15 +46952,18 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             if int((_snap or {}).get("amount") or 0) > 0:
                 trader_locked_symbol = str(_sym or "").upper()
                 break
-        if not trader_locked_symbol:
-            _sel = list(plan.get("rankedCandidates") or plan.get("selected") or [])
-            trader_locked_symbol = str((_sel[0] or {}).get("symbol") or "").upper() if _sel else ""
         if trader_locked_symbol:
+            # Lock slots only after an actual on-chain position exists. Previously
+            # a merely ranked top candidate became a session-wide asset lock;
+            # if its quote/preflight failed, other viable candidates were rejected.
             targets = {str(k).upper(): (float(budget_usd) if str(k).upper() == trader_locked_symbol else 0.0) for k in routes.keys()}
             plan["targetsUsd"] = targets
             plan["maxActiveAssets"] = 1
             plan["traderAsset"] = trader_locked_symbol
-            plan["traderSlots"] = trader_slot_count
+        else:
+            ranked_trader = list(plan.get("rankedCandidates") or plan.get("selected") or [])
+            plan["traderAsset"] = str((ranked_trader[0] or {}).get("symbol") or "").upper() if ranked_trader else ""
+        plan["traderSlots"] = trader_slot_count
     # Preserve Build223's scale-adaptive, cost-aware trailing protection in the
     # direct live portfolio path. Peaks are stored on each active asset card.
     sessions_now, _, _ = _db_get_rotation_sessions(wallet)
@@ -47207,6 +47322,14 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             if int(time.time()) - last < entry_cooldown:
                 continue
         route = routes[sym]
+        if action in {"OPEN", "ADD"}:
+            # Exact-asset reference, independent of DEX quote; no cross-symbol fallback.
+            sym_key = str(sym or "").upper()
+            market_alias = {"BTCB": "BTC", "WBTC": "BTC", "CBBTC": "BTC",
+                            "WETH": "ETH", "WBNB": "BNB", "WMATIC": "POL", "MATIC": "POL"}.get(sym_key, sym_key)
+            market_row = row_by_symbol.get(sym_key) or row_by_symbol.get(market_alias) or {}
+            market_px = _nkr_row_price_usd(market_row) if market_row else 0.0
+            route = {**route, "market_reference_price_usd": market_px}
         settlement = _live_session_settlement_token(
             _norm_addr(live_row.get("vault_address") or cfg["vault"]),
             int(str(live_row.get("onchain_session_id") or "0")),
@@ -47486,7 +47609,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             # the next tick cannot create a second executeTrade.
             pre_submit_markers = (
                 "quoter_failed", "quoter_not_configured", "quoter_returned",
-                "quote_amount", "quote_min_out", "router_config_decode",
+                "quote_amount", "quote_min_out", "entry_market_", "entry_route_decimals_", "router_config_decode",
                 "live_trade_preflight_failed", "router_not_enabled",
                 "selector_not_allowed", "invalid_live_trade_addresses",
                 "goplus", "security", "blocked by", "owner_approval",
@@ -47508,7 +47631,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             # ranked candidate (DOGE, BNB, …) instead of hard-stopping the whole tick.
             skip_next = (
                 "quoter_failed", "quoter_not_configured", "quoter_returned",
-                "quote_amount", "quote_min_out", "router_config_decode",
+                "quote_amount", "quote_min_out", "entry_market_", "entry_route_decimals_", "router_config_decode",
                 "live_trade_preflight_failed", "router_not_enabled",
                 "selector_not_allowed", "invalid_live_trade_addresses",
                 "goplus", "security", "blocked by", "owner_approval",
