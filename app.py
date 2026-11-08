@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-569-SESSION-CLOCK-FIX";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD609-SESSION-CLOCK-FIX"
+BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-570-TRADER-INTRADAY-DIAG";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD610-HEADER-CONTROLS"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -5503,7 +5503,8 @@ def _binance_public_intelligence(symbols: list[str], force: bool = False,
 # ENGINE-528: early Strategist observations from closed Binance Spot 1m candles.
 # This is market intelligence inside the existing Strategist path, NOT a new worker,
 # Shadow mode, trade gate or autonomous order trigger. In particular these metrics
-# are intentionally not mapped to momentum_1m/5m/15m or relative_volume yet.
+# are not mapped to NKR scores; Trader may consume a independently checked,
+# fresh COPY of these observations for intraday candidate ranking (ENGINE-570).
 _NEXUS_EARLY_LOCK = threading.RLock()
 _NEXUS_EARLY_CACHE = {}  # one process, keyed by spot pair
 _NEXUS_EARLY_REQUESTS = []  # bounded upstream requests during trailing 60s
@@ -5875,8 +5876,9 @@ def _binance_enrich_market_rows(rows: list[dict]) -> list[dict]:
                 if "systemScore" in row:
                     row["systemScore"] = round(strategist_score, 4)
         out.append(row)
-    # Do existing live scoring FIRST. Early 1/5/15m observations are strictly
-    # appended afterwards and do not change NKR/Trader entry decisions.
+    # Do NKR-compatible live scoring FIRST. Early 1/5/15m observations are
+    # appended afterwards; NKR ignores them, Trader checks fresh copies when
+    # building its own candidate plan (ENGINE-570).
     scored = _nkr_prepare_strategist_signals(out)
     return _nexus_enrich_early_observations(scored)
 
@@ -44632,6 +44634,140 @@ def _nkr_session_observation_gate(live_row: dict, settings: dict, starts_at: int
     }
 
 
+# ENGINE-570: Trader-only, nonblocking short-horizon observations. NKR remains unchanged.
+# This data is CONTEXT to the Trader Strategist; it never bypasses contract security,
+# quote/preflight, slippage, liquidity, available-budget or session-state guards.
+_TRADER_EARLY_MAX_ROUTES_PER_TICK = 6
+_TRADER_EARLY_MAX_CANDLE_AGE_SEC = 150
+_TRADER_EARLY_MAX_REFERENCE_PRICE_GAP_PCT = 2.0
+
+
+def _trader_live_intraday_rows(rows: list, routes: dict) -> tuple[list, dict]:
+    """Enrich only Trader candidate copies with fresh, corroborated spot candles.
+
+    Never block an on-chain tick on HTTP: the shared sampler returns cached values
+    and schedules a bounded background fetch on cache miss. A sample from a ticker
+    alone is not an execution price, and is rejected if far from the market row.
+    Existing named signals always win over the auxiliary spot observation.
+    """
+    out = list(rows or [])
+    diagnostic = {"enabled": bool(NEXUS_EARLY_ENABLED), "sampled": 0, "applied": 0,
+                  "unavailable": 0, "rejected": {}, "signalSymbols": []}
+    if not NEXUS_EARLY_ENABLED or not out:
+        return out, diagnostic
+    route_symbols = {str(k or "").upper() for k, v in (routes or {}).items()
+                     if isinstance(v, dict) and v.get("live")}
+    aliases = {"WBTC":"BTC", "CBBTC":"BTC", "BTCB":"BTC", "WETH":"ETH",
+               "WBNB":"BNB", "WMATIC":"POL", "MATIC":"POL"}
+    evaluated = 0
+    for index, original in enumerate(out):
+        if evaluated >= _TRADER_EARLY_MAX_ROUTES_PER_TICK:
+            break
+        if not isinstance(original, dict):
+            continue
+        symbol = str(original.get("symbol") or original.get("sym") or "").upper()
+        if symbol not in route_symbols and not any(aliases.get(k) == symbol for k in route_symbols):
+            continue
+        price = _nkr_row_price_usd(original)
+        if not (0 < price < float("inf")):
+            continue
+        evaluated += 1
+        reference = aliases.get(symbol, symbol)
+        if not re.fullmatch(r"[A-Z0-9]{2,16}", reference):
+            continue
+        pair = reference + "USDT"
+        sample = original.get("strategistEarlyObservation")
+        if not isinstance(sample, dict) or str(sample.get("pair") or pair).upper() != pair:
+            sample = _nexus_early_nonblocking_pair(pair)
+        # A cached pending/stale row is not used. Try refreshing it asynchronously
+        # (the helper itself rate-limits and never blocks on network requests).
+        if not isinstance(sample, dict) or not sample.get("available"):
+            if isinstance(sample, dict) and sample.get("reason") not in ("pending", "async_capacity"):
+                _nexus_early_nonblocking_pair(pair)
+            diagnostic["unavailable"] += 1
+            continue
+        now = int(time.time())
+        try:
+            closed_ts = int(sample.get("lastClosedTs") or 0)
+            age = now - closed_ts
+            sample_price = float(sample.get("priceClosed") or 0)
+            gap_pct = abs(sample_price / price - 1.0) * 100.0
+            vals = [float(sample[k]) for k in
+                    ("momentum1mPct", "momentum5mPct", "momentum15mPct", "rvol5m", "takerBuyShare5mPct")]
+        except (TypeError, ValueError, KeyError, OverflowError, ZeroDivisionError):
+            diagnostic["rejected"][symbol] = "invalid_sample"
+            continue
+        if not (0 <= age <= _TRADER_EARLY_MAX_CANDLE_AGE_SEC
+                and all(math.isfinite(v) for v in vals + [sample_price, gap_pct])
+                and sample_price > 0 and gap_pct <= _TRADER_EARLY_MAX_REFERENCE_PRICE_GAP_PCT
+                and 0 <= vals[4] <= 100 and vals[3] > 0):
+            diagnostic["rejected"][symbol] = ("stale_sample" if age < 0 or age > _TRADER_EARLY_MAX_CANDLE_AGE_SEC
+                                               else "market_price_divergence" if gap_pct > _TRADER_EARLY_MAX_REFERENCE_PRICE_GAP_PCT
+                                               else "invalid_sample")
+            continue
+        signal = dict(original.get("signals") or {})
+        additions = {"momentum_1m": vals[0], "momentum_5m": vals[1],
+                     "momentum_15m": vals[2], "relative_volume": vals[3]}
+        changed = []
+        for key, value in additions.items():
+            if signal.get(key) is None:
+                signal[key] = value
+                changed.append(key)
+        diagnostic["sampled"] += 1
+        if not changed:
+            continue
+        row = dict(original)
+        row["signals"] = signal
+        row["trader_shortterm_evidence"] = {
+            "source": "binance_spot_closed_1m_klines", "pair": pair,
+            "ageSec": age, "marketPriceGapPct": round(gap_pct, 3),
+            "takerBuyShare5mPct": vals[4], "rvol5m": vals[3],
+            "appliedFields": changed, "usedForTraderScore": True,
+            "note": "Context only: DEX quote and contract security remain authoritative",
+        }
+        out[index] = row
+        diagnostic["applied"] += 1
+        diagnostic["signalSymbols"].append(symbol)
+    return out, diagnostic
+
+
+def _trader_live_entry_gate(row: dict, threshold: float, mode: str, *, diagnostic=False) -> dict:
+    """Trader-specific scorer: absent confidence is unknown, not a zero vote.
+
+    Strong momentum is never an automatic BUY; retain the exact NKR hard-block
+    rules, threshold and directional momentum gate, followed by existing on-chain
+    security and route preflight checks.
+    """
+    quality = _nkr_live_shadow_quality(row, mode)
+    signals = _nkr_live_full_signal_vector(row)
+    prior_conf = signals.get("confidence")
+    confidence_missing = prior_conf is None or str(prior_conf).strip() == ""
+    score = _nkr_session_score({"score": (row.get("score") or row.get("systemScore")
+                                               or row.get("ratingScore") or 0), "mode": mode}, row)
+    # Only reweight when *both* actual confidence and inferred confirmed
+    # momentum confidence are unavailable. Otherwise retain canonical scoring.
+    if confidence_missing and _safe_float(quality.get("confidence"), 0.0) <= 0:
+        legacy = _safe_float(row.get("score") or row.get("systemScore")
+                             or row.get("strategistPerformanceScore") or 0, 0.0)
+        if legacy <= 0:
+            legacy = max(35.0, min(90.0, 55.0 + _nkr_row_change_pct(row) * 3.0))
+        score = max(0.0, min(100.0,
+                        (0.70 * _safe_float(quality.get("shadow_score"), 50.0) + 0.20 * legacy) / 0.90))
+    momentum = _safe_float(quality.get("momentum_score"), 0.0)
+    recovery = _safe_float(quality.get("recovery_momentum_score"), 0.0)
+    hard = bool(quality.get("hard_block"))
+    allowed = not hard and score >= float(threshold) and (momentum >= -6.0 or recovery >= 55.0)
+    reason = ("SHADOW_HARD_BLOCK" if hard else
+              "FULL_SIGNAL_SCORE_BLOCKED" if score < threshold else
+              "FULL_SIGNAL_MOMENTUM_BLOCKED" if momentum < -6 and recovery < 55 else "PASSED")
+    if not diagnostic:
+        _nexus_signal_audit_record("STRATEGIST_TRADER", row.get("symbol") or row.get("sym") or "",
+                                   quality.get("signal_vector"), "ALLOW" if allowed else reason)
+    return {"allowed": bool(allowed), "reason": reason, "score": round(float(score), 4),
+            "threshold": float(threshold), "confidenceMissing": bool(confidence_missing),
+            "quality": quality}
+
+
 def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: float, settings: dict) -> dict:
     """Build the live NKR plan as a single-position rotator.
 
@@ -44649,6 +44785,10 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         and "strategist_live_quality" in r for r in prepared_rows
     ):
         prepared_rows = _nkr_prepare_strategist_signals(prepared_rows)
+    trader_mode = str((settings or {}).get("_live_engine") or "NKR").upper() == "TRADER"
+    trader_signal_diag = {}
+    if trader_mode:
+        prepared_rows, trader_signal_diag = _trader_live_intraday_rows(prepared_rows, routes)
     row_by_symbol = {str(r.get("symbol") or r.get("sym") or "").upper(): r for r in prepared_rows if isinstance(r, dict)}
     alias_to_display = {
         "WBTC": "BTC", "CBBTC": "BTC", "BTCB": "BTC",
@@ -44658,7 +44798,6 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
     # Current NKR architecture: one open position per chain/session.  The value from
     # old capital-allocation settings must not silently create multiple live slots.
     max_active = 1
-    trader_mode = str((settings or {}).get("_live_engine") or "NKR").upper() == "TRADER"
     # ENGINE-568: Trader is a short-horizon multi-slot engine. Previously it
     # inherited NKR rotation thresholds and waited even when valid momentum
     # opportunities were present. Keep hard security blocks and quote preflight.
@@ -44675,6 +44814,8 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
     effective_threshold = max(42.0 if mode == "AGGRESSIVE" else 48.0, threshold - soft)
 
     ranked = []
+    entry_rejections = []  # TRACE ONLY, bounded in the returned plan
+    evaluated_live_routes = 0
     for sym, route in (routes or {}).items():
         if not isinstance(route, dict) or not route.get("live"):
             continue
@@ -44690,7 +44831,15 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         change = _nkr_row_change_pct(row)
         if price <= 0:
             continue
-        score = _nkr_session_score({"score": row.get("score") or row.get("systemScore") or row.get("ratingScore") or 0}, row)
+        evaluated_live_routes += 1
+        gate = (_trader_live_entry_gate(row, effective_threshold, mode)
+                if trader_mode else _nkr_live_entry_gate(row, effective_threshold, mode))
+        score = float(gate.get("score") or 0.0)
+        if trader_mode and not gate.get("allowed") and len(entry_rejections) < 8:
+            entry_rejections.append({"asset": str(sym).upper(), "reason": gate.get("reason"),
+                                     "score": round(score, 2), "threshold": round(effective_threshold, 2),
+                                     "momentum": _safe_float((gate.get("quality") or {}).get("momentum_score"), 0.0),
+                                     "confidenceMissing": bool(gate.get("confidenceMissing"))})
         # Shadow-style confirmations: quality signals improve ordering but never
         # manufacture an entry when the base gate is not met.
         short_momentum = _safe_float(
@@ -44704,7 +44853,7 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         # Small deterministic tie-breaker, capped so 24h score remains primary.
         rank_bonus = max(-4.0, min(4.0, short_momentum * 0.8 + rel * 0.25 + (1.0 if rvol >= 1.5 else 0.0)))
         ranked_score = max(0.0, min(100.0, score + rank_bonus))
-        gate = _nkr_live_entry_gate(row, effective_threshold, mode)
+        # Preserve existing NKR audit behavior, and keep the Trader audit isolated.
         if not gate.get("allowed"):
             continue
         shadow_q = gate.get("quality") or {}
@@ -44757,6 +44906,10 @@ def _nkr_live_portfolio_plan(market_rows: list[dict], routes: dict, budget_usd: 
         "mode": mode, "regime": regime, "avgChange": avg_change,
         "maxActiveAssets": 1, "singlePosition": True,
         "selected": selected, "rankedCandidates": selected,
+        "entryDiagnostics": ({"routesEvaluated": evaluated_live_routes,
+                              "routesRejected": entry_rejections,
+                              "shortTerm": trader_signal_diag,
+                              "effectiveThreshold": round(effective_threshold, 2)} if trader_mode else {}),
         "targetsUsd": targets, "investUsd": invest_usd,
         "reserveUsd": max(0.0, budget_usd - invest_usd), "release": release,
         "strategistIntent": {"decision": decision,
@@ -47742,6 +47895,20 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             f"No executable candidate cleared the {mode} strategist gate on this chain "
             f"(score, momentum, route and quote required). Reserve ${plan['reserveUsd']:.2f}."
         )
+        if engine_name == "TRADER":
+            trace = plan.get("entryDiagnostics") or {}
+            rejected = list(trace.get("routesRejected") or [])
+            short = trace.get("shortTerm") or {}
+            if rejected:
+                top = sorted(rejected, key=lambda r: float(r.get("score") or 0), reverse=True)[:3]
+                detail += " Trader blocked: " + "; ".join(
+                    f"{r['asset']} {r['reason']} score {r['score']:.1f}/{r['threshold']:.0f}"
+                    for r in top)
+            elif int(trace.get("routesEvaluated") or 0) == 0:
+                detail += " Trader blocked: no live routed asset with valid market price."
+            else:
+                detail += " Trader blocked: no confirmed signal passed."
+            detail += f"; short-term candles {int(short.get('applied') or 0)} applied, {int(short.get('unavailable') or 0)} unavailable."
         gate = "WAITING_ENTRY"
         decision = "WAIT"
     elif settlement_cash < int(round(0.20 * (10 ** max(0, min(18, int(_dec if "_dec" in dir() else 6)))))):
@@ -47799,6 +47966,7 @@ def _nkr_live_execute_portfolio(wallet: str, live_row: dict, market_rows: list[d
             "grossProfitUsd": live_gross, "costsUsd": live_costs, "netProfitUsd": live_net,
             "detail": detail,
             "error": last_skip or "",
+            "entryDiagnostics": plan.get("entryDiagnostics") if engine_name == "TRADER" else {},
             "plan": {"investUsd": plan["investUsd"], "reserveUsd": plan["reserveUsd"], "targetsUsd": targets, "selected": [x.get("symbol") for x in sel], "strategistIntent": plan.get("strategistIntent")}}
 
 def _nkr_live_execute_existing_eth_route(wallet: str, live_row: dict, market_rows: list[dict], settings: dict, decision_session: dict | None = None) -> dict:
