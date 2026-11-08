@@ -186,8 +186,8 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-571-HISTORY-FIX";
-FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD611-ENGINE-HISTORY-FIX"
+BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-572-RECEIPT-HISTORY-AUDIT";
+FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
 SHADOW_ENTRY_MODE = "FRESH_PRICE_TICK_WITH_RECOVERY_AMOUNT_FIX"
@@ -52242,6 +52242,17 @@ def _engine_history_record(wallet, engine, event_type, **fields):
     event_key = str(fields.get("eventKey") or fields.get("event_key") or "").strip()[:240]
     if not event_key:
         event_key = f"{eng}:{chain}:{sid}:{event_type}:{asset}:{tx or now_i}"[:240]
+    # Preserve an explicitly recorded zero; missing measurements must remain null.
+    def measured(*keys):
+        for key in keys:
+            value = fields.get(key)
+            if value is not None and str(value).strip() != "":
+                try:
+                    result = float(value)
+                    return result if math.isfinite(result) else None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+        return None
     payload = {
         "engine": eng,
         "eventKey": event_key,
@@ -52253,13 +52264,13 @@ def _engine_history_record(wallet, engine, event_type, **fields):
         "symbol": asset,
         "side": str(fields.get("side") or fields.get("action") or event_type).upper(),
         "action": str(fields.get("action") or event_type).upper(),
-        "priceUsd": float(fields.get("priceUsd") or fields.get("price") or 0) or 0,
-        "quantity": float(fields.get("quantity") or fields.get("qty") or 0) or 0,
-        "budgetUsd": float(fields.get("budgetUsd") or fields.get("amountUsd") or 0) or 0,
-        "amountUsd": float(fields.get("amountUsd") or fields.get("budgetUsd") or 0) or 0,
-        "grossUsd": float(fields.get("grossUsd") or 0) or 0,
-        "costsUsd": float(fields.get("costsUsd") or 0) or 0,
-        "netUsd": float(fields.get("netUsd") or 0) or 0,
+        "priceUsd": measured("priceUsd", "price"),
+        "quantity": measured("quantity", "qty"),
+        "budgetUsd": measured("budgetUsd", "amountUsd"),
+        "amountUsd": measured("amountUsd", "budgetUsd"),
+        "grossUsd": measured("grossUsd"),
+        "costsUsd": measured("costsUsd"),
+        "netUsd": measured("netUsd"),
         "reason": str(fields.get("reason") or fields.get("detail") or "")[:400],
         "txHash": tx,
         "sessionId": sid,
@@ -52383,6 +52394,70 @@ def api_nexus_engine_history_get():
         pass  # Legacy history remains readable even if operation tables are absent.
     events.sort(key=lambda x: int(x.get('ts') or 0), reverse=True)
     events = events[:limit]
+    # BUILD572: opt-in, read-only, bounded receipt verification. No RPC calls
+    # on periodic history polling. Preserve unverified state on RPC errors.
+    if str(request.args.get("verify") or "") == "1":
+        verified_count = 0
+        seen_tx = set()
+        for item in events:
+            if verified_count >= 8:
+                break
+            tx = str(item.get("txHash") or "")
+            cid = {"ETH":1,"BNB":56,"POL":137}.get(str(item.get("chain") or "").upper())
+            if not cid or not re.fullmatch(r"0x[0-9a-fA-F]{64}",tx) or (cid,tx.lower()) in seen_tx:
+                continue
+            seen_tx.add((cid,tx.lower()))
+            verified_count += 1
+            try:
+                receipt = _rpc_call(cid,"eth_getTransactionReceipt",[tx])
+                if not isinstance(receipt,dict):
+                    item["receiptStatus"] = "PENDING_OR_UNAVAILABLE"
+                    continue
+                status = int(str(receipt.get("status") or "0x0"),16)
+                item["receiptStatus"] = "CONFIRMED" if status == 1 else "FAILED"
+                item["onchainConfirmed"] = status == 1
+                item["blockNumber"] = int(str(receipt.get("blockNumber") or "0x0"),16)
+                gas_units = int(str(receipt.get("gasUsed") or "0x0"),16)
+                price_wei = int(str(receipt.get("effectiveGasPrice") or "0x0"),16)
+                if gas_units and price_wei:
+                    item["gasUsedNative"] = format(gas_units * price_wei / 1e18,".12g")
+                # Read exact TradeExecuted raw amounts only. These values are
+                # NOT USD and never imply a realized P&L or a valid swap price.
+                trades = []
+                if status == 1:
+                    for log in (receipt.get("logs") or []):
+                        if not isinstance(log,dict):
+                            continue
+                        topics = log.get("topics") or []
+                        if len(topics) < 4 or str(topics[0]).lower() != _NKR_TRADE_EXECUTED_TOPIC.lower():
+                            continue
+                        words = str(log.get("data") or "").removeprefix("0x")
+                        if len(words) < 192:
+                            continue
+                        sid = str(item.get("sessionId") or "")
+                        try:
+                            log_sid = int(str(topics[1]),16)
+                            if sid.isdigit() and int(sid) != log_sid:
+                                continue
+                            trades.append({"sessionId":str(log_sid),
+                              "tokenIn":"0x"+str(topics[3])[-40:].lower(),
+                              "tokenOut":"0x"+words[:64][-40:].lower(),
+                              "amountInRaw":str(int(words[64:128],16)),
+                              "amountOutRaw":str(int(words[128:192],16))})
+                        except (ValueError,TypeError):
+                            continue
+                if trades:
+                    item["tradeExecutedRaw"] = trades
+            except Exception:
+                item["receiptStatus"] = "RPC_UNAVAILABLE"
+        # Apply the verified fields to duplicate representations of the same tx.
+        by_tx = {(str(e.get("chain") or "").upper(),str(e.get("txHash") or "").lower()):e
+                 for e in events if e.get("receiptStatus")}
+        for item in events:
+            other = by_tx.get((str(item.get("chain") or "").upper(),str(item.get("txHash") or "").lower()))
+            if other and other is not item:
+                for key in ("receiptStatus","onchainConfirmed","blockNumber","gasUsedNative","tradeExecutedRaw"):
+                    if key in other: item[key] = other[key]
     return jsonify({"status":"ok","wallet":_norm_addr(wa),"engine":engine,"events":events,"count":len(events),
         "historyScope":"RECORDED_BACKEND_AND_CLIENT_EVENTS_NOT_FULL_CHAIN_INDEX", "ts":now_ts()})
 
