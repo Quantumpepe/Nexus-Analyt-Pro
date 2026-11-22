@@ -1,0 +1,96 @@
+name: Apply Compare asset identity fix (backend)
+on:
+  push:
+    branches: [fix/compare-asset-identity-20261122]
+    paths: [.github/workflows/apply-asset-identity-fix.yml]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Apply targeted patch
+        shell: bash
+        run: |
+          cat > /tmp/nexus_fix.py <<'PY'
+          from pathlib import Path
+          p = Path("app.py")
+          s = p.read_text()
+          def replace_once(a,b):
+              global s
+              n=s.count(a)
+              if n != 1:
+                  raise SystemExit(f"Expected exactly one match, got {n}: {a[:100]!r}")
+              s=s.replace(a,b,1)
+          
+          replace_once(
+          "def _get_series_for_symbol(sym: str, days: int):",
+          "def _get_series_for_symbol(sym: str, days: int, coin_id: str = \"\"):")
+          replace_once(
+          "    if not sym_u or days_i <= 0:\n        return []\n\n    # 1) CryptoCompare daily closes",
+          """    if not sym_u or days_i <= 0:
+                  return []
+          
+              # Compare: a specific selected asset must never be substituted by a ticker
+              # collision at CryptoCompare or by a best-ranked CoinGecko search result.
+              if coin_id:
+                  try:
+                      data = _cg_market_chart_usd(str(coin_id).strip(), days=days_i) or {}
+                      out = []
+                      for point in (data.get("prices") or []):
+                          try:
+                              ts, px = int(point[0]), float(point[1])
+                              if ts > 0 and math.isfinite(px) and px > 0:
+                                  out.append([ts, px])
+                          except (TypeError, ValueError, IndexError):
+                              continue
+                      return out
+                  except Exception:
+                      return []
+          
+              # 1) CryptoCompare daily closes""")
+          replace_once(
+          "        symbols = [s.strip().upper() for s in symbols_raw.split(\",\") if s.strip()]\n\n        # Fast shared response cache",
+          """        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+                  # Symbol is display metadata, not an asset identity. Respect the user's
+                  # explicitly selected CoinGecko ID (as persisted in the Watchlist).
+                  try:
+                      ids_payload = json.loads(request.args.get("ids", "{}") or "{}")
+                      if not isinstance(ids_payload, dict):
+                          ids_payload = {}
+                  except (TypeError, ValueError):
+                      ids_payload = {}
+                  coin_ids = {}
+                  for sym in symbols:
+                      cid = str(ids_payload.get(sym) or "").strip().lower()
+                      if cid and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,150}", cid):
+                          coin_ids[sym] = cid
+          
+                  # Fast shared response cache""")
+          replace_once(
+          "        compare_cache_key = f\"{','.join(symbols)}:{range_key}\"",
+          "        compare_cache_key = f\"asset-id-v2:{','.join(sym + '=' + coin_ids.get(sym, '') for sym in symbols)}:{range_key}\"")
+          replace_once(
+          "                series = _get_series_for_symbol(sym, days) or []",
+          "                series = _get_series_for_symbol(sym, days, coin_ids.get(sym, \"\")) or []")
+          replace_once(
+          "            if cid not in snaps_by_id:\n                try:\n                    p = _price_multi(sym)",
+          "            if cid not in snaps_by_id and not (it.get(\"id\") or it.get(\"coingecko_id\")):\n                try:\n                    p = _price_multi(sym)")
+          p.write_text(s)
+          print("Backend Compare identity patch applied; exact-id history bypasses ticker-only providers.")
+          
+          PY
+          python3 /tmp/nexus_fix.py
+          python3 -m py_compile app.py
+      - name: Commit changes to fix branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py
+          git diff --cached --check
+          git commit -m "Fix Compare histories for explicit asset IDs"
+          git push origin HEAD:fix/compare-asset-identity-20261122
