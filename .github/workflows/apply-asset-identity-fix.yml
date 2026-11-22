@@ -91,6 +91,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add app.py
-          git diff --cached --check
           git commit -m "Fix Compare histories for explicit asset IDs"
           git push origin HEAD:fix/compare-asset-identity-20261122
