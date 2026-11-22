@@ -18243,7 +18243,7 @@ def api_watchlist_snapshot():
                         snaps_by_id[cid] = snap1
                 except Exception:
                     pass
-            if cid not in snaps_by_id:
+            if cid not in snaps_by_id and not (it.get("id") or it.get("coingecko_id")):
                 try:
                     p = _price_multi(sym)
                     if isinstance(p, dict) and p.get("price") not in (None, "", 0):
@@ -18465,7 +18465,7 @@ def _daily_close(points):
         by_day[day] = [ts, px]  # overwrite => last point of day (close)
     return [by_day[k] for k in sorted(by_day.keys())]
 
-def _get_series_for_symbol(sym: str, days: int):
+def _get_series_for_symbol(sym: str, days: int, coin_id: str = ""):
     """
     Returns list[[ts_ms, price_usd], ...] for the last N days.
 
@@ -18480,6 +18480,23 @@ def _get_series_for_symbol(sym: str, days: int):
         days_i = 0
     if not sym_u or days_i <= 0:
         return []
+
+    # Compare: a specific selected asset must never be substituted by a ticker
+    # collision at CryptoCompare or by a best-ranked CoinGecko search result.
+    if coin_id:
+        try:
+            data = _cg_market_chart_usd(str(coin_id).strip(), days=days_i) or {}
+            out = []
+            for point in (data.get("prices") or []):
+                try:
+                    ts, px = int(point[0]), float(point[1])
+                    if ts > 0 and math.isfinite(px) and px > 0:
+                        out.append([ts, px])
+                except (TypeError, ValueError, IndexError):
+                    continue
+            return out
+        except Exception:
+            return []
 
     # 1) CryptoCompare daily closes
     try:
@@ -18551,10 +18568,23 @@ def api_compare():
             days = _range_to_days(range_key)
 
         symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        # Symbol is display metadata, not an asset identity. Respect the user's
+        # explicitly selected CoinGecko ID (as persisted in the Watchlist).
+        try:
+            ids_payload = json.loads(request.args.get("ids", "{}") or "{}")
+            if not isinstance(ids_payload, dict):
+                ids_payload = {}
+        except (TypeError, ValueError):
+            ids_payload = {}
+        coin_ids = {}
+        for sym in symbols:
+            cid = str(ids_payload.get(sym) or "").strip().lower()
+            if cid and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,150}", cid):
+                coin_ids[sym] = cid
 
         # Fast shared response cache for normal page loads. Explicit refresh with `_` or `force`
         # continues to rebuild data; trading/Strategist pathways are not involved.
-        compare_cache_key = f"{','.join(symbols)}:{range_key}"
+        compare_cache_key = f"asset-id-v2:{','.join(sym + '=' + coin_ids.get(sym, '') for sym in symbols)}:{range_key}"
         force_compare = str(request.args.get("force") or request.args.get("refresh") or request.args.get("_") or "").strip() not in ("", "0", "false", "False")
         if not force_compare and len(symbols) >= 2:
             fresh_compare = _cache_get_fresh(_COMPARE_CACHE, compare_cache_key, min(_COMPARE_TTL_SEC, 90))
@@ -18583,7 +18613,7 @@ def api_compare():
         # per symbol). Parallelism only affects this read-only Compare endpoint.
         def _load_compare_symbol(sym):
             try:
-                series = _get_series_for_symbol(sym, days) or []
+                series = _get_series_for_symbol(sym, days, coin_ids.get(sym, "")) or []
                 try:
                     dc = _daily_close(series)
                     daily = dc[-(days + 2):] if days and len(dc) > (days + 2) else dc
