@@ -1,0 +1,1 @@
+Temporary GitHub connector write-permission check. No app logic changed.
