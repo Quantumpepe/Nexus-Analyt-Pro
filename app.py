@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-574-NKR-TRADER-TRADE-IDEMPOTENCY";
+BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-575-GRID-LEGACY-RECONCILIATION";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27297,6 +27297,173 @@ def _grid_swap_journal(operation_key, *, create=None, broadcast_hash=None):
         conn.close()
 
 
+_GRID_LEGACY_LOOKUP_CACHE = {}
+
+
+def _grid_legacy_privy_lookup(chain_id, wallet_id, reference, token_in, settlement):
+    """Read-only lookup of the original Privy request via its transaction history.
+
+    Absence from the history is NOT proof of failure. No retry is authorized by
+    an empty response, a timeout, a provider error or a pending transaction.
+    The documented wallet-history and transaction-ID GET endpoints are used.
+    """
+    cid = int(chain_id)
+    chain = {1: "ethereum", 56: "bnb-smart-chain", 137: "polygon"}.get(cid)
+    if not chain or not wallet_id or not reference:
+        return {"status": "LOOKUP_UNAVAILABLE"}
+    cache_key = (cid, str(wallet_id), str(reference))
+    now = time.time()
+    cached = _GRID_LEGACY_LOOKUP_CACHE.get(cache_key)
+    if cached and now - cached[0] < 90:
+        return dict(cached[1])
+    answer = {"status": "NOT_OBSERVED"}
+    try:
+        cfg = _privy_trading_cfg(cid)
+        if not cfg.get("appId") or not cfg.get("appSecret"):
+            raise RuntimeError("credentials_missing")
+        auth = (cfg["appId"], cfg["appSecret"])
+        headers = {"privy-app-id": cfg["appId"], "Accept": "application/json"}
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", str(wallet_id)):
+            raise RuntimeError("wallet_id_invalid")
+        history_url = f"{_PRIVY_TRADING_API}/v1/wallets/{wallet_id}/transactions"
+        ids = set()
+        rows = []
+        for asset in dict.fromkeys((token_in, settlement)):
+            res = requests.get(history_url, params={"chain": chain, "token": asset, "limit": 25},
+                               headers=headers, auth=auth, timeout=(3, 5))
+            if res.status_code != 200:
+                raise RuntimeError(f"history_http_{res.status_code}")
+            payload = res.json()
+            batch = payload.get("transactions") if isinstance(payload, dict) else None
+            if not isinstance(batch, list):
+                raise RuntimeError("history_schema_unknown")
+            rows.extend(batch)
+        # Direct reference matches can be used if the provider includes them.
+        # Otherwise inspect the newest Privy transaction IDs, in a bounded batch.
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            tid = str(row.get("privy_transaction_id") or "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", tid) or tid in ids:
+                continue
+            ids.add(tid)
+            if len(ids) > 8:
+                break
+            res = requests.get(f"{_PRIVY_TRADING_API}/v1/transactions/{tid}",
+                               headers=headers, auth=auth, timeout=(3, 5))
+            if res.status_code != 200:
+                raise RuntimeError(f"transaction_http_{res.status_code}")
+            data = res.json()
+            if not isinstance(data, dict):
+                raise RuntimeError("transaction_schema_unknown")
+            if str(data.get("reference_id") or "") != reference:
+                continue
+            if str(data.get("wallet_id") or "") != str(wallet_id) or str(data.get("caip2") or "") != f"eip155:{cid}":
+                raise RuntimeError("reference_identity_mismatch")
+            answer = {"status": str(data.get("status") or "UNKNOWN").upper(),
+                      "txHash": str(data.get("transaction_hash") or ""), "transactionId": tid}
+            break
+    except Exception as exc:
+        answer = {"status": "LOOKUP_UNAVAILABLE", "detail": str(exc)[:100]}
+    if len(_GRID_LEGACY_LOOKUP_CACHE) >= 256:
+        _GRID_LEGACY_LOOKUP_CACHE.clear()
+    _GRID_LEGACY_LOOKUP_CACHE[cache_key] = (now, dict(answer))
+    return answer
+
+
+def _grid_legacy_reconcile(wallet, chain_id, vault, order_id, token_in, settlement, amount, prior):
+    """Reconcile a legacy swap without sending anything. Only a matching mined
+    success is imported. A mined revert permits a tightly scoped retry only
+    after checking the retained funding and current wallet state. Unknown
+    outcomes stay blocked, including a mere absence from Privy history.
+    """
+    txs = dict(prior or {})
+    ref = "grid-519-" + hashlib.sha256(
+        f"{wallet.lower()}:{chain_id}:{vault.lower()}:{order_id}:swap".encode()).hexdigest()[:44]
+    txs.update(legacySwapPending=True, uncertainStep="swap", uncertainReference=ref)
+    if not all(txs.get(k) is not None for k in ("withdraw", "amountIn", "minOut", "poolFee", "prePayoutUnits")):
+        return txs, "grid_legacy_funding_evidence_missing"
+    if int(txs["amountIn"]) != int(amount) or int(amount) <= 0:
+        return txs, "grid_legacy_amount_mismatch"
+    if _norm_addr(txs.get("payoutToken") or "").lower() != _norm_addr(settlement).lower():
+        return txs, "grid_legacy_payout_token_mismatch"
+    wallet_id = str(_privy_wallet_id_for_user(wallet) or "")
+    info = _grid_legacy_privy_lookup(chain_id, wallet_id, ref, token_in, settlement)
+    status = str(info.get("status") or "UNKNOWN")
+    txs["legacyPrivyStatus"] = status
+    if info.get("transactionId"):
+        txs["legacyPrivyTransactionId"] = info["transactionId"]
+    if info.get("detail"):
+        txs["legacyPrivyLookupDetail"] = info["detail"]
+    txh = str(info.get("txHash") or "")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{64}", txh):
+        return txs, f"grid_legacy_privy_{status.lower()}:ref={ref}"
+    txs["legacyPrivyTxHash"] = txh
+    if status not in ("CONFIRMED", "FINALIZED", "EXECUTION_REVERTED"):
+        return txs, f"grid_legacy_privy_{status.lower()}:ref={ref}"
+    try:
+        tx = _rpc_call(chain_id, "eth_getTransactionByHash", [txh])
+        rc = _rpc_call(chain_id, "eth_getTransactionReceipt", [txh])
+        if not isinstance(tx, dict) or not isinstance(rc, dict) or not rc.get("blockNumber"):
+            raise RuntimeError("receipt_missing")
+        router = _norm_addr(_privy_trading_cfg(chain_id).get("router") or "")
+        if _norm_addr(tx.get("from")).lower() != wallet.lower() or _norm_addr(tx.get("to")).lower() != router.lower():
+            raise RuntimeError("swap_identity_mismatch")
+        data = str(tx.get("input") or "").lower()
+        sel = data[:10]
+        if sel == _PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR.lower():
+            deadline = int(data[10+4*64:10+5*64], 16)
+        elif sel == _PRIVY_EXACT_INPUT_SINGLE_SELECTOR.lower():
+            deadline = 0
+        else:
+            raise RuntimeError("swap_selector_mismatch")
+        expected = _router_exact_input_single_data(sel, token_in, settlement, wallet, int(amount),
+                     int(txs.get("legacyOriginalMinOut") or txs["minOut"]),
+                     int(txs.get("legacyOriginalPoolFee") or txs["poolFee"]), deadline).lower()
+        if expected != data or _try_parse_int(tx.get("value")) != 0:
+            raise RuntimeError("swap_calldata_mismatch")
+        if str(rc.get("transactionHash") or "").lower() != txh.lower():
+            raise RuntimeError("receipt_hash_mismatch")
+        if rc.get("status") not in (0, 1, "0x0", "0x1", "0", "1"):
+            raise RuntimeError("receipt_status_missing")
+        receipt_status = _try_parse_int(rc.get("status"))
+        if status == "EXECUTION_REVERTED" and receipt_status == 0:
+            txs["legacyOriginalMinOut"] = str(txs.get("legacyOriginalMinOut") or txs["minOut"])
+            txs["legacyOriginalPoolFee"] = str(txs.get("legacyOriginalPoolFee") or txs["poolFee"])
+            txs["legacyRecoveryProof"] = txh
+            txs.pop("uncertainStep", None)
+            txs.pop("uncertainReference", None)
+            txs.pop("legacySwapPending", None)
+            return txs, "grid_legacy_swap_reverted_verified_retry_eligible"
+        if status not in ("CONFIRMED", "FINALIZED") or receipt_status != 1:
+            raise RuntimeError("status_mismatch")
+        # Require proof that the exact input and at least the original minimum
+        # output actually changed hands in this transaction, not merely a hash.
+        transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        wallet_word = "0x" + _addr_to_32(wallet).lower()
+        spent = received = 0
+        for log in rc.get("logs") or []:
+            topics = [str(t).lower() for t in (log.get("topics") or [])]
+            if len(topics) != 3 or topics[0] != transfer_topic:
+                continue
+            value = int(str(log.get("data") or "0x0"), 16)
+            addr = _norm_addr(log.get("address") or "").lower()
+            if addr == token_in.lower() and topics[1] == wallet_word:
+                spent += value
+            if addr == settlement.lower() and topics[2] == wallet_word:
+                received += value
+        if spent != int(amount) or received < int(txs["minOut"]):
+            raise RuntimeError("swap_transfer_proof_mismatch")
+        txs["swap"] = txh
+        txs["legacyVerifiedReceivedUnits"] = str(received)
+        txs.pop("uncertainStep", None)
+        txs.pop("uncertainReference", None)
+        txs.pop("legacySwapPending", None)
+        return txs, "grid_legacy_swap_confirmed_recovered"
+    except Exception as exc:
+        return txs, f"grid_legacy_proof_failed:{str(exc)[:90]}:ref={ref}"
+
+
 def _grid_freebase_withdraw_swap_deposit(
     wallet: str,
     chain_id: int,
@@ -27357,7 +27524,7 @@ def _grid_freebase_withdraw_swap_deposit(
             saved["uncertainStep"] = "swap"
             saved["uncertainReference"] = journal["requestKey"]
             raise _GridExitStepError("grid_swap_broadcast_unknown_reconciliation_required", saved)
-    elif not txs.get("swap") and (txs.get("prePayoutUnits") is not None or
+    elif not txs.get("swap") and not txs.get("legacyRecoveryProof") and (txs.get("prePayoutUnits") is not None or
                                     txs.get("legacySwapPending")):
         # A pre-upgrade swap may already have been sent under grid-519. Never
         # rotate its key blindly: the HTTP conflict says nothing about its outcome.
@@ -27473,6 +27640,9 @@ def _grid_freebase_withdraw_swap_deposit(
         before = int(txs["prePayoutUnits"])
         # Do not count stablecoins the wallet held before this GRID sale.
         received = after - before
+        if txs.get("legacyVerifiedReceivedUnits") is not None:
+            # This amount was verified against the matching original receipt logs.
+            received = int(txs["legacyVerifiedReceivedUnits"])
         required_out = int(txs.get("minOut") or min_out)
         if received < required_out:
             _partial_error("payout_proof", RuntimeError(f"stablecoin_delta_below_min:{received}:{required_out}"))
@@ -27487,6 +27657,35 @@ def _grid_freebase_withdraw_swap_deposit(
 
     if txs.get("swap"):
         return _finish_wallet_payout()
+
+    legacy_recovery = bool(txs.get("legacyRecoveryProof"))
+    if legacy_recovery:
+        # Never refuel a legacy order. Require the original funded steps and a
+        # verified reverted swap, exact original token balance and allowance.
+        # Only the current SWAP may be sent, under the existing durable journal.
+        if not txs.get("withdraw") or (is_native and not txs.get("wrap")) or not txs.get("approveRouter"):
+            _partial_error("legacy_recovery", RuntimeError("funding_steps_missing"))
+        try:
+            old_hash = str(txs["legacyRecoveryProof"])
+            old_tx = _rpc_call(chain_id, "eth_getTransactionByHash", [old_hash])
+            old_rc = _rpc_call(chain_id, "eth_getTransactionReceipt", [old_hash])
+            if not isinstance(old_tx, dict) or not isinstance(old_rc, dict) or not old_rc.get("blockNumber"):
+                raise RuntimeError("original_swap_receipt_missing")
+            if old_rc.get("status") not in (0, "0x0", "0") or str(old_rc.get("transactionHash") or "").lower() != old_hash.lower():
+                raise RuntimeError("original_swap_not_reverted")
+            if _norm_addr(old_tx.get("from")) != wa or _norm_addr(old_tx.get("to")) != router:
+                raise RuntimeError("original_swap_identity_mismatch")
+            if _balance(token_in) != amount_in or _balance(settlement) != int(txs["prePayoutUnits"]):
+                raise RuntimeError("wallet_balances_changed")
+            exact_allowance = int(str(_eth_call(chain_id, token_in, "0xdd62ed3e" + _addr_to_32(wa) + _addr_to_32(router))), 16)
+            if exact_allowance != amount_in:
+                raise RuntimeError("original_allowance_not_exact")
+            latest = _rpc_call(chain_id, "eth_getTransactionCount", [wa, "latest"])
+            pending = _rpc_call(chain_id, "eth_getTransactionCount", [wa, "pending"])
+            if not isinstance(latest, str) or not isinstance(pending, str) or int(latest, 16) != int(pending, 16):
+                raise RuntimeError("wallet_has_pending_transactions")
+        except Exception as exc:
+            _partial_error("legacy_recovery", exc)
 
     # Only withdraw previously reserved freeBase from the user's Vault.
     # Merely having assets in the Privy wallet never authorizes selling them.
@@ -27530,6 +27729,8 @@ def _grid_freebase_withdraw_swap_deposit(
         allowance = int(str(allow_raw or "0x0"), 16)
     except Exception as exc:
         _partial_error("allowance", exc)
+    if legacy_recovery and allowance != amount_in:
+        _partial_error("legacy_recovery", RuntimeError("allowance_changed_no_reapproval"))
     if allowance < amount_in:
         approve_data = "0x095ea7b3" + _addr_to_32(router) + _uint_to_32(amount_in)
         _send_step("approve", "approveRouter", token_in, approve_data)
@@ -27564,7 +27765,10 @@ def _grid_freebase_withdraw_swap_deposit(
         _partial_error("swap_preflight", RuntimeError("|".join(candidate_errors)[:240]))
 
     try:
-        txs["prePayoutUnits"] = str(_balance(settlement))
+        current_baseline = _balance(settlement)
+        if legacy_recovery and (current_baseline != int(txs["prePayoutUnits"]) or _balance(token_in) != amount_in):
+            raise RuntimeError("legacy_wallet_balance_changed_before_swap")
+        txs["prePayoutUnits"] = str(current_baseline)
     except Exception as exc:
         _partial_error("payout_baseline", exc)
     _send_step("swap", "swap", router, swap_data)
@@ -27757,13 +27961,22 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     elif not prior.get("swap") and (prior.get("legacySwapPending") or
             prior.get("prePayoutUnits") is not None or
             "STEP=swap:" in str((order or {}).get("sell_pending_reason") or ve_prior.get("reason") or "")):
-        prior = dict(prior)
-        prior["legacySwapPending"] = True
-        prior["uncertainStep"] = "swap"
-        prior["uncertainReference"] = "grid-519-" + hashlib.sha256(
-            f"{wa.lower()}:{chain_id}:{vault.lower()}:{order_id}:swap".encode()).hexdigest()[:44]
-        result.update(attempted=True, reason="grid_legacy_swap_reconciliation_required", txs=prior)
-        return result
+        # ENGINE-575: check the exact old Privy reference. Never infer failure
+        # from no history entry, and never repeat the legacy funding steps.
+        try:
+            settle_state = _v5_engine_funding_state(wa, chain_key, payout) or {}
+            legacy_settlement = _norm_addr(settle_state.get("token") or "")
+            legacy_input = wrapped if is_native else token
+            if not order_id or not _looks_like_evm_addr(legacy_settlement):
+                raise RuntimeError("legacy_order_or_settlement_missing")
+            prior, reconcile_reason = _grid_legacy_reconcile(
+                wa, chain_id, vault, order_id, legacy_input, legacy_settlement, order_units, prior)
+        except Exception as exc:
+            prior = dict(prior)
+            reconcile_reason = f"grid_legacy_reconciliation_error:{str(exc)[:120]}"
+        if not prior.get("swap") and reconcile_reason != "grid_legacy_swap_reverted_verified_retry_eligible":
+            result.update(attempted=True, reason=reconcile_reason, txs=prior)
+            return result
     if prior.get("uncertainStep") and not prior.get("swap"):
         result.update(attempted=True, reason="grid_privy_broadcast_uncertain_manual_reconciliation", txs=prior)
         return result
