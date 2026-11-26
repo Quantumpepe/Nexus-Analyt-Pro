@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-575-GRID-LEGACY-RECONCILIATION";
+BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-576-GRID-SCOPED-RECOVERY";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27371,6 +27371,85 @@ def _grid_legacy_privy_lookup(chain_id, wallet_id, reference, token_in, settleme
     return answer
 
 
+# ENGINE-576: operator-approved one-time recovery of the exact legacy POL order.
+# No general NOT_OBSERVED -> FAILED transition. Restrict the exception to the
+# immutable reference and the three funding transactions observed by the owner.
+_GRID_576_REF = "grid-519-6590a8fd2fdfb89e61ac6b22ae990be0bcd9dbe657bc"
+_GRID_576_WALLET = "0x150270ac191ba7caee8f098add651fa9db38b028"
+_GRID_576_VAULT = "0x97aa0d7c3508620b5ad841d20edfad637fc8de9a"
+_GRID_576_WPOL = "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"
+_GRID_576_USDC = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+
+
+def _grid_576_recovery_nonce(wallet, chain_id, vault, order_id, token_in, settlement, amount, txs, router):
+    """Return the sole permitted next nonce, or fail closed. No writes or sends.
+
+    A missing Privy record is not proof of failure. Owner-approved recovery is
+    limited to this order, with exact on-chain funding, one remaining input lot,
+    one exact allowance and no observed later or pending wallet transaction.
+    """
+    wallet, vault, token_in, settlement, router = (str(a).lower() for a in
+        (wallet, vault, token_in, settlement, router))
+    ref = "grid-519-" + hashlib.sha256(
+        f"{wallet}:{chain_id}:{vault}:{order_id}:swap".encode()).hexdigest()[:44]
+    if (ref != _GRID_576_REF or int(chain_id) != 137 or wallet != _GRID_576_WALLET
+            or vault != _GRID_576_VAULT or token_in != _GRID_576_WPOL
+            or settlement != _GRID_576_USDC or int(amount) != 20 * 10**18
+            or not _looks_like_evm_addr(router)):
+        raise RuntimeError("recovery_scope_mismatch")
+    if txs.get("swap") or int(txs.get("amountIn") or 0) != int(amount):
+        raise RuntimeError("recovery_amount_or_swap_mismatch")
+    if str(txs.get("payoutToken") or "").lower() != settlement or txs.get("prePayoutUnits") is None:
+        raise RuntimeError("recovery_baseline_missing")
+    # Strictly validate the saved txs against the specific observed chain blocks,
+    # from/to addresses, exact ABI arguments, values and successful receipts.
+    wd_data = _CORE_VAULT_SELECTORS["withdrawNative"] + _uint_to_32(amount) + _addr_to_32(wallet)
+    approve_data = "0x095ea7b3" + _addr_to_32(router) + _uint_to_32(amount)
+    steps = (("withdraw", 97992716, vault, wd_data, 0, "0xef8dfd2f2d1", "5053"),
+             ("wrap", 97992718, token_in, "0xd0e30db0", amount, "0x96ce4c1326", "3500"),
+             ("approveRouter", 97992721, token_in, approve_data, 0, "0x390529e8ad", "fb1f"))
+    nonces = []
+    def quantity(x):
+        if not isinstance(x, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", x):
+            raise RuntimeError("recovery_rpc_quantity_missing")
+        return int(x, 16)
+    for key, block, to, data, value, prefix, suffix in steps:
+        h = str(txs.get(key) or "").lower()
+        if not re.fullmatch(r"0x[0-9a-f]{64}", h) or not h.startswith(prefix) or not h.endswith(suffix):
+            raise RuntimeError("recovery_funding_hash_mismatch:" + key)
+        tx = _rpc_call(137, "eth_getTransactionByHash", [h])
+        rc = _rpc_call(137, "eth_getTransactionReceipt", [h])
+        if not isinstance(tx, dict) or not isinstance(rc, dict):
+            raise RuntimeError("recovery_funding_receipt_missing:" + key)
+        if (str(tx.get("hash") or "").lower() != h or str(rc.get("transactionHash") or "").lower() != h
+                or quantity(tx.get("blockNumber")) != block or quantity(rc.get("blockNumber")) != block
+                or not tx.get("blockHash") or tx.get("blockHash") != rc.get("blockHash")
+                or quantity(rc.get("status")) != 1 or str(tx.get("from") or "").lower() != wallet
+                or str(tx.get("to") or "").lower() != to or str(tx.get("input") or "").lower() != data.lower()
+                or quantity(tx.get("value")) != value):
+            raise RuntimeError("recovery_funding_identity_mismatch:" + key)
+        nonces.append(quantity(tx.get("nonce")))
+    if nonces != list(range(nonces[0], nonces[0]+3)):
+        raise RuntimeError("recovery_funding_nonces_not_consecutive")
+    # Confirm substantial depth and check the exact current and pending nonce.
+    if quantity(_rpc_call(137, "eth_blockNumber", [])) < steps[-1][1] + 128:
+        raise RuntimeError("recovery_funding_not_deep_enough")
+    expected = nonces[-1] + 1
+    latest = quantity(_rpc_call(137, "eth_getTransactionCount", [wallet, "latest"]))
+    pending = quantity(_rpc_call(137, "eth_getTransactionCount", [wallet, "pending"]))
+    if latest != expected or pending != expected:
+        raise RuntimeError("recovery_wallet_nonce_changed_or_pending")
+    balance_data = "0x70a08231" + _addr_to_32(wallet)
+    allowance_data = "0xdd62ed3e" + _addr_to_32(wallet) + _addr_to_32(router)
+    if quantity(_eth_call(137, token_in, balance_data)) != int(amount):
+        raise RuntimeError("recovery_input_balance_not_exact")
+    if quantity(_eth_call(137, settlement, balance_data)) != int(txs["prePayoutUnits"]):
+        raise RuntimeError("recovery_payout_balance_changed")
+    if quantity(_eth_call(137, token_in, allowance_data)) != int(amount):
+        raise RuntimeError("recovery_allowance_not_exact")
+    return expected
+
+
 def _grid_legacy_reconcile(wallet, chain_id, vault, order_id, token_in, settlement, amount, prior):
     """Reconcile a legacy swap without sending anything. Only a matching mined
     success is imported. A mined revert permits a tightly scoped retry only
@@ -27397,6 +27476,18 @@ def _grid_legacy_reconcile(wallet, chain_id, vault, order_id, token_in, settleme
         txs["legacyPrivyLookupDetail"] = info["detail"]
     txh = str(info.get("txHash") or "")
     if not re.fullmatch(r"0x[0-9a-fA-F]{64}", txh):
+        if status == "NOT_OBSERVED" and ref == _GRID_576_REF and not txh:
+            try:
+                router = _norm_addr(_privy_trading_cfg(chain_id).get("router") or "")
+                nonce = _grid_576_recovery_nonce(wallet, chain_id, vault, order_id,
+                    token_in, settlement, amount, txs, router)
+                txs["legacyScopedRecoveryRef"] = ref
+                txs["legacyScopedRecoveryNonce"] = nonce
+                for field in ("uncertainStep", "uncertainReference", "legacySwapPending"):
+                    txs.pop(field, None)
+                return txs, "grid_legacy_scoped_retry_eligible"
+            except Exception as exc:
+                return txs, f"grid_legacy_scoped_recovery_blocked:{str(exc)[:110]}"
         return txs, f"grid_legacy_privy_{status.lower()}:ref={ref}"
     txs["legacyPrivyTxHash"] = txh
     if status not in ("CONFIRMED", "FINALIZED", "EXECUTION_REVERTED"):
@@ -27524,7 +27615,7 @@ def _grid_freebase_withdraw_swap_deposit(
             saved["uncertainStep"] = "swap"
             saved["uncertainReference"] = journal["requestKey"]
             raise _GridExitStepError("grid_swap_broadcast_unknown_reconciliation_required", saved)
-    elif not txs.get("swap") and not txs.get("legacyRecoveryProof") and (txs.get("prePayoutUnits") is not None or
+    elif not txs.get("swap") and not txs.get("legacyRecoveryProof") and not txs.get("legacyScopedRecoveryRef") and (txs.get("prePayoutUnits") is not None or
                                     txs.get("legacySwapPending")):
         # A pre-upgrade swap may already have been sent under grid-519. Never
         # rotate its key blindly: the HTTP conflict says nothing about its outcome.
@@ -27564,6 +27655,16 @@ def _grid_freebase_withdraw_swap_deposit(
         ).hexdigest()[:44]
         transaction = {"from": wa, "to": _norm_addr(to_addr), "data": data, "value": value}
         if key == "swap":
+            if txs.get("legacyScopedRecoveryRef"):
+                # Revalidate just before claiming the single durable submission.
+                try:
+                    nonce = _grid_576_recovery_nonce(wa, chain_id, vault, order_id,
+                        token_in, settlement, amount_in, txs, router)
+                    if txs.get("legacyScopedRecoveryRef") != _GRID_576_REF or nonce != txs.get("legacyScopedRecoveryNonce"):
+                        raise RuntimeError("recovery_nonce_or_reference_changed")
+                    transaction["nonce"] = nonce
+                except Exception as exc:
+                    _partial_error("legacy_scoped_recovery", exc)
             ref = _grid_swap_request_key(operation_key, wallet_id, chain_id, transaction)
             snapshot = {"requestKey": ref, "transaction": transaction, "txs": dict(txs)}
             saved, won = _grid_swap_journal(operation_key, create=snapshot)
@@ -27658,8 +27759,18 @@ def _grid_freebase_withdraw_swap_deposit(
     if txs.get("swap"):
         return _finish_wallet_payout()
 
-    legacy_recovery = bool(txs.get("legacyRecoveryProof"))
-    if legacy_recovery:
+    scoped_recovery = bool(txs.get("legacyScopedRecoveryRef"))
+    legacy_recovery = bool(txs.get("legacyRecoveryProof")) or scoped_recovery
+    if scoped_recovery:
+        # Do not trust the persisted eligibility marker alone.
+        try:
+            nonce = _grid_576_recovery_nonce(wa, chain_id, vault, order_id,
+                token_in, settlement, amount_in, txs, router)
+            if txs.get("legacyScopedRecoveryRef") != _GRID_576_REF or nonce != txs.get("legacyScopedRecoveryNonce"):
+                raise RuntimeError("recovery_nonce_or_reference_changed")
+        except Exception as exc:
+            _partial_error("legacy_scoped_recovery", exc)
+    elif legacy_recovery:
         # Never refuel a legacy order. Require the original funded steps and a
         # verified reverted swap, exact original token balance and allowance.
         # Only the current SWAP may be sent, under the existing durable journal.
@@ -27689,6 +27800,8 @@ def _grid_freebase_withdraw_swap_deposit(
 
     # Only withdraw previously reserved freeBase from the user's Vault.
     # Merely having assets in the Privy wallet never authorizes selling them.
+    if scoped_recovery and (not txs.get("withdraw") or not txs.get("wrap") or not txs.get("approveRouter")):
+        _partial_error("legacy_scoped_recovery", RuntimeError("funding_steps_missing"))
     if not txs.get("withdraw"):
         if is_native:
             wd = _CORE_VAULT_SELECTORS["withdrawNative"] + _uint_to_32(amount_in) + _addr_to_32(wa)
@@ -27974,7 +28087,8 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
         except Exception as exc:
             prior = dict(prior)
             reconcile_reason = f"grid_legacy_reconciliation_error:{str(exc)[:120]}"
-        if not prior.get("swap") and reconcile_reason != "grid_legacy_swap_reverted_verified_retry_eligible":
+        if not prior.get("swap") and reconcile_reason not in (
+                "grid_legacy_swap_reverted_verified_retry_eligible", "grid_legacy_scoped_retry_eligible"):
             result.update(attempted=True, reason=reconcile_reason, txs=prior)
             return result
     if prior.get("uncertainStep") and not prior.get("swap"):
