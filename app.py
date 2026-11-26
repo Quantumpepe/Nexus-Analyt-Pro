@@ -28652,7 +28652,7 @@ def api_grid_manual_add():
                     reserved_qty = float(reserved_rows['reserved'] or 0) if reserved_rows else 0.0
                 finally:
                     conn_res.close()
-                reserved_units = _parse_asset_units(str(max(0.0,reserved_qty)), int(funding_state['decimals']))
+                reserved_units = _parse_asset_units(str(reserved_qty), int(funding_state['decimals'])) if reserved_qty > 0 else 0
                 available_units = max(0, available_units - reserved_units)
             except Exception:
                 # Fail closed: don't let a DB outage cause an overcommitted SELL.
