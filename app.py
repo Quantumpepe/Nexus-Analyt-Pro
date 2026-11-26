@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-573-GRID-SWAP-IDEMPOTENCY";
+BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-574-NKR-TRADER-TRADE-IDEMPOTENCY";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -528,6 +528,19 @@ def _live_op_reserve(
                 "WHERE status='CONFIRMING' AND expires_ts<=? AND tx_hash IS NOT NULL AND length(tx_hash)>=10",
                 (nowi, nowi + 300, nowi),
             )
+            # ENGINE-574: an unresolved protected trade blocks new cycles and closing
+            # operations for the same session, even if a stale slot/position read
+            # proposes a different business key. SQLite's write transaction serializes
+            # this check with the reservation.
+            if biz[0] in {"ENTRY", "EXIT", "START_CLOSING", "FINALIZE"}:
+                pending_trade = conn.execute(
+                    "SELECT 1 FROM nexus_live_operations WHERE wallet_address=? AND chain_id=? "
+                    "AND vault_address=? AND onchain_session_id=? AND op_type IN ('ENTRY','EXIT') "
+                    "AND status IN ('SUBMITTING','CONFIRMING','RECOVERING') "
+                    "AND privy_idempotency_key LIKE 'nt574-%' LIMIT 1", biz[1:5],
+                ).fetchone()
+                if pending_trade:
+                    return None
             # If a successful op already exists for this business key, refuse a duplicate.
             existing = conn.execute(
                 "SELECT operation_id, status, tx_hash, attempt, privy_idempotency_key, error_text "
@@ -626,8 +639,27 @@ def _live_op_update(operation_id: str, status: str, **fields) -> bool:
     conn = _db()
     try:
         with DB_WRITE_LOCK:
+            # ENGINE-574: only receipt/definitive-response handling may settle a
+            # protected trade. Legacy cleanup/guard code must not downgrade it,
+            # erase its hash, or replace the actual request identity.
+            where = "operation_id=?"
+            if not fields.get("trade_verified_terminal"):
+                if st in _LIVE_OP_TERMINAL_STATES or st in {"RESERVED", "SUBMITTING"} or any(
+                    k in fields for k in ("privy_idempotency_key", "request_body_hash", "attempt", "tx_hash")
+                ):
+                    where += " AND COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%'"
+                else:
+                    where += " AND (COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%' OR status IN ('SUBMITTING','CONFIRMING','RECOVERING'))"
+            else:
+                where += " AND (COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%' OR status IN ('SUBMITTING','CONFIRMING','RECOVERING'))"
+            if fields.get("trade_verified_terminal") and fields.get("tx_hash"):
+                where += " AND (COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%' OR tx_hash=?)"
+                vals.append(str(fields["tx_hash"]))
+            if fields.get("expected_attempt") is not None:
+                where += " AND attempt=?"
+                vals.append(int(fields["expected_attempt"]))
             cur = conn.execute(
-                f"UPDATE nexus_live_operations SET {', '.join(sets)} WHERE operation_id=?",
+                f"UPDATE nexus_live_operations SET {', '.join(sets)} WHERE {where}",
                 tuple(vals),
             )
             conn.commit()
@@ -967,8 +999,7 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     exit_attempt = max(1, int(exit_op.get("attempt") or 1))
     ref = _live_op_privy_key(exit_op_id, call_fp, attempt=exit_attempt)
     try:
-        _live_op_update(exit_op_id, "SUBMITTING", request_body_hash=call_fp, privy_idempotency_key=ref)
-        sent = _send_vault_tx(wallet_id, wallet, vault, call, ref)
+        sent = _send_vault_tx(wallet_id, wallet, vault, call, ref, trade_operation_id=exit_op_id, trade_operation_attempt=exit_attempt)
     except Exception as exit_exc:
         try:
             _live_op_update(exit_op_id, "FAILED", error_text=str(exit_exc)[:900])
@@ -980,14 +1011,14 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     if not tx_hash:
         tx_hash = str(receipt.get("transactionHash") or "")
     try:
-        _live_op_update(exit_op_id, "CONFIRMING", tx_hash=tx_hash)
+        _live_op_update(exit_op_id, "CONFIRMING", tx_hash=tx_hash, trade_verified_terminal=True)
     except Exception:
         pass
 
     remaining = _position_amount(vault, session_id, cfg["weth"])
     if remaining != 0:
         try:
-            _live_op_update(exit_op_id, "RECOVERING", tx_hash=tx_hash, error_text=f"weth_position_not_zero:{remaining}")
+            _live_op_update(exit_op_id, "RECOVERING", tx_hash=tx_hash, error_text=f"weth_position_not_zero:{remaining}", trade_verified_terminal=True)
         except Exception:
             pass
         raise RuntimeError(f"weth_position_not_zero_after_exit:{remaining}")
@@ -996,12 +1027,12 @@ def _nkr_exit_open_eth_position(wallet: str, row: dict, session_id: int) -> dict
     open_assets = int(words[12]) if len(words) >= 13 else -1
     if open_assets != 0:
         try:
-            _live_op_update(exit_op_id, "RECOVERING", tx_hash=tx_hash, error_text=f"open_assets_after_exit:{open_assets}")
+            _live_op_update(exit_op_id, "RECOVERING", tx_hash=tx_hash, error_text=f"open_assets_after_exit:{open_assets}", trade_verified_terminal=True)
         except Exception:
             pass
         raise RuntimeError(f"open_assets_after_orderly_exit:{open_assets}")
     try:
-        _live_op_update(exit_op_id, "SUCCEEDED", tx_hash=tx_hash)
+        _live_op_update(exit_op_id, "SUCCEEDED", tx_hash=tx_hash, trade_verified_terminal=True)
     except Exception:
         pass
     return {"executed": True, "txHash": tx_hash, "amountIn": amount_in, "amountOut": quote, "liveOperationId": exit_op_id}
@@ -37462,7 +37493,66 @@ def _privy_estimate_tx_gas(chain_id: int, transaction: dict) -> int:
     return max(floor, min(units, 1_500_000))
 
 
-def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id="", chain_id=1):
+def _nt574_trade_request_key(operation_id, attempt, url, body):
+    """Stable key for the final normalized RPC payload (before adding its own reference)."""
+    canonical = json.dumps([str(url), body], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    identity = json.dumps([str(operation_id), int(attempt), digest], separators=(",", ":"))
+    return "nt574-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:58]
+
+
+def _nt574_trade_claim(operation_id, attempt, key, body):
+    """Persist the exact body hash before sending; no automatic resend after a crash."""
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")).hexdigest()
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            nowi = int(time.time())
+            cur = conn.execute(
+                "UPDATE nexus_live_operations SET status='RECOVERING', request_body_hash=?, "
+                "privy_idempotency_key=?, updated_ts=?, expires_ts=?, error_text='trade_broadcast_unconfirmed' "
+                "WHERE operation_id=? AND attempt=? AND status='RESERVED' AND expires_ts>? "
+                "AND op_type IN ('ENTRY','EXIT') AND COALESCE(tx_hash,'')='' "
+                "AND NOT EXISTS (SELECT 1 FROM nexus_live_operations AS other "
+                "WHERE other.operation_id<>nexus_live_operations.operation_id "
+                "AND other.wallet_address=nexus_live_operations.wallet_address "
+                "AND other.chain_id=nexus_live_operations.chain_id "
+                "AND other.vault_address=nexus_live_operations.vault_address "
+                "AND other.onchain_session_id=nexus_live_operations.onchain_session_id "
+                "AND other.op_type IN ('ENTRY','EXIT','START_CLOSING','FINALIZE') "
+                "AND other.status IN ('SUBMITTING','CONFIRMING','RECOVERING'))",
+                (digest, key, nowi, nowi + 600, str(operation_id), int(attempt), nowi),
+            )
+            conn.commit()
+            if cur.rowcount != 1:
+                raise RuntimeError("trade_request_claim_rejected_no_submission")
+    finally:
+        conn.close()
+
+
+def _nt574_trade_result(operation_id, key, status, tx_hash=None, error=""):
+    """Compare-and-set only this claimed attempt. Never lose a known transaction hash."""
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            nowi = int(time.time())
+            cur = conn.execute(
+                "UPDATE nexus_live_operations SET status=?, updated_ts=?, expires_ts=?, "
+                "error_text=?, tx_hash=COALESCE(?,tx_hash), completed_ts=CASE WHEN ?='FAILED' THEN ? ELSE completed_ts END "
+                "WHERE operation_id=? AND privy_idempotency_key=? "
+                "AND status IN ('SUBMITTING','CONFIRMING','RECOVERING') "
+                "AND (? IS NULL OR COALESCE(tx_hash,'') IN ('',?))",
+                (status, nowi, nowi + 600, str(error)[:900], tx_hash, status, nowi,
+                 str(operation_id), key, tx_hash, tx_hash),
+            )
+            conn.commit()
+            if cur.rowcount != 1:
+                raise RuntimeError("trade_request_state_conflict_reconcile_required")
+    finally:
+        conn.close()
+
+
+def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id="", chain_id=1, *, trade_operation_id="", trade_operation_attempt=0):
     # Privy accepts at most 64 characters for reference_id. Keep the value
     # deterministic so the same operation also keeps the same idempotency key.
     raw_reference = str(reference_id or "").strip()
@@ -37523,6 +37613,19 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
         "params": {"transaction": tx},
     }
 
+    # ENGINE-574: only the opted-in trade paths change keys. Hash the final
+    # normalized transaction, including any estimated gas_limit, not just calldata.
+    trade_attempt = 0
+    if trade_operation_id:
+        op = _live_op_get(trade_operation_id)
+        if not op or str(op.get("status") or "") != "RESERVED":
+            raise RuntimeError("trade_operation_not_reserved_no_submission")
+        if int(op.get("chain_id") or 0) != cid or _norm_addr(op.get("wallet_address")) != _norm_addr(tx.get("from")) or _norm_addr(op.get("vault_address")) != _norm_addr(tx.get("to")):
+            raise RuntimeError("trade_operation_identity_mismatch_no_submission")
+        trade_attempt = int(trade_operation_attempt or 0)
+        if trade_attempt <= 0 or trade_attempt != int(op.get("attempt") or 1):
+            raise RuntimeError("trade_operation_attempt_mismatch_no_submission")
+        reference_id = _nt574_trade_request_key(trade_operation_id, trade_attempt, url, body)
     if reference_id:
         body["reference_id"] = reference_id
     expiry = str(int(time.time() * 1000) + 60_000)
@@ -37544,6 +37647,8 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
     # A read timeout can happen after Privy has already accepted and broadcast the
     # transaction. Retry once with the identical idempotency key so Privy returns
     # the original result instead of creating a duplicate transaction.
+    if trade_operation_id:
+        _nt574_trade_claim(trade_operation_id, trade_attempt, reference_id, body)
     response = None
     last_timeout = None
     for attempt in range(2):
@@ -37572,6 +37677,19 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
         # Keep the raw Privy body so the UI can show a precise, non-generic message.
         blob = data if isinstance(data, str) else json.dumps(data, default=str)[:1200]
         low = blob.lower()
+        if trade_operation_id:
+            # A clear first-response policy/balance rejection can safely be retried
+            # as a new attempt. A timeout, idempotency collision, server error or
+            # broadcast failure is not proof that no transaction was submitted.
+            definitive = (last_timeout is None and response.status_code in (400, 403, 422)
+                          and "idempotency" not in low and "broadcast" not in low
+                          and ("insufficient funds" in low or "insufficient balance" in low
+                               or ("policy" in low and ("violat" in low or "denied" in low))))
+            if definitive:
+                _nt574_trade_result(trade_operation_id, reference_id, "FAILED", error="privy_explicit_rejection:" + blob[:500])
+            else:
+                _nt574_trade_result(trade_operation_id, reference_id, "RECOVERING", error=f"trade_broadcast_unconfirmed:privy_rpc_{response.status_code}:{blob[:500]}")
+                raise RuntimeError(f"trade_broadcast_unconfirmed:privy_rpc_{response.status_code}:chain={cid}")
         if "insufficient funds" in low or "insufficient balance" in low:
             raise RuntimeError(f"privy_insufficient_native_gas:chain={cid}:{blob[:300]}")
         if "gas required exceeds allowance" in low:
@@ -37582,6 +37700,12 @@ def _privy_send_delegated_transaction(privy_wallet_id, transaction, reference_id
             raise RuntimeError(f"privy_policy_denied:chain={cid}:{blob[:400]}")
         raise RuntimeError(f"privy_rpc_{response.status_code}:chain={cid}:{blob[:500]}")
     tx_hash = str(((data or {}).get("data") or {}).get("hash") or (data or {}).get("hash") or "")
+    if trade_operation_id:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
+            _nt574_trade_result(trade_operation_id, reference_id, "RECOVERING", error="trade_broadcast_unconfirmed:missing_valid_hash")
+            raise RuntimeError("trade_broadcast_unconfirmed:missing_valid_hash")
+        # Store the hash before any receipt wait or caller-side work.
+        _nt574_trade_result(trade_operation_id, reference_id, "CONFIRMING", tx_hash=tx_hash)
     if not tx_hash:
         raise RuntimeError(f"privy_rpc_missing_hash:{data}")
     return {
@@ -38390,12 +38514,16 @@ def _nkr_live_dust_exit_route(wallet: str, live_row: dict, token_in: str, settle
     _live_engine_mark(runtime_engine, status="closing", decision="DUST_EXIT_SUBMITTING", gate_status="DUST_RESCUE", active_asset=symbol or "DUST", position_state="EXITING", pending_tx="submitting", last_error="", reason=f"CLOSING session #{sid}: clearing non-tradeable residual through approved dust rescue router")
     txh = ""
     try:
-        _live_op_update(op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref, expires_ts=int(time.time()) + 300)
-        sent = _privy_send_delegated_transaction(wallet_id, {"from":_norm_addr(wallet),"to":vault,"data":call,"value":"0x0"}, ref, chain_id=chain_id)
+        protected_dust = runtime_engine in {"NKR", "TRADER"}
+        if not protected_dust:
+            _live_op_update(op_id, "SUBMITTING", request_body_hash=body_hash, privy_idempotency_key=ref, expires_ts=int(time.time()) + 300)
+        sent = _privy_send_delegated_transaction(wallet_id, {"from":_norm_addr(wallet),"to":vault,"data":call,"value":"0x0"}, ref, chain_id=chain_id,
+                 trade_operation_id=op_id if protected_dust else "", trade_operation_attempt=int(op.get("attempt") or 1))
         txh = str((sent or {}).get("hash") or (sent or {}).get("txHash") or "")
         if not txh.startswith("0x"):
             raise RuntimeError("dust_rescue_missing_tx_hash")
-        _live_op_update(op_id, "CONFIRMING", tx_hash=txh, expires_ts=int(time.time()) + 180)
+        if not protected_dust:
+            _live_op_update(op_id, "CONFIRMING", tx_hash=txh, expires_ts=int(time.time()) + 180)
         receipt = _privy_wait_receipt(txh, chain_id=chain_id)
         status_raw = (receipt or {}).get("status") if isinstance(receipt, dict) else None
         status_int = int(str(status_raw),16) if isinstance(status_raw,str) and str(status_raw).startswith("0x") else int(status_raw)
@@ -38404,7 +38532,7 @@ def _nkr_live_dust_exit_route(wallet: str, live_row: dict, token_in: str, settle
         remaining = _position_amount(vault, sid, token_in, chain_id=chain_id)
         if remaining != 0:
             raise RuntimeError(f"dust_rescue_position_not_zero:{remaining}")
-        _live_op_update(op_id, "SUCCEEDED", tx_hash=txh)
+        _live_op_update(op_id, "SUCCEEDED", tx_hash=txh, trade_verified_terminal=protected_dust)
         return {"executed":True,"txHash":txh,"amountIn":amount_in,"amountOut":1,"routeMode":"DUST_RESCUE_ROUTER","router":router}
     except Exception as exc:
         try:
@@ -38414,11 +38542,16 @@ def _nkr_live_dust_exit_route(wallet: str, live_row: dict, token_in: str, settle
         raise
 
 
-def _send_vault_tx(wallet_id, wallet, vault, data, reference, chain_id=1):
+def _send_vault_tx(wallet_id, wallet, vault, data, reference, chain_id=1, *, trade_operation_id="", trade_operation_attempt=0):
     sent = _privy_send_delegated_transaction(wallet_id, {
         "from": _norm_addr(wallet), "to": _norm_addr(vault), "data": data, "value": "0x0"
-    }, reference, chain_id=int(chain_id))
-    receipt = _privy_wait_receipt(sent["hash"], chain_id=int(chain_id))
+    }, reference, chain_id=int(chain_id), trade_operation_id=trade_operation_id, trade_operation_attempt=trade_operation_attempt)
+    try:
+        receipt = _privy_wait_receipt(sent["hash"], chain_id=int(chain_id))
+    except Exception as exc:
+        if trade_operation_id:
+            _nt574_trade_result(trade_operation_id, sent["idempotencyKey"], "RECOVERING", tx_hash=sent["hash"], error=str(exc))
+        raise
     return {"hash": sent["hash"], "receipt": receipt}
 
 
@@ -45440,8 +45573,13 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
                 f"status={(existing or {}).get('status') or 'ACTIVE'}"
             )
         live_op_id = str(live_op_row.get("operation_id") or "")
+    # ENGINE-574: NKR/Trader must have a durable operation for every trade.
+    protected_trade = runtime_engine in {"NKR", "TRADER"}
+    trade_attempt = int((live_op_row or {}).get("attempt") or (live_row or {}).get("_live_operation_attempt") or 0)
+    if protected_trade and (not live_op_id or trade_attempt <= 0):
+        raise RuntimeError("trade_operation_missing_no_submission")
     # Prefer ENGINE-364 privy key when we have an operation_id; fall back to legacy fingerprint.
-    if live_op_id:
+    if live_op_id and not protected_trade:
         ref = _live_op_privy_key(live_op_id, call_fingerprint, attempt=int((live_op_row or {}).get("attempt") or 1))
         try:
             _live_op_update(live_op_id, "SUBMITTING", request_body_hash=call_fingerprint, privy_idempotency_key=ref,
@@ -45458,7 +45596,39 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
     # from receipt waiting so a missing Privy broadcast is reported as EXIT_FAILED
     # instead of looking like a pending on-chain trade. ENTRY keeps the established
     # synchronous helper.
-    if is_exit:
+    if protected_trade:
+        if is_exit:
+            _live_engine_mark(runtime_engine, status="closing", decision="EXIT_SUBMITTING",
+                              gate_status="EXIT_PENDING", position_state="EXITING", tx_hash="",
+                              pending_tx="submitting", last_error="",
+                              reason=f"Submitting exit executeTrade for session #{sid}")
+        try:
+            submitted = _privy_send_delegated_transaction(
+                wallet_id, {"from": _norm_addr(wallet), "to": _norm_addr(vault), "data": call, "value": "0x0"},
+                ref, chain_id=int(chain_id), trade_operation_id=live_op_id, trade_operation_attempt=trade_attempt,
+            )
+        except Exception as exc:
+            # Only pre-claim failures can be rearmed here. Once claimed, the
+            # sender owns the state; any unknown outcome stays locked.
+            op_now = _live_op_get(live_op_id) or {}
+            if str(op_now.get("status")) == "RESERVED" and int(op_now.get("attempt") or 0) == trade_attempt:
+                _live_op_update(live_op_id, "FAILED", error_text=str(exc)[:900], expected_attempt=trade_attempt)
+            raise
+        txh = str(submitted["hash"])
+        if is_exit:
+            _live_engine_mark(runtime_engine, status="closing", decision="EXIT_CONFIRMING",
+                              gate_status="EXIT_PENDING", position_state="EXITING", tx_hash=txh,
+                              pending_tx="confirmation", last_error="",
+                              reason=f"Exit executeTrade broadcast for session #{sid}; waiting for receipt")
+        try:
+            receipt = _privy_wait_receipt(txh, chain_id=int(chain_id))
+        except Exception as exc:
+            # Let receipt reconciliation establish success/revert, never infer
+            # failure from a timeout or malformed RPC response.
+            _nt574_trade_result(live_op_id, submitted["idempotencyKey"], "RECOVERING", tx_hash=txh, error=str(exc))
+            raise
+        sent = {"hash": txh, "receipt": receipt}
+    elif is_exit:
         _live_engine_mark(
             runtime_engine, status="closing", decision="EXIT_SUBMITTING",
             gate_status="EXIT_PENDING", active_asset=str((route or {}).get("symbol") or ""),
@@ -45567,7 +45737,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
                 _live_op_update(
                     live_op_id, "RECOVERING", tx_hash=txh,
                     error_text=f"receipt_without_mutation:pos={confirmed_position}:open={confirmed_open_assets}",
-                    expires_ts=int(time.time()) + 600,
+                    expires_ts=int(time.time()) + 600, trade_verified_terminal=protected_trade,
                 )
         except Exception:
             pass
@@ -45577,7 +45747,7 @@ def _nkr_live_trade_route(wallet: str, live_row: dict, route: dict, token_in: st
         )
     try:
         if live_op_id:
-            _live_op_update(live_op_id, "SUCCEEDED", tx_hash=txh)
+            _live_op_update(live_op_id, "SUCCEEDED", tx_hash=txh, trade_verified_terminal=protected_trade)
     except Exception:
         pass
     return {
@@ -45846,13 +46016,26 @@ def _nkr_live_bnb_v2_closing_exit(wallet: str, row: dict, session_id: int,
         reason=f"Submitting PancakeSwap V2 {best['label']} closing exit for session #{session_id}",
         position_state="EXITING", pending_tx="submitting", last_error="",
     )
-    reference = f"nexus-nkr-bnb-v2-closing-{session_id}-{int(time.time())}"
-    sent = _send_vault_tx(wallet_id, wallet, vault, call, reference, chain_id=chain_id)
+    op = _live_op_reserve("EXIT", wallet=wallet, chain_id=chain_id, vault=vault,
+                          onchain_session_id=str(session_id), live_row=row, token=token_in,
+                          cycle_key="closing-bnb-v2", ttl_sec=300, meta={"source":"bnb_v2_closing"})
+    if not op:
+        raise RuntimeError("bnb_v2_exit_operation_inflight_or_completed")
+    oid = str(op["operation_id"])
+    attempt = int(op.get("attempt") or 1)
+    try:
+        sent = _send_vault_tx(wallet_id, wallet, vault, call, "", chain_id=chain_id,
+                              trade_operation_id=oid, trade_operation_attempt=attempt)
+    except Exception as exc:
+        _live_op_update(oid, "FAILED", error_text=str(exc)[:900], expected_attempt=attempt)
+        raise
     receipt = sent.get("receipt") if isinstance(sent.get("receipt"), dict) else {}
     tx_hash = str(sent.get("hash") or sent.get("txHash") or receipt.get("transactionHash") or "")
     remaining = _position_amount(vault, int(session_id), token_in, chain_id=chain_id)
     if remaining != 0:
+        _live_op_update(oid, "RECOVERING", tx_hash=tx_hash, error_text=f"bnb_v2_position_not_zero:{remaining}", trade_verified_terminal=True)
         raise RuntimeError(f"bnb_v2_position_not_zero_after_exit:{remaining}")
+    _live_op_update(oid, "SUCCEEDED", tx_hash=tx_hash, trade_verified_terminal=True)
     return {
         "executed": True, "txHash": tx_hash, "router": router,
         "selector": selector, "routeMode": "PANCAKESWAP_V2_RECOVERY",
@@ -46483,6 +46666,7 @@ def _nkr_entry_guard_acquire(wallet: str, live_row: dict, ttl_sec: int = 180, cy
     try:
         if isinstance(live_row, dict):
             live_row["_live_operation_id"] = str(live_op.get("operation_id") or "")
+            live_row["_live_operation_attempt"] = int(live_op.get("attempt") or 1)
             live_row["_live_operation_type"] = "ENTRY"
     except Exception:
         pass
@@ -46604,7 +46788,7 @@ def _live_clear_entry_blockers_for_session(wallet: str, row: dict, reason: str =
     try:
         with DB_WRITE_LOCK:
             conn.execute("DELETE FROM nexus_nkr_entry_guards WHERE guard_key=?", (str(ident.get("identityKey") or ""),))
-            conn.execute("UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, completed_ts=?, error_text=? WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING')", (nowi,nowi,str(reason)[:900],str(ident.get("walletAddress") or "").lower(),int(ident.get("chainId") or 0),str(ident.get("vaultAddress") or "").lower(),str(ident.get("onchainSessionId") or "")))
+            conn.execute("UPDATE nexus_live_operations SET status='ABORTED', updated_ts=?, completed_ts=?, error_text=? WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? AND lower(vault_address)=? AND onchain_session_id=? AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING') AND COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%'", (nowi,nowi,str(reason)[:900],str(ident.get("walletAddress") or "").lower(),int(ident.get("chainId") or 0),str(ident.get("vaultAddress") or "").lower(),str(ident.get("onchainSessionId") or "")))
             conn.commit()
     finally: conn.close()
 
@@ -46644,7 +46828,8 @@ def _nkr_entry_guard_force_clear_stale(wallet: str, live_row: dict, max_age_sec:
                     "WHERE op_type='ENTRY' AND lower(wallet_address)=? AND chain_id=? "
                     "AND lower(vault_address)=? AND onchain_session_id=? "
                     "AND (tx_hash IS NULL OR tx_hash='' OR tx_hash='0x' OR length(tx_hash)<10) "
-                    "AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING','SUCCEEDED')",
+                    "AND status IN ('RESERVED','SUBMITTING','CONFIRMING','RECOVERING','SUCCEEDED') "
+                    "AND COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%'",
                     (nowi, wa, cid, vault, sid),
                 )
                 conn.commit()
@@ -48324,8 +48509,9 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
         rows = conn.execute(
             "SELECT * FROM nexus_live_operations "
             "WHERE status IN ('CONFIRMING','RECOVERING') AND tx_hash IS NOT NULL AND length(tx_hash)>=10 "
+            "AND (COALESCE(privy_idempotency_key,'') NOT LIKE 'nt574-%' OR status='RECOVERING' OR expires_ts<=?) "
             "ORDER BY updated_ts ASC LIMIT ?",
-            (max(1, int(limit or 40)),),
+            (int(time.time()), max(1, int(limit or 40))),
         ).fetchall()
         rows = [dict(r) for r in rows]
     finally:
@@ -48334,6 +48520,7 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
         out["checked"] += 1
         oid = str(row.get("operation_id") or "")
         txh = str(row.get("tx_hash") or "").strip()
+        protected_trade = str(row.get("privy_idempotency_key") or "").startswith("nt574-")
         try:
             chain_id = int(row.get("chain_id") or 1)
         except Exception:
@@ -48367,7 +48554,7 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
             reserved_ts = int(row.get("reserved_ts") or row.get("updated_ts") or 0)
             age_sec = max(0, int(time.time()) - reserved_ts) if reserved_ts else 0
 
-            if tx_obj is None and not tx_lookup_error and age_sec >= recovery_grace_sec:
+            if not protected_trade and tx_obj is None and not tx_lookup_error and age_sec >= recovery_grace_sec:
                 try:
                     _live_op_update(
                         oid, "FAILED", tx_hash=txh,
@@ -48386,7 +48573,7 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
             try:
                 _live_op_update(
                     oid, "RECOVERING", tx_hash=txh, expires_ts=int(time.time()) + 180,
-                    error_text=(
+                    trade_verified_terminal=protected_trade, error_text=(
                         f"tx_lookup_pending:{tx_lookup_error}" if tx_lookup_error
                         else ("transaction_seen_awaiting_receipt" if tx_obj else "transaction_not_seen_within_grace")
                     ),
@@ -48396,19 +48583,23 @@ def _live_ops_reconcile_confirming(limit: int = 40) -> dict:
             out["pending"] += 1
             continue
         try:
-            status = int(str(receipt.get("status") or "0x0"), 16)
+            raw_status = receipt.get("status")
+            status = int(str(raw_status), 16) if raw_status is not None else -1
         except Exception:
-            status = 0
+            status = -1
+        if protected_trade and (status not in (0, 1) or str(receipt.get("transactionHash") or "").lower() != txh.lower()):
+            out["pending"] += 1
+            continue
         if status == 1:
             try:
-                _live_op_update(oid, "SUCCEEDED", tx_hash=txh, error_text="")
+                _live_op_update(oid, "SUCCEEDED", tx_hash=txh, error_text="", trade_verified_terminal=protected_trade)
                 out["succeeded"] += 1
             except Exception as exc:
                 out["failed"] += 1
                 out["errors"].append(f"{oid}:mark_ok:{str(exc)[:80]}")
         else:
             try:
-                _live_op_update(oid, "FAILED", tx_hash=txh, error_text=f"transaction_reverted:{txh}")
+                _live_op_update(oid, "FAILED", tx_hash=txh, error_text=f"transaction_reverted:{txh}", trade_verified_terminal=protected_trade)
                 if str(row.get("op_type") or "").upper() == "ENTRY":
                     _live_clear_entry_blockers_for_session(row.get("wallet_address") or "", row, reason=f"entry_transaction_reverted:{txh}")
                 out["failed"] += 1
