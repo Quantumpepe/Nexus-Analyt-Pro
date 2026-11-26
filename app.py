@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-576-GRID-SCOPED-RECOVERY";
+BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-577-WALLET-SWAP";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -28637,6 +28637,204 @@ def api_wallet_swap_prepare():
             "slippageBps":slip, "router":router, "gasReserveWei":str(gas_reserve),
             "steps":steps,
             "note":"Manual Privy wallet swap. Wait for each mined confirmation. Not a Vault deposit. USDC.e is legacy bridged wallet-only.",
+            "ts":now_ts(),
+        })
+    except Exception as exc:
+        return jsonify({"status":"error","error":str(exc)[:240],"ts":now_ts()}), 502
+
+
+# ENGINE-577: wallet-only bidirectional swaps. Existing endpoints remain intact
+# for old frontend builds. No engine, vault, signer policy or shared quote change.
+def _manual_wallet_swap_assets(chain_id):
+    cid = int(chain_id)
+    if cid not in (1, 56, 137):
+        raise ValueError("unsupported_swap_chain")
+    cfg = _privy_trading_cfg(cid)
+    native = str(cfg.get("nativeSymbol") or {1:"ETH",56:"BNB",137:"POL"}[cid]).upper()
+    specs = [("W"+native, cfg.get("weth"), 18, False),
+             ("USDC", _POL_USDC_NATIVE if cid == 137 else cfg.get("usdc"), 18 if cid == 56 else 6, False),
+             ("USDT", cfg.get("usdt"), 18 if cid == 56 else 6, False)]
+    if cid == 137:
+        specs.append(("USDC.e", _POL_USDC_BRIDGED, 6, True))
+    assets = [{"symbol":native,"address":"native","decimals":18,"walletSwapSupported":True,"legacyOptional":False}]
+    seen = {"native"}
+    for symbol, raw, expected, legacy in specs:
+        address = _norm_addr(raw or "")
+        if not _looks_like_evm_addr(address) or address.lower() in seen:
+            continue
+        try:
+            if _nexus_wallet_swap_decimals(cid, address) != expected:
+                continue
+        except Exception:
+            continue
+        seen.add(address.lower())
+        assets.append({"symbol":symbol,"address":address,"decimals":expected,"walletSwapSupported":True,"legacyOptional":legacy})
+    return assets
+
+
+@app.get("/api/wallet/swap/v2/targets")
+def api_wallet_swap_v2_targets():
+    try:
+        if not _looks_like_evm_addr(_norm_addr(_require_auth() or "")):
+            return jsonify({"status":"error","error":"unauthorized"}), 401
+        chain = str(request.args.get("chain") or "").strip().upper()
+        cid = {"ETH":1,"BNB":56,"POL":137}.get(chain)
+        if not cid:
+            return jsonify({"status":"error","error":"unsupported_swap_chain"}), 400
+        return jsonify({"status":"ok","chain":chain,"chainId":cid,"targets":_manual_wallet_swap_assets(cid)})
+    except Exception as exc:
+        return jsonify({"status":"error","error":str(exc)[:180]}), 503
+
+
+@app.post("/api/wallet/swap/v2/prepare")
+def api_wallet_swap_v2_prepare():
+    """Prepare a same-chain manual wallet conversion; user signs via Privy.
+
+    Mandatory real Quoter output, decimal-safe units, bounded approval,
+    chain-specific gas reserve. No private-key use or automatic broadcast.
+    """
+    try:
+        from decimal import Decimal, InvalidOperation, ROUND_DOWN
+        authenticated = _norm_addr(_require_auth() or "")
+        if not _looks_like_evm_addr(authenticated):
+            return jsonify({"status":"error","error":"unauthorized"}), 401
+        body = request.get_json(silent=True) or {}
+        wallet = _norm_addr(body.get("wallet") or body.get("wallet_address") or "")
+        if not _looks_like_evm_addr(wallet) or wallet.lower() != authenticated.lower():
+            return jsonify({"status":"error","error":"wallet_mismatch"}), 403
+        chain_key = str(body.get("chain") or body.get("chainKey") or "").upper().strip()
+        aliases = {"ETH":1, "BNB":56, "POL":137}
+        cid = aliases.get(chain_key, 0)
+        if not cid or (body.get("chainId") and int(body["chainId"]) != cid):
+            return jsonify({"status":"error","error":"unsupported_swap_chain"}), 400
+        cfg = _privy_trading_cfg(cid)
+        router = _norm_addr(cfg.get("router") or "")
+        wrapped = _norm_addr(cfg.get("weth") or "")
+        if not _looks_like_evm_addr(router) or not _looks_like_evm_addr(wrapped):
+            return jsonify({"status":"error","error":"swap_router_or_wrapped_unconfigured"}), 503
+        raw_in = str(body.get("tokenIn") or "").strip()
+        native_symbol = str(cfg.get("nativeSymbol") or chain_key).upper()
+        assets = _manual_wallet_swap_assets(cid)
+        is_native = raw_in.upper() in ("NATIVE", native_symbol)
+        source_address = "native" if is_native else _norm_addr(raw_in)
+        source = next((x for x in assets if x["address"].lower() == source_address.lower()), None)
+        selected = next((x for x in assets if x["symbol"].upper() == str(body.get("tokenOut") or "").strip().upper()), None)
+        if not source or not selected or source["address"].lower() == selected["address"].lower():
+            return jsonify({"status":"error","error":"unsupported_or_identical_wallet_pair"}), 400
+        dest = selected["symbol"]
+        to_native = selected["address"] == "native"
+        from_token = wrapped if is_native else source["address"]
+        token_out = wrapped if to_native else selected["address"]
+        dec_in, dec_out = int(source["decimals"]), int(selected["decimals"])
+        direct_wrap = is_native and token_out.lower() == wrapped.lower()
+        direct_unwrap = to_native and from_token.lower() == wrapped.lower()
+        direct = direct_wrap or direct_unwrap
+        legacy_target = bool(selected.get("legacyOptional"))
+        slip = int(body.get("slippageBps") or 100)
+        if not 10 <= slip <= 300:
+            return jsonify({"status":"error","error":"slippage_outside_safe_bounds"}), 400
+        # BUILD533: Gas reserve is read from the chain BEFORE calculating an
+        # amount. Auto/Max always uses actual on-chain balances, not stale UI
+        # cache values. Native spendable = balance minus reserved network gas.
+        gas_price_hex = _rpc_call(cid, "eth_gasPrice", [])
+        gas_price = int(str(gas_price_hex), 16)
+        if gas_price <= 0:
+            raise RuntimeError("wallet_swap_gas_price_unavailable")
+        native_balance = int(str(_rpc_call(cid, "eth_getBalance", [wallet, "latest"])), 16)
+        gas_reserve = 2 * (100_000 if direct else 650_000) * gas_price
+        if native_balance < gas_reserve:
+            return jsonify({"status":"error","error":"insufficient_native_gas_reserve",
+                            "gasReserveWei":str(gas_reserve)}), 400
+        source_balance = None
+        if not is_native:
+            raw_bal = _eth_call(cid, from_token, "0x70a08231" + _addr_to_32(wallet))
+            source_balance = int(str(raw_bal or "0x0"), 16)
+
+        amount_mode = str(body.get("amountMode") or "CUSTOM").upper().strip()
+        if amount_mode == "PERCENT":
+            # Explicitly supported preset percentages only. Never trust a
+            # client's display amount for an auto swap.
+            percent = body.get("amountPercent")
+            if type(percent) is not int or percent not in (25, 50, 75, 100):
+                return jsonify({"status":"error","error":"invalid_amount_percent"}), 400
+            spendable = (native_balance - gas_reserve) if is_native else source_balance
+            if spendable is None or spendable <= 0:
+                return jsonify({"status":"error","error":"no_spendable_balance_after_gas_reserve"}), 400
+            amount_in = (spendable * percent) // 100
+            if amount_in <= 0:
+                return jsonify({"status":"error","error":"amount_too_small"}), 400
+            amount = Decimal(amount_in) / (Decimal(10) ** dec_in)
+        elif amount_mode == "CUSTOM":
+            amount_text = str(body.get("amount") or "").strip()
+            try:
+                amount = Decimal(amount_text)
+            except (InvalidOperation, ValueError):
+                return jsonify({"status":"error","error":"amount_invalid"}), 400
+            if not amount.is_finite() or amount <= 0 or amount.as_tuple().exponent < -dec_in:
+                return jsonify({"status":"error","error":"amount_invalid_or_excess_decimals"}), 400
+            from decimal import localcontext
+            with localcontext() as ctx:
+                ctx.prec = max(100, len(amount.as_tuple().digits) + dec_in + 2)
+                raw_units = amount * (Decimal(10) ** dec_in)
+            if raw_units > Decimal(2**128 - 1):
+                return jsonify({"status":"error","error":"amount_exceeds_limit"}), 400
+            amount_in = int(raw_units.to_integral_value(rounding=ROUND_DOWN))
+        else:
+            return jsonify({"status":"error","error":"unsupported_amount_mode"}), 400
+        if amount_in <= 0:
+            return jsonify({"status":"error","error":"amount_too_small"}), 400
+        if amount_in > 2**128 - 1:
+            return jsonify({"status":"error","error":"amount_exceeds_limit"}), 400
+        if is_native and amount_in > native_balance - gas_reserve:
+            return jsonify({"status":"error","error":"insufficient_native_after_gas_reserve",
+                            "gasReserveWei":str(gas_reserve)}), 400
+        if not is_native and (source_balance is None or amount_in > source_balance):
+            return jsonify({"status":"error","error":"insufficient_source_token_balance"}), 400
+        # Format the EXACT integer amount without Decimal context rounding.
+        scale = 10 ** dec_in
+        whole, remainder = divmod(amount_in, scale)
+        exact_amount_human = str(whole) + (
+            "." + str(remainder).zfill(dec_in).rstrip("0") if remainder else ""
+        )
+        deadline = int(time.time()) + 600
+        steps = []
+        if direct:
+            quote_out = min_out = amount_in
+            fee = 0
+            if direct_wrap:
+                steps.append({"type":"wrap", "to":wrapped, "data":"0xd0e30db0", "value":hex(amount_in), "label":f"Wrap {native_symbol}"})
+            else:
+                steps.append({"type":"unwrap", "to":wrapped, "data":"0x2e1a7d4d"+_uint_to_32(amount_in), "value":"0x0", "label":f"Unwrap W{native_symbol}"})
+        else:
+            quote_out, fee = _nexus_wallet_swap_exact_quote(cfg, from_token, token_out, amount_in)
+            min_out = (quote_out * (10_000 - slip)) // 10_000
+            if min_out <= 0 or (dest.upper() in ("USDC", "USDT", "USDC.E") and min_out < (10 ** dec_out) // 10):
+                return jsonify({"status":"error","error":"quote_too_small_to_trade_safely"}), 400
+            if is_native:
+                steps.append({"type":"wrap", "to":wrapped, "data":"0xd0e30db0", "value":hex(amount_in), "label":f"Wrap {native_symbol}"})
+            allowance_raw = _eth_call(cid, from_token, "0xdd62ed3e" + _addr_to_32(wallet) + _addr_to_32(router))
+            allowance = int(str(allowance_raw or "0x0"), 16)
+            if allowance < amount_in:
+                if allowance > 0:
+                    steps.append({"type":"approve_reset", "to":from_token, "data":"0x095ea7b3"+_addr_to_32(router)+_uint_to_32(0), "value":"0x0", "label":"Reset existing approval"})
+                steps.append({"type":"approve", "to":from_token, "data":"0x095ea7b3"+_addr_to_32(router)+_uint_to_32(amount_in), "value":"0x0", "label":"Approve exact swap amount"})
+            selector = (_PRIVY_EXACT_INPUT_SINGLE_LEGACY_SELECTOR if cid == 56 else _PRIVY_EXACT_INPUT_SINGLE_SELECTOR)
+            swap_data = _router_exact_input_single_data(selector, from_token, token_out, router if to_native else wallet, amount_in, min_out, fee, deadline)
+            if to_native:
+                # Atomic swap + unwrap within the router; never leave an unapproved second swap.
+                swap_data = _privy_multicall_data([swap_data, _privy_unwrap_weth9_data(min_out, wallet)])
+            steps.append({"type":"swap", "to":router, "data":swap_data, "value":"0x0", "label":f"Swap to {dest}"})
+        return jsonify({
+            "status":"ok", "chain":chain_key, "chainId":cid,
+            "quoteSource":"DIRECT_WRAP" if direct else "ONCHAIN_QUOTER", "quoteAt":int(time.time()),
+            "deadline":deadline, "feeTier":fee,
+            "tokenIn":source, "tokenOut":selected,
+            "amountIn":str(amount_in), "amountInHuman":exact_amount_human,
+            "amountMode":amount_mode, "amountPercent":percent if amount_mode == "PERCENT" else None,
+            "quoteOut":str(quote_out), "minOut":str(min_out),
+            "slippageBps":slip, "router":router, "gasReserveWei":str(gas_reserve),
+            "steps":steps,
+            "note":"Manual Privy wallet conversion. Wait for each mined confirmation. Not a Vault deposit.",
             "ts":now_ts(),
         })
     except Exception as exc:
