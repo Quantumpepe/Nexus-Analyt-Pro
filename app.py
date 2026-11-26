@@ -28782,7 +28782,7 @@ def api_grid_manual_add():
                         (wa,item_id.upper()),
                     ).fetchone()
                     open_qty = float(row_locked['reserved'] or 0) if row_locked else 0.0
-                    already_units = _parse_asset_units(str(max(0.0,open_qty)), int(funding_state['decimals']))
+                    already_units = _parse_asset_units(str(open_qty), int(funding_state['decimals'])) if open_qty > 0 else 0
                     available_locked = max(0, int(funding_state['freeBaseUnits']) - already_units)
                     if requested_units > available_locked:
                         conn.rollback()
@@ -28805,6 +28805,11 @@ def api_grid_manual_add():
                 pass
         finally:
             conn.close()
+
+        # Never report success or start the runtime for an unsaved order.
+        if not db_saved:
+            print("[ERROR] manual add DB save failed:", db_error)
+            return jsonify({"status": "error", "error": "grid_order_save_failed", "db_saved": False}), 503
 
         # Fast path: do not mirror into GRID_SESSIONS, do not persist runtime state,
         # do not rebuild vault/order summaries, and do not refresh insight profiles here.
