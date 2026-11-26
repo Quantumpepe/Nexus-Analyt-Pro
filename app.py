@@ -186,7 +186,7 @@ def _handle_options_preflight():
 # -------------------------
 # Nexus deploy proof / debug build identifiers
 # -------------------------
-BACKEND_BUILD_ID = "B-2026.11.08-ENGINE-572-RECEIPT-HISTORY-AUDIT";
+BACKEND_BUILD_ID = "B-2026.11.26-ENGINE-573-GRID-SWAP-IDEMPOTENCY";
 FRONTEND_TARGET_BUILD_ID = "F-2026.11.08-BUILD612-RECEIPT-HISTORY-AUDIT"
 STRATEGIST_BUILD_ID = "S-ENGINE-078-OBSERVABILITY-REENTRY-CHECK"
 SHADOW_BUILD_ID = "SH-ENGINE-072-NKR-BACKEND-EXECUTOR-LOGIC"
@@ -27208,6 +27208,64 @@ class _GridExitStepError(RuntimeError):
         self.txs = dict(txs)
 
 
+def _grid_swap_operation_key(wallet, chain_id, vault, order_id):
+    # Stable business identity; not itself a Privy request key.
+    return hashlib.sha256(json.dumps([str(wallet).lower(), int(chain_id),
+        str(vault).lower(), str(order_id)], separators=(",", ":")).encode()).hexdigest()
+
+
+def _grid_swap_request_key(operation_key, wallet_id, chain_id, transaction):
+    # The wallet RPC endpoint, chain and exact transaction determine this request.
+    # This GRID router path does not use executeTrade gas estimation.
+    canonical = json.dumps([operation_key, str(wallet_id), int(chain_id),
+        "eth_sendTransaction", transaction], sort_keys=True, separators=(",", ":"))
+    return "grid-573-" + hashlib.sha256(canonical.encode()).hexdigest()[:55]
+
+
+def _grid_swap_journal(operation_key, *, create=None, broadcast_hash=None):
+    """Atomic durable swap claim. Never replace a claim of unknown outcome.
+
+    The first writer alone may submit. Subsequent workers recover a recorded
+    broadcast or fail closed for reconciliation, including after a crash.
+    """
+    conn = _db()
+    try:
+        with DB_WRITE_LOCK:
+            conn.execute("CREATE TABLE IF NOT EXISTS nexus_grid_swap_journal ("
+                         "operation_key TEXT PRIMARY KEY, request_key TEXT NOT NULL, "
+                         "snapshot_json TEXT NOT NULL, tx_hash TEXT NOT NULL DEFAULT '', "
+                         "created_ts INTEGER NOT NULL)")
+            conn.commit()
+            if create is not None:
+                cur = conn.execute("INSERT OR IGNORE INTO nexus_grid_swap_journal "
+                    "(operation_key, request_key, snapshot_json, created_ts) VALUES (?,?,?,?)",
+                    (operation_key, create["requestKey"], json.dumps(create, sort_keys=True,
+                        separators=(",", ":")), int(time.time())))
+                won = cur.rowcount == 1
+                conn.commit()
+            else:
+                won = False
+            if broadcast_hash is not None:
+                if not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(broadcast_hash)):
+                    raise RuntimeError("grid_swap_journal_invalid_hash")
+                cur = conn.execute("UPDATE nexus_grid_swap_journal SET tx_hash=? "
+                    "WHERE operation_key=? AND (tx_hash='' OR tx_hash=?)",
+                    (broadcast_hash, operation_key, broadcast_hash))
+                if cur.rowcount != 1:
+                    raise RuntimeError("grid_swap_journal_conflicting_hash")
+                conn.commit()
+            row = conn.execute("SELECT * FROM nexus_grid_swap_journal WHERE operation_key=?",
+                               (operation_key,)).fetchone()
+            if row is None:
+                return None, won
+            snapshot = json.loads(row["snapshot_json"])
+            if row["tx_hash"]:
+                snapshot["txs"]["swap"] = row["tx_hash"]
+            return snapshot, won
+    finally:
+        conn.close()
+
+
 def _grid_freebase_withdraw_swap_deposit(
     wallet: str,
     chain_id: int,
@@ -27255,6 +27313,27 @@ def _grid_freebase_withdraw_swap_deposit(
     if not order_id:
         raise RuntimeError("grid_order_id_missing_blocked_to_avoid_duplicate_trade")
     txs = dict(prior_txs or {})
+    operation_key = _grid_swap_operation_key(wa, chain_id, vault, order_id)
+    journal, _ = _grid_swap_journal(operation_key)
+    if journal is not None:
+        # Restore the original quote, funding and balance evidence after restart.
+        saved = dict(journal["txs"])
+        if saved.get("swap"):
+            txs = saved
+            min_out = int(txs["minOut"])
+            pool_fee = int(txs["poolFee"])
+        else:
+            saved["uncertainStep"] = "swap"
+            saved["uncertainReference"] = journal["requestKey"]
+            raise _GridExitStepError("grid_swap_broadcast_unknown_reconciliation_required", saved)
+    elif not txs.get("swap") and (txs.get("prePayoutUnits") is not None or
+                                    txs.get("legacySwapPending")):
+        # A pre-upgrade swap may already have been sent under grid-519. Never
+        # rotate its key blindly: the HTTP conflict says nothing about its outcome.
+        txs["uncertainStep"] = "swap"
+        txs["uncertainReference"] = "grid-519-" + hashlib.sha256(
+            f"{wa.lower()}:{chain_id}:{vault.lower()}:{order_id}:swap".encode()).hexdigest()[:44]
+        raise _GridExitStepError("grid_legacy_swap_reconciliation_required", txs)
     native_zero = NATIVE_TOKEN_ADDRESS
     token_in = wrapped if is_native else _norm_addr(asset_token)
     if not _looks_like_evm_addr(token_in) or token_in == native_zero:
@@ -27285,18 +27364,36 @@ def _grid_freebase_withdraw_swap_deposit(
         ref = "grid-519-" + hashlib.sha256(
             (f"{wa.lower()}:{chain_id}:{vault.lower()}:{order_id}:{key}").encode("utf-8")
         ).hexdigest()[:44]
+        transaction = {"from": wa, "to": _norm_addr(to_addr), "data": data, "value": value}
+        if key == "swap":
+            ref = _grid_swap_request_key(operation_key, wallet_id, chain_id, transaction)
+            snapshot = {"requestKey": ref, "transaction": transaction, "txs": dict(txs)}
+            saved, won = _grid_swap_journal(operation_key, create=snapshot)
+            if not won:
+                txs.update(saved["txs"])
+                if txs.get("swap"):
+                    _require_receipt(step, txs[key])
+                    return txs[key]
+                txs["uncertainStep"] = key
+                txs["uncertainReference"] = saved["requestKey"]
+                _partial_error(step, RuntimeError("grid_swap_already_claimed_reconciliation_required"))
         try:
             sent = _privy_send_delegated_transaction(
-                wallet_id,
-                {"from": wa, "to": _norm_addr(to_addr), "data": data, "value": value},
-                ref, chain_id=chain_id,
+                wallet_id, transaction, ref, chain_id=chain_id,
             )
             tx_hash = str((sent or {}).get("hash") or (sent or {}).get("txHash") or "")
             if not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx_hash):
                 raise RuntimeError("privy_sent_without_valid_hash")
             txs[key] = tx_hash  # Store BEFORE receipt polling.
+            if key == "swap":
+                _grid_swap_journal(operation_key, broadcast_hash=tx_hash)
         except Exception as exc:
-            if "timeout" in str(exc).lower() or "after_submit" in str(exc).lower():
+            if key == "swap" and not txs.get("swap"):
+                # Even HTTP 400 can mean an earlier request used this reference.
+                # Do not replace a potentially broadcast transaction automatically.
+                txs["uncertainStep"] = key
+                txs["uncertainReference"] = ref
+            elif "timeout" in str(exc).lower() or "after_submit" in str(exc).lower():
                 # An unknown broadcast must NOT trigger a new wallet transaction.
                 txs["uncertainStep"] = key
                 txs["uncertainReference"] = ref
@@ -27324,6 +27421,9 @@ def _grid_freebase_withdraw_swap_deposit(
     if txs.get("amountIn") and int(txs["amountIn"]) != amount_in:
         raise RuntimeError("grid_resume_amount_mismatch_manual_review")
     txs["amountIn"] = str(amount_in)
+    txs["minOut"] = str(min_out)
+    txs["poolFee"] = str(pool_fee)
+    txs["payoutToken"] = settlement
 
     # Previously submitted transactions are authoritative. Never repeat them.
     for key in ("withdraw", "wrap", "approveRouter", "swap"):
@@ -27342,8 +27442,9 @@ def _grid_freebase_withdraw_swap_deposit(
         before = int(txs["prePayoutUnits"])
         # Do not count stablecoins the wallet held before this GRID sale.
         received = after - before
-        if received < min_out:
-            _partial_error("payout_proof", RuntimeError(f"stablecoin_delta_below_min:{received}:{min_out}"))
+        required_out = int(txs.get("minOut") or min_out)
+        if received < required_out:
+            _partial_error("payout_proof", RuntimeError(f"stablecoin_delta_below_min:{received}:{required_out}"))
         return {
             "executed": True, "txHash": txs["swap"], "txs": txs,
             "walletStableUnits": str(after), "receivedStableUnits": str(received),
@@ -27607,14 +27708,41 @@ def _grid_try_vault_sell_on_fill(wallet: str, session: dict, order: dict, fill_p
     # An interrupted wallet sale must be recovered before handling any new freeBase.
     ve_prior = (order or {}).get("vault_exit") if isinstance((order or {}).get("vault_exit"), dict) else {}
     prior = ve_prior.get("txs") if isinstance(ve_prior.get("txs"), dict) else {}
-    # Prefer explicit session position, then interrupted wallet swap, then freeBase.
-    if pos_units > 0:
-        sell_units = min(order_units, pos_units)
-        sell_source = sell_source_override or "session_position"
-    elif prior.get("withdraw"):
+    # Recover an existing wallet swap before any new position/freeBase sale.
+    # The journal survives a crash even if the order metadata was not yet saved.
+    order_id = str((order or {}).get("id") or (order or {}).get("order_id") or (order or {}).get("orderId") or "")
+    try:
+        saved_swap, _ = _grid_swap_journal(_grid_swap_operation_key(wa, chain_id, vault, order_id)) if order_id else (None, False)
+    except Exception as journal_exc:
+        result["reason"] = f"grid_swap_journal_unavailable:{str(journal_exc)[:120]}"
+        return result
+    if saved_swap is not None:
+        prior = dict(saved_swap["txs"])
+        if not prior.get("swap"):
+            prior["uncertainStep"] = "swap"
+            prior["uncertainReference"] = saved_swap["requestKey"]
+            result.update(attempted=True, reason="grid_swap_broadcast_unknown_reconciliation_required", txs=prior)
+            return result
+    elif not prior.get("swap") and (prior.get("legacySwapPending") or
+            prior.get("prePayoutUnits") is not None or
+            "STEP=swap:" in str((order or {}).get("sell_pending_reason") or ve_prior.get("reason") or "")):
+        prior = dict(prior)
+        prior["legacySwapPending"] = True
+        prior["uncertainStep"] = "swap"
+        prior["uncertainReference"] = "grid-519-" + hashlib.sha256(
+            f"{wa.lower()}:{chain_id}:{vault.lower()}:{order_id}:swap".encode()).hexdigest()[:44]
+        result.update(attempted=True, reason="grid_legacy_swap_reconciliation_required", txs=prior)
+        return result
+    if prior.get("uncertainStep") and not prior.get("swap"):
+        result.update(attempted=True, reason="grid_privy_broadcast_uncertain_manual_reconciliation", txs=prior)
+        return result
+    if prior.get("withdraw"):
         sell_units = int(prior.get("amountIn") or order_units)
         sell_source = "wallet_swap_resume"
         result["_prior_txs"] = prior
+    elif pos_units > 0:
+        sell_units = min(order_units, pos_units)
+        sell_source = sell_source_override or "session_position"
     elif free_units > 0:
         sell_units = min(order_units, free_units)
         sell_source = "free_base_native" if is_native else "free_base"
